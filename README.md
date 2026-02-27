@@ -106,7 +106,7 @@ The model was trained using the following configuration:
 If you use this code, please cite:
 
 ```bibtex
-@article{selfflow2025,
+@article{selfflow2026,
   title={Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis},
   author={...},
   year={2026}
