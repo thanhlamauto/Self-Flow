@@ -101,18 +101,6 @@ The model was trained using the following configuration:
 - **Mixed precision**: BFloat16
 - **Self-distillation**: Teacher at layer 20 (EMA), student at layer 8
 
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@article{selfflow2026,
-  title={Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis},
-  author={...},
-  year={2026}
-}
-```
-
 ## Acknowledgments
 
 This code builds upon:
