@@ -23,7 +23,8 @@ pip install -r requirements.txt
 
 ### Download Checkpoint
 
-```python -c "
+```
+python -c "
 from huggingface_hub import hf_hub_download
 hf_hub_download(
     repo_id='Hila/Self-Flow',
