@@ -21,6 +21,17 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+### Download Checkpoint
+
+```python
+from huggingface_hub import hf_hub_download
+
+checkpoint_path = hf_hub_download(
+    repo_id="Hila/selfflow-imagenet256",
+    filename="selfflow_imagenet256.pt"
+)
+```
+
 ### Generate 50k samples (multi-GPU recommended)
 
 ```bash
