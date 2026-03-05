@@ -30,6 +30,58 @@ try:
 except Exception:
     pass # Fallback to system environment variable if not on Kaggle
 
+import concurrent.futures
+from PIL import Image
+from torch.utils.data import Dataset
+
+class FastImageFolder(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        
+        # Get all subdirectories (classes)
+        try:
+            self.classes = sorted([d.name for d in os.scandir(root) if d.is_dir()])
+        except FileNotFoundError:
+            self.classes = []
+            
+        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
+        self.samples = self._make_dataset_fast(root)
+        
+    def _make_dataset_fast(self, root):
+        samples = []
+        
+        def process_dir(cls_name):
+            d_path = os.path.join(root, cls_name)
+            class_idx = self.class_to_idx[cls_name]
+            # Use os.listdir to avoid slow stat calls on Kaggle's FUSE filesystem
+            try:
+                filenames = os.listdir(d_path)
+                return [(os.path.join(d_path, fname), class_idx) for fname in filenames
+                        if fname.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            except Exception:
+                return []
+                
+        # Use ThreadPoolExecutor to hide network latency when scanning 1,000 directories
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(process_dir, self.classes))
+            
+        for r in results:
+            samples.extend(r)
+            
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        with open(path, 'rb') as f:
+            sample = Image.open(f).convert('RGB')
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample, target
+
 def get_dataloader(data_dir, split, batch_size, num_workers=4):
     """Create PyTorch DataLoader for ImageNet folder structure."""
     split_dir = os.path.join(data_dir, split)
@@ -43,7 +95,8 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
     
-    dataset = datasets.ImageFolder(split_dir, transform=transform)
+    print(f"Scanning directory {split_dir} (Fast parallel scan for Kaggle)...")
+    dataset = FastImageFolder(split_dir, transform=transform)
     
     dataloader = torch.utils.data.DataLoader(
         dataset,
