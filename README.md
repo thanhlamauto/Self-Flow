@@ -1,6 +1,6 @@
 # Self-Flow ImageNet Inference
 
-This folder contains inference code for generating images with our Self-Flow trained diffusion model on ImageNet 256×256.
+This folder contains inference code for generating images with our [Self-Flow](https://bfl.ai/research/self-flow) trained diffusion model on ImageNet 256×256.
 
 ## Overview
 
