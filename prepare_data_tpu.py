@@ -136,12 +136,11 @@ def main():
     # 2. PMAP Encoding Function
     @jax.pmap
     def encode_fn(images, params):
-        # Flax models expect NHWC format (Batch, Height, Width, Channels)
-        # However, PyTorch gives NCHW. JAX transposition allows perfect mapping:
-        images_nhwc = jnp.transpose(images, (0, 2, 3, 1))
+        # Flax models from Diffusers (with from_pt=True) expect NCHW input format,
+        # otherwise they mistake the Height dimension for the Channel dimension.
         
         # Apply VAE
-        latent_dist = vae.apply({"params": params}, images_nhwc, method=vae.encode).latent_dist
+        latent_dist = vae.apply({"params": params}, images, method=vae.encode).latent_dist
         
         # Using MEAN instead of random sampling to make it deterministic 
         # (similar to stable diffusion training latents cache)
