@@ -276,14 +276,16 @@ class AsyncWandbLogger:
 class AsyncFIDWorker:
     """Background CPU worker for VAE decode + FID to avoid blocking TPU training."""
 
-    def __init__(self, vae, real_data_path, real_batch_size, num_fid_samples=4000, scale_factor=0.18215):
+    def __init__(self, vae, num_fid_samples=4000, decode_batch_size=32, scale_factor=0.18215):
         self.queue = queue.Queue(maxsize=2)
         self.vae = vae
-        self.real_data_path = real_data_path
-        self.real_batch_size = real_batch_size
         self.num_fid_samples = num_fid_samples
+        self.decode_batch_size = decode_batch_size
         self.scale_factor = scale_factor
         self.failed = False
+        self.real_latents_buffer = []
+        self.real_latents_count = 0
+        self.real_features_ready = False
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -315,38 +317,50 @@ class AsyncFIDWorker:
             images = self.vae.decode(latents).sample
         return ((images + 1.0) / 2.0).clamp(0, 1)
 
-    def _populate_real_features(self, fid_metric):
-        print(f"FID Worker: Loading real features from {self.real_data_path} ...")
-        real_iterator = create_data_iterator(
-            data_pattern=self.real_data_path,
-            batch_size=self.real_batch_size,
-            is_training=False,
+    def add_real_latents(self, latents):
+        if self.failed or self.real_features_ready:
+            return
+
+        latents = np.asarray(latents, dtype=np.float32)
+        if latents.ndim != 3:
+            return
+
+        remaining = self.num_fid_samples - self.real_latents_count
+        if remaining <= 0:
+            return
+
+        latents = latents[:remaining]
+        if len(latents) == 0:
+            return
+
+        self.real_latents_buffer.append(np.array(latents, copy=True))
+        self.real_latents_count += len(latents)
+
+    def _ensure_real_features(self, fid_metric):
+        if self.real_features_ready:
+            return True
+
+        if not self.real_latents_buffer:
+            return self.real_latents_count > 0
+
+        real_latents = np.concatenate(self.real_latents_buffer, axis=0)
+        print(
+            f"FID Worker: building real features from {len(real_latents)} buffered latent samples..."
         )
-        loaded = 0
-
-        while loaded < self.num_fid_samples:
-            try:
-                batch = next(real_iterator)
-            except StopIteration:
-                break
-
-            batch_latents = np.asarray(batch[0])
-            remaining = self.num_fid_samples - loaded
-            batch_latents = batch_latents[:remaining]
-            if len(batch_latents) == 0:
-                break
-
+        for start in range(0, len(real_latents), self.decode_batch_size):
+            batch_latents = real_latents[start:start + self.decode_batch_size]
             images = self._decode_patchified_latents(batch_latents)
             fid_metric.update(images, real=True)
-            loaded += len(batch_latents)
 
-        if loaded == 0:
-            raise RuntimeError("No latents were available to build FID real features.")
-
-        if loaded < self.num_fid_samples:
-            print(f"FID Worker: only found {loaded} real samples for FID (requested {self.num_fid_samples}).")
-
-        print(f"FID Worker: real features ready using {loaded} samples.")
+        self.real_latents_buffer.clear()
+        self.real_features_ready = self.real_latents_count >= self.num_fid_samples
+        if self.real_features_ready:
+            print(f"FID Worker: real features ready using {self.real_latents_count} samples.")
+        else:
+            print(
+                f"FID Worker: cached {self.real_latents_count}/{self.num_fid_samples} real samples so far."
+            )
+        return True
 
     def _worker(self):
         try:
@@ -357,7 +371,6 @@ class AsyncFIDWorker:
                 reset_real_features=False,
                 normalize=True,
             ).to("cpu")
-            self._populate_real_features(fid_metric)
 
             while True:
                 item = self.queue.get()
@@ -367,14 +380,23 @@ class AsyncFIDWorker:
 
                 fake_latents_list, target_step = item
                 try:
+                    if not self._ensure_real_features(fid_metric):
+                        print(
+                            f"FID Worker: skipping step {target_step} because real features "
+                            "have not been collected yet."
+                        )
+                        continue
+
                     print(
                         f"FID Worker: decoding {len(fake_latents_list)} generated latent batches "
                         f"for step {target_step}..."
                     )
                     for latents_dev in fake_latents_list:
                         latents = np.asarray(jax.device_get(latents_dev), dtype=np.float32)
-                        images = self._decode_generated_latents(latents)
-                        fid_metric.update(images, real=False)
+                        for start in range(0, len(latents), self.decode_batch_size):
+                            batch_latents = latents[start:start + self.decode_batch_size]
+                            images = self._decode_generated_latents(batch_latents)
+                            fid_metric.update(images, real=False)
 
                     fid_score = float(fid_metric.compute())
                     fid_metric.reset()
@@ -463,12 +485,15 @@ def main():
     parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
     parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps (0 disables)")
     parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of generated/real samples used for FID")
+    parser.add_argument("--fid-batch-size", type=int, default=32, help="CPU decode batch size used for FID real/fake image batches")
     args = parser.parse_args()
 
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if args.fid_freq > 0 and args.num_fid_samples <= 0:
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
+    if args.fid_freq > 0 and args.fid_batch_size <= 0:
+        raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
     
     # Initialize WandB
     wandb.init(project=args.wandb_project, config=vars(args))
@@ -521,6 +546,9 @@ def main():
 
     vae = None
     fid_worker = None
+    fid_real_source = "live train batches"
+    if args.val_data_path is not None and args.eval_freq > 0:
+        fid_real_source += " + validation batches"
     if args.sample_freq > 0 or args.fid_freq > 0:
         # Lazy-load CPU-side libraries to reduce native-runtime conflicts on TPU.
         from diffusers.models import AutoencoderKL
@@ -530,18 +558,19 @@ def main():
         vae.eval()
 
     if args.fid_freq > 0:
-        fid_real_data_path = args.val_data_path or args.data_path
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
 
             _ = FrechetInceptionDistance
             fid_worker = AsyncFIDWorker(
                 vae=vae,
-                real_data_path=fid_real_data_path,
-                real_batch_size=args.batch_size,
                 num_fid_samples=args.num_fid_samples,
+                decode_batch_size=args.fid_batch_size,
             )
-            print(f"FID will use real samples from: {fid_real_data_path}")
+            print(
+                f"FID worker initialized. Real features will be collected from {fid_real_source} batches "
+                f"and decoded on CPU with batch size {args.fid_batch_size}."
+            )
         except ImportError:
             print("WARNING: torchmetrics is not installed. FID will be disabled.")
         except Exception as e:
@@ -555,6 +584,8 @@ def main():
             if data_iterator is not None:
                 # Real TPU Batch from ArrayRecord Pipeline
                 batch = next(data_iterator)
+                if fid_worker is not None:
+                    fid_worker.add_real_latents(batch[0])
                 batch_x = jnp.array(batch[0])
                 batch_y = jnp.array(batch[1])
             else:
@@ -562,6 +593,8 @@ def main():
                 rng_mock, = jax.random.split(rng[0], 1)
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+                if fid_worker is not None:
+                    fid_worker.add_real_latents(np.asarray(batch_x, dtype=np.float32))
             
             # Reshape batch for SPMD distribution: (Global, ...) -> (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
@@ -593,6 +626,8 @@ def main():
                         data_pattern=args.val_data_path,
                         batch_size=args.batch_size,
                     )
+                    if fid_worker is not None:
+                        fid_worker.add_real_latents(val_batch[0])
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = eval_step(state, (val_x, val_y), rng)
