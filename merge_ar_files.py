@@ -48,12 +48,12 @@ def main():
             if hasattr(reader, "num_records"):
                 n = reader.num_records()
                 for i in range(n):
-                    writer.write(reader.read(i))
+                    writer.write(reader.read([i])[0])
             # Fallback 2: NumRecords() (C++ style)
             elif hasattr(reader, "NumRecords"):
                 n = reader.NumRecords()
                 for i in range(n):
-                    writer.write(reader.read(i))
+                    writer.write(reader.read([i])[0])
             # Fallback 3: Sequence behavior
             elif hasattr(reader, "__len__"):
                 for i in range(len(reader)):
