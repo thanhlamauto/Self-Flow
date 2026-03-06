@@ -4,14 +4,18 @@ import pickle
 import time
 import threading
 import queue
+import functools
 
 import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from flax.training import train_state, checkpoints
-from flax import jax_utils
 from tqdm import tqdm
+from diffusers.models import AutoencoderKL
+import torch
+from flax.training import train_state, checkpoints
+from flax import jax_utils, core
+import flax.linen as nn
 from diffusers.models import AutoencoderKL
 import torch
 
@@ -28,21 +32,48 @@ from src.sampling import denoise_loop
 from src.utils import batched_prc_img, scattercat
 
 
+class TrainStateWithEMA(train_state.TrainState):
+    ema_params: core.FrozenDict[str, jnp.ndarray]
+
+class ProjectionHead(nn.Module):
+    """Linear projection head for Student feature alignment."""
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.out_dim)(x)
+
+class SelfFlowModelWithHead(nn.Module):
+    config: dict
+    
+    def setup(self):
+        self.dit = SelfFlowPerTokenDiT(
+            input_size=self.config["input_size"],
+            patch_size=self.config["patch_size"],
+            in_channels=self.config["in_channels"],
+            hidden_size=self.config["hidden_size"],
+            depth=self.config["depth"],
+            num_heads=self.config["num_heads"],
+            mlp_ratio=self.config["mlp_ratio"],
+            num_classes=self.config["num_classes"],
+            learn_sigma=self.config["learn_sigma"],
+            compatibility_mode=self.config["compatibility_mode"],
+            per_token=True,
+        )
+        self.proj_head = ProjectionHead(out_dim=self.config["hidden_size"])
+        
+    def __call__(self, x, timesteps, vector, return_features=False, deterministic=True, rngs=None):
+        if return_features:
+            out, features = self.dit(x, timesteps=timesteps, vector=vector, return_features=return_features, deterministic=deterministic)
+            projected_features = self.proj_head(features)
+            return out, projected_features
+        else:
+            return self.dit(x, timesteps=timesteps, vector=vector, deterministic=deterministic)
+
+
 def create_train_state(rng, config, learning_rate):
     """Initializes the model and TrainState."""
-    model = SelfFlowPerTokenDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=True,
-    )
+    model = SelfFlowModelWithHead(config=config)
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -60,65 +91,138 @@ def create_train_state(rng, config, learning_rate):
         deterministic=False
     )
     
-    tx = optax.adamw(learning_rate)
+    # Cast base params to bfloat16 for TPU efficiency, but keep EMA in fp32 for stability
+    params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), variables['params'])
+    ema_params = variables['params'] # Keep float32
     
-    return train_state.TrainState.create(
+    # Optimizer with Gradient Clipping
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate)
+    )
+    
+    return TrainStateWithEMA.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
+        ema_params=ema_params,
         tx=tx,
     )
 
 
-@jax.pmap
-def train_step(state, batch, rng):
-    """Executes a single distributed training step."""
+@functools.partial(jax.pmap, static_broadcasted_argnums=(3, 4, 5, 6))
+def train_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, mask_ratio=0.25):
+    """Executes a single distributed training step with Self-Flow."""
     x, y = batch
     
-    rng, step_rng, time_rng, noise_rng, drop_rng = jax.random.split(rng, 5)
+    rng, step_rng, t_rng, s_rng, noise_rng, drop_rng, mask_rng = jax.random.split(rng, 7)
     
-    t = jax.random.uniform(time_rng, shape=(x.shape[0],))
-    noise = jax.random.normal(noise_rng, x.shape)
+    # 1. Self-Flow: Dual-Timestep Scheduling
+    batch_size, n_patches, patch_dim = x.shape
     
-    t_expanded = t[:, None, None]
-    x_t = (1.0 - t_expanded) * noise + t_expanded * x 
-    target = x - noise
+    # Draw independent scalars t and s
+    t = jax.random.uniform(t_rng, shape=(batch_size,))
+    s = jax.random.uniform(s_rng, shape=(batch_size,))
+    noise = jax.random.normal(noise_rng, x.shape, dtype=x.dtype)
     
+    # Generate Boolean masks for tokens
+    rand_mask = jax.random.uniform(mask_rng, shape=(batch_size, n_patches))
+    M = rand_mask < mask_ratio
+    
+    # Create per-token timestep vector tau
+    t_expanded = jnp.broadcast_to(t[:, None], (batch_size, n_patches))
+    s_expanded = jnp.broadcast_to(s[:, None], (batch_size, n_patches))
+    tau = jnp.where(M, s_expanded, t_expanded) # tokens inside M get s, outside get t
+    
+    # 2. Student Forward Pass (x_tau)
+    # x_t = (1 - t)x + t * noise --> matches velocity target (noise - x)
+    tau_expanded_input = tau[:, :, None]
+    x_tau = (1.0 - tau_expanded_input) * x + tau_expanded_input * noise 
+    target = noise - x # Standard target for flow matching
+
+    # 3. Teacher Forward Pass (x_tau_min)
+    tau_min = jnp.minimum(t, s) # scalar condition
+    tau_min_expanded_input = tau_min[:, None, None]
+    x_tau_min = (1.0 - tau_min_expanded_input) * x + tau_min_expanded_input * noise
+    
+    # Extract Teacher Features
+    _, teacher_features = state.apply_fn(
+        {'params': state.ema_params},
+        x_tau_min,
+        timesteps=tau_min, # Teacher uses scalar timestep
+        vector=y,
+        return_features=teacher_layer,
+        deterministic=True
+    )
+    teacher_features = jax.lax.stop_gradient(teacher_features)
+
     def loss_fn(params):
-        pred = state.apply_fn(
+        # Predict Student Velocity and Extract Features
+        pred_velocity, student_features = state.apply_fn(
             {'params': params},
-            x_t,
-            timesteps=t,
+            x_tau,
+            timesteps=tau, # Student uses per-token timestep vector
             vector=y,
+            return_features=student_layer,
             deterministic=False,
             rngs={'dropout': drop_rng}
         )
-        # Compute losses
-        loss_sq = (pred - target) ** 2
-        loss = jnp.mean(loss_sq)
+        
+        # A. Flow Loss (velocity prediction against target)
+        loss_flow_sq = (pred_velocity - target) ** 2
+        loss_flow = jnp.mean(loss_flow_sq)
+        
+        # B. Representation Alignment Loss (Cosine Similarity)
+        # Convert to float32 to prevent instabilities during normalization and sum reduction
+        student_feat_fp32 = student_features.astype(jnp.float32)
+        teacher_feat_fp32 = teacher_features.astype(jnp.float32)
+        
+        student_norm = student_feat_fp32 / (jnp.linalg.norm(student_feat_fp32, axis=-1, keepdims=True) + 1e-6)
+        teacher_norm = teacher_feat_fp32 / (jnp.linalg.norm(teacher_feat_fp32, axis=-1, keepdims=True) + 1e-6)
+        
+        # Cosine similarity: sum(A_norm * B_norm, axis=-1) -> mean over batch/sequence
+        cos_sim = jnp.sum(student_norm * teacher_norm, axis=-1)
+        loss_distill = jnp.mean(1.0 - cos_sim)
+        
+        # C. Total Loss
+        loss = loss_flow + gamma * loss_distill
         
         # Internal Metrics calculation to avoid host transfers
         v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+        v_pred_abs_mean = jnp.mean(jnp.abs(pred_velocity))
         
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (loss_flow, loss_distill, v_abs_mean, v_pred_abs_mean)
         
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (loss_flow, loss_distill, v_abs, v_pred)), grads = grad_fn(state.params)
     
     # Cross-device synchronization (TPU v5e-8 Data Parallel)
     loss = jax.lax.pmean(loss, axis_name='batch')
+    loss_flow = jax.lax.pmean(loss_flow, axis_name='batch')
+    loss_distill = jax.lax.pmean(loss_distill, axis_name='batch')
     v_abs = jax.lax.pmean(v_abs, axis_name='batch')
     v_pred = jax.lax.pmean(v_pred, axis_name='batch')
     grads = jax.lax.pmean(grads, axis_name='batch')
     
-    # Calculate norms on device
-    grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)]))
-    param_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)]))
+    # Calculate norms on device in fp32
+    grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x.astype(jnp.float32))) for x in jax.tree_util.tree_leaves(grads)]))
+    param_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x.astype(jnp.float32))) for x in jax.tree_util.tree_leaves(state.params)]))
     
+    # Apply gradients
     state = state.apply_gradients(grads=grads)
     
+    # Update Teacher EMA params
+    ema_decay = 0.9999
+    new_ema_params = jax.tree_util.tree_map(
+        lambda ema, param: ema_decay * ema + (1.0 - ema_decay) * param,
+        state.ema_params,
+        state.params
+    )
+    state = state.replace(ema_params=new_ema_params)
+    
     metrics = {
-        "train/loss": loss,
+        "train/loss_total": loss,
+        "train/loss_flow": loss_flow,
+        "train/loss_distill": loss_distill,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
@@ -212,8 +316,8 @@ class AsyncWandbLogger:
         self.thread.join()
 
   
-@jax.jit
-def sample_latents_jit(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
+@functools.partial(jax.jit, static_argnames=('hidden_size', 'depth', 'num_heads', 'num_steps', 'cfg_scale'))
+def sample_latents_jit(params, class_labels, rng, hidden_size=1152, depth=28, num_heads=16, num_steps=50, cfg_scale=4.0):
     """Generate sample latents on TPU."""
     batch_size = class_labels.shape[0]
     latent_channels, latent_size, patch_size = 4, 32, 2
@@ -232,10 +336,11 @@ def sample_latents_jit(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
         
     def model_fn(z_x, t):
         # We need a dummy apply_fn call mapping mechanism
-        model = SelfFlowPerTokenDiT(
-            input_size=32, patch_size=2, in_channels=4, hidden_size=1152, depth=28, 
-            num_heads=16, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True, per_token=True
+        config = dict(
+            input_size=32, patch_size=2, in_channels=4, hidden_size=hidden_size, depth=depth, 
+            num_heads=num_heads, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
         )
+        model = SelfFlowModelWithHead(config=config)
         return model.apply({'params': params}, z_x, timesteps=t, vector=class_labels, deterministic=True)
         
     rng, denoise_rng = jax.random.split(rng)
@@ -264,6 +369,7 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
     parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
     parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
+    parser.add_argument("--model", type=str, default="DiT-XL/2", choices=["DiT-XL/2", "DiT-B/2", "DiT-S/2"], help="Model architecture")
     args = parser.parse_args()
     
     # Initialize WandB
@@ -279,9 +385,22 @@ def main():
 
     rng = jax.random.PRNGKey(42)
     
+    # Model configuration
+    model_configs = {
+        "DiT-XL/2": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
+        "DiT-B/2": {"hidden_size": 768, "depth": 12, "num_heads": 12},
+        "DiT-S/2": {"hidden_size": 384, "depth": 12, "num_heads": 6},
+    }
+    m_cfg = model_configs[args.model]
+    
+    # Distillation Feature Extraction setup (l = 0.3D, k = 0.7D)
+    teacher_layer = int(round(0.7 * m_cfg["depth"]))
+    student_layer = int(round(0.3 * m_cfg["depth"]))
+    print(f"Selected Model: {args.model} -> Teacher extracted at block {teacher_layer}, Student aligns at block {student_layer}")
+    
     config = dict(
-        input_size=32, patch_size=2, in_channels=4, hidden_size=1152, depth=28,
-        num_heads=16, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
+        input_size=32, patch_size=2, in_channels=4, hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"],
+        num_heads=m_cfg["num_heads"], mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
     )
     
     state = create_train_state(rng, config, args.learning_rate)
@@ -329,7 +448,7 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
             
             # Pmap execute step
-            state, metrics, rng = train_step(state, (batch_x, batch_y), rng)
+            state, metrics, rng = train_step(state, (batch_x, batch_y), rng, teacher_layer, student_layer)
             global_step += 1
             
             # Periodic Async Logging
@@ -356,7 +475,10 @@ def main():
                 single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
                 
                 # Generate latents asynchronously via JIT
-                latents_dev = sample_latents_jit(single_params, sample_classes, sample_rng)
+                latents_dev = sample_latents_jit(
+                    single_params, sample_classes, sample_rng,
+                    hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"], num_heads=m_cfg["num_heads"]
+                )
                 
                 # Hand over to background worker to pull array to host, decode in PyTorch VAE, and wandb.log
                 def background_decode_and_log(z_dev, classes, target_step):
