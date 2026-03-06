@@ -10,6 +10,13 @@ Usage:
         --output-dir ./imagenet_latents \
         --batch-size 128 \
         --num-shards 1024
+
+    python prepare_data_tpu.py \
+        --split train val \
+        --data-dir /kaggle/input/competitions/imagenet-object-localization-challenge/ILSVRC/Data/CLS-LOC \
+        --output-dir ./imagenet_latents \
+        --batch-size 128 \
+        --num-shards 1024
 """
 
 import os
@@ -47,6 +54,9 @@ try:
     os.environ["HF_TOKEN"] = user_secrets.get_secret("HF_TOKEN")
 except Exception:
     pass
+
+
+SUPPORTED_SPLITS = ("train", "val", "test")
 
 
 class FastImageFolder(Dataset):
@@ -144,6 +154,36 @@ def validate_dependencies():
         )
 
 
+def resolve_splits(split_args):
+    resolved = []
+    for item in split_args:
+        for token in item.split(","):
+            split = token.strip().lower()
+            if not split:
+                continue
+            if split == "all":
+                resolved.extend(SUPPORTED_SPLITS)
+                continue
+            if split not in SUPPORTED_SPLITS:
+                raise ValueError(
+                    f"Unsupported split '{split}'. "
+                    f"Expected one of {', '.join(SUPPORTED_SPLITS)} or 'all'."
+                )
+            resolved.append(split)
+
+    deduped = []
+    seen = set()
+    for split in resolved:
+        if split in seen:
+            continue
+        seen.add(split)
+        deduped.append(split)
+
+    if not deduped:
+        raise ValueError("No valid splits were provided.")
+    return deduped
+
+
 def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, vae_model="stabilityai/sd-vae-ft-ema"):
     validate_dependencies()
     os.makedirs(output_dir, exist_ok=True)
@@ -235,7 +275,12 @@ def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, v
 
 def main():
     parser = argparse.ArgumentParser(description="Encode ImageNet using JAX/TPU v5e-8.")
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--split",
+        nargs="+",
+        default=["train"],
+        help="One or more splits to encode. Examples: --split train, --split train val, --split all",
+    )
     parser.add_argument("--data-dir", type=str, required=True, help="Base directory")
     parser.add_argument("--output-dir", type=str, default="./outputs", help="Directory to save .ar files")
     parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
@@ -243,14 +288,17 @@ def main():
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
     
     args = parser.parse_args()
-    run_encoding(
-        split=args.split,
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        num_shards=args.num_shards,
-        vae_model=args.vae_model,
-    )
+    splits = resolve_splits(args.split)
+    print(f"[prepare_data_tpu] Encoding splits: {', '.join(splits)}")
+    for split in splits:
+        run_encoding(
+            split=split,
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            num_shards=args.num_shards,
+            vae_model=args.vae_model,
+        )
 
 if __name__ == "__main__":
     main()
