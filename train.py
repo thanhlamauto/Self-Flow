@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import argparse
 import pickle
@@ -7,33 +8,358 @@ import threading
 import queue
 import functools
 import subprocess
-import shutil
+import faulthandler
+from pathlib import Path
+
+faulthandler.enable(all_threads=True)
+print("[train.py] Script import started", flush=True)
 
 import jax
 import jax.numpy as jnp
 import optax
 import wandb
-from tqdm import tqdm
 from diffusers.models import AutoencoderKL
 import torch
-from flax import struct
 from flax.training import train_state
 from flax import jax_utils, core
 import flax.linen as nn
 import orbax.checkpoint as ocp
-from diffusers.models import AutoencoderKL
-import torch
 
 # Import data loaders
 try:
     import numpy as np
+except ImportError:
+    np = None
+    print("WARNING: numpy import failed.", flush=True)
+
+try:
     import grain.python as grain
 except ImportError:
+    grain = None
     print("WARNING: grain not installed. Please `pip install grain-balsa` for ArrayRecord support.", flush=True)
 
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
 from src.utils import batched_prc_img, scattercat
+
+
+MODEL_CONFIGS = {
+    "DiT-XL/2": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
+    "DiT-B/2": {"hidden_size": 768, "depth": 12, "num_heads": 12},
+    "DiT-S/2": {"hidden_size": 384, "depth": 12, "num_heads": 6},
+}
+
+
+def log_stage(message):
+    print(f"[train.py] {message}", flush=True)
+
+
+def wandb_is_active():
+    return getattr(wandb, "run", None) is not None
+
+
+def safe_wandb_log(metrics, step=None):
+    if not wandb_is_active():
+        return
+    try:
+        if step is None:
+            wandb.log(metrics)
+        else:
+            wandb.log(metrics, step=step)
+    except Exception as exc:
+        log_stage(f"WandB logging failed at step {step}: {exc}")
+
+
+def init_wandb(args):
+    log_stage("Initializing WandB...")
+    try:
+        run = wandb.init(project=args.wandb_project, config=vars(args))
+        wandb.define_metric("train/step")
+        wandb.define_metric("*", step_metric="train/step")
+        log_stage("WandB initialized.")
+        return run
+    except Exception as exc:
+        log_stage(f"WandB init failed, disabling WandB logging: {exc}")
+        try:
+            run = wandb.init(mode="disabled")
+            log_stage("WandB switched to disabled mode.")
+            return run
+        except Exception as disabled_exc:
+            log_stage(f"Failed to enter disabled WandB mode: {disabled_exc}")
+            return None
+
+
+def load_host_vae():
+    log_stage("Loading host-side VAE...")
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
+    vae.eval()
+    log_stage("Host-side VAE ready.")
+    return vae
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
+    parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps in an epoch")
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--ckpt-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--data-path", type=str, default="/path/to/imagenet/latents/*.ar", help="Path to ArrayRecords")
+    parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
+    parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
+    parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
+    parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps")
+    parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of samples for FID")
+    parser.add_argument("--model", type=str, default="DiT-XL/2", choices=sorted(MODEL_CONFIGS), help="Model architecture")
+    parser.add_argument("--online-encode", type=str, default=None, help="Path to raw ImageNet data to trigger auto TPU VAE encoding before training")
+    parser.add_argument("--online-batch-size", type=int, default=128, help="Batch size for online VAE encoding")
+    return parser.parse_args()
+
+
+def create_checkpoint_manager(ckpt_dir):
+    ckpt_path = Path(ckpt_dir).expanduser().resolve()
+    log_stage(f"Initializing Checkpoint Manager at: {ckpt_path}")
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
+    manager = ocp.CheckpointManager(str(ckpt_path), options=options)
+    log_stage("Orbax Checkpoint Manager initialized.")
+    return manager
+
+
+def maybe_run_online_encoding(args):
+    if args.online_encode is None:
+        return args.data_path
+
+    log_stage(f"Online Encode requested. Source data: {args.online_encode}")
+    ar_output_dir = "/kaggle/working/latents"
+    os.makedirs(ar_output_dir, exist_ok=True)
+    cmd = [
+        sys.executable, "-u", "prepare_data_tpu.py",
+        "--split", "train",
+        "--data-dir", args.online_encode,
+        "--output-dir", ar_output_dir,
+        "--batch-size", str(args.online_batch_size),
+        "--num-shards", "1024",
+    ]
+    log_stage(f"Executing: {' '.join(cmd)}")
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    for line in process.stdout:
+        print(f"[Encoder]: {line.strip()}", flush=True)
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"Online encoding failed with return code {process.returncode}")
+
+    data_path = f"{ar_output_dir}/*.ar"
+    log_stage(f"Online Encoding completed successfully. Using data path: {data_path}")
+    return data_path
+
+
+def get_device_setup(global_batch_size):
+    num_devices = jax.device_count()
+    if global_batch_size % num_devices != 0:
+        raise ValueError(f"--batch-size ({global_batch_size}) must be divisible by the JAX device count ({num_devices})")
+
+    local_batch_size = global_batch_size // num_devices
+    log_stage(f"JAX devices detected: {num_devices}")
+    log_stage(f"Global Batch: {global_batch_size}, Local Batch: {local_batch_size}")
+    return num_devices, local_batch_size
+
+
+def build_model_setup(model_name):
+    model_dims = MODEL_CONFIGS[model_name]
+    teacher_layer = int(round(0.7 * model_dims["depth"]))
+    student_layer = int(round(0.3 * model_dims["depth"]))
+    config = dict(
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=model_dims["hidden_size"],
+        depth=model_dims["depth"],
+        num_heads=model_dims["num_heads"],
+        mlp_ratio=4.0,
+        num_classes=1001,
+        learn_sigma=True,
+        compatibility_mode=True,
+    )
+    patch_dim = config["in_channels"] * config["patch_size"] ** 2
+    n_patches = (config["input_size"] // config["patch_size"]) ** 2
+    log_stage(f"Selected Model: {model_name} -> Teacher block {teacher_layer}, Student block {student_layer}")
+    return model_dims, config, teacher_layer, student_layer, patch_dim, n_patches
+
+
+def initialize_train_state_for_devices(config, learning_rate, num_devices):
+    rng = jax.random.PRNGKey(42)
+    log_stage("Creating initial TrainState...")
+    state = create_train_state(rng, config, learning_rate)
+    state = jax_utils.replicate(state)
+    device_rngs = jax.random.split(rng, num_devices)
+    log_stage("Replicated TrainState initialized.")
+    return state, device_rngs
+
+
+def create_data_iterator(data_path, batch_size):
+    log_stage(f"Initializing Grain dataloader with pattern: {data_path}")
+    dataloader = get_arrayrecord_dataloader(data_pattern=data_path, batch_size=batch_size, is_training=True)
+    log_stage("DataLoader initialized successfully via Grain.")
+    return iter(dataloader)
+
+
+def maybe_initialize_host_eval(args):
+    vae = None
+    fid_worker = None
+    if args.sample_freq <= 0 and args.fid_freq <= 0:
+        return vae, fid_worker
+
+    try:
+        vae = load_host_vae()
+    except Exception as exc:
+        log_stage(f"Host-side VAE init failed. Disabling sample/FID hooks. Error: {exc}")
+        args.sample_freq = 0
+        args.fid_freq = 0
+        return None, None
+
+    if args.fid_freq <= 0:
+        return vae, None
+
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        _ = FrechetInceptionDistance
+        fid_worker = AsyncFIDWorker(vae=vae, num_fid_samples=args.num_fid_samples)
+        log_stage("FID worker initialized.")
+    except ImportError:
+        log_stage("WARNING: torchmetrics not installed. FID evaluation will be disabled. Run pip install torchmetrics.")
+    except Exception as exc:
+        log_stage(f"FID worker init failed. FID evaluation will be disabled. Error: {exc}")
+
+    return vae, fid_worker
+
+
+def split_leading_rng(device_rngs):
+    next_rng, worker_rng = jax.random.split(device_rngs[0])
+    return device_rngs.at[0].set(next_rng), worker_rng
+
+
+def get_training_batch(data_iterator, device_rngs, batch_size, n_patches, patch_dim):
+    if data_iterator is not None:
+        batch = next(data_iterator)
+        batch_x = jnp.array(batch[0])
+        batch_y = jnp.array(batch[1])
+        return batch_x, batch_y, device_rngs
+
+    device_rngs, mock_rng = split_leading_rng(device_rngs)
+    batch_x = jax.random.normal(mock_rng, (batch_size, n_patches, patch_dim))
+    batch_y = jax.random.randint(mock_rng, (batch_size,), 0, 1000)
+    return batch_x, batch_y, device_rngs
+
+
+def distribute_batch(batch_x, batch_y, num_devices, local_batch_size, n_patches, patch_dim):
+    batch_x_dist = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+    batch_y_dist = batch_y.reshape(num_devices, local_batch_size)
+    return batch_x_dist, batch_y_dist
+
+
+def extract_leading_replica(tree):
+    return jax.tree_util.tree_map(lambda value: value[0], tree)
+
+
+def maybe_log_metrics(logger, metrics, global_step, last_log_time, log_freq):
+    if log_freq <= 0 or global_step % log_freq != 0:
+        return last_log_time
+
+    cpu_metrics = extract_leading_replica(metrics)
+    now = time.time()
+    cpu_metrics["perf/train_step_time"] = (now - last_log_time) / log_freq
+    cpu_metrics["train/step"] = global_step
+    logger.log(cpu_metrics, step=global_step)
+    return now
+
+
+def decode_and_log_samples(vae, latents_dev, classes, target_step):
+    latents = jax.device_get(latents_dev)
+    latents = torch.from_numpy(latents) / 0.18215
+    classes = jax.device_get(classes)
+
+    with torch.no_grad():
+        images = vae.decode(latents).sample
+
+    images = (images + 1.0) / 2.0
+    images = images.clamp(0, 1).permute(0, 2, 3, 1).numpy()
+    images = (images * 255).astype(np.uint8)
+    safe_wandb_log({
+        "train/step": target_step,
+        "samples": [wandb.Image(img, caption=f"Class {cls}") for img, cls in zip(images, classes)],
+    })
+
+
+def maybe_generate_samples(args, vae, state, device_rngs, global_step, model_dims):
+    if vae is None or args.sample_freq <= 0 or global_step % args.sample_freq != 0:
+        return device_rngs
+
+    log_stage(f"Step {global_step}: Generating evaluation samples...")
+    device_rngs, sample_rng = split_leading_rng(device_rngs)
+    sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
+    single_params = extract_leading_replica(state.params)
+    latents_dev = sample_latents_jit(
+        single_params,
+        sample_classes,
+        sample_rng,
+        hidden_size=model_dims["hidden_size"],
+        depth=model_dims["depth"],
+        num_heads=model_dims["num_heads"],
+    )
+    threading.Thread(
+        target=decode_and_log_samples,
+        args=(vae, latents_dev, sample_classes, global_step),
+        daemon=True,
+    ).start()
+    return device_rngs
+
+
+def maybe_schedule_fid(args, fid_worker, state, device_rngs, global_step, model_dims):
+    if fid_worker is None or args.fid_freq <= 0 or global_step % args.fid_freq != 0:
+        return device_rngs
+
+    log_stage(f"Step {global_step}: Generating {args.num_fid_samples} latents for FID computation...")
+    fid_batch_size = args.batch_size
+    num_fid_batches = math.ceil(args.num_fid_samples / fid_batch_size)
+    all_fake_latents_dev = []
+    ema_params = extract_leading_replica(state.ema_params)
+
+    for _ in range(num_fid_batches):
+        device_rngs, sample_rng = split_leading_rng(device_rngs)
+        sample_classes = jax.random.randint(sample_rng, (fid_batch_size,), 0, 1000)
+        latents_dev = sample_latents_jit(
+            ema_params,
+            sample_classes,
+            sample_rng,
+            hidden_size=model_dims["hidden_size"],
+            depth=model_dims["depth"],
+            num_heads=model_dims["num_heads"],
+            num_steps=50,
+        )
+        all_fake_latents_dev.append(latents_dev)
+
+    fid_worker.compute_fid(all_fake_latents_dev, global_step)
+    return device_rngs
+
+
+def save_checkpoint(checkpoint_manager, state, global_step):
+    log_stage(f"Saving checkpoint for step {global_step}...")
+    checkpoint_manager.save(global_step, args=ocp.args.StandardSave(jax_utils.unreplicate(state)))
+    checkpoint_manager.wait_until_finished()
+
+
+def shutdown_runtime(logger, fid_worker):
+    logger.shutdown()
+    if fid_worker is not None:
+        fid_worker.shutdown()
 
 
 class TrainStateWithEMA(train_state.TrainState):
@@ -92,6 +418,7 @@ def create_train_state(rng, config, learning_rate):
         x=dummy_x, 
         timesteps=dummy_t, 
         vector=dummy_vec, 
+        return_features=1,
         deterministic=False
     )
     
@@ -113,12 +440,12 @@ def create_train_state(rng, config, learning_rate):
     )
 
 
-@functools.partial(jax.pmap, static_broadcasted_argnums=(3, 4, 5, 6))
+@functools.partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(3, 4))
 def train_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, mask_ratio=0.25):
     """Executes a single distributed training step with Self-Flow."""
     x, y = batch
     
-    rng, step_rng, t_rng, s_rng, noise_rng, drop_rng, mask_rng = jax.random.split(rng, 7)
+    rng, _, t_rng, s_rng, noise_rng, drop_rng, mask_rng = jax.random.split(rng, 7)
     
     # 1. Self-Flow: Dual-Timestep Scheduling
     batch_size, n_patches, patch_dim = x.shape
@@ -240,6 +567,11 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     """
     Creates an optimized Grain dataloader reading from ArrayRecord files.
     """
+    if grain is None:
+        raise RuntimeError("grain is not installed")
+    if np is None:
+        raise RuntimeError("numpy is not available")
+
     data_source = grain.ArrayRecordDataSource(data_pattern)
     
     class ParseAndTokenizeLatents(grain.MapTransform):
@@ -302,9 +634,9 @@ class AsyncWandbLogger:
             # Perform jax.device_get to block *only* the worker thread
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
-                wandb.log(metrics_cpu, step=step)
+                safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
-                print(f"WandB Logging error: {e}")
+                log_stage(f"WandB Logging error: {e}")
             finally:
                 self.queue.task_done()
                 
@@ -355,7 +687,7 @@ class AsyncFIDWorker:
                 
                 # Compute real features if we haven't yet and have enough latents
                 if not self.is_real_computed and self.real_latents_buffer:
-                    print(f"FID Worker: Computing real features from {self.num_fid_samples} training latents...")
+                    log_stage(f"FID Worker: Computing real features from {self.num_fid_samples} training latents...")
                     real_latents = np.concatenate(self.real_latents_buffer, axis=0)[:self.num_fid_samples]
                     
                     for i in range(0, len(real_latents), 64):
@@ -370,14 +702,14 @@ class AsyncFIDWorker:
                     
                     self.is_real_computed = True
                     self.real_latents_buffer.clear()
-                    print("FID Worker: Real features computed successfully.")
+                    log_stage("FID Worker: Real features computed successfully.")
                 
                 if not self.is_real_computed:
-                    print("FID Worker: Can't compute FID yet, real features not populated.")
+                    log_stage("FID Worker: Can't compute FID yet, real features not populated.")
                     self.queue.task_done()
                     continue
                     
-                print(f"FID Worker: Decoding {len(fake_latents_list)} batches of fake latents and computing FID...")
+                log_stage(f"FID Worker: Decoding {len(fake_latents_list)} batches of fake latents and computing FID...")
                 for z_dev in fake_latents_list:
                     z = jax.device_get(z_dev) # Transfer from TPU
                     z = torch.from_numpy(z) / self.scale_factor
@@ -390,19 +722,20 @@ class AsyncFIDWorker:
                 fid_score = float(fid_metric.compute())
                 fid_metric.reset() # resets fake features only
                 
-                wandb.log({"val/FID": fid_score, "train/step": target_step})
-                print(f"FID Worker: FID = {fid_score:.4f} at step {target_step}")
+                safe_wandb_log({"val/FID": fid_score, "train/step": target_step})
+                log_stage(f"FID Worker: FID = {fid_score:.4f} at step {target_step}")
                 
                 self.queue.task_done()
         except Exception as e:
-            print(f"FID Worker error: {e}")
-            self.queue.task_done()
+            log_stage(f"FID Worker error: {e}")
+            if not self.queue.empty():
+                self.queue.task_done()
             
     def compute_fid(self, fake_latents_list, step):
         try:
             self.queue.put_nowait((fake_latents_list, step))
         except queue.Full:
-            print("FID Worker queue full, skipping this FID evaluation.")
+            log_stage("FID Worker queue full, skipping this FID evaluation.")
             
     def shutdown(self):
         self.queue.put(None)
@@ -452,240 +785,73 @@ def sample_latents_jit(params, class_labels, rng, hidden_size=1152, depth=28, nu
 
 
 def main():
-    print("--- Self-Flow Training Script Starting ---", flush=True)
-    parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
-    parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps in an epoch")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--ckpt-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--data-path", type=str, default="/path/to/imagenet/latents/*.ar", help="Path to ArrayRecords")
-    parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
-    parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
-    parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
-    parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps")
-    parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of samples for FID")
-    parser.add_argument("--model", type=str, default="DiT-XL/2", choices=["DiT-XL/2", "DiT-B/2", "DiT-S/2"], help="Model architecture")
-    parser.add_argument("--online-encode", type=str, default=None, help="Path to raw ImageNet data to trigger auto TPU VAE encoding before training")
-    parser.add_argument("--online-batch-size", type=int, default=128, help="Batch size for online VAE encoding")
-    args = parser.parse_args()
-    
-    # Checkpoint settings via Orbax
-    print(f"Initializing Checkpoint Manager at: {args.ckpt_dir}", flush=True)
-    try:
-        os.makedirs(args.ckpt_dir, exist_ok=True)
-        options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
-        checkpoint_manager = ocp.CheckpointManager(os.path.abspath(args.ckpt_dir), options=options)
-        print("Orbax Checkpoint Manager initialized.", flush=True)
-    except Exception as e:
-        print(f"CRITICAL ERROR: Failed to initialize Orbax CheckpointManager: {e}", flush=True)
-        raise e
-    
-    # 0. Optional Online ArrayRecord Encoding
-    if args.online_encode is not None:
-        print(f"Online Encode requested. Source data: {args.online_encode}", flush=True)
-        ar_output_dir = "/kaggle/working/latents"
-        os.makedirs(ar_output_dir, exist_ok=True)
-        try:
-            cmd = [
-                "python", "prepare_data_tpu.py",
-                "--split", "train",
-                "--data-dir", args.online_encode,
-                "--output-dir", ar_output_dir,
-                "--batch-size", str(args.online_batch_size),
-                "--num-shards", "1024"
-            ]
-            print(f"Executing: {' '.join(cmd)}", flush=True)
-            # Use capture_output=False and let it stream to Kaggle console directly if possible
-            # or use subprocess.PIPE and print line by line
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in process.stdout:
-                print(f"[Encoder]: {line.strip()}", flush=True)
-            process.wait()
-            
-            if process.returncode != 0:
-                print(f"Online Encoding Failed with return code {process.returncode}", flush=True)
-                return
+    log_stage("--- Self-Flow Training Script Starting ---")
+    args = parse_args()
+    log_stage(f"Arguments parsed. PID={os.getpid()} Python={sys.version.split()[0]}")
 
-            print("Online Encoding completed successfully!", flush=True)
-            args.data_path = f"{ar_output_dir}/*.ar" # Override data paths automatically
-        except Exception as e:
-            print(f"Online Encoding Failed with exception: {e}", flush=True)
-            return
-            
-    # Initialize WandB
-    print("Initializing WandB...", flush=True)
-    wandb.init(project=args.wandb_project, config=vars(args))
-    wandb.define_metric("train/step")
-    wandb.define_metric("*", step_metric="train/step")
+    checkpoint_manager = create_checkpoint_manager(args.ckpt_dir)
+    args.data_path = maybe_run_online_encoding(args)
+    init_wandb(args)
     logger = AsyncWandbLogger()
+    num_devices, local_batch_size = get_device_setup(args.batch_size)
+    model_dims, config, teacher_layer, student_layer, patch_dim, n_patches = build_model_setup(args.model)
+    state, device_rngs = initialize_train_state_for_devices(config, args.learning_rate, num_devices)
 
-    # Device count checks
-    num_devices = jax.device_count()
-    local_batch_size = args.batch_size // num_devices
-    print(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
-
-    rng = jax.random.PRNGKey(42)
-    
-    # Model configuration
-    model_configs = {
-        "DiT-XL/2": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
-        "DiT-B/2": {"hidden_size": 768, "depth": 12, "num_heads": 12},
-        "DiT-S/2": {"hidden_size": 384, "depth": 12, "num_heads": 6},
-    }
-    m_cfg = model_configs[args.model]
-    
-    # Distillation Feature Extraction setup (l = 0.3D, k = 0.7D)
-    teacher_layer = int(round(0.7 * m_cfg["depth"]))
-    student_layer = int(round(0.3 * m_cfg["depth"]))
-    print(f"Selected Model: {args.model} -> Teacher extracted at block {teacher_layer}, Student aligns at block {student_layer}")
-    
-    config = dict(
-        input_size=32, patch_size=2, in_channels=4, hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"],
-        num_heads=m_cfg["num_heads"], mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
-    )
-    
-    state = create_train_state(rng, config, args.learning_rate)
-    # Replicate state across all TPU cores
-    state = jax_utils.replicate(state)
-    rng = jax.random.split(rng, num_devices)
-    
-    print("Initialized Replicated TrainState")
-    
-    patch_dim = config["in_channels"] * config["patch_size"] ** 2
-    n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    
+    data_iterator = None
     try:
-        dataloader = get_arrayrecord_dataloader(data_pattern=args.data_path, batch_size=args.batch_size, is_training=True)
-        data_iterator = iter(dataloader)
-        print("DataLoader initialized successfully via Grain.")
-    except Exception as e:
-        print(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {e}")
-        data_iterator = None
+        data_iterator = create_data_iterator(args.data_path, args.batch_size)
+    except Exception as exc:
+        log_stage(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {exc}")
 
-    # Load SD-VAE exclusively on CPU (Host) for standalone asynchronous decoding. 
-    # This prevents blocking the main TPU SPMD devices.
-    print("Loading VAE on Host CPU for WandB image generation...")
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
-    vae.eval()
-    
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-        fid_worker = AsyncFIDWorker(vae=vae, num_fid_samples=args.num_fid_samples)
-    except ImportError:
-        print("WARNING: torchmetrics not installed. FID evaluation will be disabled. Run pip install torchmetrics.")
-        fid_worker = None
-    
+    vae, fid_worker = maybe_initialize_host_eval(args)
     global_step = 0
-    t0 = time.time()
+    last_log_time = time.time()
     
-    for epoch in range(args.epochs):
-        for step in range(args.steps_per_epoch):
-            if data_iterator is not None:
-                # Real TPU Batch from ArrayRecord Pipeline
-                batch = next(data_iterator)
-                batch_x = jnp.array(batch[0])
-                batch_y = jnp.array(batch[1])
-            else:
-                # Mock fallback
-                rng_mock, = jax.random.split(rng[0], 1)
-                batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
-                batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+    for _ in range(args.epochs):
+        for _ in range(args.steps_per_epoch):
+            batch_x, batch_y, device_rngs = get_training_batch(
+                data_iterator,
+                device_rngs,
+                args.batch_size,
+                n_patches,
+                patch_dim,
+            )
             
             # Add early original batch_x to fid_worker real buffer (before reshape)
-            if getattr(locals().get('fid_worker', None), 'is_real_computed', True) is False:
+            if fid_worker is not None and not fid_worker.is_real_computed:
                 fid_worker.add_real_latents(batch_x)
 
-            # Reshape batch for SPMD distribution: (Global, ...) -> (Devices, Local, ...)
-            batch_x_dist = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-            batch_y_dist = batch_y.reshape(num_devices, local_batch_size)
+            batch_x_dist, batch_y_dist = distribute_batch(
+                batch_x,
+                batch_y,
+                num_devices,
+                local_batch_size,
+                n_patches,
+                patch_dim,
+            )
             
             # Pmap execute step
-            state, metrics, rng = train_step(state, (batch_x_dist, batch_y_dist), rng, teacher_layer, student_layer)
+            state, metrics, device_rngs = train_step(
+                state,
+                (batch_x_dist, batch_y_dist),
+                device_rngs,
+                teacher_layer,
+                student_layer,
+            )
             global_step += 1
             
-            # Periodic Async Logging
-            if global_step % args.log_freq == 0:
-                # Extract index 0 since pmap returns duplicated metrics for all cores
-                cpu_metrics = jax.tree_util.tree_map(lambda m: m[0], metrics)
-                
-                t1 = time.time()
-                cpu_metrics["perf/train_step_time"] = (t1 - t0) / args.log_freq
-                cpu_metrics["train/step"] = global_step
-                t0 = time.time()
-                
-                logger.log(cpu_metrics, step=global_step)
-            
-            # Periodic Image Evaluation & Generation (Latents generated on TPU[0], Decoded on CPU Thread via VAE)
-            if global_step % args.sample_freq == 0:
-                print(f"Step {global_step}: Generating evaluation samples...")
-                
-                # Use ONLY Core 0 explicitly to generate Latents
-                sample_rng, = jax.random.split(rng[0], 1)
-                sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
-                
-                # Fetch params of Core 0
-                single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
-                
-                # Generate latents asynchronously via JIT
-                latents_dev = sample_latents_jit(
-                    single_params, sample_classes, sample_rng,
-                    hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"], num_heads=m_cfg["num_heads"]
-                )
-                
-                # Hand over to background worker to pull array to host, decode in PyTorch VAE, and wandb.log
-                def background_decode_and_log(z_dev, classes, target_step):
-                    # Blocking device_get ONLY on this temporary background thread
-                    z = jax.device_get(z_dev) 
-                    z = torch.from_numpy(z)
-                    classes = jax.device_get(classes)
-                    
-                    z = z / 0.18215 # Scale factor
-                    with torch.no_grad():
-                        images = vae.decode(z).sample
-                        
-                    images = (images + 1.0) / 2.0
-                    images = images.clamp(0, 1).permute(0, 2, 3, 1).numpy()
-                    images = (images * 255).astype(np.uint8)
-                    
-                    wandb.log({
-                        "train/step": target_step,
-                        "samples": [wandb.Image(img, caption=f"Class {cls}") for img, cls in zip(images, classes)]
-                    })
+            last_log_time = maybe_log_metrics(logger, metrics, global_step, last_log_time, args.log_freq)
+            device_rngs = maybe_generate_samples(args, vae, state, device_rngs, global_step, model_dims)
+            device_rngs = maybe_schedule_fid(args, fid_worker, state, device_rngs, global_step, model_dims)
 
-                # Fire and forget decoding thread
-                threading.Thread(target=background_decode_and_log, args=(latents_dev, sample_classes, global_step), daemon=True).start()
+    save_checkpoint(checkpoint_manager, state, global_step)
+    shutdown_runtime(logger, fid_worker)
+    log_stage("Done")
 
-            # Periodic Asynchronous FID4K Eval
-            if global_step % args.fid_freq == 0 and locals().get('fid_worker') is not None:
-                import math
-                print(f"Step {global_step}: Generating {args.num_fid_samples} latents for FID computation...")
-                fid_batch_size = args.batch_size
-                num_fid_batches = math.ceil(args.num_fid_samples / fid_batch_size)
-                
-                all_fake_latents_dev = []
-                single_params_ema = jax.tree_util.tree_map(lambda w: w[0], state.ema_params) 
-                
-                for _ in range(num_fid_batches):
-                    # Use Core 0 explicitly to generate Latents
-                    rng, sample_rng = jax.random.split(rng[0], 2)
-                    sample_classes = jax.random.randint(sample_rng, (fid_batch_size,), 0, 1000)
-                    
-                    latents_dev = sample_latents_jit(
-                        single_params_ema, sample_classes, sample_rng,
-                        hidden_size=m_cfg["hidden_size"], depth=m_cfg["depth"], num_heads=m_cfg["num_heads"], num_steps=50
-                    )
-                    all_fake_latents_dev.append(latents_dev)
-                    
-                    # Ensure next step has unique rng across devices
-                    rng = jax.random.split(rng, num_devices)
-                    
-                fid_worker.compute_fid(all_fake_latents_dev, global_step)
 
-    # Save checkpoint at end (keeping only the last one via Orbax logic)
-    unreplicated_state = jax_utils.unreplicate(state)
-    checkpoint_manager.save(global_step, args=ocp.args.StandardSave(unreplicated_state))
-    checkpoint_manager.wait_until_finished()
-    
-    logger.shutdown()
-    print("Done")
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        log_stage(f"FATAL: {type(exc).__name__}: {exc}")
+        raise

@@ -144,7 +144,7 @@ class DiTBlock(nn.Module):
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
             # Self Attention
             attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size // self.num_heads, out_features=self.hidden_size
+                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa * attn
             
@@ -164,7 +164,7 @@ class DiTBlock(nn.Module):
             
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size // self.num_heads, out_features=self.hidden_size
+                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
             
@@ -250,6 +250,7 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
     @nn.compact
     def __call__(
@@ -280,20 +281,23 @@ class SelfFlowDiT(nn.Module):
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
         y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
 
-        # Embeddings
-        t_emb = t_embedder(timesteps)
-        y_emb = y_embedder(vector, deterministic=deterministic)
-
         if self.per_token:
             batch_size, seq_len, _ = x.shape
             if timesteps.ndim == 1:
+                t_emb = t_embedder(timesteps)
                 t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
             elif timesteps.ndim == 2:
                 t_flat = timesteps.reshape(-1)
                 t_emb_flat = t_embedder(t_flat)
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
+            else:
+                raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
             
+            y_emb = y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
+        else:
+            t_emb = t_embedder(timesteps)
+            y_emb = y_embedder(vector, deterministic=deterministic)
 
         c = t_emb + y_emb
 
@@ -307,7 +311,7 @@ class SelfFlowDiT(nn.Module):
             )(x, c)
             
             if (i + 1) == return_features:
-                zs = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)(x)
+                zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
                 zs = x
 

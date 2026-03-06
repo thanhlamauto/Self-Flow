@@ -1,0 +1,9 @@
+2026-03-06 18:36:49,218 INFO    MainThread:61217 [wandb_setup.py:_flush():81] Current SDK version is 0.25.0
+2026-03-06 18:36:49,220 INFO    MainThread:61217 [wandb_setup.py:_flush():81] Configure stats pid to 61217
+2026-03-06 18:36:49,220 INFO    MainThread:61217 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-03-06 18:36:49,226 INFO    MainThread:61217 [wandb_init.py:setup_run_log_directory():717] Logging user logs to /Users/nguyenthanhlam/Self-Flow/wandb/offline-run-20260306_183649-hkzkyltx/logs/debug.log
+2026-03-06 18:36:49,227 INFO    MainThread:61217 [wandb_init.py:setup_run_log_directory():718] Logging internal logs to /Users/nguyenthanhlam/Self-Flow/wandb/offline-run-20260306_183649-hkzkyltx/logs/debug-internal.log
+2026-03-06 18:36:49,230 INFO    MainThread:61217 [wandb_init.py:init():844] calling init triggers
+2026-03-06 18:36:49,231 INFO    MainThread:61217 [wandb_init.py:init():849] wandb.init called with sweep_config: {}
+config: {'batch_size': 1, 'epochs': 1, 'steps_per_epoch': 0, 'learning_rate': 0.0001, 'ckpt_dir': '/tmp/selfflow-test-ckpt', 'data_path': '/path/to/imagenet/latents/*.ar', 'wandb_project': 'selfflow-jax', 'log_freq': 0, 'sample_freq': 0, 'fid_freq': 0, 'num_fid_samples': 4000, 'model': 'DiT-S/2', 'online_encode': None, 'online_batch_size': 128, '_wandb': {}}
+2026-03-06 18:36:49,231 INFO    MainThread:61217 [wandb_init.py:init():892] starting backend
