@@ -836,11 +836,21 @@ def main():
     if args.preflight_fid_samples < 0:
         raise ValueError("--preflight-fid-samples must be greater than or equal to 0")
 
-    # Device count checks
-    try:
-        num_devices = jax.device_count()
-    except Exception as exc:
-        raise RuntimeError(f"Failed to initialize JAX devices: {exc}") from exc
+    # Device count checks — retry briefly in case a previous run is still releasing TPU locks
+    _tpu_init_attempts = 3
+    for _attempt in range(_tpu_init_attempts):
+        try:
+            num_devices = jax.device_count()
+            break
+        except Exception as exc:
+            if _attempt < _tpu_init_attempts - 1 and "busy" in str(exc).lower():
+                log_stage(f"TPU device busy (attempt {_attempt + 1}/{_tpu_init_attempts}), retrying in 10s…")
+                time.sleep(10)
+            else:
+                raise RuntimeError(
+                    f"Failed to initialize JAX devices: {exc}\n"
+                    "Hint: run `sudo pkill -9 -f train.py && sleep 3` in the notebook to release the TPU lock."
+                ) from exc
     pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
     pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
     if args.batch_size % num_devices != 0:
