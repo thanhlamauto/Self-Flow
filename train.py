@@ -117,8 +117,6 @@ def resolve_arrayrecord_paths(data_pattern):
     )
 
 
-
-
 def unpatchify_patchified_latents(latents):
     from einops import rearrange
 
@@ -182,8 +180,12 @@ from src.sampling import denoise_loop
 from src.utils import batched_prc_img
 
 
-def create_train_state(rng, config, learning_rate):
-    """Initializes the model and TrainState."""
+def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+    """Initializes the model, optimizer, and initial EMA params.
+
+    Returns (state, ema_params) where ema_params is a copy of the initial
+    online params.  Caller should replicate both via jax_utils.replicate.
+    """
     model = SelfFlowPerTokenDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -200,89 +202,209 @@ def create_train_state(rng, config, learning_rate):
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    
+
     dummy_x = jnp.ones((1, n_patches, patch_dim))
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
-    
+
     rng, drop_rng = jax.random.split(rng)
     variables = model.init(
-        {'params': rng, 'dropout': drop_rng}, 
-        x=dummy_x, 
-        timesteps=dummy_t, 
-        vector=dummy_vec, 
+        {'params': rng, 'dropout': drop_rng},
+        x=dummy_x,
+        timesteps=dummy_t,
+        vector=dummy_vec,
         deterministic=False
     )
-    
-    tx = optax.adamw(learning_rate)
-    
-    return train_state.TrainState.create(
+
+    # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
+    tx = optax.chain(
+        optax.clip_by_global_norm(grad_clip),
+        optax.adamw(learning_rate),
+    )
+
+    state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
         tx=tx,
     )
+    # EMA params start as an exact copy of the initial online params
+    ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
+    return state, ema_params
 
 
-def train_step(state, batch, rng):
-    """Executes a single distributed training step."""
-    x, y = batch
-    
-    rng, step_rng, time_rng, noise_rng, drop_rng = jax.random.split(rng, 5)
-    
-    t = jax.random.uniform(time_rng, shape=(x.shape[0],))
-    noise = jax.random.normal(noise_rng, x.shape)
-    
-    t_expanded = t[:, None, None]
-    x_t = (1.0 - t_expanded) * noise + t_expanded * x 
-    target = x - noise
-    
+# ── Self-Flow core helpers ────────────────────────────────────────────────────
+
+def ema_update(ema_params, new_params, decay):
+    """Exponential moving average: ema = decay * ema + (1 - decay) * new.
+
+    Paper-faithful: EMA decay = 0.9999 by default.
+    Called after each gradient step inside train_step.
+    """
+    return jax.tree_util.tree_map(
+        lambda ema, new: decay * ema + (1.0 - decay) * new,
+        ema_params,
+        new_params,
+    )
+
+
+def cosine_sim_loss(a, b, mask):
+    """Negative mean cosine similarity over masked tokens (Lrep).
+
+    a, b : [B, N, D] — student / teacher feature maps
+    mask : [B, N] bool — True for tokens that received the cleaner timestep
+
+    Returns (loss, mean_sim) where loss = -mean_sim.
+    Paper-faithful: Lrep = -E[cos_sim(student, sg(teacher))] over masked tokens.
+    """
+    a_norm = a / (jnp.linalg.norm(a, axis=-1, keepdims=True) + 1e-6)
+    b_norm = b / (jnp.linalg.norm(b, axis=-1, keepdims=True) + 1e-6)
+    cos_sim = jnp.sum(a_norm * b_norm, axis=-1)   # [B, N]
+    mask_f = mask.astype(jnp.float32)
+    denom = jnp.sum(mask_f) + 1e-6
+    mean_sim = jnp.sum(cos_sim * mask_f) / denom
+    return -mean_sim, mean_sim   # (loss, diagnostic)
+
+
+# ── Training step ─────────────────────────────────────────────────────────────
+
+def train_step(
+    state, ema_params, batch, rng,
+    *, mask_ratio, gamma, ema_decay, student_layer, teacher_layer,
+):
+    """Self-Flow distributed training step.
+
+    Paper-faithful changes vs. vanilla flow matching:
+      - Dual-timestep sampling: t, s ~ U(0,1); t_clean=min, t_noisy=max
+      - Per-token mask M ~ Bernoulli(mask_ratio); masked tokens get t_clean
+      - Student forward on x_tau (per-token tau, rank-2 timestep)
+      - Teacher forward on x_tau_min (scalar tau_min, EMA params, no grad)
+      - Loss = Lgen (velocity MSE) + gamma * Lrep (neg cosine sim, masked tokens)
+      - EMA update applied after gradient step
+
+    TPU deviations (intentional for throughput):
+      - pmap over data-parallel axis (not model-parallel as in some paper setups)
+      - eval_step kept as cheap scalar-t proxy; see eval_step docstring
+    """
+    x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
+    local_batch = x0.shape[0]
+    num_tokens  = x0.shape[1]
+
+    rng, t_rng, s_rng, mask_rng, noise_rng, drop_rng = jax.random.split(rng, 6)
+
+    # --- Dual-timestep sampling (paper §3.2, paper-faithful) ---
+    t = jax.random.uniform(t_rng, shape=(local_batch,))
+    s = jax.random.uniform(s_rng, shape=(local_batch,))
+    t_clean = jnp.minimum(t, s)   # [B] — lower noise level (masked tokens)
+    t_noisy = jnp.maximum(t, s)   # [B] — higher noise level (unmasked tokens)
+
+    # Bernoulli mask: True for tokens that receive the cleaner (lower-noise) timestep
+    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))  # [B, N]
+
+    # Per-token timestep for student: masked → t_clean, unmasked → t_noisy
+    tau = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
+
+    # Shared noise; used for both student and teacher interpolations
+    x1 = jax.random.normal(noise_rng, x0.shape)   # [B, N, D]
+
+    # Student input: per-token interpolation
+    tau_e     = tau[:, :, None]               # [B, N, 1] for broadcast with [B, N, D]
+    x_tau     = (1.0 - tau_e) * x1 + tau_e * x0
+
+    # Teacher input: uniform scalar tau_min across all tokens
+    tau_min_e = t_clean[:, None, None]        # [B, 1, 1]
+    x_tau_min = (1.0 - tau_min_e) * x1 + tau_min_e * x0
+
+    # Flow-matching velocity target (linear path: d/dt x_t = x0 - x1)
+    target = x0 - x1   # [B, N, D]
+
+    # --- Teacher forward (no gradient; uses EMA params) ---
+    # t_clean is rank-1 [B]; model tiles it uniformly across all N tokens
+    # (per_token branch with timesteps.ndim == 1 → jnp.tile to [B, N, D])
+    _, t_feat = state.apply_fn(
+        {'params': ema_params},
+        x_tau_min,
+        timesteps=t_clean,
+        vector=y,
+        deterministic=True,
+        return_features=teacher_layer,
+    )
+    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, hidden]
+
+    # --- Student forward + combined Self-Flow loss ---
     def loss_fn(params):
-        pred = state.apply_fn(
+        # tau is rank-2 [B, N]; model uses per-token conditioning branch
+        pred, s_feat = state.apply_fn(
             {'params': params},
-            x_t,
-            timesteps=t,
+            x_tau,
+            timesteps=tau,
             vector=y,
             deterministic=False,
-            rngs={'dropout': drop_rng}
+            return_features=student_layer,
+            rngs={'dropout': drop_rng},
         )
-        # Compute losses
-        loss_sq = (pred - target) ** 2
-        loss = jnp.mean(loss_sq)
-        
-        # Internal Metrics calculation to avoid host transfers
-        v_abs_mean = jnp.mean(jnp.abs(target))
+        # Lgen: flow-matching velocity MSE (paper-faithful)
+        loss_gen = jnp.mean((pred - target) ** 2)
+
+        # Lrep: negative cosine similarity on masked tokens (paper-faithful)
+        loss_rep, mean_cos_sim = cosine_sim_loss(s_feat, t_feat, mask)
+
+        loss_total = loss_gen + gamma * loss_rep
+
+        # Auxiliary diagnostics (on-device to avoid host-transfer stalls)
+        v_abs_mean      = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        
-        return loss, (v_abs_mean, v_pred_abs_mean)
-        
+        mask_ratio_eff  = jnp.mean(mask.astype(jnp.float32))
+
+        return loss_total, (loss_gen, loss_rep, mean_cos_sim,
+                            v_abs_mean, v_pred_abs_mean, mask_ratio_eff)
+
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
-    
-    # Cross-device synchronization (TPU v5e-8 Data Parallel)
-    loss = jax.lax.pmean(loss, axis_name='batch')
-    v_abs = jax.lax.pmean(v_abs, axis_name='batch')
-    v_pred = jax.lax.pmean(v_pred, axis_name='batch')
-    grads = jax.lax.pmean(grads, axis_name='batch')
-    
-    # Calculate norms on device
-    grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)]))
-    param_norm = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)]))
-    
+    (loss_total, (loss_gen, loss_rep, mean_cos,
+                  v_abs, v_pred, mask_ratio_eff)), grads = grad_fn(state.params)
+
+    # Cross-device aggregation (TPU v5e-8 data-parallel)
+    loss_total     = jax.lax.pmean(loss_total,     axis_name='batch')
+    loss_gen       = jax.lax.pmean(loss_gen,       axis_name='batch')
+    loss_rep       = jax.lax.pmean(loss_rep,       axis_name='batch')
+    mean_cos       = jax.lax.pmean(mean_cos,       axis_name='batch')
+    v_abs          = jax.lax.pmean(v_abs,          axis_name='batch')
+    v_pred         = jax.lax.pmean(v_pred,         axis_name='batch')
+    mask_ratio_eff = jax.lax.pmean(mask_ratio_eff, axis_name='batch')
+    grads          = jax.lax.pmean(grads,          axis_name='batch')
+
+    grad_norm  = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+
     state = state.apply_gradients(grads=grads)
-    
+
+    # EMA update applied after gradient step (paper-faithful, decay=0.9999)
+    ema_params = ema_update(ema_params, state.params, ema_decay)
+
     metrics = {
-        "train/loss": loss,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
+        "train/loss_total":           loss_total,
+        "train/loss_gen":             loss_gen,
+        "train/loss_rep":             loss_rep,
+        "train/cosine_sim":           mean_cos,
+        "train/grad_norm":            grad_norm,
+        "train/param_norm":           param_norm,
+        "train/v_abs_mean":           v_abs,
+        "train/v_pred_abs_mean":      v_pred,
+        "train/mask_ratio_effective": mask_ratio_eff,
     }
-    
-    return state, metrics, rng
+
+    return state, ema_params, metrics, rng
 
 
 def eval_step(state, batch, rng):
-    """Evaluates validation metrics without updating parameters."""
+    """Fast validation loss proxy using online params.
+
+    TPU deviation from paper: uses a single scalar timestep per sample
+    (vanilla flow-matching objective) rather than the dual-timestep Self-Flow
+    objective.  This is intentional — a cheap proxy metric to monitor training
+    convergence without the overhead of a full dual forward pass on each
+    validation batch.  Not paper-comparable; use FID / sample preview for
+    qualitative assessment.
+    """
     x, y = batch
 
     rng, _, time_rng, noise_rng, _ = jax.random.split(rng, 5)
@@ -325,25 +447,25 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     """
     input_paths = resolve_arrayrecord_paths(data_pattern)
     data_source = grain.ArrayRecordDataSource(input_paths)
-    
+
     class ParseAndTokenizeLatents(grain.MapTransform):
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
-            
+
             latent = parsed["latent"] # numpy array shape: (4, 32, 32)
             label = parsed["label"]
-            
+
             # Patchify the latent to DiT input (256, 16)
             c, h, w = latent.shape
             p = 2
-            
+
             # Using numpy to manipulate shapes to send cleanly into DataLoader
             latent = np.reshape(latent, (c, h // p, p, w // p, p))
             latent = np.transpose(latent, (1, 3, 2, 4, 0)) # block arrangement
             latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
-            
+
             return latent, label
-            
+
     operations = [
         ParseAndTokenizeLatents(),
         grain.Batch(batch_size=batch_size, drop_remainder=True),
@@ -364,7 +486,7 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
         worker_count=8,
         read_options=grain.ReadOptions(prefetch_buffer_size=1024)
     )
-    
+
     return dataloader
 
 
@@ -403,15 +525,15 @@ class AsyncWandbLogger:
         self.queue = queue.Queue(maxsize=max_queue_size)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        
+
     def _worker(self):
         while True:
             item = self.queue.get()
             if item is None:
                 break
-                
+
             metrics, step = item
-            
+
             # Perform jax.device_get to block *only* the worker thread
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
@@ -420,7 +542,7 @@ class AsyncWandbLogger:
                 log_stage(f"WandB logging failed: {e}")
             finally:
                 self.queue.task_done()
-                
+
     def log(self, metrics, step):
         if not self.enabled:
             return
@@ -429,7 +551,7 @@ class AsyncWandbLogger:
             self.queue.put_nowait((metrics, step))
         except queue.Full:
             pass # Skip logging if CPU is lagging too far behind TPU
-            
+
     def shutdown(self):
         if not self.enabled:
             return
@@ -437,9 +559,16 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
+def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+    """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
-  
-def make_sample_latents_fn(config):
+    XLA's scan requires a static sequence length, so num_steps cannot be a
+    dynamic argument — it is compiled in.  Provide different values for
+    different eval modes:
+      - Fast TPU monitoring default: num_steps=50, cfg_scale=1.0
+      - Paper-like eval: num_steps=250, cfg_scale=1.0
+        (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
+    """
     model = SelfFlowPerTokenDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -454,8 +583,8 @@ def make_sample_latents_fn(config):
         per_token=True,
     )
 
-    def sample_latents(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
-        """Generate sample latents on TPU."""
+    def sample_latents(params, class_labels, rng):
+        """Generate sample latents on TPU using EMA params."""
         batch_size = class_labels.shape[0]
         latent_channels = config["in_channels"]
         latent_size = config["input_size"]
@@ -525,6 +654,7 @@ def make_sample_latents_fn(config):
 
 def run_preflight_checks(
     state,
+    ema_params,
     rng,
     sample_latents_jitted,
     decode_latents,
@@ -535,6 +665,7 @@ def run_preflight_checks(
 ):
     """Smoke-test VAE decode and FID pipeline before the training loop.
 
+    Uses EMA params for sampling (same as training-time eval).
     decode_latents : callable(latents_nchw) → NHWC float32 [0,1]
     inception_fn   : pmap'd InceptionV3 (from get_fid_network), or None
     """
@@ -544,11 +675,12 @@ def run_preflight_checks(
     if requested_fake_samples <= 0:
         return rng
 
-    single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
+    # Use EMA params for preflight sampling (consistent with training-time eval)
+    single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
     sample_rng_base, sample_rng = jax.random.split(rng[0])
     sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
     fake_latents = np.asarray(
-        jax.device_get(sample_latents_jitted(single_params, sample_classes, sample_rng)),
+        jax.device_get(sample_latents_jitted(single_ema_params, sample_classes, sample_rng)),
         dtype=np.float32,
     )
     rng = rng.at[0].set(sample_rng_base)
@@ -605,44 +737,80 @@ def run_preflight_checks(
 
 def main():
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
-    parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
-    parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size preset: S, B, L, or XL")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps in an epoch")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--ckpt-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--data-path", type=str, default="/path/to/imagenet/latents/*.ar", help="Path to ArrayRecords")
-    parser.add_argument("--val-data-path", type=str, default=None, help="Path to validation ArrayRecords")
-    parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
-    parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
-    parser.add_argument("--eval-freq", type=int, default=500, help="Evaluate validation loss every N steps (0 disables)")
-    parser.add_argument("--eval-batches", type=int, default=4, help="Number of validation batches to average per evaluation")
-    parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
-    parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps (0 disables)")
-    parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of generated/real samples used for FID")
-    parser.add_argument("--fid-batch-size", type=int, default=32, help="CPU decode batch size used for FID real/fake image batches")
-    parser.add_argument("--preflight-checks", action="store_true", help="Run a quick sample/VAE/FID smoke test before entering the training loop")
-    parser.add_argument("--preflight-only", action="store_true", help="Run the preflight smoke test and exit without training")
-    parser.add_argument("--preflight-sample-count", type=int, default=4, help="Number of fake samples to decode during preflight")
-    parser.add_argument("--preflight-fid-samples", type=int, default=16, help="Number of real/fake samples used for the preflight FID smoke test")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging for debugging")
+    # ── Core training args ────────────────────────────────────────────────────
+    parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
+    parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--steps-per-epoch", type=int, default=1000)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
+    parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
+    parser.add_argument("--val-data-path", type=str, default=None)
+    parser.add_argument("--wandb-project", type=str, default="selfflow-jax")
+    parser.add_argument("--no-wandb", action="store_true")
+    # ── Self-Flow algorithm args (paper-faithful defaults) ────────────────────
+    parser.add_argument("--mask-ratio", type=float, default=0.25,
+                        help="Bernoulli mask ratio RM for per-token masking (paper: 0.25)")
+    parser.add_argument("--self-flow-gamma", type=float, default=0.8,
+                        help="Weight for Lrep in L = Lgen + gamma * Lrep (paper: 0.8)")
+    parser.add_argument("--ema-decay", type=float, default=0.9999,
+                        help="EMA teacher decay (paper: 0.9999)")
+    parser.add_argument("--student-layer", type=int, default=None,
+                        help="Layer index for student features (default: round(0.3 * depth))")
+    parser.add_argument("--teacher-layer", type=int, default=None,
+                        help="Layer index for teacher features (default: round(0.7 * depth))")
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Gradient clip max_norm (paper: 1.0)")
+    # ── Logging / eval args ───────────────────────────────────────────────────
+    parser.add_argument("--log-freq", type=int, default=20)
+    parser.add_argument("--eval-freq", type=int, default=500)
+    parser.add_argument("--eval-batches", type=int, default=4)
+    # ── Sample preview args (TPU-friendly defaults) ───────────────────────────
+    parser.add_argument("--sample-freq", type=int, default=1000)
+    parser.add_argument("--sample-num-steps", type=int, default=50,
+                        help="Denoising steps for sample previews. "
+                             "TPU-friendly default: 50. Paper-like eval: 250.")
+    parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
+                        help="CFG scale for sample previews. Default 1.0 (no CFG; "
+                             "classifier-free training not implemented).")
+    # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
+    parser.add_argument("--fid-freq", type=int, default=10000,
+                        help="Run FID every N steps (0 disables). "
+                             "Default cadence is for TPU monitoring, not paper eval.")
+    parser.add_argument("--num-fid-samples", type=int, default=4000,
+                        help="Number of real/fake samples for FID. "
+                             "TPU default: 4000 (monitoring). Paper: 50000.")
+    parser.add_argument("--fid-batch-size", type=int, default=32)
+    parser.add_argument("--fid-num-steps", type=int, default=50,
+                        help="Denoising steps for FID generation. "
+                             "TPU default: 50 (monitoring). Paper: 250.")
+    parser.add_argument("--fid-cfg-scale", type=float, default=1.0,
+                        help="CFG scale for FID generation. Default 1.0 (paper uses 1.0).")
+    # ── Preflight / safety args ───────────────────────────────────────────────
+    parser.add_argument("--preflight-checks", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--preflight-sample-count", type=int, default=4)
+    parser.add_argument("--preflight-fid-samples", type=int, default=16)
+    parser.add_argument("--mock-data", action="store_true",
+                        help="Allow falling back to random mock batches when data is unavailable. "
+                             "WARNING: mock batches are not suitable for real training. "
+                             "Requires explicit opt-in to prevent silent failures.")
     args = parser.parse_args()
 
     if args.preflight_only:
         args.preflight_checks = True
 
+    # ── Argument validation ───────────────────────────────────────────────────
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if args.fid_freq > 0 and args.num_fid_samples <= 0:
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
-    if args.preflight_sample_count < 0:
-        raise ValueError("--preflight-sample-count must be greater than or equal to 0")
-    if args.preflight_fid_samples < 0:
-        raise ValueError("--preflight-fid-samples must be greater than or equal to 0")
+    if not (0.0 < args.mask_ratio < 1.0):
+        raise ValueError("--mask-ratio must be in (0, 1)")
 
-    # Device count checks — retry briefly in case a previous run is still releasing TPU locks
+    # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
     for _attempt in range(_tpu_init_attempts):
         try:
@@ -657,52 +825,117 @@ def main():
                     f"Failed to initialize JAX devices: {exc}\n"
                     "Hint: run `sudo pkill -9 -f train.py && sleep 3` in the notebook to release the TPU lock."
                 ) from exc
-    pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
-    pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
+
     if args.batch_size % num_devices != 0:
-        raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
+        raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
-    if args.no_wandb:
-        pass
-    else:
+    # ── Model config and layer inference ──────────────────────────────────────
+    config = build_model_config(args.model_size)
+    depth = config["depth"]
+
+    # Infer student/teacher layers from depth if not provided.
+    # Rule: student = round(0.3 * D), teacher = round(0.7 * D).
+    # Matches paper's XL layers (depth=28 → student=8, teacher=20) exactly.
+    # For B (depth=12): student=4, teacher=8.
+    student_layer = args.student_layer if args.student_layer is not None else max(1, round(0.3 * depth))
+    teacher_layer = args.teacher_layer if args.teacher_layer is not None else max(1, round(0.7 * depth))
+    if not (1 <= student_layer <= depth):
+        raise ValueError(f"--student-layer {student_layer} out of range [1, {depth}]")
+    if not (1 <= teacher_layer <= depth):
+        raise ValueError(f"--teacher-layer {teacher_layer} out of range [1, {depth}]")
+    if student_layer >= teacher_layer:
+        raise ValueError(f"student_layer ({student_layer}) must be < teacher_layer ({teacher_layer})")
+
+    log_stage(
+        f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
+        f"depth={depth} heads={config['num_heads']} "
+        f"student_layer={student_layer} teacher_layer={teacher_layer}"
+    )
+    log_stage(
+        f"Self-Flow: mask_ratio={args.mask_ratio} gamma={args.self_flow_gamma} "
+        f"ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+    )
+
+    # ── WandB ─────────────────────────────────────────────────────────────────
+    if not args.no_wandb:
         wandb.init(project=args.wandb_project, config=vars(args))
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
+    # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    config = build_model_config(args.model_size)
-    log_stage(
-        f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} depth={config['depth']} heads={config['num_heads']}"
-    )
-    sample_latents_jitted = make_sample_latents_fn(config)
-    
-    state = create_train_state(rng, config, args.learning_rate)
-    # Replicate state across all TPU cores
+    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
     state = jax_utils.replicate(state)
+    ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
-    
+
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    
+
+    # ── Build pmapped training step with Self-Flow hyperparams baked in ───────
+    # functools.partial is used because pmap cannot take Python scalar args
+    # (mask_ratio, gamma, etc.) as traced inputs — they must be static.
+    _selfflow_train_fn = functools.partial(
+        train_step,
+        mask_ratio=args.mask_ratio,
+        gamma=args.self_flow_gamma,
+        ema_decay=args.ema_decay,
+        student_layer=student_layer,
+        teacher_layer=teacher_layer,
+    )
+    pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
+    pmapped_eval_step  = jax.pmap(eval_step,           axis_name='batch')
+
+    # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
+    # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
+    # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
+    #       not implemented; default is 1.0 for all eval modes.
+    sample_latents_jitted = make_sample_latents_fn(
+        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+    )
+    # Separate function for FID generation (may differ in num_steps/cfg_scale)
+    if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
+        fid_sample_latents_jitted = make_sample_latents_fn(
+            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        )
+    else:
+        fid_sample_latents_jitted = sample_latents_jitted
+
+    # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
+    data_iterator = None
     try:
-        dataloader = get_arrayrecord_dataloader(data_pattern=args.data_path, batch_size=args.batch_size, is_training=True)
+        dataloader = get_arrayrecord_dataloader(
+            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+        )
         data_iterator = iter(dataloader)
     except Exception as e:
-        log_stage(f"Training data unavailable; falling back to mocked batches. {e}")
-        data_iterator = None
+        if args.mock_data:
+            log_stage(
+                f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
+                f"This is NOT suitable for real training; metrics will be meaningless. "
+                f"Error: {e}"
+            )
+        else:
+            raise RuntimeError(
+                f"Failed to load training data from {args.data_path!r}: {e}\n"
+                "If you intentionally want to test with random mock batches (not real training), "
+                "add the --mock-data flag. Do NOT use mock batches for actual training runs."
+            ) from e
 
     val_iterator = None
     if args.val_data_path is not None:
         try:
-            val_iterator = create_data_iterator(data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False)
+            val_iterator = create_data_iterator(
+                data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False
+            )
         except Exception as e:
             log_stage(f"Validation disabled. {e}")
             val_iterator = None
 
-    # ── VAE: load directly in main process, jit decode on TPU ────────────────
+    # ── VAE: load directly in main process, jit decode on TPU ─────────────────
     vae_module, vae_params = load_vae()
     _vae_decode_jit = _make_vae_decode_fn(vae_module)
 
@@ -711,7 +944,7 @@ def main():
         images = _vae_decode_jit(vae_params, jnp.asarray(latents_nchw))
         return np.asarray(jax.device_get(images), dtype=np.float32)
 
-    # ── InceptionV3 for FID: lazy-init, cached across calls ──────────────────
+    # ── InceptionV3 for FID: lazy-init, cached across calls ───────────────────
     _inception_fn = [None]
 
     def get_inception():
@@ -726,7 +959,12 @@ def main():
     _fid_real_acts = [None]
 
     def compute_fid(step, val_data_iter):
-        """Synchronous FID: decode real + fake images, run InceptionV3 on TPU."""
+        """Synchronous FID using EMA params and configurable num_steps.
+
+        TPU deviation: default 50 steps and 4000 samples for fast monitoring.
+        This FID is NOT paper-comparable at default settings.
+        For paper-comparable FID, run with --fid-num-steps 250 --num-fid-samples 50000.
+        """
         from src.fid_utils import fid_from_stats
 
         inception_fn = get_inception()
@@ -744,7 +982,7 @@ def main():
                         img.astype(np.float32) * 2.0 - 1.0,
                         (299, 299, img.shape[-1]), method="bilinear"
                     )) for img in chunk
-                ])  # (n_dev, 299, 299, 3)
+                ])
                 acts = np.array(inception_fn(imgs_299[:, None])).reshape(n_dev, 2048)
                 acts_all.append(acts)
             return np.concatenate(acts_all, axis=0)
@@ -772,9 +1010,10 @@ def main():
 
         mu_real, sigma_real = _fid_real_acts[0]
 
-        # Generate fake images
-        log_stage(f"[FID] generating {args.num_fid_samples} fake images @ step {step}…")
-        single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
+        # Generate fake images using EMA params (consistent with paper eval)
+        log_stage(f"[FID] generating {args.num_fid_samples} fake images @ step {step} "
+                  f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})…")
+        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
         gen_imgs = []
         sample_rng_base = rng[0]
         gen_bs = min(args.fid_batch_size, args.num_fid_samples)
@@ -783,7 +1022,7 @@ def main():
             needed = min(gen_bs, args.num_fid_samples - len(gen_imgs))
             classes = jax.random.randint(sample_rng, (needed,), 0, 1000)
             latents = np.asarray(jax.device_get(
-                sample_latents_jitted(single_params, classes, sample_rng)
+                fid_sample_latents_jitted(single_ema_params, classes, sample_rng)
             ), dtype=np.float32)
             for img in decode_latents(latents):
                 gen_imgs.append(img)
@@ -793,18 +1032,19 @@ def main():
             mu_real, sigma_real,
             np.mean(gen_acts, 0), np.cov(gen_acts, rowvar=False),
         )
-        log_stage(f"[FID] step {step}: FID = {fid_val:.2f}")
+        log_stage(f"[FID] step {step}: FID = {fid_val:.2f} "
+                  f"(monitoring mode: {args.fid_num_steps} steps, {args.num_fid_samples} samples — "
+                  f"not paper-comparable at defaults)")
         safe_wandb_log({"val/FID": fid_val, "train/step": step}, step=step)
 
+    # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
     if args.preflight_checks:
         inception_fn_for_preflight = get_inception() if args.preflight_fid_samples > 0 else None
         preflight_real_latents = None
         if val_iterator is not None:
             preflight_batch, val_iterator = next_validation_batch(
-                val_iterator,
-                data_pattern=args.val_data_path,
-                batch_size=args.batch_size,
+                val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
             )
             preflight_real_latents = preflight_batch[0]
         elif data_iterator is not None:
@@ -813,6 +1053,7 @@ def main():
 
         rng = run_preflight_checks(
             state=state,
+            ema_params=ema_params,
             rng=rng,
             sample_latents_jitted=sample_latents_jitted,
             decode_latents=decode_latents,
@@ -825,14 +1066,14 @@ def main():
         if args.preflight_only:
             logger.shutdown()
             return
-    
+
+    # ── Training loop ─────────────────────────────────────────────────────────
     global_step = 0
     t0 = time.time()
-    
+
     for epoch in range(args.epochs):
         for step in range(args.steps_per_epoch):
             if data_iterator is not None:
-                # Real TPU Batch from ArrayRecord Pipeline
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
                     prefetched_train_batch = None
@@ -841,40 +1082,37 @@ def main():
                 batch_x = jnp.array(batch[0])
                 batch_y = jnp.array(batch[1])
             else:
-                # Mock fallback
+                # Mock fallback: only reaches here if --mock-data was explicitly set
                 rng_mock, = jax.random.split(rng[0], 1)
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
-            
-            # Reshape batch for SPMD distribution: (Global, ...) -> (Devices, Local, ...)
+
+            # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
-            
-            # Pmap execute step
-            state, metrics, rng = pmapped_train_step(state, (batch_x, batch_y), rng)
+
+            # Self-Flow training step (returns updated EMA params)
+            state, ema_params, metrics, rng = pmapped_train_step(
+                state, ema_params, (batch_x, batch_y), rng
+            )
             global_step += 1
-            
-            # Periodic Async Logging
+
+            # Async metric logging
             if args.log_freq > 0 and global_step % args.log_freq == 0:
-                # Extract index 0 since pmap returns duplicated metrics for all cores
                 cpu_metrics = jax.tree_util.tree_map(lambda m: m[0], metrics)
-                
                 t1 = time.time()
                 cpu_metrics["perf/train_step_time"] = (t1 - t0) / args.log_freq
                 cpu_metrics["train/step"] = global_step
                 t0 = time.time()
-                
                 logger.log(cpu_metrics, step=global_step)
 
+            # Validation loss (online params, scalar-t proxy — cheap monitoring)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
-
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
-                        val_iterator,
-                        data_pattern=args.val_data_path,
-                        batch_size=args.batch_size,
+                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
@@ -883,26 +1121,26 @@ def main():
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
 
-                averaged_val_metrics = {
-                    key: value / args.eval_batches for key, value in metric_sums.items()
-                }
+                averaged_val_metrics = {k: v / args.eval_batches for k, v in metric_sums.items()}
                 averaged_val_metrics["train/step"] = global_step
                 logger.log(averaged_val_metrics, step=global_step)
 
-            # Synchronous FID (blocks training; InceptionV3 + VAE decode on TPU)
+            # Synchronous FID (blocks training; see compute_fid docstring)
             if args.fid_freq > 0 and global_step % args.fid_freq == 0:
                 try:
                     compute_fid(global_step, val_iterator)
                 except Exception as exc:
                     log_stage(f"FID skipped: {exc}")
 
-            # Sample images: decode on TPU, log to wandb in a background thread
+            # Sample preview: uses EMA params and configurable num_steps
             if args.sample_freq > 0 and global_step % args.sample_freq == 0:
-                print(f"Step {global_step}: Generating evaluation samples...")
+                print(f"Step {global_step}: Generating sample previews "
+                      f"({args.sample_num_steps} steps, cfg={args.sample_cfg_scale})...")
                 sample_rng, = jax.random.split(rng[0], 1)
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
-                single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
-                latents_dev = sample_latents_jitted(single_params, sample_classes, sample_rng)
+                # Use EMA params for sample generation (paper-faithful eval)
+                single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+                latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
 
                 def _bg_log(z_dev, classes, target_step):
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
@@ -919,9 +1157,20 @@ def main():
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
 
-    # Save checkpoint at end
+    # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    checkpoints.save_checkpoint(ckpt_dir=args.ckpt_dir, target=jax_utils.unreplicate(state.params), step=global_step)
+    unreplicated_params = jax_utils.unreplicate(state.params)
+    unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    checkpoints.save_checkpoint(
+        ckpt_dir=args.ckpt_dir,
+        target=unreplicated_params,
+        step=global_step,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
+        target=unreplicated_ema,
+        step=global_step,
+    )
     logger.shutdown()
 
 
