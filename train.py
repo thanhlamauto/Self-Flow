@@ -78,18 +78,24 @@ def _format_subprocess_failure(stdout, stderr, returncode):
 def probe_host_vae_subprocess(timeout_seconds=180):
     probe_code = """
 import os
+# Must be set before any JAX import — prevents the subprocess from trying to
+# claim the TPU VFIO devices that the parent process already holds exclusively.
+os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+import jax
 import jax.numpy as jnp
 from diffusers import FlaxAutoencoderKL
-FlaxAutoencoderKL.from_pretrained(
-    "stabilityai/sd-vae-ft-ema",
-    from_pt=True,
-    use_safetensors=True,
-    dtype=jnp.bfloat16,
-)
+cpu_device = jax.devices("cpu")[0]
+with jax.default_device(cpu_device):
+    FlaxAutoencoderKL.from_pretrained(
+        "stabilityai/sd-vae-ft-ema",
+        from_pt=True,
+        use_safetensors=True,
+        dtype=jnp.bfloat16,
+    )
 print("HOST_VAE_PROBE_OK", flush=True)
 """.strip()
 
@@ -151,21 +157,27 @@ def resolve_arrayrecord_paths(data_pattern):
 def load_host_vae():
     from diffusers import FlaxAutoencoderKL
 
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        "stabilityai/sd-vae-ft-ema",
-        from_pt=True,
-        use_safetensors=True,
-        dtype=jnp.bfloat16,
-    )
     cpu_devices = jax.devices("cpu")
     if not cpu_devices:
         raise RuntimeError("No CPU backend is available for host-side VAE decoding.")
+    cpu_device = cpu_devices[0]
+
+    # Load params directly onto the CPU device so that both params and input
+    # tensors live on the same backend during decode — avoids device mismatch
+    # when JAX's default backend is TPU.
+    with jax.default_device(cpu_device):
+        vae, vae_params = FlaxAutoencoderKL.from_pretrained(
+            "stabilityai/sd-vae-ft-ema",
+            from_pt=True,
+            use_safetensors=True,
+            dtype=jnp.bfloat16,
+        )
     return {
         "vae": vae,
         "params": vae_params,
         "scale_factor": 0.18215,
         "shift_factor": 0.0,
-        "cpu_device": cpu_devices[0],
+        "cpu_device": cpu_device,
     }
 
 
