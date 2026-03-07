@@ -177,6 +177,21 @@ def decode_latents_with_host_vae(host_vae, latents_nchw):
     return images
 
 
+def unpatchify_patchified_latents(latents):
+    from einops import rearrange
+
+    latents = np.asarray(latents, dtype=np.float32)
+    return rearrange(
+        latents,
+        "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+        h=16,
+        w=16,
+        p1=2,
+        p2=2,
+        c=4,
+    )
+
+
 DIT_VARIANTS = {
     "S": {"hidden_size": 384, "depth": 12, "num_heads": 6},
     "B": {"hidden_size": 768, "depth": 12, "num_heads": 12},
@@ -757,6 +772,72 @@ def make_sample_latents_fn(config):
     return jax.jit(sample_latents)
 
 
+def run_preflight_checks(
+    state,
+    rng,
+    sample_latents_jitted,
+    ensure_vae,
+    real_latents_patchified,
+    preflight_sample_count,
+    preflight_fid_samples,
+):
+    log_stage("Starting preflight checks")
+
+    requested_fake_samples = max(preflight_sample_count, preflight_fid_samples)
+    if requested_fake_samples <= 0:
+        log_stage("Preflight checks skipped because both sample and FID counts are zero.")
+        return rng
+
+    single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
+    sample_rng_base, sample_rng = jax.random.split(rng[0])
+    sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
+    fake_latents = np.asarray(
+        jax.device_get(sample_latents_jitted(single_params, sample_classes, sample_rng)),
+        dtype=np.float32,
+    )
+    rng = rng.at[0].set(sample_rng_base)
+    log_stage(f"Preflight fake latent generation OK: shape={fake_latents.shape}")
+
+    host_vae = ensure_vae()
+
+    if preflight_sample_count > 0:
+        preview_count = min(preflight_sample_count, len(fake_latents))
+        preview_images = decode_latents_with_host_vae(host_vae, fake_latents[:preview_count])
+        log_stage(f"Preflight VAE decode OK: image_batch_shape={preview_images.shape}")
+
+    if preflight_fid_samples > 0:
+        if real_latents_patchified is None:
+            raise RuntimeError("Preflight FID requested but no real latents are available.")
+
+        import torch
+        from torchmetrics.image.fid import FrechetInceptionDistance
+
+        real_count = min(preflight_fid_samples, len(real_latents_patchified))
+        fake_count = min(preflight_fid_samples, len(fake_latents))
+        fid_count = min(real_count, fake_count)
+        if fid_count <= 0:
+            raise RuntimeError("Preflight FID requested but there are no samples to compare.")
+
+        real_latents = unpatchify_patchified_latents(real_latents_patchified[:fid_count])
+        real_images = decode_latents_with_host_vae(host_vae, real_latents)
+        fake_images = decode_latents_with_host_vae(host_vae, fake_latents[:fid_count])
+
+        fid_metric = FrechetInceptionDistance(
+            feature=2048,
+            reset_real_features=False,
+            normalize=True,
+        ).to("cpu")
+        fid_metric.update(torch.from_numpy(np.transpose(real_images, (0, 3, 1, 2))).float(), real=True)
+        fid_metric.update(torch.from_numpy(np.transpose(fake_images, (0, 3, 1, 2))).float(), real=False)
+        fid_score = float(fid_metric.compute())
+        log_stage(
+            f"Preflight FID smoke test OK with {fid_count} real/{fid_count} fake samples: {fid_score:.4f}"
+        )
+
+    log_stage("Preflight checks completed")
+    return rng
+
+
 def main():
     log_stage("main() entered")
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
@@ -776,9 +857,16 @@ def main():
     parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps (0 disables)")
     parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of generated/real samples used for FID")
     parser.add_argument("--fid-batch-size", type=int, default=32, help="CPU decode batch size used for FID real/fake image batches")
+    parser.add_argument("--preflight-checks", action="store_true", help="Run a quick sample/VAE/FID smoke test before entering the training loop")
+    parser.add_argument("--preflight-only", action="store_true", help="Run the preflight smoke test and exit without training")
+    parser.add_argument("--preflight-sample-count", type=int, default=4, help="Number of fake samples to decode during preflight")
+    parser.add_argument("--preflight-fid-samples", type=int, default=16, help="Number of real/fake samples used for the preflight FID smoke test")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging for debugging")
     args = parser.parse_args()
     log_stage(f"Arguments parsed. no_wandb={args.no_wandb}")
+
+    if args.preflight_only:
+        args.preflight_checks = True
 
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
@@ -786,6 +874,10 @@ def main():
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
+    if args.preflight_sample_count < 0:
+        raise ValueError("--preflight-sample-count must be greater than or equal to 0")
+    if args.preflight_fid_samples < 0:
+        raise ValueError("--preflight-fid-samples must be greater than or equal to 0")
 
     # Device count checks
     probe_vfio_owners()
@@ -882,6 +974,41 @@ def main():
             )
         except Exception as e:
             log_stage(f"WARNING: failed to initialize FID worker. FID will be disabled. Error: {e}")
+
+    prefetched_train_batch = None
+    if args.preflight_checks:
+        preflight_real_latents = None
+        if val_iterator is not None:
+            preflight_batch, val_iterator = next_validation_batch(
+                val_iterator,
+                data_pattern=args.val_data_path,
+                batch_size=args.batch_size,
+            )
+            preflight_real_latents = preflight_batch[0]
+            log_stage("Preflight checks will use a validation batch for real-image smoke tests")
+        elif data_iterator is not None:
+            prefetched_train_batch = next(data_iterator)
+            preflight_real_latents = prefetched_train_batch[0]
+            log_stage("Preflight checks will use the first training batch for real-image smoke tests")
+        else:
+            log_stage("Preflight checks have no real dataset batch available; FID smoke test may be skipped or fail")
+
+        rng = run_preflight_checks(
+            state=state,
+            rng=rng,
+            sample_latents_jitted=sample_latents_jitted,
+            ensure_vae=ensure_vae,
+            real_latents_patchified=preflight_real_latents,
+            preflight_sample_count=args.preflight_sample_count,
+            preflight_fid_samples=args.preflight_fid_samples,
+        )
+
+        if args.preflight_only:
+            log_stage("Preflight-only mode complete; exiting before training loop")
+            if fid_worker is not None:
+                fid_worker.shutdown()
+            logger.shutdown()
+            return
     
     global_step = 0
     t0 = time.time()
@@ -890,7 +1017,11 @@ def main():
         for step in range(args.steps_per_epoch):
             if data_iterator is not None:
                 # Real TPU Batch from ArrayRecord Pipeline
-                batch = next(data_iterator)
+                if prefetched_train_batch is not None:
+                    batch = prefetched_train_batch
+                    prefetched_train_batch = None
+                else:
+                    batch = next(data_iterator)
                 if fid_worker is not None:
                     fid_worker.add_real_latents(batch[0])
                 batch_x = jnp.array(batch[0])
