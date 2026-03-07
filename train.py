@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import pickle
 import time
@@ -8,27 +9,9 @@ import functools
 import shutil
 import subprocess
 
-import jax
-import jax.numpy as jnp
-import optax
-import wandb
-from flax.training import train_state, checkpoints
-from flax import jax_utils
-
-# Import data loaders
-try:
-    import numpy as np
-    import grain.python as grain
-except ImportError:
-    print("WARNING: grain not installed. Please `pip install grain-balsa` for ArrayRecord support.")
-
-from src.model import SelfFlowPerTokenDiT
-from src.sampling import denoise_loop
-from src.utils import batched_prc_img, scattercat
-
 
 def log_stage(message):
-    print(f"[train.py] {message}", flush=True)
+    print(f"[train.py] {message}", file=sys.stderr, flush=True)
 
 
 def safe_wandb_log(metrics, step=None):
@@ -100,6 +83,51 @@ def probe_vfio_owners():
         "If TPU init still fails with 'Device or resource busy', kill the owning PID(s) "
         "or restart the kernel/runtime before retrying."
     )
+
+
+probe_vfio_owners()
+
+log_stage("Importing jax")
+import jax
+log_stage("Imported jax")
+
+log_stage("Importing jax.numpy")
+import jax.numpy as jnp
+log_stage("Imported jax.numpy")
+
+log_stage("Importing optax")
+import optax
+log_stage("Imported optax")
+
+log_stage("Importing wandb")
+import wandb
+log_stage("Imported wandb")
+
+log_stage("Importing flax")
+from flax.training import train_state, checkpoints
+from flax import jax_utils
+log_stage("Imported flax")
+
+log_stage("Importing numpy/grain")
+try:
+    import numpy as np
+    import grain.python as grain
+except ImportError:
+    log_stage("grain not installed. Please `pip install grain-balsa` for ArrayRecord support.")
+    raise
+log_stage("Imported numpy/grain")
+
+log_stage("Importing src.model")
+from src.model import SelfFlowPerTokenDiT
+log_stage("Imported src.model")
+
+log_stage("Importing src.sampling")
+from src.sampling import denoise_loop
+log_stage("Imported src.sampling")
+
+log_stage("Importing src.utils")
+from src.utils import batched_prc_img, scattercat
+log_stage("Imported src.utils")
 
 
 def create_train_state(rng, config, learning_rate):
