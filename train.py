@@ -208,12 +208,17 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
+    # Pass return_features=1 so that feature_head is called during init and
+    # its parameters are materialized into the param tree.  Without this,
+    # the first call to apply_fn with return_features=<layer> would raise
+    # ScopeParamNotFoundError because feature_head was never initialized.
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
-        deterministic=False
+        deterministic=False,
+        return_features=1,
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
