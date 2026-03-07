@@ -223,49 +223,21 @@ def build_model_config(model_size):
     )
 
 
-probe_vfio_owners()
-
-log_stage("Importing jax")
 import jax
-log_stage("Imported jax")
-
-log_stage("Importing jax.numpy")
 import jax.numpy as jnp
-log_stage("Imported jax.numpy")
-
-log_stage("Importing optax")
 import optax
-log_stage("Imported optax")
-
-log_stage("Importing wandb")
 import wandb
-log_stage("Imported wandb")
-
-log_stage("Importing flax")
 from flax.training import train_state, checkpoints
 from flax import jax_utils
-log_stage("Imported flax")
-
-log_stage("Importing numpy/grain")
 try:
     import numpy as np
     import grain.python as grain
 except ImportError:
     log_stage("grain not installed. Please `pip install grain-balsa` for ArrayRecord support.")
     raise
-log_stage("Imported numpy/grain")
-
-log_stage("Importing src.model")
 from src.model import SelfFlowPerTokenDiT
-log_stage("Imported src.model")
-
-log_stage("Importing src.sampling")
 from src.sampling import denoise_loop
-log_stage("Imported src.sampling")
-
-log_stage("Importing src.utils")
 from src.utils import batched_prc_img, scattercat
-log_stage("Imported src.utils")
 
 
 def create_train_state(rng, config, learning_rate):
@@ -713,7 +685,7 @@ def make_sample_latents_fn(config):
         noise = jax.random.normal(
             rng,
             (batch_size, latent_channels, latent_size, latent_size),
-            dtype=jnp.bfloat16,
+            dtype=jnp.float32,
         )
 
         from einops import rearrange
@@ -724,6 +696,7 @@ def make_sample_latents_fn(config):
             p2=patch_size,
         )
         x, x_ids = batched_prc_img(noise_patched)
+        x = x.astype(jnp.float32)
 
         use_cfg = cfg_scale > 1.0
         if use_cfg:
@@ -863,7 +836,6 @@ def main():
     parser.add_argument("--preflight-fid-samples", type=int, default=16, help="Number of real/fake samples used for the preflight FID smoke test")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging for debugging")
     args = parser.parse_args()
-    log_stage(f"Arguments parsed. no_wandb={args.no_wandb}")
 
     if args.preflight_only:
         args.preflight_checks = True
@@ -880,19 +852,14 @@ def main():
         raise ValueError("--preflight-fid-samples must be greater than or equal to 0")
 
     # Device count checks
-    probe_vfio_owners()
-    log_stage("About to call jax.device_count()")
     try:
         num_devices = jax.device_count()
     except Exception as exc:
         log_stage(f"jax.device_count() failed: {exc}")
         probe_vfio_owners()
         raise
-    log_stage(f"jax.device_count() returned {num_devices}")
-    log_stage("Creating JAX-transformed step functions")
     pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
     pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
-    log_stage("Created JAX-transformed step functions")
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
@@ -1140,9 +1107,5 @@ def main():
     log_stage("Done")
 
 
-log_stage("Module import complete")
-
-
 if __name__ == "__main__":
-    log_stage("Calling main()")
     main()
