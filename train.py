@@ -64,7 +64,9 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-ema"):
     Assumption: scaling_factor from vae.config is 0.18215 for this model,
     consistent with the SCALE_FACTOR=0.18215 hardcoded in prepare_data_tpu.py.
     """
-    from diffusers import FlaxAutoencoderKL
+    # Import from the narrow diffusers.models namespace. On Kaggle TPU this is
+    # more stable than the top-level diffusers import path used for Flax.
+    from diffusers.models import FlaxAutoencoderKL
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
     vae_params = jax.device_get(vae_params)
     log_stage(f"VAE loaded: {vae_model!r} (scaling_factor={vae.config.scaling_factor})")

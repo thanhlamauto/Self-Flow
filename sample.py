@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 from PIL import Image
 from tqdm import tqdm
-from diffusers import FlaxAutoencoderKL
 from einops import rearrange
 import orbax.checkpoint as ocp
 
@@ -37,9 +36,12 @@ def create_npz_from_samples(samples, output_path):
 
 def load_vae(dtype=jnp.bfloat16):
     """Load the SD-VAE for decoding latents to images."""
+    from diffusers.models import FlaxAutoencoderKL
+
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        "stabilityai/sd-vae-ft-ema", 
-        dtype=dtype
+        "stabilityai/sd-vae-ft-ema",
+        from_pt=True,
+        dtype=dtype,
     )
     scale_factor = 0.18215
     shift_factor = 0.0
