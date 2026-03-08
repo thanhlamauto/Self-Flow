@@ -54,77 +54,93 @@ def safe_wandb_log(metrics, step=None):
         log_stage(f"WandB logging error: {e}")
 
 
-class VAEDecodeSubprocess:
-    """VAE decode worker running in an isolated child process.
+# Self-contained worker script run by subprocess.Popen.
+# Deliberately has NO import of train.py and NO import of jax/flax so the
+# child process is free of JAX/TPU and can load torch+diffusers cleanly.
+_VAE_WORKER_SCRIPT = """\
+import sys, struct, pickle
+import numpy as np
+import torch
+from diffusers import AutoencoderKL
 
-    JAX/libtpu and PyTorch each link against libprotobuf but at different
-    versions; loading both in the same process causes a SIGSEGV in
-    protobuf's static initialiser on Kaggle TPU v5e.  Spawning a dedicated
-    child process for VAE decode gives it a clean address space with no
-    JAX/TPU, so the two libprotobuf copies never coexist.
+vae_model = sys.argv[1]
+try:
+    vae = AutoencoderKL.from_pretrained(vae_model, torch_dtype=torch.float32).eval()
+    sys.stdout.buffer.write(b"READY\\n")
+except Exception as exc:
+    sys.stdout.buffer.write(("ERROR " + str(exc) + "\\n").encode())
+sys.stdout.buffer.flush()
+
+while True:
+    hdr = sys.stdin.buffer.read(8)
+    if len(hdr) < 8:
+        break
+    (n,) = struct.unpack("<Q", hdr)
+    latents = pickle.loads(sys.stdin.buffer.read(n))
+    try:
+        with torch.no_grad():
+            t = torch.from_numpy(latents) / 0.18215
+            imgs = vae.decode(t).sample
+            imgs = (imgs / 2.0 + 0.5).clamp(0, 1)
+            imgs = imgs.permute(0, 2, 3, 1).numpy().astype(np.float32)
+        payload = pickle.dumps(("ok", imgs))
+    except Exception as exc:
+        payload = pickle.dumps(("error", str(exc)))
+    sys.stdout.buffer.write(struct.pack("<Q", len(payload)) + payload)
+    sys.stdout.buffer.flush()
+"""
+
+
+class VAEDecodeSubprocess:
+    """VAE decode via stdin/stdout pipe to an isolated child process.
+
+    multiprocessing.spawn re-imports train.py in the child, which triggers
+    `import jax` and reloads JAX/TPU — reproducing the exact protobuf
+    SIGSEGV we are trying to avoid.  subprocess.Popen with an inline script
+    starts a completely fresh Python that never touches JAX, so torch and
+    diffusers load cleanly.
 
     The worker is started lazily (first decode call) and stays alive for the
-    lifetime of training, so the VAE model is loaded only once.
+    full training run so the VAE model is loaded only once.
     stabilityai/sd-vae-ft-ema scaling_factor=0.18215 matches prepare_data_tpu.py.
     """
 
     def __init__(self, vae_model: str):
-        import multiprocessing as mp
-        ctx = mp.get_context("spawn")
-        self._req_q = ctx.Queue()
-        self._res_q = ctx.Queue()
-        self._proc = ctx.Process(
-            target=VAEDecodeSubprocess._worker,
-            args=(vae_model, self._req_q, self._res_q),
-            daemon=True,
+        import subprocess
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", _VAE_WORKER_SCRIPT, vae_model],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        self._proc.start()
-        # Block until worker signals ready, or propagate load error
-        ack = self._res_q.get(timeout=180)
-        if ack != "ready":
-            raise RuntimeError(f"VAE worker failed to start: {ack}")
-
-    @staticmethod
-    def _worker(vae_model, req_q, res_q):
-        """Child-process entry: load VAE once, serve decode requests."""
-        try:
-            import numpy as np
-            import torch
-            from diffusers import AutoencoderKL
-            vae = AutoencoderKL.from_pretrained(
-                vae_model, torch_dtype=torch.float32
-            ).eval()
-            res_q.put("ready")
-        except Exception as exc:
-            res_q.put(f"error: {exc}")
-            return
-        while True:
-            item = req_q.get()
-            if item is None:    # shutdown sentinel
-                return
-            try:
-                with torch.no_grad():
-                    t = torch.from_numpy(item) / 0.18215
-                    imgs = vae.decode(t).sample             # NCHW [-1, 1]
-                    imgs = (imgs / 2.0 + 0.5).clamp(0, 1)
-                    imgs = imgs.permute(0, 2, 3, 1).numpy().astype(np.float32)
-                res_q.put(("ok", imgs))
-            except Exception as exc:
-                res_q.put(("error", str(exc)))
+        ready = self._proc.stdout.readline().strip()
+        if ready != b"READY":
+            err = self._proc.stderr.read(4096).decode(errors="replace")
+            raise RuntimeError(
+                f"VAE worker failed to start.\nstdout: {ready!r}\nstderr: {err}"
+            )
 
     def decode(self, latents_nchw):
         """NCHW float32 → NHWC float32 [0, 1]."""
-        self._req_q.put(np.asarray(latents_nchw, dtype=np.float32))
-        tag, result = self._res_q.get(timeout=300)
+        import struct, pickle
+        data = pickle.dumps(np.asarray(latents_nchw, dtype=np.float32))
+        self._proc.stdin.write(struct.pack("<Q", len(data)) + data)
+        self._proc.stdin.flush()
+        hdr = self._proc.stdout.read(8)
+        if len(hdr) < 8:
+            raise RuntimeError("VAE worker process died unexpectedly.")
+        (n,) = struct.unpack("<Q", hdr)
+        tag, result = pickle.loads(self._proc.stdout.read(n))
         if tag != "ok":
-            raise RuntimeError(f"VAE decode subprocess error: {result}")
+            raise RuntimeError(f"VAE decode error in worker: {result}")
         return result
 
     def shutdown(self):
-        self._req_q.put(None)
-        self._proc.join(timeout=10)
-        if self._proc.is_alive():
-            self._proc.terminate()
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=10)
+        except Exception:
+            self._proc.kill()
 
 
 def resolve_arrayrecord_paths(data_pattern):
