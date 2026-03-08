@@ -26,7 +26,6 @@ import orbax.checkpoint as ocp
 # Import from local src/ folder
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
-from src.utils import batched_prc_img
 
 
 def create_npz_from_samples(samples, output_path):
@@ -115,13 +114,12 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             dtype=jnp.bfloat16
         )
         
-        noise_patched = rearrange(
+        # Patchify matching the training dataloader: each token in (p1 p2 c) order.
+        x = rearrange(
             noise,
-            "b c (h p1) (w p2) -> b (c p1 p2) h w",
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
             p1=patch_size, p2=patch_size
         )
-        
-        x, _ = batched_prc_img(noise_patched)
         token_h = latent_size // patch_size
         token_w = latent_size // patch_size
         
@@ -157,10 +155,11 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         if use_cfg:
             samples = samples[batch_size:]
         
-        samples = rearrange(samples, "b (h w) c -> b c h w", h=token_h, w=token_w)
+        # Unpatchify: inverse of (p1 p2 c) train patchify → NCHW latent.
         samples = rearrange(
             samples,
-            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h, w=token_w,
             p1=patch_size, p2=patch_size, c=latent_channels
         )
         

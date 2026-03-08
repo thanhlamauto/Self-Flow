@@ -54,17 +54,20 @@ def safe_wandb_log(metrics, step=None):
         log_stage(f"WandB logging error: {e}")
 
 
-def load_vae():
+def load_vae(vae_model="stabilityai/sd-vae-ft-ema"):
     """Load VAE weights directly in the main process.
 
-    Uses the Flax-native checkpoint so no PyTorch conversion is needed and
-    no subprocess probe is required.  `jax.device_get` returns numpy arrays;
-    JAX places them on the default backend (TPU) on the first jit call.
+    Default model matches prepare_data_tpu.py which encodes latents with
+    stabilityai/sd-vae-ft-ema.  from_pt=True converts PyTorch weights to Flax
+    at load time (required for the stabilityai/* checkpoints which ship as PT).
+
+    Assumption: scaling_factor from vae.config is 0.18215 for this model,
+    consistent with the SCALE_FACTOR=0.18215 hardcoded in prepare_data_tpu.py.
     """
     from diffusers import FlaxAutoencoderKL
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained("pcuenq/sd-vae-ft-mse-flax")
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
     vae_params = jax.device_get(vae_params)
-    log_stage(f"VAE loaded (scaling_factor={vae.config.scaling_factor})")
+    log_stage(f"VAE loaded: {vae_model!r} (scaling_factor={vae.config.scaling_factor})")
     return vae, vae_params
 
 
@@ -177,7 +180,6 @@ except ImportError:
     raise
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
-from src.utils import batched_prc_img
 
 
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
@@ -602,13 +604,15 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         )
 
         from einops import rearrange
-        noise_patched = rearrange(
+        # Patchify matching the training dataloader: each token in (p1 p2 c) order.
+        # Dataloader does: reshape(c,h//p,p,w//p,p) → transpose(1,3,2,4,0) → reshape(N,p*p*c)
+        # which is exactly rearrange "b c (h p1) (w p2) -> b (h w) (p1 p2 c)".
+        x = rearrange(
             noise,
-            "b c (h p1) (w p2) -> b (c p1 p2) h w",
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
             p1=patch_size,
             p2=patch_size,
         )
-        x, _ = batched_prc_img(noise_patched)
         x = x.astype(jnp.float32)
         token_h = latent_size // patch_size
         token_w = latent_size // patch_size
@@ -644,10 +648,13 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
 
         if use_cfg:
             samples = samples[batch_size:]
-        samples = rearrange(samples, "b (h w) c -> b c h w", h=token_h, w=token_w)
+        # Unpatchify: inverse of (p1 p2 c) train patchify → NCHW latent.
+        # Matches unpatchify_patchified_latents() which uses the same formula.
         samples = rearrange(
             samples,
-            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h,
+            w=token_w,
             p1=patch_size,
             p2=patch_size,
             c=latent_channels,
@@ -766,6 +773,18 @@ def main():
                         help="Layer index for teacher features (default: round(0.7 * depth))")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    # ── VAE model (must match the model used in prepare_data_tpu.py) ─────────
+    parser.add_argument(
+        "--vae-model",
+        type=str,
+        default="stabilityai/sd-vae-ft-ema",
+        help=(
+            "HuggingFace VAE model for preview/FID decode. "
+            "Default matches prepare_data_tpu.py encoder (stabilityai/sd-vae-ft-ema). "
+            "Loaded with from_pt=True; pass a Flax-native checkpoint only if you "
+            "also re-encode your dataset with that checkpoint."
+        ),
+    )
     # ── Logging / eval args ───────────────────────────────────────────────────
     parser.add_argument("--log-freq", type=int, default=20)
     parser.add_argument("--eval-freq", type=int, default=500)
@@ -791,11 +810,17 @@ def main():
                              "TPU default: 50 (monitoring). Paper: 250.")
     parser.add_argument("--fid-cfg-scale", type=float, default=1.0,
                         help="CFG scale for FID generation. Default 1.0 (paper uses 1.0).")
+    parser.add_argument("--vae-decode-batch-size", type=int, default=8,
+                        help="Micro-batch size for VAE decode during previews/FID/preflight. "
+                             "Lower this on 16GB TPU if decode OOMs.")
     # ── Preflight / safety args ───────────────────────────────────────────────
     parser.add_argument("--preflight-checks", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--preflight-sample-count", type=int, default=4)
     parser.add_argument("--preflight-fid-samples", type=int, default=16)
+    parser.add_argument("--preflight-fid-memory-probe", action="store_true",
+                        help="Run one discarded train step plus one real/fake FID batch at startup "
+                             "to catch TPU OOMs before long training.")
     parser.add_argument("--mock-data", action="store_true",
                         help="Allow falling back to random mock batches when data is unavailable. "
                              "WARNING: mock batches are not suitable for real training. "
@@ -812,6 +837,8 @@ def main():
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
+    if args.vae_decode_batch_size <= 0:
+        raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not (0.0 < args.mask_ratio < 1.0):
         raise ValueError("--mask-ratio must be in (0, 1)")
 
@@ -941,13 +968,25 @@ def main():
             val_iterator = None
 
     # ── VAE: load directly in main process, jit decode on TPU ─────────────────
-    vae_module, vae_params = load_vae()
+    vae_module, vae_params = load_vae(args.vae_model)
     _vae_decode_jit = _make_vae_decode_fn(vae_module)
 
     def decode_latents(latents_nchw):
         """NCHW float32 → NHWC float32 [0, 1].  Runs on TPU via jit."""
         images = _vae_decode_jit(vae_params, jnp.asarray(latents_nchw))
         return np.asarray(jax.device_get(images), dtype=np.float32)
+
+    def decode_latents_batched(latents_nchw, decode_batch_size=None):
+        """Decode latents in small chunks to avoid VAE OOM on TPU."""
+        latents_nchw = np.asarray(latents_nchw, dtype=np.float32)
+        if latents_nchw.shape[0] == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        chunk_size = int(decode_batch_size or args.vae_decode_batch_size)
+        chunks = []
+        for start in range(0, latents_nchw.shape[0], chunk_size):
+            chunks.append(decode_latents(latents_nchw[start:start + chunk_size]))
+        return np.concatenate(chunks, axis=0)
 
     # ── InceptionV3 for FID: lazy-init, cached across calls ───────────────────
     _inception_fn = [None]
@@ -963,6 +1002,77 @@ def main():
     # Real image Inception activations cached so we only decode real images once
     _fid_real_acts = [None]
 
+    def imgs_to_acts(imgs_nhwc, inception_fn):
+        imgs = list(imgs_nhwc)
+        acts_all = []
+        for start in range(0, len(imgs), num_devices):
+            chunk = imgs[start:start + num_devices]
+            while len(chunk) < num_devices:
+                chunk.append(chunk[-1])
+            imgs_299 = np.stack([
+                np.array(jax.image.resize(
+                    img.astype(np.float32) * 2.0 - 1.0,
+                    (299, 299, img.shape[-1]), method="bilinear"
+                )) for img in chunk
+            ])
+            acts = np.array(inception_fn(imgs_299[:, None])).reshape(num_devices, 2048)
+            acts_all.append(acts)
+        return np.concatenate(acts_all, axis=0)
+
+    def block_pytree(tree):
+        jax.tree_util.tree_map(
+            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+            tree,
+        )
+
+    def run_fid_memory_probe(val_data_iter, cached_train_batch):
+        """Mimic FID peak allocations after one train step to catch TPU OOMs early."""
+        if val_data_iter is None:
+            raise RuntimeError("FID memory probe requires --val-data-path.")
+        if cached_train_batch is None:
+            if data_iterator is None:
+                raise RuntimeError("FID memory probe requires real training data.")
+            cached_train_batch = next(data_iterator)
+
+        log_stage("[FID probe] running one discarded train step to match training-time memory...")
+        probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+        probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        _, _, probe_metrics, _ = pmapped_train_step(state, ema_params, (probe_x, probe_y), rng)
+        block_pytree(probe_metrics)
+
+        inception_fn = get_inception()
+
+        log_stage(
+            f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
+            f"with VAE micro-batch {args.vae_decode_batch_size}..."
+        )
+        probe_val_batch, val_data_iter = next_validation_batch(
+            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+        )
+        real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
+        real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
+        block_pytree(imgs_to_acts(real_images, inception_fn))
+
+        fake_bs = min(args.fid_batch_size, args.num_fid_samples)
+        log_stage(
+            f"[FID probe] generating one fake batch of {fake_bs} latents "
+            f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
+        )
+        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+        probe_rng = jax.random.fold_in(rng[0], 0xF1D)
+        probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
+        fake_latents = np.asarray(
+            jax.device_get(fid_sample_latents_jitted(single_ema_params, probe_classes, probe_rng)),
+            dtype=np.float32,
+        )
+        fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
+        block_pytree(imgs_to_acts(fake_images, inception_fn))
+
+        log_stage(
+            "[FID probe] success: discarded train step + real/fake FID batches completed without OOM."
+        )
+        return val_data_iter, cached_train_batch
+
     def compute_fid(step, val_data_iter):
         """Synchronous FID using EMA params and configurable num_steps.
 
@@ -973,28 +1083,13 @@ def main():
         from src.fid_utils import fid_from_stats
 
         inception_fn = get_inception()
-        n_dev = num_devices
-
-        def imgs_to_acts(imgs_nhwc):
-            imgs = list(imgs_nhwc)
-            acts_all = []
-            for start in range(0, len(imgs), n_dev):
-                chunk = imgs[start:start + n_dev]
-                while len(chunk) < n_dev:
-                    chunk.append(chunk[-1])
-                imgs_299 = np.stack([
-                    np.array(jax.image.resize(
-                        img.astype(np.float32) * 2.0 - 1.0,
-                        (299, 299, img.shape[-1]), method="bilinear"
-                    )) for img in chunk
-                ])
-                acts = np.array(inception_fn(imgs_299[:, None])).reshape(n_dev, 2048)
-                acts_all.append(acts)
-            return np.concatenate(acts_all, axis=0)
 
         # Build real image stats once; reuse across FID calls
         if _fid_real_acts[0] is None:
-            log_stage(f"[FID] decoding {args.num_fid_samples} real images…")
+            log_stage(
+                f"[FID] decoding {args.num_fid_samples} real images "
+                f"(VAE micro-batch {args.vae_decode_batch_size})…"
+            )
             real_imgs = []
             while len(real_imgs) < args.num_fid_samples and val_data_iter is not None:
                 try:
@@ -1005,12 +1100,12 @@ def main():
                 except StopIteration:
                     break
                 latents_nchw = unpatchify_patchified_latents(vbatch[0])
-                for img in decode_latents(latents_nchw):
+                for img in decode_latents_batched(latents_nchw, args.vae_decode_batch_size):
                     real_imgs.append(img)
                     if len(real_imgs) >= args.num_fid_samples:
                         break
             log_stage(f"[FID] {len(real_imgs)} real images decoded.")
-            real_acts = imgs_to_acts(real_imgs[:args.num_fid_samples])
+            real_acts = imgs_to_acts(real_imgs[:args.num_fid_samples], inception_fn)
             _fid_real_acts[0] = (np.mean(real_acts, 0), np.cov(real_acts, rowvar=False))
 
         mu_real, sigma_real = _fid_real_acts[0]
@@ -1029,10 +1124,10 @@ def main():
             latents = np.asarray(jax.device_get(
                 fid_sample_latents_jitted(single_ema_params, classes, sample_rng)
             ), dtype=np.float32)
-            for img in decode_latents(latents):
+            for img in decode_latents_batched(latents, args.vae_decode_batch_size):
                 gen_imgs.append(img)
 
-        gen_acts = imgs_to_acts(gen_imgs[:args.num_fid_samples])
+        gen_acts = imgs_to_acts(gen_imgs[:args.num_fid_samples], inception_fn)
         fid_val = fid_from_stats(
             mu_real, sigma_real,
             np.mean(gen_acts, 0), np.cov(gen_acts, rowvar=False),
@@ -1061,12 +1156,15 @@ def main():
             ema_params=ema_params,
             rng=rng,
             sample_latents_jitted=sample_latents_jitted,
-            decode_latents=decode_latents,
+            decode_latents=decode_latents_batched,
             inception_fn=inception_fn_for_preflight,
             real_latents_patchified=preflight_real_latents,
             preflight_sample_count=args.preflight_sample_count,
             preflight_fid_samples=args.preflight_fid_samples,
         )
+
+        if args.preflight_fid_memory_probe:
+            val_iterator, prefetched_train_batch = run_fid_memory_probe(val_iterator, prefetched_train_batch)
 
         if args.preflight_only:
             logger.shutdown()
@@ -1150,7 +1248,7 @@ def main():
                 def _bg_log(z_dev, classes, target_step):
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
                     classes = jax.device_get(classes)
-                    images = decode_latents(z)
+                    images = decode_latents_batched(z, args.vae_decode_batch_size)
                     images = (images * 255).astype(np.uint8)
                     safe_wandb_log({
                         "train/step": target_step,
