@@ -399,8 +399,8 @@ def run_multi_split_encoding(
     data_dir,
     output_dir,
     batch_size=128,
-    num_shards=1024,
-    vae_model="stabilityai/sd-vae-ft-ema",
+    num_shards=256,
+    vae_model="stabilityai/sd-vae-ft-mse",
     group_size=1,
 ):
     for split in resolve_splits(splits):
@@ -428,7 +428,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
     parser.add_argument("--group-size", type=int, default=1, help="ArrayRecord group_size to write. Use 1 for Grain training.")
-    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
+    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse", help="HF VAE")
     
     args = parser.parse_args()
     splits = resolve_splits(args.split)
