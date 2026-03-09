@@ -8,6 +8,7 @@ import threading
 import queue
 import functools
 import logging
+import zipfile
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -58,14 +59,53 @@ def safe_wandb_log(metrics, step=None):
 # Deliberately has NO import of train.py and NO import of jax/flax so the
 # child process is free of JAX/TPU and can load torch+diffusers cleanly.
 _VAE_WORKER_SCRIPT = """\
-import sys, struct, pickle
+import sys, struct, pickle, os, zipfile, tempfile, json
 import numpy as np
 import torch
 from diffusers import AutoencoderKL
 
-vae_model = sys.argv[1]
+vae_path = sys.argv[1]
+# Optional: HF model ID dùng để lấy config.json khi load từ local Flax zip
+hf_config_id = sys.argv[2] if len(sys.argv) > 2 else "stabilityai/sd-vae-ft-ema"
+
+def _load_from_flax_zip(zip_path, hf_config_id):
+    \"\"\"Extract Flax msgpack từ zip của prepare_data_tpu.py, build thư mục HF chuẩn, load bằng from_flax=True.\"\"\"
+    tmpdir = tempfile.mkdtemp(prefix="vae_flax_")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        msgpack_name = next((n for n in zf.namelist() if n.endswith(".msgpack")), None)
+        if msgpack_name is None:
+            raise ValueError(f"Không tìm thấy file .msgpack trong {zip_path}")
+        with zf.open(msgpack_name) as src, open(os.path.join(tmpdir, "flax_model.msgpack"), "wb") as dst:
+            dst.write(src.read())
+    # Lấy config.json: ưu tiên từ cùng thư mục, fallback về HF Hub
+    config_src = os.path.join(os.path.dirname(zip_path), "config.json")
+    if os.path.exists(config_src):
+        import shutil
+        shutil.copy(config_src, os.path.join(tmpdir, "config.json"))
+    else:
+        cfg = AutoencoderKL.load_config(hf_config_id)
+        with open(os.path.join(tmpdir, "config.json"), "w") as cf:
+            json.dump(cfg, cf)
+    return AutoencoderKL.from_pretrained(tmpdir, from_flax=True, torch_dtype=torch.float32).eval()
+
 try:
-    vae = AutoencoderKL.from_pretrained(vae_model, torch_dtype=torch.float32).eval()
+    if os.path.isdir(vae_path):
+        flax_msgpack = os.path.join(vae_path, "flax_model.msgpack")
+        zip_files = sorted(
+            os.path.join(vae_path, f) for f in os.listdir(vae_path) if f.endswith(".zip")
+        )
+        if os.path.exists(flax_msgpack):
+            # Standard HF Flax format (config.json + flax_model.msgpack)
+            vae = AutoencoderKL.from_pretrained(vae_path, from_flax=True, torch_dtype=torch.float32).eval()
+        elif zip_files:
+            # Custom zip format từ prepare_data_tpu.py save_vae_params()
+            vae = _load_from_flax_zip(zip_files[0], hf_config_id)
+        else:
+            # PyTorch local path (config.json + pytorch_model.bin / model.safetensors)
+            vae = AutoencoderKL.from_pretrained(vae_path, torch_dtype=torch.float32).eval()
+    else:
+        # HuggingFace repo ID
+        vae = AutoencoderKL.from_pretrained(vae_path, torch_dtype=torch.float32).eval()
     sys.stdout.buffer.write(b"READY\\n")
 except Exception as exc:
     sys.stdout.buffer.write(("ERROR " + str(exc) + "\\n").encode())
@@ -104,12 +144,15 @@ class VAEDecodeSubprocess:
     full training run so the VAE model is loaded only once.
     Both sd-vae-ft-ema and sd-vae-ft-mse share scaling_factor=0.18215; pass the
     same variant used when running prepare_data_tpu.py (default: sd-vae-ft-mse).
+
+    vae_model: HF repo ID hoặc local path chứa model (PyTorch hoặc Flax).
+    vae_hf_config: HF repo ID để lấy config.json khi vae_model là local Flax zip.
     """
 
-    def __init__(self, vae_model: str):
+    def __init__(self, vae_model: str, vae_hf_config: str = "stabilityai/sd-vae-ft-ema"):
         import subprocess
         self._proc = subprocess.Popen(
-            [sys.executable, "-c", _VAE_WORKER_SCRIPT, vae_model],
+            [sys.executable, "-c", _VAE_WORKER_SCRIPT, vae_model, vae_hf_config],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -142,6 +185,66 @@ class VAEDecodeSubprocess:
             self._proc.wait(timeout=10)
         except Exception:
             self._proc.kill()
+
+
+def _build_flax_vae_decode_fn(vae_model_path, num_devices):
+    """Load Flax VAE từ local path và build pmap'd decode function chạy trên TPU.
+
+    Trả về (decode_fn, params_replicated) nếu thành công, hoặc (None, None) nếu
+    path không phải Flax (fallback về CPU subprocess).
+
+    decode_fn signature: (latents_nchw_sharded, params_repl) → images_nhwc_sharded
+        latents_nchw_sharded: (num_devices, batch_per_device, 4, 32, 32)  bfloat16
+        images_nhwc_sharded : (num_devices, batch_per_device, 256, 256, 3) float32 [0,1]
+    """
+    if not os.path.isdir(vae_model_path):
+        return None, None  # HF repo ID: dùng subprocess như cũ
+
+    flax_msgpack = os.path.join(vae_model_path, "flax_model.msgpack")
+    zip_files = sorted(
+        os.path.join(vae_model_path, f)
+        for f in os.listdir(vae_model_path) if f.endswith(".zip")
+    )
+    if not os.path.exists(flax_msgpack) and not zip_files:
+        return None, None  # PyTorch local dir: dùng subprocess như cũ
+
+    try:
+        from diffusers.models import FlaxAutoencoderKL
+        import flax.serialization
+    except ImportError as e:
+        log_stage(f"[VAE-TPU] diffusers/flax không có sẵn ({e}), fallback về CPU subprocess.")
+        return None, None
+
+    if os.path.exists(flax_msgpack):
+        log_stage(f"[VAE-TPU] Loading Flax VAE từ {vae_model_path} (flax_model.msgpack)…")
+        vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_path)
+    else:
+        log_stage(f"[VAE-TPU] Loading Flax VAE từ zip: {zip_files[0]}…")
+        with zipfile.ZipFile(zip_files[0], "r") as zf:
+            msgpack_name = next((n for n in zf.namelist() if n.endswith(".msgpack")), None)
+            if msgpack_name is None:
+                log_stage("[VAE-TPU] Zip không chứa .msgpack, fallback về CPU subprocess.")
+                return None, None
+            params_bytes = zf.read(msgpack_name)
+        vae_params = flax.serialization.from_bytes(None, params_bytes)
+        vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
+        vae = FlaxAutoencoderKL.from_config(FlaxAutoencoderKL.load_config(vae_model_path))
+
+    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
+
+    @jax.pmap
+    def _decode_pmap(latents_nchw, params):
+        # latents_nchw: (batch_per_device, 4, 32, 32) bfloat16, đã scale ×0.18215
+        # Unscale rồi chuyển NCHW→NHWC vì Diffusers Flax VAE dùng NHWC
+        latents_nhwc = jnp.transpose(latents_nchw / jnp.bfloat16(0.18215), (0, 2, 3, 1))
+        images = vae.apply({"params": params}, latents_nhwc, method=vae.decode).sample
+        # [-1, 1] NHWC → [0, 1] float32
+        return ((images / 2.0 + 0.5).clip(0, 1)).astype(jnp.float32)
+
+    from flax.jax_utils import replicate
+    vae_params_repl = replicate(vae_params)
+    log_stage(f"[VAE-TPU] Flax VAE decode ready trên {num_devices} TPU device(s).")
+    return _decode_pmap, vae_params_repl
 
 
 def resolve_arrayrecord_paths(data_pattern):
@@ -889,17 +992,24 @@ def main():
     parser.add_argument(
         "--vae-model",
         type=str,
-        default="stabilityai/sd-vae-ft-mse",
-        choices=[
-            "stabilityai/sd-vae-ft-mse",
-            "stabilityai/sd-vae-ft-ema",
-        ],
+        default="/kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1",
         help=(
-            "SD-VAE variant for preview/FID decode. Must match whichever variant "
-            "was used when running prepare_data_tpu.py. "
-            "'sd-vae-ft-mse' (default) = MSE-finetuned, sharper reconstructions; "
-            "'sd-vae-ft-ema' = EMA-finetuned, slightly smoother. "
-            "Both share scaling_factor=0.18215."
+            "Local path hoặc HF repo ID của VAE dùng để decode trong preview/FID. "
+            "Chấp nhận 3 dạng: "
+            "(1) local dir có flax_model.msgpack — load Flax trực tiếp; "
+            "(2) local dir có *.zip — zip từ prepare_data_tpu.py save_vae_params(); "
+            "(3) HF repo ID hoặc local PyTorch dir — load bình thường. "
+            "Scaling factor cố định 0.18215 (sd-vae-ft-mse/ema)."
+        ),
+    )
+    parser.add_argument(
+        "--vae-hf-config",
+        type=str,
+        default="stabilityai/sd-vae-ft-ema",
+        help=(
+            "HF repo ID dùng để tải config.json khi --vae-model là local Flax zip "
+            "mà không có sẵn config.json cùng thư mục. "
+            "Không cần thiết nếu thư mục đã có config.json hoặc flax_model.msgpack."
         ),
     )
     # ── Logging / eval args ───────────────────────────────────────────────────
@@ -1091,24 +1201,50 @@ def main():
             log_stage(f"Validation disabled. {e}")
             val_iterator = None
 
-    # ── VAE: lazy subprocess worker — spawned only on first decode call ───────
-    # torch/diffusers are loaded exclusively inside the child process, which has
-    # no JAX/TPU in its address space, so the protobuf SIGSEGV cannot occur.
-    _vae_cache = [None]  # None until first use; then VAEDecodeSubprocess instance
+    # ── VAE decode: TPU (Flax pmap) nếu local Flax path, còn lại CPU subprocess ─
+    # CPU subprocess: torch/diffusers load trong child process không có JAX/TPU,
+    # tránh protobuf SIGSEGV khi dùng multiprocessing.spawn.
+    # TPU Flax path: dùng khi --vae-model là local dir có flax_model.msgpack / *.zip.
+    _flax_decode_cache = [None]  # (decode_fn, params_repl) | "subprocess" | None
 
-    def ensure_vae_loaded():
-        if _vae_cache[0] is None:
-            log_stage(f"Spawning VAE decode worker: {args.vae_model!r} …")
-            _vae_cache[0] = VAEDecodeSubprocess(args.vae_model)
-            log_stage("VAE decode worker ready.")
-        return _vae_cache[0]
+    def _ensure_vae_backend():
+        if _flax_decode_cache[0] is None:
+            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_devices)
+            if decode_fn is not None:
+                _flax_decode_cache[0] = (decode_fn, params_repl)
+            else:
+                log_stage(f"Spawning VAE decode worker (CPU subprocess): {args.vae_model!r} …")
+                _flax_decode_cache[0] = VAEDecodeSubprocess(args.vae_model, args.vae_hf_config)
+                log_stage("VAE decode worker ready.")
+        return _flax_decode_cache[0]
+
+    def _decode_tpu(latents_nchw, decode_fn, params_repl):
+        """NCHW float32 → NHWC float32 [0, 1] trên TPU, tự pad cho chia hết num_devices."""
+        latents_nchw = np.asarray(latents_nchw, dtype=np.float32)
+        n = latents_nchw.shape[0]
+        pad = (num_devices - n % num_devices) % num_devices
+        if pad > 0:
+            latents_nchw = np.concatenate(
+                [latents_nchw, np.zeros((pad, 4, 32, 32), dtype=np.float32)], axis=0
+            )
+        batch_per_device = latents_nchw.shape[0] // num_devices
+        latents_sharded = jnp.array(
+            latents_nchw.reshape(num_devices, batch_per_device, 4, 32, 32),
+            dtype=jnp.bfloat16,
+        )
+        images = decode_fn(latents_sharded, params_repl)  # (devices, bpd, H, W, 3)
+        return jax.device_get(images).reshape(-1, 256, 256, 3).astype(np.float32)[:n]
 
     def decode_latents(latents_nchw):
-        """NCHW float32 → NHWC float32 [0, 1]. Decoded in isolated subprocess."""
-        return ensure_vae_loaded().decode(latents_nchw)
+        """NCHW float32 → NHWC float32 [0, 1]. TPU (Flax) nếu có, fallback CPU subprocess."""
+        backend = _ensure_vae_backend()
+        if isinstance(backend, VAEDecodeSubprocess):
+            return backend.decode(latents_nchw)
+        decode_fn, params_repl = backend
+        return _decode_tpu(latents_nchw, decode_fn, params_repl)
 
     def decode_latents_batched(latents_nchw, decode_batch_size=None):
-        """Decode latents in small chunks to avoid VAE OOM on TPU."""
+        """Decode latents theo chunk. Khi dùng TPU backend, chunk_size nên lớn hơn (≥32×num_devices)."""
         latents_nchw = np.asarray(latents_nchw, dtype=np.float32)
         if latents_nchw.shape[0] == 0:
             return np.empty((0,), dtype=np.float32)
@@ -1405,8 +1541,8 @@ def main():
         target=unreplicated_ema,
         step=global_step,
     )
-    if _vae_cache[0] is not None:
-        _vae_cache[0].shutdown()
+    if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
+        _flax_decode_cache[0].shutdown()
     logger.shutdown()
 
 
