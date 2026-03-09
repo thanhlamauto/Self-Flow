@@ -224,9 +224,27 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
     import flax.serialization
     FlaxAutoencoderKL = _FlaxAutoencoderKL
 
-    # Config: ưu tiên local config.json trong model dir, sau đó hf_config_id.
-    # Nếu hf_config_id là path đến file .json hoặc thư mục → đọc local (an toàn, không lazy import).
-    # Nếu là HF repo ID → gọi load_config() → có thể trigger lazy import → SIGSEGV risk.
+    # Config của SD VAE (sd-vae-ft-ema và sd-vae-ft-mse có cùng architecture).
+    # Hardcode để tránh mọi network call / lazy import gây SIGSEGV.
+    _SD_VAE_CONFIG_HARDCODED = {
+        "in_channels": 3,
+        "out_channels": 3,
+        "down_block_types": [
+            "DownEncoderBlock2D", "DownEncoderBlock2D",
+            "DownEncoderBlock2D", "DownEncoderBlock2D",
+        ],
+        "up_block_types": [
+            "UpDecoderBlock2D", "UpDecoderBlock2D",
+            "UpDecoderBlock2D", "UpDecoderBlock2D",
+        ],
+        "block_out_channels": [128, 256, 512, 512],
+        "layers_per_block": 2,
+        "act_fn": "silu",
+        "latent_channels": 4,
+        "norm_num_groups": 32,
+        "sample_size": 256,
+    }
+
     def _get_vae_config():
         import json as _json
         # 1. config.json trong cùng thư mục với model file
@@ -235,7 +253,7 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
             log_stage(f"[VAE-TPU] Reading config.json từ {cfg_path}")
             with open(cfg_path) as f:
                 return _json.load(f)
-        # 2. hf_config_id là path trực tiếp đến file config.json
+        # 2. hf_config_id là path trực tiếp đến file .json
         if os.path.isfile(hf_config_id):
             log_stage(f"[VAE-TPU] Reading config.json từ file: {hf_config_id}")
             with open(hf_config_id) as f:
@@ -246,9 +264,9 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
             log_stage(f"[VAE-TPU] Reading config.json từ dir: {local_cfg}")
             with open(local_cfg) as f:
                 return _json.load(f)
-        # 4. Fallback HF Hub (rủi ro lazy import → SIGSEGV)
-        log_stage(f"[VAE-TPU] Không tìm thấy config.json local → tải từ HF: {hf_config_id}")
-        return FlaxAutoencoderKL.load_config(hf_config_id)
+        # 4. Fallback: dùng hardcoded config — không network, không lazy import, không SIGSEGV
+        log_stage("[VAE-TPU] Không tìm thấy config.json local → dùng hardcoded SD-VAE config.")
+        return _SD_VAE_CONFIG_HARDCODED
 
     if all_msgpack:
         # Standard HF format (config.json + flax_model.msgpack) → from_pretrained
