@@ -102,7 +102,8 @@ class VAEDecodeSubprocess:
 
     The worker is started lazily (first decode call) and stays alive for the
     full training run so the VAE model is loaded only once.
-    stabilityai/sd-vae-ft-ema scaling_factor=0.18215 matches prepare_data_tpu.py.
+    Both sd-vae-ft-ema and sd-vae-ft-mse share scaling_factor=0.18215; pass the
+    same variant used when running prepare_data_tpu.py (default: sd-vae-ft-mse).
     """
 
     def __init__(self, vae_model: str):
@@ -281,7 +282,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate),
+        optax.adamw(learning_rate, weight_decay=0),
     )
 
     state = train_state.TrainState.create(
@@ -336,16 +337,15 @@ def train_step(
     """Self-Flow distributed training step.
 
     Paper-faithful changes vs. vanilla flow matching:
-      - Dual-timestep sampling: t, s ~ U(0,1); t_clean=min, t_noisy=max
+      - Dual-timestep sampling: t, s ~ U(0,1); t_clean=max, t_noisy=min
       - Per-token mask M ~ Bernoulli(mask_ratio); masked tokens get t_clean
       - Student forward on x_tau (per-token tau, rank-2 timestep)
       - Teacher forward on x_tau_min (scalar tau_min, EMA params, no grad)
       - Loss = Lgen (velocity MSE) + gamma * Lrep (neg cosine sim, masked tokens)
       - EMA update applied after gradient step
 
-    TPU deviations (intentional for throughput):
+    TPU deviation (intentional for throughput):
       - pmap over data-parallel axis (not model-parallel as in some paper setups)
-      - eval_step kept as cheap scalar-t proxy; see eval_step docstring
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
@@ -356,10 +356,10 @@ def train_step(
     # --- Dual-timestep sampling (paper §3.2, paper-faithful) ---
     t = jax.random.uniform(t_rng, shape=(local_batch,))
     s = jax.random.uniform(s_rng, shape=(local_batch,))
-    t_clean = jnp.minimum(t, s)   # [B] — lower noise level (masked tokens)
-    t_noisy = jnp.maximum(t, s)   # [B] — higher noise level (unmasked tokens)
+    t_clean = jnp.maximum(t, s)   # [B] — higher tau → cleaner input (masked tokens / teacher)
+    t_noisy = jnp.minimum(t, s)   # [B] — lower tau → noisier input (unmasked tokens)
 
-    # Bernoulli mask: True for tokens that receive the cleaner (lower-noise) timestep
+    # Bernoulli mask: True for tokens that receive the cleaner (higher-tau) timestep
     mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))  # [B, N]
 
     # Per-token timestep for student: masked → t_clean, unmasked → t_noisy
@@ -380,7 +380,7 @@ def train_step(
     target = x0 - x1   # [B, N, D]
 
     # --- Teacher forward (no gradient; uses EMA params) ---
-    # t_clean is rank-1 [B]; model tiles it uniformly across all N tokens
+    # t_clean = max(t,s) is rank-1 [B]; higher tau → cleaner view for teacher supervision
     # (per_token branch with timesteps.ndim == 1 → jnp.tile to [B, N, D])
     _, t_feat = state.apply_fn(
         {'params': ema_params},
@@ -457,48 +457,104 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
-def eval_step(state, batch, rng):
-    """Fast validation loss proxy using online params.
+def eval_step(
+    state, ema_params, batch, rng,
+    *, mask_ratio, gamma, student_layer, teacher_layer,
+):
+    """Self-Flow validation step that mirrors the dual-timestep training objective.
 
-    TPU deviation from paper: uses a single scalar timestep per sample
-    (vanilla flow-matching objective) rather than the dual-timestep Self-Flow
-    objective.  This is intentional — a cheap proxy metric to monitor training
-    convergence without the overhead of a full dual forward pass on each
-    validation batch.  Not paper-comparable; use FID / sample preview for
-    qualitative assessment.
+    Mirrors train_step's Self-Flow construction exactly, but:
+      - uses state.params for the student (no parameter updates)
+      - uses ema_params for the teacher (stop-gradient, same as training)
+      - deterministic=True throughout (no dropout)
+      - computes Lgen + gamma * Lrep without gradients
+
+    Returns val/loss_total, val/loss_gen, val/loss_rep, val/cosine_sim, and
+    magnitude diagnostics consistent with training metrics.
     """
-    x, y = batch
+    x0, y = batch
+    local_batch = x0.shape[0]
+    num_tokens  = x0.shape[1]
 
-    rng, _, time_rng, noise_rng, _ = jax.random.split(rng, 5)
+    rng, t_rng, s_rng, mask_rng, noise_rng = jax.random.split(rng, 5)
 
-    t = jax.random.uniform(time_rng, shape=(x.shape[0],))
-    noise = jax.random.normal(noise_rng, x.shape)
+    # --- Dual-timestep sampling (mirrors train_step) ---
+    t = jax.random.uniform(t_rng, shape=(local_batch,))
+    s = jax.random.uniform(s_rng, shape=(local_batch,))
+    t_clean = jnp.maximum(t, s)   # [B]
+    t_noisy = jnp.minimum(t, s)   # [B]
 
-    t_expanded = t[:, None, None]
-    x_t = (1.0 - t_expanded) * noise + t_expanded * x
-    target = x - noise
+    # Bernoulli mask: True for tokens that receive the cleaner timestep
+    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))  # [B, N]
 
-    pred = state.apply_fn(
-        {'params': state.params},
-        x_t,
-        timesteps=t,
+    # Per-token timestep for student: masked → t_clean, unmasked → t_noisy
+    tau = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
+
+    # Shared noise
+    x1 = jax.random.normal(noise_rng, x0.shape)   # [B, N, D]
+
+    # Student input: per-token interpolation
+    tau_e     = tau[:, :, None]
+    x_tau     = (1.0 - tau_e) * x1 + tau_e * x0
+
+    # Teacher input: uniform scalar tau_min across all tokens
+    tau_min_e = t_clean[:, None, None]
+    x_tau_min = (1.0 - tau_min_e) * x1 + tau_min_e * x0
+
+    # Flow-matching velocity target
+    target = x0 - x1   # [B, N, D]
+
+    # --- Teacher forward (EMA params, stop-gradient, deterministic) ---
+    _, t_feat = state.apply_fn(
+        {'params': ema_params},
+        x_tau_min,
+        timesteps=t_clean,
         vector=y,
         deterministic=True,
+        return_features=teacher_layer,
+    )
+    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, hidden]
+
+    # --- Student forward (online params, no dropout, no gradients) ---
+    pred, s_feat = state.apply_fn(
+        {'params': state.params},
+        x_tau,
+        timesteps=tau,
+        vector=y,
+        deterministic=True,
+        return_features=student_layer,
     )
 
-    loss_sq = (pred - target) ** 2
-    loss = jnp.mean(loss_sq)
-    v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+    # Lgen: flow-matching velocity MSE
+    loss_gen = jnp.mean((pred - target) ** 2)
 
-    loss = jax.lax.pmean(loss, axis_name='batch')
-    v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name='batch')
+    # Lrep: negative cosine similarity on masked tokens
+    loss_rep, mean_cos_sim = cosine_sim_loss(s_feat, t_feat, mask)
+
+    loss_total = loss_gen + gamma * loss_rep
+
+    # Magnitude diagnostics (mirrors training metrics)
+    v_abs_mean      = jnp.mean(jnp.abs(target))
+    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+    mask_ratio_eff  = jnp.mean(mask.astype(jnp.float32))
+
+    # Cross-device aggregation (consistent with train_step)
+    loss_total      = jax.lax.pmean(loss_total,      axis_name='batch')
+    loss_gen        = jax.lax.pmean(loss_gen,        axis_name='batch')
+    loss_rep        = jax.lax.pmean(loss_rep,        axis_name='batch')
+    mean_cos_sim    = jax.lax.pmean(mean_cos_sim,    axis_name='batch')
+    v_abs_mean      = jax.lax.pmean(v_abs_mean,      axis_name='batch')
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name='batch')
+    mask_ratio_eff  = jax.lax.pmean(mask_ratio_eff,  axis_name='batch')
 
     metrics = {
-        "val/loss": loss,
-        "val/v_abs_mean": v_abs_mean,
-        "val/v_pred_abs_mean": v_pred_abs_mean,
+        "val/loss_total":           loss_total,
+        "val/loss_gen":             loss_gen,
+        "val/loss_rep":             loss_rep,
+        "val/cosine_sim":           mean_cos_sim,
+        "val/v_abs_mean":           v_abs_mean,
+        "val/v_pred_abs_mean":      v_pred_abs_mean,
+        "val/mask_ratio_effective": mask_ratio_eff,
     }
     return metrics, rng
 
@@ -829,16 +885,21 @@ def main():
                         help="Layer index for teacher features (default: round(0.7 * depth))")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
-    # ── VAE model (must match the model used in prepare_data_tpu.py) ─────────
+    # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
         type=str,
-        default="stabilityai/sd-vae-ft-ema",
+        default="stabilityai/sd-vae-ft-mse",
+        choices=[
+            "stabilityai/sd-vae-ft-mse",
+            "stabilityai/sd-vae-ft-ema",
+        ],
         help=(
-            "HuggingFace VAE model for preview/FID decode. "
-            "Default matches prepare_data_tpu.py encoder (stabilityai/sd-vae-ft-ema). "
-            "Loaded with from_pt=True; pass a Flax-native checkpoint only if you "
-            "also re-encode your dataset with that checkpoint."
+            "SD-VAE variant for preview/FID decode. Must match whichever variant "
+            "was used when running prepare_data_tpu.py. "
+            "'sd-vae-ft-mse' (default) = MSE-finetuned, sharper reconstructions; "
+            "'sd-vae-ft-ema' = EMA-finetuned, slightly smoother. "
+            "Both share scaling_factor=0.18215."
         ),
     )
     # ── Logging / eval args ───────────────────────────────────────────────────
@@ -974,8 +1035,15 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
     )
+    _selfflow_eval_fn = functools.partial(
+        eval_step,
+        mask_ratio=args.mask_ratio,
+        gamma=args.self_flow_gamma,
+        student_layer=student_layer,
+        teacher_layer=teacher_layer,
+    )
     pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
-    pmapped_eval_step  = jax.pmap(eval_step,           axis_name='batch')
+    pmapped_eval_step  = jax.pmap(_selfflow_eval_fn,  axis_name='batch')
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1272,9 +1340,9 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation loss (online params, scalar-t proxy — cheap monitoring)
+            # Validation: full Self-Flow objective (student + EMA teacher, no grads)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
-                print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
+                print(f"Step {global_step}: Evaluating Self-Flow validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
@@ -1282,7 +1350,7 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, (val_x, val_y), rng)
+                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value

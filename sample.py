@@ -27,6 +27,31 @@ from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
 
 
+DIT_VARIANTS = {
+    "S":  {"hidden_size": 384,  "depth": 12, "num_heads": 6},
+    "B":  {"hidden_size": 768,  "depth": 12, "num_heads": 12},
+    "L":  {"hidden_size": 1024, "depth": 24, "num_heads": 16},
+    "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
+}
+
+
+def _model_config_for_size(model_size):
+    """Return the full model-init config dict for a DiT variant name (S/B/L/XL)."""
+    variant = DIT_VARIANTS[model_size.upper()]
+    return dict(
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=variant["hidden_size"],
+        depth=variant["depth"],
+        num_heads=variant["num_heads"],
+        mlp_ratio=4.0,
+        num_classes=1001,
+        learn_sigma=True,
+        compatibility_mode=True,
+    )
+
+
 def create_npz_from_samples(samples, output_path):
     """Save samples to NPZ file for ADM evaluation."""
     samples = np.stack(samples, axis=0)
@@ -34,12 +59,12 @@ def create_npz_from_samples(samples, output_path):
     print(f"Saved {len(samples)} samples to {output_path}")
 
 
-def load_vae(dtype=jnp.bfloat16):
+def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     """Load the SD-VAE for decoding latents to images."""
     from diffusers.models import FlaxAutoencoderKL
 
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        "stabilityai/sd-vae-ft-ema",
+        vae_model,
         from_pt=True,
         dtype=dtype,
     )
@@ -48,21 +73,9 @@ def load_vae(dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None):
+def load_model(ckpt_path=None, model_size="XL"):
     """Load the Self-Flow model from checkpoint."""
-    # Create model with DiT-XL/2 settings
-    config = dict(
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
-        hidden_size=1152,
-        depth=28,
-        num_heads=16,
-        mlp_ratio=4.0,
-        num_classes=1001,
-        learn_sigma=True,
-        compatibility_mode=True,
-    )
+    config = _model_config_for_size(model_size)
     model = SelfFlowPerTokenDiT(**config)
     
     # Initialize parameters with random key
@@ -190,6 +203,10 @@ def main():
     parser.add_argument("--seed", type=int, default=31, help="Random seed")
     parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
     parser.add_argument("--no-save-images", action="store_false", dest="save_images")
+    parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
+                        choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
+                        help="HuggingFace VAE model ID")
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="CFG scale (1.0 = no guidance)")
     parser.add_argument("--guidance-low", type=float, default=0.0, help="Lower guidance bound")
     parser.add_argument("--guidance-high", type=float, default=0.7, help="Upper guidance bound")
@@ -206,8 +223,8 @@ def main():
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
         
-    model, params = load_model(args.ckpt)
-    vae, vae_params, scale_factor, shift_factor = load_vae()
+    model, params = load_model(args.ckpt, model_size=args.model_size)
+    vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
     sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)
     
