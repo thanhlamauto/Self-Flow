@@ -26,6 +26,7 @@ import argparse
 import pickle
 import gc
 import csv
+import zipfile
 import concurrent.futures
 from tqdm import tqdm
 from PIL import Image
@@ -243,6 +244,61 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
     return dataloader, len(dataset)
 
 
+_VAE_PARAMS_FILENAME = "vae_params_bf16.msgpack"
+
+
+def save_vae_params(vae_params, cache_zip_path):
+    """Convert Flax VAE params sang msgpack rồi zip lại để dễ tải."""
+    import flax.serialization
+
+    os.makedirs(os.path.dirname(os.path.abspath(cache_zip_path)), exist_ok=True)
+    tmp_msgpack = cache_zip_path.replace(".zip", "")
+    params_bytes = flax.serialization.to_bytes(vae_params)
+    with open(tmp_msgpack, "wb") as f:
+        f.write(params_bytes)
+    with zipfile.ZipFile(cache_zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.write(tmp_msgpack, arcname=_VAE_PARAMS_FILENAME)
+    os.remove(tmp_msgpack)
+    size_mb = os.path.getsize(cache_zip_path) / (1024 * 1024)
+    print(f"[VAE Cache] Saved Flax params → {cache_zip_path} ({size_mb:.1f} MB)")
+
+
+def load_vae_params_from_zip(vae_model, cache_zip_path):
+    """Load Flax VAE params từ file zip đã cache, chỉ tải config model (không cần PyTorch)."""
+    import flax.serialization
+
+    print(f"[VAE Cache] Loading cached Flax params from {cache_zip_path} ...")
+    with zipfile.ZipFile(cache_zip_path, "r") as zf:
+        with zf.open(_VAE_PARAMS_FILENAME) as f:
+            vae_params = flax.serialization.from_bytes(None, f.read())
+
+    # Chỉ download config.json để build model architecture, không cần download PyTorch weights
+    vae = FlaxAutoencoderKL.from_config(FlaxAutoencoderKL.load_config(vae_model))
+    vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
+    size_mb = os.path.getsize(cache_zip_path) / (1024 * 1024)
+    print(f"[VAE Cache] Loaded ({size_mb:.1f} MB, skipped PyTorch conversion)")
+    return vae, vae_params
+
+
+def load_vae(vae_model, vae_cache=None):
+    """
+    Load VAE Flax params. Ưu tiên load từ cache zip nếu có.
+    Nếu không có cache, convert từ PyTorch rồi tự động lưu zip.
+    """
+    if vae_cache and os.path.exists(vae_cache):
+        return load_vae_params_from_zip(vae_model, vae_cache)
+
+    print(f"[VAE] Loading Flax VAE from {vae_model!r} (converting from PyTorch)...")
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
+    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
+
+    if vae_cache:
+        print(f"[VAE Cache] Saving converted params to {vae_cache} ...")
+        save_vae_params(vae_params, vae_cache)
+
+    return vae, vae_params
+
+
 def validate_dependencies():
     missing_deps = []
     if FlaxAutoencoderKL is None:
@@ -301,6 +357,7 @@ def run_encoding(
     num_shards=256,
     vae_model="stabilityai/sd-vae-ft-mse",
     group_size=1,
+    vae_cache=None,
 ):
     validate_dependencies()
     os.makedirs(output_dir, exist_ok=True)
@@ -309,18 +366,15 @@ def run_encoding(
         f"[prepare_data_tpu] data-dir={data_dir} split={split} output-dir={output_dir} "
         f"group_size={group_size}"
     )
-    
+
     # Verify JAX devices
     num_devices = jax.device_count()
     print(f"JAX detects {num_devices} devices.")
     assert batch_size % num_devices == 0, f"Batch size must be divisible by {num_devices}"
     batch_per_device = batch_size // num_devices
-    
-    # 1. Load VAE natively in Flax (from standard PyTorch weights)
-    print(f"Loading Flax VAE: {vae_model}")
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
-    # Cast to bf16 for TPU optimization
-    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
+
+    # 1. Load VAE (dùng cache zip nếu có, ngược lại convert từ PyTorch rồi tự lưu cache)
+    vae, vae_params = load_vae(vae_model, vae_cache=vae_cache)
     
     SCALE_FACTOR = 0.18215 
 
@@ -402,6 +456,7 @@ def run_multi_split_encoding(
     num_shards=256,
     vae_model="stabilityai/sd-vae-ft-mse",
     group_size=1,
+    vae_cache=None,
 ):
     for split in resolve_splits(splits):
         run_encoding(
@@ -412,6 +467,7 @@ def run_multi_split_encoding(
             num_shards=num_shards,
             vae_model=vae_model,
             group_size=group_size,
+            vae_cache=vae_cache,
         )
 
 
@@ -429,7 +485,17 @@ def main():
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
     parser.add_argument("--group-size", type=int, default=1, help="ArrayRecord group_size to write. Use 1 for Grain training.")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse", help="HF VAE")
-    
+    parser.add_argument(
+        "--vae-cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to cache file for converted Flax VAE params (e.g. ./vae_params_bf16.zip). "
+            "Nếu file chưa tồn tại: convert từ PyTorch rồi tự động lưu zip. "
+            "Nếu file đã có: load thẳng, bỏ qua bước convert PyTorch."
+        ),
+    )
+
     args = parser.parse_args()
     splits = resolve_splits(args.split)
     print(f"[prepare_data_tpu] Encoding splits: {', '.join(splits)}")
@@ -441,6 +507,7 @@ def main():
         num_shards=args.num_shards,
         group_size=args.group_size,
         vae_model=args.vae_model,
+        vae_cache=args.vae_cache,
     )
 
 if __name__ == "__main__":
