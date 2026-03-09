@@ -224,11 +224,30 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
     import flax.serialization
     FlaxAutoencoderKL = _FlaxAutoencoderKL
 
-    # Config: ưu tiên local config.json, fallback về HF Hub (chỉ tải ~1KB)
+    # Config: ưu tiên local config.json trong model dir, sau đó hf_config_id.
+    # Nếu hf_config_id là path đến file .json hoặc thư mục → đọc local (an toàn, không lazy import).
+    # Nếu là HF repo ID → gọi load_config() → có thể trigger lazy import → SIGSEGV risk.
     def _get_vae_config():
+        import json as _json
+        # 1. config.json trong cùng thư mục với model file
         if has_config:
-            return FlaxAutoencoderKL.load_config(vae_model_path)
-        log_stage(f"[VAE-TPU] Không có config.json local → tải từ HF: {hf_config_id}")
+            cfg_path = os.path.join(vae_model_path, "config.json")
+            log_stage(f"[VAE-TPU] Reading config.json từ {cfg_path}")
+            with open(cfg_path) as f:
+                return _json.load(f)
+        # 2. hf_config_id là path trực tiếp đến file config.json
+        if os.path.isfile(hf_config_id):
+            log_stage(f"[VAE-TPU] Reading config.json từ file: {hf_config_id}")
+            with open(hf_config_id) as f:
+                return _json.load(f)
+        # 3. hf_config_id là thư mục chứa config.json
+        local_cfg = os.path.join(hf_config_id, "config.json")
+        if os.path.isfile(local_cfg):
+            log_stage(f"[VAE-TPU] Reading config.json từ dir: {local_cfg}")
+            with open(local_cfg) as f:
+                return _json.load(f)
+        # 4. Fallback HF Hub (rủi ro lazy import → SIGSEGV)
+        log_stage(f"[VAE-TPU] Không tìm thấy config.json local → tải từ HF: {hf_config_id}")
         return FlaxAutoencoderKL.load_config(hf_config_id)
 
     if all_msgpack:
@@ -1043,11 +1062,13 @@ def main():
     parser.add_argument(
         "--vae-hf-config",
         type=str,
-        default="stabilityai/sd-vae-ft-ema",
+        default="/kaggle/working/huggingface_cache/hub/models--stabilityai--sd-vae-ft-ema/snapshots/f04b2c4b98319346dad8c65879f680b1997b204a/config.json",
         help=(
-            "HF repo ID dùng để tải config.json khi --vae-model là local Flax zip "
-            "mà không có sẵn config.json cùng thư mục. "
-            "Không cần thiết nếu thư mục đã có config.json hoặc flax_model.msgpack."
+            "Path đến config.json của VAE. Chấp nhận 3 dạng: "
+            "(1) path trực tiếp đến file config.json — đọc local, an toàn nhất; "
+            "(2) path đến thư mục chứa config.json; "
+            "(3) HF repo ID — tải từ HF Hub (rủi ro SIGSEGV do lazy import). "
+            "Chỉ dùng khi --vae-model dir không có sẵn config.json."
         ),
     )
     # ── Logging / eval args ───────────────────────────────────────────────────

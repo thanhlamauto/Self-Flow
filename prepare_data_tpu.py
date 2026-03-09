@@ -293,8 +293,13 @@ def load_vae(vae_model, vae_cache=None):
     vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
 
     if vae_cache:
+        cache_dir = os.path.dirname(os.path.abspath(vae_cache))
         print(f"[VAE Cache] Saving converted params to {vae_cache} ...")
         save_vae_params(vae_params, vae_cache)
+        # Lưu config.json cùng thư mục để train.py load local, tránh HF download
+        # (HF download kích hoạt lazy import C extension → SIGSEGV trong main JAX process)
+        vae.save_config(cache_dir)
+        print(f"[VAE Cache] Saved config.json → {os.path.join(cache_dir, 'config.json')}")
 
     return vae, vae_params
 
