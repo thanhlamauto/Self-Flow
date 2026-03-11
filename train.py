@@ -1454,7 +1454,19 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(state, ema_params, (probe_x, probe_y), rng)
+        # Preflight uses the first-step schedule values; only tensor shapes matter
+        # for the memory probe, but matching the real call signature avoids drift.
+        probe_progress = 1.0 / max(total_steps, 1)
+        probe_ema_decay_rep = jax_utils.replicate(jnp.float32(
+            min(0.996 + (1.0 - 0.996) * probe_progress, 1.0)
+        ))
+        probe_lambda_jepa_rep = jax_utils.replicate(jnp.float32(
+            args.lambda_jepa * min(1.0 / 10000.0, 1.0)
+        ))
+        _, _, probe_metrics, _ = pmapped_train_step(
+            state, ema_params, (probe_x, probe_y), rng,
+            probe_lambda_jepa_rep, probe_ema_decay_rep,
+        )
         block_pytree(probe_metrics)
 
         inception_fn = get_inception()
