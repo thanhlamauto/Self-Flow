@@ -20,7 +20,9 @@ import jax.numpy as jnp
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
-import orbax.checkpoint as ocp
+import collections.abc
+
+from flax.training import checkpoints as flax_ckpt
 
 # Import from local src/ folder
 from src.model import SelfFlowPerTokenDiT
@@ -74,32 +76,44 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
 
 
 def load_model(ckpt_path=None, model_size="XL"):
-    """Load the Self-Flow model from checkpoint."""
+    """Load the Self-Flow backbone from a flax.training.checkpoints checkpoint.
+
+    Handles three checkpoint shapes written by train.py:
+      1. New nested format  {"backbone": ..., "predictor": ...} — extract "backbone".
+      2. Old flat format with "feature_head" key (pre-JEPA)     — strip "feature_head".
+      3. Old flat format without "feature_head"                 — use as-is.
+
+    train.py writes checkpoints via flax.training.checkpoints.save_checkpoint
+    (legacy msgpack).  The EMA checkpoint at <ckpt_dir>/ema is backbone-only and
+    is the preferred path for sampling.
+    """
     config = _model_config_for_size(model_size)
     model = SelfFlowPerTokenDiT(**config)
-    
-    # Initialize parameters with random key
+
     key = jax.random.PRNGKey(0)
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    dummy_x = jnp.ones((1, n_patches, patch_dim))
-    dummy_t = jnp.ones((1,))
+    dummy_x   = jnp.ones((1, n_patches, patch_dim))
+    dummy_t   = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
-    
-    variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)
+
+    variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec,
+                           deterministic=True)
     params = variables["params"]
-    
+
     if ckpt_path is not None and os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}")
-        # Assuming Flax native checkpoints via Orbax:
-        options = ocp.CheckpointManagerOptions()
-        checkpoint_manager = ocp.CheckpointManager(ckpt_path, options=options)
-        
-        # Orbax usually requires the target to know the shape
-        restored = checkpoint_manager.restore(checkpoint_manager.latest_step(), args=ocp.args.StandardRestore(params))
-        if restored is not None:
-             params = restored
-    
+        # Restore raw (target=None) so the loader does not try to match a
+        # flat backbone structure against a nested {"backbone","predictor"} dict.
+        raw = flax_ckpt.restore_checkpoint(ckpt_dir=ckpt_path, target=None)
+        if raw is not None:
+            # Normalise checkpoint structure to flat backbone params.
+            if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
+                raw = dict(raw["backbone"])
+            elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
+                raw = {k: v for k, v in raw.items() if k != "feature_head"}
+            params = raw
+
     return model, params
 
 

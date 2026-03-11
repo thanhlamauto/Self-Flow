@@ -415,62 +415,70 @@ except ImportError:
     raise
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
+from src.jepa import JEPAPredictor, sample_jepa_masks
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
-    """Initializes the model, optimizer, and initial EMA params.
+def create_train_state(rng, config, backbone, predictor, learning_rate, grad_clip=1.0):
+    """Initializes optimizer and initial EMA params for the JEPA training setup.
 
-    Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
+    backbone and predictor are passed in from main() so the same module objects
+    are reused in functools.partial for train_step / eval_step.
+
+    state.params = {"backbone": ..., "predictor": ...}
+    ema_params   = backbone params only (predictor is not EMA-tracked).
+
+    Returns (state, ema_params); caller replicates both via jax_utils.replicate.
     """
-    model = SelfFlowPerTokenDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=True,
-    )
-
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
-    dummy_x = jnp.ones((1, n_patches, patch_dim))
-    dummy_t = jnp.ones((1,))
+    dummy_x   = jnp.ones((1, n_patches, patch_dim))
+    dummy_t   = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
-    # Pass return_features=1 so that feature_head is called during init and
-    # its parameters are materialized into the param tree.  Without this,
-    # the first call to apply_fn with return_features=<layer> would raise
-    # ScopeParamNotFoundError because feature_head was never initialized.
-    variables = model.init(
+
+    # Init backbone with return_raw_features=False: all DiTBlock params are
+    # materialized, feature_head is never called so it has no params.
+    backbone_vars = backbone.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
-        return_features=1,
+        return_raw_features=False,
     )
+    backbone_params = backbone_vars['params']
 
-    # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
+    # Init predictor with dummy inputs matching expected shapes.
+    rng, pred_rng = jax.random.split(rng)
+    dummy_ctx_feats  = jnp.ones((1, 256, config["hidden_size"]))
+    dummy_ctx_valid  = jnp.ones((1, 256), dtype=jnp.bool_)
+    dummy_tgt_idx    = jnp.zeros((1, 64), dtype=jnp.int32)
+    dummy_tgt_valid  = jnp.ones((1, 64), dtype=jnp.bool_)
+    predictor_vars = predictor.init(
+        pred_rng,
+        dummy_ctx_feats,
+        dummy_ctx_valid,
+        dummy_tgt_idx,
+        dummy_tgt_valid,
+    )
+    predictor_params = predictor_vars['params']
+
+    all_params = {"backbone": backbone_params, "predictor": predictor_params}
+
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
         optax.adamw(learning_rate, weight_decay=0),
     )
 
     state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
+        apply_fn=backbone.apply,
+        params=all_params,
         tx=tx,
     )
-    # EMA params start as an exact copy of the initial online params
-    ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
+    # EMA tracks backbone only; predictor is optimized online, not EMA-tracked.
+    ema_params = jax.tree_util.tree_map(lambda x: x, backbone_params)
     return state, ema_params
 
 
@@ -479,8 +487,9 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 def ema_update(ema_params, new_params, decay):
     """Exponential moving average: ema = decay * ema + (1 - decay) * new.
 
-    Paper-faithful: EMA decay = 0.9999 by default.
-    Called after each gradient step inside train_step.
+    Operates on backbone params only.  Call as:
+      ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
+    EMA decay is scheduled linearly from 0.996 → 1.0 over training.
     """
     return jax.tree_util.tree_map(
         lambda ema, new: decay * ema + (1.0 - decay) * new,
@@ -489,251 +498,284 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def cosine_sim_loss(a, b, mask):
-    """Negative mean cosine similarity over masked tokens (Lrep).
+def _pf_layer_norm(x):
+    """Parameter-free layer normalisation (no learnable scale or bias).
 
-    a, b : [B, N, D] — student / teacher feature maps
-    mask : [B, N] bool — True for tokens that received the cleaner timestep
-
-    Returns (loss, mean_sim) where loss = -mean_sim.
-    Paper-faithful: Lrep = -E[cos_sim(student, sg(teacher))] over masked tokens.
+    Equivalent to nn.LayerNorm(use_scale=False, use_bias=False) applied to the
+    last axis.  Used in Ljepa to normalize predictor outputs and teacher targets
+    before computing MSE, following the I-JEPA convention.
     """
-    a_norm = a / (jnp.linalg.norm(a, axis=-1, keepdims=True) + 1e-6)
-    b_norm = b / (jnp.linalg.norm(b, axis=-1, keepdims=True) + 1e-6)
-    cos_sim = jnp.sum(a_norm * b_norm, axis=-1)   # [B, N]
-    mask_f = mask.astype(jnp.float32)
-    denom = jnp.sum(mask_f) + 1e-6
-    mean_sim = jnp.sum(cos_sim * mask_f) / denom
-    return -mean_sim, mean_sim   # (loss, diagnostic)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var  = jnp.var(x,  axis=-1, keepdims=True)
+    return (x - mean) / jnp.sqrt(var + 1e-6)
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng,
-    *, mask_ratio, gamma, ema_decay, student_layer, teacher_layer,
+    state, ema_params, batch, rng, lambda_jepa, ema_decay,
+    *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
 ):
-    """Self-Flow distributed training step.
+    """Self-Flow + I-JEPA distributed training step.
 
-    Paper-faithful changes vs. vanilla flow matching:
-      - Dual-timestep sampling: t, s ~ U(0,1); t_clean=max, t_noisy=min
-      - Per-token mask M ~ Bernoulli(mask_ratio); masked tokens get t_clean
-      - Student forward on x_tau (per-token tau, rank-2 timestep)
-      - Teacher forward on x_tau_min (scalar tau_min, EMA params, no grad)
-      - Loss = Lgen (velocity MSE) + gamma * Lrep (neg cosine sim, masked tokens)
-      - EMA update applied after gradient step
+    Loss = Lgen (flow-matching velocity MSE) + lambda_jepa * Ljepa (JEPA block MSE).
 
-    TPU deviation (intentional for throughput):
-      - pmap over data-parallel axis (not model-parallel as in some paper setups)
+    Self-Flow dual-timestep construction is unchanged:
+      - t, s ~ U(0,1); t_clean = max(t,s), tau_clean = max(t,s) for teacher view.
+      - Per-token tau: masked tokens use t_clean, unmasked use t_noisy.
+      - Student forward on full x_tau; teacher EMA forward on x_tau_min.
+
+    I-JEPA block prediction (Ljepa):
+      - 4 target blocks sampled per image with static T_max=64 padded indices.
+      - 1 context block (scale [0.85,1.0], ar=1.0), minus target union → C'.
+      - Shared predictor [B*4, C_max+T_max, 384] predicts teacher target features.
+      - Both sides normalised with parameter-free layer norm before MSE.
+      - Ljepa averaged over valid patches per block, then over 4 blocks.
+
+    lambda_jepa and ema_decay are per-step JAX float32 scalars (replicated).
+    backbone and predictor are Python module objects baked in via functools.partial.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
 
-    rng, t_rng, s_rng, mask_rng, noise_rng, drop_rng = jax.random.split(rng, 6)
+    rng, t_rng, s_rng, mask_rng, noise_rng, drop_rng, jepa_rng = jax.random.split(rng, 7)
 
-    # --- Dual-timestep sampling (paper §3.2, paper-faithful) ---
+    # --- Dual-timestep sampling (Self-Flow §3.2, unchanged) ---
     t = jax.random.uniform(t_rng, shape=(local_batch,))
     s = jax.random.uniform(s_rng, shape=(local_batch,))
-    t_clean = jnp.maximum(t, s)   # [B] — higher tau → cleaner input (masked tokens / teacher)
-    t_noisy = jnp.minimum(t, s)   # [B] — lower tau → noisier input (unmasked tokens)
+    t_clean = jnp.maximum(t, s)   # [B]
+    t_noisy = jnp.minimum(t, s)   # [B]
 
-    # Bernoulli mask: True for tokens that receive the cleaner (higher-tau) timestep
-    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))  # [B, N]
+    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))
+    tau  = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
 
-    # Per-token timestep for student: masked → t_clean, unmasked → t_noisy
-    tau = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
+    x1        = jax.random.normal(noise_rng, x0.shape)
+    x_tau     = (1.0 - tau[:, :, None]) * x1 + tau[:, :, None] * x0
+    x_tau_min = (1.0 - t_clean[:, None, None]) * x1 + t_clean[:, None, None] * x0
+    target    = x0 - x1   # [B, N, D]
 
-    # Shared noise; used for both student and teacher interpolations
-    x1 = jax.random.normal(noise_rng, x0.shape)   # [B, N, D]
+    # --- JEPA spatial masks (static-shape padded; sampled outside loss_fn) ---
+    ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
+        jepa_rng, local_batch,
+    )
+    # ctx_idx   [B, 256], ctx_valid [B, 256]
+    # tgt_idx   [B, 4, 64], tgt_valid [B, 4, 64]
 
-    # Student input: per-token interpolation
-    tau_e     = tau[:, :, None]               # [B, N, 1] for broadcast with [B, N, D]
-    x_tau     = (1.0 - tau_e) * x1 + tau_e * x0
-
-    # Teacher input: uniform scalar tau_min across all tokens
-    tau_min_e = t_clean[:, None, None]        # [B, 1, 1]
-    x_tau_min = (1.0 - tau_min_e) * x1 + tau_min_e * x0
-
-    # Flow-matching velocity target (linear path: d/dt x_t = x0 - x1)
-    target = x0 - x1   # [B, N, D]
-
-    # --- Teacher forward (no gradient; uses EMA params) ---
-    # t_clean = max(t,s) is rank-1 [B]; higher tau → cleaner view for teacher supervision
-    # (per_token branch with timesteps.ndim == 1 → jnp.tile to [B, N, D])
-    _, t_feat = state.apply_fn(
+    # --- Teacher forward (EMA backbone, no grad, raw features at layer k) ---
+    _, t_feat = backbone.apply(
         {'params': ema_params},
         x_tau_min,
         timesteps=t_clean,
         vector=y,
         deterministic=True,
-        return_features=teacher_layer,
+        return_raw_features=teacher_layer,
     )
-    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, hidden]
+    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, D]
 
-    # --- Student forward + combined Self-Flow loss ---
+    # --- Student + predictor forward; gradients w.r.t. all params ---
     def loss_fn(params):
-        # tau is rank-2 [B, N]; model uses per-token conditioning branch
-        pred, s_feat = state.apply_fn(
-            {'params': params},
+        # Student backbone: raw features at layer l for I-JEPA predictor input.
+        pred, s_feat = backbone.apply(
+            {'params': params["backbone"]},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=False,
-            return_features=student_layer,
+            return_raw_features=student_layer,
             rngs={'dropout': drop_rng},
         )
-        # Lgen: flow-matching velocity MSE (paper-faithful)
         loss_gen = jnp.mean((pred - target) ** 2)
 
-        # Lrep: negative cosine similarity on masked tokens (paper-faithful)
-        loss_rep, mean_cos_sim = cosine_sim_loss(s_feat, t_feat, mask)
+        D = s_feat.shape[-1]   # hidden_size (768 for DiT-B)
+        n_tgt = tgt_idx.shape[1]  # 4
+        T_max = tgt_idx.shape[2]  # 64
+        C_max = ctx_idx.shape[1]  # 256
 
-        loss_total = loss_gen + gamma * loss_rep
+        # Gather context student features: [B, C_max, D]
+        ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
 
-        # Auxiliary diagnostics (on-device to avoid host-transfer stalls)
+        # Repeat context for each of the 4 target blocks → [B*4, C_max, D]
+        ctx_feats_rep  = jnp.repeat(ctx_feats,  n_tgt, axis=0)
+        ctx_valid_rep  = jnp.repeat(ctx_valid,  n_tgt, axis=0)
+
+        # Flatten target block dimension into batch: [B*4, T_max]
+        tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
+        tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
+
+        # Predictor: context features + mask-token queries → predicted target features
+        pred_feats = predictor.apply(
+            {'params': params["predictor"]},
+            ctx_feats_rep,
+            ctx_valid_rep,
+            tgt_idx_flat,
+            tgt_valid_flat,
+        )  # [B*4, T_max, D]
+
+        # Gather teacher targets at target positions: [B*4, T_max, D]
+        t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)   # [B*4, N, D]
+        t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
+
+        # Normalise both sides (parameter-free) then compute MSE over valid patches.
+        pred_norm = _pf_layer_norm(pred_feats)
+        tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
+
+        mse     = jnp.sum((pred_norm - tgt_norm) ** 2, axis=-1)   # [B*4, T_max]
+        valid_f = tgt_valid_flat.astype(jnp.float32)
+        per_block = (
+            jnp.sum(mse * valid_f, axis=-1) /
+            (jnp.sum(valid_f, axis=-1) + 1e-6)
+        )  # [B*4]
+        loss_jepa = jnp.mean(per_block)
+
+        loss_total = loss_gen + lambda_jepa * loss_jepa
+
         v_abs_mean      = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        mask_ratio_eff  = jnp.mean(mask.astype(jnp.float32))
 
-        return loss_total, (loss_gen, loss_rep, mean_cos_sim,
-                            v_abs_mean, v_pred_abs_mean, mask_ratio_eff)
+        return loss_total, (loss_gen, loss_jepa, v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss_total, (loss_gen, loss_rep, mean_cos,
-                  v_abs, v_pred, mask_ratio_eff)), grads = grad_fn(state.params)
+    (loss_total, (loss_gen, loss_jepa, v_abs, v_pred)), grads = grad_fn(state.params)
 
-    # Cross-device aggregation (TPU v5e-8 data-parallel)
-    loss_total     = jax.lax.pmean(loss_total,     axis_name='batch')
-    loss_gen       = jax.lax.pmean(loss_gen,       axis_name='batch')
-    loss_rep       = jax.lax.pmean(loss_rep,       axis_name='batch')
-    mean_cos       = jax.lax.pmean(mean_cos,       axis_name='batch')
-    v_abs          = jax.lax.pmean(v_abs,          axis_name='batch')
-    v_pred         = jax.lax.pmean(v_pred,         axis_name='batch')
-    mask_ratio_eff = jax.lax.pmean(mask_ratio_eff, axis_name='batch')
-    grads          = jax.lax.pmean(grads,          axis_name='batch')
+    loss_total = jax.lax.pmean(loss_total, axis_name='batch')
+    loss_gen   = jax.lax.pmean(loss_gen,   axis_name='batch')
+    loss_jepa  = jax.lax.pmean(loss_jepa,  axis_name='batch')
+    v_abs      = jax.lax.pmean(v_abs,      axis_name='batch')
+    v_pred     = jax.lax.pmean(v_pred,     axis_name='batch')
+    grads      = jax.lax.pmean(grads,      axis_name='batch')
 
-    grad_norm  = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+    grad_norm  = jnp.sqrt(sum(
+        jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)
+    ))
+    param_norm = jnp.sqrt(sum(
+        jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)
+    ))
 
     state = state.apply_gradients(grads=grads)
 
-    # EMA update applied after gradient step (paper-faithful, decay=0.9999)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+    # EMA update: backbone params only; decay scheduled linearly to 1.0.
+    ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
 
     metrics = {
-        "train/loss_total":           loss_total,
-        "train/loss_gen":             loss_gen,
-        "train/loss_rep":             loss_rep,
-        "train/cosine_sim":           mean_cos,
-        "train/grad_norm":            grad_norm,
-        "train/param_norm":           param_norm,
-        "train/v_abs_mean":           v_abs,
-        "train/v_pred_abs_mean":      v_pred,
-        "train/mask_ratio_effective": mask_ratio_eff,
+        "train/loss_total":      loss_total,
+        "train/loss_gen":        loss_gen,
+        "train/loss_jepa":       loss_jepa,
+        "train/lambda_jepa":     lambda_jepa,
+        "train/ema_decay":       ema_decay,
+        "train/grad_norm":       grad_norm,
+        "train/param_norm":      param_norm,
+        "train/v_abs_mean":      v_abs,
+        "train/v_pred_abs_mean": v_pred,
     }
 
     return state, ema_params, metrics, rng
 
 
 def eval_step(
-    state, ema_params, batch, rng,
-    *, mask_ratio, gamma, student_layer, teacher_layer,
+    state, ema_params, batch, rng, lambda_jepa,
+    *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
 ):
-    """Self-Flow validation step that mirrors the dual-timestep training objective.
+    """Self-Flow + I-JEPA validation step.
 
-    Mirrors train_step's Self-Flow construction exactly, but:
-      - uses state.params for the student (no parameter updates)
-      - uses ema_params for the teacher (stop-gradient, same as training)
-      - deterministic=True throughout (no dropout)
-      - computes Lgen + gamma * Lrep without gradients
-
-    Returns val/loss_total, val/loss_gen, val/loss_rep, val/cosine_sim, and
-    magnitude diagnostics consistent with training metrics.
+    Mirrors train_step exactly, but:
+      - No parameter updates or EMA update.
+      - deterministic=True throughout (no dropout).
+      - lambda_jepa is the same per-step scheduled value used in training so
+        val/loss_total tracks the same objective during warmup.
     """
     x0, y = batch
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
 
-    rng, t_rng, s_rng, mask_rng, noise_rng = jax.random.split(rng, 5)
+    rng, t_rng, s_rng, mask_rng, noise_rng, jepa_rng = jax.random.split(rng, 6)
 
-    # --- Dual-timestep sampling (mirrors train_step) ---
     t = jax.random.uniform(t_rng, shape=(local_batch,))
     s = jax.random.uniform(s_rng, shape=(local_batch,))
-    t_clean = jnp.maximum(t, s)   # [B]
-    t_noisy = jnp.minimum(t, s)   # [B]
+    t_clean = jnp.maximum(t, s)
+    t_noisy = jnp.minimum(t, s)
 
-    # Bernoulli mask: True for tokens that receive the cleaner timestep
-    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))  # [B, N]
+    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))
+    tau  = jnp.where(mask, t_clean[:, None], t_noisy[:, None])
 
-    # Per-token timestep for student: masked → t_clean, unmasked → t_noisy
-    tau = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
+    x1        = jax.random.normal(noise_rng, x0.shape)
+    x_tau     = (1.0 - tau[:, :, None]) * x1 + tau[:, :, None] * x0
+    x_tau_min = (1.0 - t_clean[:, None, None]) * x1 + t_clean[:, None, None] * x0
+    target    = x0 - x1
 
-    # Shared noise
-    x1 = jax.random.normal(noise_rng, x0.shape)   # [B, N, D]
+    ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
+        jepa_rng, local_batch,
+    )
 
-    # Student input: per-token interpolation
-    tau_e     = tau[:, :, None]
-    x_tau     = (1.0 - tau_e) * x1 + tau_e * x0
-
-    # Teacher input: uniform scalar tau_min across all tokens
-    tau_min_e = t_clean[:, None, None]
-    x_tau_min = (1.0 - tau_min_e) * x1 + tau_min_e * x0
-
-    # Flow-matching velocity target
-    target = x0 - x1   # [B, N, D]
-
-    # --- Teacher forward (EMA params, stop-gradient, deterministic) ---
-    _, t_feat = state.apply_fn(
+    # Teacher forward (EMA backbone)
+    _, t_feat = backbone.apply(
         {'params': ema_params},
         x_tau_min,
         timesteps=t_clean,
         vector=y,
         deterministic=True,
-        return_features=teacher_layer,
+        return_raw_features=teacher_layer,
     )
-    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, hidden]
+    t_feat = jax.lax.stop_gradient(t_feat)
 
-    # --- Student forward (online params, no dropout, no gradients) ---
-    pred, s_feat = state.apply_fn(
-        {'params': state.params},
+    # Student backbone (online params, no dropout)
+    pred, s_feat = backbone.apply(
+        {'params': state.params["backbone"]},
         x_tau,
         timesteps=tau,
         vector=y,
         deterministic=True,
-        return_features=student_layer,
+        return_raw_features=student_layer,
     )
 
-    # Lgen: flow-matching velocity MSE
     loss_gen = jnp.mean((pred - target) ** 2)
 
-    # Lrep: negative cosine similarity on masked tokens
-    loss_rep, mean_cos_sim = cosine_sim_loss(s_feat, t_feat, mask)
+    n_tgt = tgt_idx.shape[1]
+    T_max = tgt_idx.shape[2]
 
-    loss_total = loss_gen + gamma * loss_rep
+    ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
+    ctx_feats_rep  = jnp.repeat(ctx_feats, n_tgt, axis=0)
+    ctx_valid_rep  = jnp.repeat(ctx_valid, n_tgt, axis=0)
+    tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
+    tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
 
-    # Magnitude diagnostics (mirrors training metrics)
+    pred_feats = predictor.apply(
+        {'params': state.params["predictor"]},
+        ctx_feats_rep,
+        ctx_valid_rep,
+        tgt_idx_flat,
+        tgt_valid_flat,
+    )
+
+    t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)
+    t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
+
+    pred_norm = _pf_layer_norm(pred_feats)
+    tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
+    mse       = jnp.sum((pred_norm - tgt_norm) ** 2, axis=-1)
+    valid_f   = tgt_valid_flat.astype(jnp.float32)
+    per_block = (
+        jnp.sum(mse * valid_f, axis=-1) /
+        (jnp.sum(valid_f, axis=-1) + 1e-6)
+    )
+    loss_jepa = jnp.mean(per_block)
+
+    loss_total      = loss_gen + lambda_jepa * loss_jepa
     v_abs_mean      = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-    mask_ratio_eff  = jnp.mean(mask.astype(jnp.float32))
 
-    # Cross-device aggregation (consistent with train_step)
     loss_total      = jax.lax.pmean(loss_total,      axis_name='batch')
     loss_gen        = jax.lax.pmean(loss_gen,        axis_name='batch')
-    loss_rep        = jax.lax.pmean(loss_rep,        axis_name='batch')
-    mean_cos_sim    = jax.lax.pmean(mean_cos_sim,    axis_name='batch')
+    loss_jepa       = jax.lax.pmean(loss_jepa,       axis_name='batch')
     v_abs_mean      = jax.lax.pmean(v_abs_mean,      axis_name='batch')
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name='batch')
-    mask_ratio_eff  = jax.lax.pmean(mask_ratio_eff,  axis_name='batch')
 
     metrics = {
-        "val/loss_total":           loss_total,
-        "val/loss_gen":             loss_gen,
-        "val/loss_rep":             loss_rep,
-        "val/cosine_sim":           mean_cos_sim,
-        "val/v_abs_mean":           v_abs_mean,
-        "val/v_pred_abs_mean":      v_pred_abs_mean,
-        "val/mask_ratio_effective": mask_ratio_eff,
+        "val/loss_total":      loss_total,
+        "val/loss_gen":        loss_gen,
+        "val/loss_jepa":       loss_jepa,
+        "val/v_abs_mean":      v_abs_mean,
+        "val/v_pred_abs_mean": v_pred_abs_mean,
     }
     return metrics, rng
 
@@ -1051,13 +1093,12 @@ def main():
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="selfflow-jax")
     parser.add_argument("--no-wandb", action="store_true")
-    # ── Self-Flow algorithm args (paper-faithful defaults) ────────────────────
+    # ── Self-Flow + I-JEPA algorithm args ────────────────────────────────────
     parser.add_argument("--mask-ratio", type=float, default=0.25,
                         help="Bernoulli mask ratio RM for per-token masking (paper: 0.25)")
-    parser.add_argument("--self-flow-gamma", type=float, default=0.8,
-                        help="Weight for Lrep in L = Lgen + gamma * Lrep (paper: 0.8)")
-    parser.add_argument("--ema-decay", type=float, default=0.9999,
-                        help="EMA teacher decay (paper: 0.9999)")
+    parser.add_argument("--lambda-jepa", type=float, default=0.25,
+                        help="Final weight for Ljepa in L = Lgen + lambda_jepa * Ljepa. "
+                             "Linearly warmed up from 0 to this value over the first 10k steps.")
     parser.add_argument("--student-layer", type=int, default=None,
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
@@ -1191,8 +1232,8 @@ def main():
         f"student_layer={student_layer} teacher_layer={teacher_layer}"
     )
     log_stage(
-        f"Self-Flow: mask_ratio={args.mask_ratio} gamma={args.self_flow_gamma} "
-        f"ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
+        f"ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1202,9 +1243,37 @@ def main():
         wandb.define_metric("*", step_metric="train/step")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
-    # ── Model, state, EMA ─────────────────────────────────────────────────────
+    # ── Backbone + predictor + state + EMA ────────────────────────────────────
+    # Instantiate modules here so the same objects can be reused in
+    # functools.partial for train_step / eval_step (they need to be in scope).
+    backbone = SelfFlowPerTokenDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=True,
+    )
+    predictor = JEPAPredictor(
+        backbone_dim=config["hidden_size"],
+        hidden_size=384,
+        depth=4,
+        num_heads=6,
+        mlp_ratio=4.0,
+        grid_size=config["input_size"] // config["patch_size"],
+        T_max=64,
+        C_max=256,
+    )
+
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng, config, backbone, predictor, args.learning_rate, args.grad_clip
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1212,21 +1281,24 @@ def main():
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
-    # ── Build pmapped training step with Self-Flow hyperparams baked in ───────
-    # functools.partial is used because pmap cannot take Python scalar args
-    # (mask_ratio, gamma, etc.) as traced inputs — they must be static.
+    total_steps = args.epochs * args.steps_per_epoch
+
+    # ── Build pmapped training step ───────────────────────────────────────────
+    # backbone and predictor are Python objects (static); lambda_jepa and
+    # ema_decay are per-step JAX float32 arrays (positional, not partialised).
     _selfflow_train_fn = functools.partial(
         train_step,
+        backbone=backbone,
+        predictor=predictor,
         mask_ratio=args.mask_ratio,
-        gamma=args.self_flow_gamma,
-        ema_decay=args.ema_decay,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
+        backbone=backbone,
+        predictor=predictor,
         mask_ratio=args.mask_ratio,
-        gamma=args.self_flow_gamma,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
     )
@@ -1539,9 +1611,18 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            # Self-Flow training step (returns updated EMA params)
+            # Per-step schedules.  Use (global_step + 1) so the final step
+            # reaches progress=1.0 and lambda_jepa reaches its target value.
+            progress        = (global_step + 1) / max(total_steps, 1)
+            ema_decay_val   = min(0.996 + (1.0 - 0.996) * progress, 1.0)
+            lambda_jepa_val = args.lambda_jepa * min((global_step + 1) / 10000.0, 1.0)
+            ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
+            lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
+
+            # Self-Flow + JEPA training step
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng
+                state, ema_params, (batch_x, batch_y), rng,
+                lambda_jepa_rep, ema_decay_rep,
             )
             global_step += 1
 
@@ -1554,9 +1635,9 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation: full Self-Flow objective (student + EMA teacher, no grads)
+            # Validation: JEPA objective (student + EMA teacher, no grads)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
-                print(f"Step {global_step}: Evaluating Self-Flow validation loss over {args.eval_batches} batch(es)...")
+                print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
@@ -1564,7 +1645,9 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    val_metrics, rng = pmapped_eval_step(
+                        state, ema_params, (val_x, val_y), rng, lambda_jepa_rep,
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -1605,7 +1688,9 @@ def main():
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
 
-    # ── Checkpoint save (online params + EMA params) ──────────────────────────
+    # ── Checkpoint save ────────────────────────────────────────────────────────
+    # Online: nested {"backbone": ..., "predictor": ...}
+    # EMA:    backbone params only (used directly by sampling / sample.py)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     unreplicated_params = jax_utils.unreplicate(state.params)
     unreplicated_ema    = jax_utils.unreplicate(ema_params)
@@ -1616,7 +1701,7 @@ def main():
     )
     checkpoints.save_checkpoint(
         ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
+        target=unreplicated_ema,  # backbone-only; loadable directly by sample.py
         step=global_step,
     )
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
