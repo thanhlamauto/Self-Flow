@@ -1099,6 +1099,8 @@ def main():
     parser.add_argument("--lambda-jepa", type=float, default=0.25,
                         help="Final weight for Ljepa in L = Lgen + lambda_jepa * Ljepa. "
                              "Linearly warmed up from 0 to this value over the first 10k steps.")
+    parser.add_argument("--predictor-depth", type=int, default=4,
+                        help="Number of Transformer blocks in the I-JEPA predictor (default: 4).")
     parser.add_argument("--student-layer", type=int, default=None,
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
@@ -1187,6 +1189,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not (0.0 < args.mask_ratio < 1.0):
         raise ValueError("--mask-ratio must be in (0, 1)")
+    if args.predictor_depth <= 0:
+        raise ValueError("--predictor-depth must be greater than 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1233,7 +1237,7 @@ def main():
     )
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
-        f"ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
+        f"predictor_depth={args.predictor_depth} ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1262,7 +1266,7 @@ def main():
     predictor = JEPAPredictor(
         backbone_dim=config["hidden_size"],
         hidden_size=384,
-        depth=4,
+        depth=args.predictor_depth,
         num_heads=6,
         mlp_ratio=4.0,
         grid_size=config["input_size"] // config["patch_size"],
