@@ -272,7 +272,7 @@ class SelfFlowDiT(nn.Module):
         if isinstance(return_raw_features, (tuple, list)):
             raw_layers = tuple(int(l) for l in return_raw_features)
             raw_single = len(raw_layers) == 1
-        elif isinstance(return_raw_features, int):
+        elif isinstance(return_raw_features, int) and not isinstance(return_raw_features, bool):
             raw_layers = (int(return_raw_features),)
             raw_single = True
         else:
