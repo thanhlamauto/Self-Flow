@@ -110,7 +110,7 @@ The model was trained using the following configuration:
 - **Training**: Self-Flow with per-token masking (25% mask ratio)
 - **Optimizer**: AdamW with gradient clipping (max_norm=1)
 - **Mixed precision**: BFloat16
-- **Self-distillation**: Teacher at layer 20 (EMA), student at layer 8
+- **JEPA alignment**: Target branch at layer 20, context branch at layer 8
 
 ## Acknowledgments
 

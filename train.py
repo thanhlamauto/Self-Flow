@@ -419,15 +419,12 @@ from src.jepa import JEPAPredictor, sample_jepa_masks
 
 
 def create_train_state(rng, config, backbone, predictor, learning_rate, grad_clip=1.0):
-    """Initializes optimizer and initial EMA params for the JEPA training setup.
+    """Initializes optimizer state for the JEPA training setup.
 
     backbone and predictor are passed in from main() so the same module objects
     are reused in functools.partial for train_step / eval_step.
 
     state.params = {"backbone": ..., "predictor": ...}
-    ema_params   = backbone params only (predictor is not EMA-tracked).
-
-    Returns (state, ema_params); caller replicates both via jax_utils.replicate.
     """
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -477,32 +474,17 @@ def create_train_state(rng, config, backbone, predictor, learning_rate, grad_cli
         params=all_params,
         tx=tx,
     )
-    # EMA tracks backbone only; predictor is optimized online, not EMA-tracked.
-    ema_params = jax.tree_util.tree_map(lambda x: x, backbone_params)
-    return state, ema_params
+    return state
 
 
 # ── Self-Flow core helpers ────────────────────────────────────────────────────
-
-def ema_update(ema_params, new_params, decay):
-    """Exponential moving average: ema = decay * ema + (1 - decay) * new.
-
-    Operates on backbone params only.  Call as:
-      ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
-    EMA decay is scheduled linearly from 0.996 → 1.0 over training.
-    """
-    return jax.tree_util.tree_map(
-        lambda ema, new: decay * ema + (1.0 - decay) * new,
-        ema_params,
-        new_params,
-    )
 
 
 def _pf_layer_norm(x):
     """Parameter-free layer normalisation (no learnable scale or bias).
 
     Equivalent to nn.LayerNorm(use_scale=False, use_bias=False) applied to the
-    last axis.  Used in Ljepa to normalize predictor outputs and teacher targets
+    last axis.  Used in Ljepa to normalize predictor outputs and target-branch features
     before computing MSE, following the I-JEPA convention.
     """
     mean = jnp.mean(x, axis=-1, keepdims=True)
@@ -513,7 +495,7 @@ def _pf_layer_norm(x):
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, lambda_jepa, ema_decay,
+    state, batch, rng, lambda_jepa,
     *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
 ):
     """Self-Flow + I-JEPA distributed training step.
@@ -521,18 +503,18 @@ def train_step(
     Loss = Lgen (flow-matching velocity MSE) + lambda_jepa * Ljepa (JEPA block MSE).
 
     Self-Flow dual-timestep construction is unchanged:
-      - t, s ~ U(0,1); t_clean = max(t,s), tau_clean = max(t,s) for teacher view.
+      - t, s ~ U(0,1); t_clean = max(t,s), tau_clean = max(t,s) for target view.
       - Per-token tau: masked tokens use t_clean, unmasked use t_noisy.
-      - Student forward on full x_tau; teacher EMA forward on x_tau_min.
+      - Context forward on full x_tau; online target branch on x_tau_min.
 
     I-JEPA block prediction (Ljepa):
       - 4 target blocks sampled per image with static T_max=64 padded indices.
       - 1 context block (scale [0.85,1.0], ar=1.0), minus target union → C'.
-      - Shared predictor [B*4, C_max+T_max, 384] predicts teacher target features.
+      - Shared predictor [B*4, C_max+T_max, 384] predicts target-branch features.
       - Both sides normalised with parameter-free layer norm before MSE.
       - Ljepa averaged over valid patches per block, then over 4 blocks.
 
-    lambda_jepa and ema_decay are per-step JAX float32 scalars (replicated).
+    lambda_jepa is a per-step JAX float32 scalar (replicated).
     backbone and predictor are Python module objects baked in via functools.partial.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
@@ -562,20 +544,9 @@ def train_step(
     # ctx_idx   [B, 256], ctx_valid [B, 256]
     # tgt_idx   [B, 4, 64], tgt_valid [B, 4, 64]
 
-    # --- Teacher forward (EMA backbone, no grad, raw features at layer k) ---
-    _, t_feat = backbone.apply(
-        {'params': ema_params},
-        x_tau_min,
-        timesteps=t_clean,
-        vector=y,
-        deterministic=True,
-        return_raw_features=teacher_layer,
-    )
-    t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, D]
-
     # --- Student + predictor forward; gradients w.r.t. all params ---
     def loss_fn(params):
-        # Student backbone: raw features at layer l for I-JEPA predictor input.
+        # Context backbone: full forward for generation loss and JEPA context features.
         pred, s_feat = backbone.apply(
             {'params': params["backbone"]},
             x_tau,
@@ -587,12 +558,24 @@ def train_step(
         )
         loss_gen = jnp.mean((pred - target) ** 2)
 
+        # Target branch: same online backbone, partial forward only up to teacher_layer.
+        t_feat = backbone.apply(
+            {'params': params["backbone"]},
+            x_tau_min,
+            timesteps=t_clean,
+            vector=y,
+            layer=teacher_layer,
+            deterministic=True,
+            method=backbone.extract_raw_features,
+        )
+        t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, D]
+
         D = s_feat.shape[-1]   # hidden_size (768 for DiT-B)
         n_tgt = tgt_idx.shape[1]  # 4
         T_max = tgt_idx.shape[2]  # 64
         C_max = ctx_idx.shape[1]  # 256
 
-        # Gather context student features: [B, C_max, D]
+        # Gather context-branch features: [B, C_max, D]
         ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
 
         # Repeat context for each of the 4 target blocks → [B*4, C_max, D]
@@ -612,7 +595,7 @@ def train_step(
             tgt_valid_flat,
         )  # [B*4, T_max, D]
 
-        # Gather teacher targets at target positions: [B*4, T_max, D]
+        # Gather target-branch features at target positions: [B*4, T_max, D]
         t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)   # [B*4, N, D]
         t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
 
@@ -654,32 +637,28 @@ def train_step(
 
     state = state.apply_gradients(grads=grads)
 
-    # EMA update: backbone params only; decay scheduled linearly to 1.0.
-    ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
-
     metrics = {
         "train/loss_total":      loss_total,
         "train/loss_gen":        loss_gen,
         "train/loss_jepa":       loss_jepa,
         "train/lambda_jepa":     lambda_jepa,
-        "train/ema_decay":       ema_decay,
         "train/grad_norm":       grad_norm,
         "train/param_norm":      param_norm,
         "train/v_abs_mean":      v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
 
-    return state, ema_params, metrics, rng
+    return state, metrics, rng
 
 
 def eval_step(
-    state, ema_params, batch, rng, lambda_jepa,
+    state, batch, rng, lambda_jepa,
     *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
 ):
     """Self-Flow + I-JEPA validation step.
 
     Mirrors train_step exactly, but:
-      - No parameter updates or EMA update.
+      - No parameter updates.
       - deterministic=True throughout (no dropout).
       - lambda_jepa is the same per-step scheduled value used in training so
         val/loss_total tracks the same objective during warmup.
@@ -707,18 +686,19 @@ def eval_step(
         jepa_rng, local_batch,
     )
 
-    # Teacher forward (EMA backbone)
-    _, t_feat = backbone.apply(
-        {'params': ema_params},
+    # Target branch: shared online backbone, partial forward only up to teacher_layer.
+    t_feat = backbone.apply(
+        {'params': state.params["backbone"]},
         x_tau_min,
         timesteps=t_clean,
         vector=y,
+        layer=teacher_layer,
         deterministic=True,
-        return_raw_features=teacher_layer,
+        method=backbone.extract_raw_features,
     )
     t_feat = jax.lax.stop_gradient(t_feat)
 
-    # Student backbone (online params, no dropout)
+    # Context backbone (online params, no dropout)
     pred, s_feat = backbone.apply(
         {'params': state.params["backbone"]},
         x_tau,
@@ -923,7 +903,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     )
 
     def sample_latents(params, class_labels, rng):
-        """Generate sample latents on TPU using EMA params."""
+        """Generate sample latents on TPU using backbone params."""
         batch_size = class_labels.shape[0]
         latent_channels = config["in_channels"]
         latent_size = config["input_size"]
@@ -999,7 +979,6 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
 
 def run_preflight_checks(
     state,
-    ema_params,
     rng,
     sample_latents_jitted,
     decode_latents,
@@ -1010,7 +989,7 @@ def run_preflight_checks(
 ):
     """Smoke-test VAE decode and FID pipeline before the training loop.
 
-    Uses EMA params for sampling (same as training-time eval).
+    Uses current online backbone params for sampling (same as training-time eval).
     decode_latents : callable(latents_nchw) → NHWC float32 [0,1]
     inception_fn   : pmap'd InceptionV3 (from get_fid_network), or None
     """
@@ -1020,12 +999,12 @@ def run_preflight_checks(
     if requested_fake_samples <= 0:
         return rng
 
-    # Use EMA params for preflight sampling (consistent with training-time eval)
-    single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+    # Use current online backbone params for preflight sampling.
+    single_backbone_params = jax.tree_util.tree_map(lambda w: w[0], state.params["backbone"])
     sample_rng_base, sample_rng = jax.random.split(rng[0])
     sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
     fake_latents = np.asarray(
-        jax.device_get(sample_latents_jitted(single_ema_params, sample_classes, sample_rng)),
+        jax.device_get(sample_latents_jitted(single_backbone_params, sample_classes, sample_rng)),
         dtype=np.float32,
     )
     rng = rng.at[0].set(sample_rng_base)
@@ -1112,9 +1091,9 @@ def main():
     parser.add_argument("--predictor-depth", type=int, default=4,
                         help="Number of Transformer blocks in the I-JEPA predictor (default: 4).")
     parser.add_argument("--student-layer", type=int, default=None,
-                        help="Layer index for student features (default: round(0.3 * depth))")
+                        help="Layer index for context-branch features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
-                        help="Layer index for teacher features (default: round(0.7 * depth))")
+                        help="Layer index for target-branch features (default: round(0.7 * depth))")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1243,7 +1222,7 @@ def main():
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']} "
-        f"student_layer={student_layer} teacher_layer={teacher_layer}"
+        f"context_layer={student_layer} target_layer={teacher_layer}"
     )
     # Late-off JEPA validation (only enforced when the feature is enabled)
     if args.late_off_jepa:
@@ -1257,7 +1236,7 @@ def main():
 
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
-        f"predictor_depth={args.predictor_depth} ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
+        f"predictor_depth={args.predictor_depth} grad_clip={args.grad_clip}"
     )
     if args.late_off_jepa:
         log_stage(
@@ -1275,7 +1254,7 @@ def main():
         wandb.define_metric("*", step_metric="train/step")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
-    # ── Backbone + predictor + state + EMA ────────────────────────────────────
+    # ── Backbone + predictor + state ──────────────────────────────────────────
     # Instantiate modules here so the same objects can be reused in
     # functools.partial for train_step / eval_step (they need to be in scope).
     backbone = SelfFlowPerTokenDiT(
@@ -1303,21 +1282,18 @@ def main():
     )
 
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(
+    state = create_train_state(
         rng, config, backbone, predictor, args.learning_rate, args.grad_clip
     )
     state = jax_utils.replicate(state)
-    ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
-    total_steps = args.epochs * args.steps_per_epoch
-
     # ── Build pmapped training step ───────────────────────────────────────────
-    # backbone and predictor are Python objects (static); lambda_jepa and
-    # ema_decay are per-step JAX float32 arrays (positional, not partialised).
+    # backbone and predictor are Python objects (static); lambda_jepa is passed
+    # positionally as a replicated JAX float32 array.
     _selfflow_train_fn = functools.partial(
         train_step,
         backbone=backbone,
@@ -1486,18 +1462,11 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        # Preflight uses the first-step schedule values; only tensor shapes matter
-        # for the memory probe, but matching the real call signature avoids drift.
-        probe_progress = 1.0 / max(total_steps, 1)
-        probe_ema_decay_rep = jax_utils.replicate(jnp.float32(
-            min(0.996 + (1.0 - 0.996) * probe_progress, 1.0)
-        ))
         probe_lambda_jepa_rep = jax_utils.replicate(jnp.float32(
             args.lambda_jepa * min(1.0 / 10000.0, 1.0)
         ))
-        _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng,
-            probe_lambda_jepa_rep, probe_ema_decay_rep,
+        _, probe_metrics, _ = pmapped_train_step(
+            state, (probe_x, probe_y), rng, probe_lambda_jepa_rep,
         )
         block_pytree(probe_metrics)
 
@@ -1519,11 +1488,11 @@ def main():
             f"[FID probe] generating one fake batch of {fake_bs} latents "
             f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
         )
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+        single_backbone_params = jax.tree_util.tree_map(lambda w: w[0], state.params["backbone"])
         probe_rng = jax.random.fold_in(rng[0], 0xF1D)
         probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
         fake_latents = np.asarray(
-            jax.device_get(fid_sample_latents_jitted(single_ema_params, probe_classes, probe_rng)),
+            jax.device_get(fid_sample_latents_jitted(single_backbone_params, probe_classes, probe_rng)),
             dtype=np.float32,
         )
         fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
@@ -1535,7 +1504,7 @@ def main():
         return val_data_iter, cached_train_batch
 
     def compute_fid(step, val_data_iter):
-        """Synchronous FID using EMA params and configurable num_steps.
+        """Synchronous FID using online backbone params and configurable num_steps.
 
         TPU deviation: default 50 steps and 4000 samples for fast monitoring.
         This FID is NOT paper-comparable at default settings.
@@ -1571,10 +1540,10 @@ def main():
 
         mu_real, sigma_real = _fid_real_acts[0]
 
-        # Generate fake images using EMA params (consistent with paper eval)
+        # Generate fake images using the current online backbone params.
         log_stage(f"[FID] generating {args.num_fid_samples} fake images @ step {step} "
                   f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})…")
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+        single_backbone_params = jax.tree_util.tree_map(lambda w: w[0], state.params["backbone"])
         gen_imgs = []
         sample_rng_base = rng[0]
         gen_bs = min(args.fid_batch_size, args.num_fid_samples)
@@ -1583,7 +1552,7 @@ def main():
             needed = min(gen_bs, args.num_fid_samples - len(gen_imgs))
             classes = jax.random.randint(sample_rng, (needed,), 0, 1000)
             latents = np.asarray(jax.device_get(
-                fid_sample_latents_jitted(single_ema_params, classes, sample_rng)
+                fid_sample_latents_jitted(single_backbone_params, classes, sample_rng)
             ), dtype=np.float32)
             for img in decode_latents_batched(latents, args.vae_decode_batch_size):
                 gen_imgs.append(img)
@@ -1614,7 +1583,6 @@ def main():
 
         rng = run_preflight_checks(
             state=state,
-            ema_params=ema_params,
             rng=rng,
             sample_latents_jitted=sample_latents_jitted,
             decode_latents=decode_latents_batched,
@@ -1657,8 +1625,6 @@ def main():
 
             # Per-step schedules.  Use (global_step + 1) so the final step
             # reaches progress=1.0 and lambda_jepa reaches its target value.
-            progress        = (global_step + 1) / max(total_steps, 1)
-            ema_decay_val   = min(0.996 + (1.0 - 0.996) * progress, 1.0)
             # Base warmup: ramp from 0 to args.lambda_jepa over the first 10k steps.
             lambda_jepa_val = args.lambda_jepa * min((global_step + 1) / 10000.0, 1.0)
             # Late-off phase: optionally decay the coefficient to 0 after warmup.
@@ -1670,13 +1636,11 @@ def main():
                         args.late_off_end_step - args.late_off_start_step
                     )
                     lambda_jepa_val = args.lambda_jepa * (1.0 - decay_frac)
-            ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
             lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
 
             # Self-Flow + JEPA training step
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng,
-                lambda_jepa_rep, ema_decay_rep,
+            state, metrics, rng = pmapped_train_step(
+                state, (batch_x, batch_y), rng, lambda_jepa_rep,
             )
             global_step += 1
 
@@ -1689,7 +1653,7 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation: JEPA objective (student + EMA teacher, no grads)
+            # Validation: JEPA objective with shared online backbone, no grads
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
@@ -1700,7 +1664,7 @@ def main():
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, lambda_jepa_rep,
+                        state, (val_x, val_y), rng, lambda_jepa_rep,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
@@ -1717,15 +1681,14 @@ def main():
                 except Exception as exc:
                     log_stage(f"FID skipped: {exc}")
 
-            # Sample preview: uses EMA params and configurable num_steps
+            # Sample preview: uses current online backbone params and configurable num_steps
             if args.sample_freq > 0 and global_step % args.sample_freq == 0:
                 print(f"Step {global_step}: Generating sample previews "
                       f"({args.sample_num_steps} steps, cfg={args.sample_cfg_scale})...")
                 sample_rng, = jax.random.split(rng[0], 1)
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
-                # Use EMA params for sample generation (paper-faithful eval)
-                single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
-                latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
+                single_backbone_params = jax.tree_util.tree_map(lambda w: w[0], state.params["backbone"])
+                latents_dev = sample_latents_jitted(single_backbone_params, sample_classes, sample_rng)
 
                 def _bg_log(z_dev, classes, target_step):
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
@@ -1743,19 +1706,12 @@ def main():
                                  daemon=True).start()
 
     # ── Checkpoint save ────────────────────────────────────────────────────────
-    # Online: nested {"backbone": ..., "predictor": ...}
-    # EMA:    backbone params only (used directly by sampling / sample.py)
+    # Save the nested online checkpoint; sample.py extracts the backbone params.
     os.makedirs(args.ckpt_dir, exist_ok=True)
     unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,  # backbone-only; loadable directly by sample.py
         step=global_step,
     )
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):

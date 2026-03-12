@@ -84,8 +84,8 @@ def load_model(ckpt_path=None, model_size="XL"):
       3. Old flat format without "feature_head"                 — use as-is.
 
     train.py writes checkpoints via flax.training.checkpoints.save_checkpoint
-    (legacy msgpack).  The EMA checkpoint at <ckpt_dir>/ema is backbone-only and
-    is the preferred path for sampling.
+    (legacy msgpack). Sampling reads the root checkpoint directory and extracts
+    the backbone params from the nested {"backbone", "predictor"} structure.
     """
     config = _model_config_for_size(model_size)
     model = SelfFlowPerTokenDiT(**config)
@@ -117,21 +117,27 @@ def load_model(ckpt_path=None, model_size="XL"):
     return model, params
 
 
-def build_sample_step(model, vae, scale_factor, shift_factor):
-    """Build JIT-compiled sampling function."""
-    
+def build_sample_step(
+    model,
+    vae,
+    scale_factor,
+    shift_factor,
+    *,
+    num_steps,
+    cfg_scale,
+    guidance_low,
+    guidance_high,
+):
+    """Build JIT-compiled sampling function with static sampling config baked in."""
+
     @jax.jit
     def sample_batch_jit(
         params,
         vae_params,
         rng,
         class_labels,
-        batch_size,
-        num_steps,
-        cfg_scale,
-        guidance_low,
-        guidance_high,
     ):
+        batch_size = class_labels.shape[0]
         latent_channels = 4
         latent_size = 32
         patch_size = 2
@@ -149,6 +155,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
             p1=patch_size, p2=patch_size
         )
+        x = x.astype(jnp.float32)
         token_h = latent_size // patch_size
         token_w = latent_size // patch_size
         
@@ -240,8 +247,17 @@ def main():
         
     model, params = load_model(args.ckpt, model_size=args.model_size)
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
-    
-    sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)
+
+    sample_step_fn = build_sample_step(
+        model,
+        vae,
+        scale_factor,
+        shift_factor,
+        num_steps=args.num_steps,
+        cfg_scale=args.cfg_scale,
+        guidance_low=args.guidance_low,
+        guidance_high=args.guidance_high,
+    )
     
     total_samples = args.num_fid_samples
     num_batches = math.ceil(total_samples / args.batch_size)
@@ -261,11 +277,6 @@ def main():
             vae_params=vae_params,
             rng=step_rng,
             class_labels=class_labels,
-            batch_size=current_batch_size,
-            num_steps=args.num_steps,
-            cfg_scale=args.cfg_scale,
-            guidance_low=args.guidance_low,
-            guidance_high=args.guidance_high,
         )
         
         # JAX arrays to NumPy

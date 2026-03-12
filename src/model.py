@@ -247,12 +247,95 @@ class SelfFlowDiT(nn.Module):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.patch_embed = PatchedPatchEmbed(
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
+            name="PatchedPatchEmbed_0",
+        )
+        self.t_embedder = TimestepEmbedder(
+            hidden_size=self.hidden_size,
+            name="TimestepEmbedder_0",
+        )
+        self.y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=0.0,
+            name="LabelEmbedder_0",
+        )
+        self.blocks = [
+            DiTBlock(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                per_token=self.per_token,
+                name=f"DiTBlock_{i}",
+            )
+            for i in range(self.depth)
+        ]
+        self.final_layer = FinalLayer(
+            hidden_size=self.hidden_size,
+            patch_size=self.patch_size,
+            out_channels=self.out_channels_val,
+            per_token=self.per_token,
+            name="FinalLayer_0",
+        )
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
-    @nn.compact
+    def _embed_inputs(self, x: jax.Array, timesteps: jax.Array, vector: jax.Array, deterministic: bool):
+        """Embed inputs once so full and partial forwards share the same path."""
+        timesteps = 1.0 - timesteps
+
+        x = self.patch_embed(x)
+        x = x + self.pos_embed_val
+
+        if self.per_token:
+            batch_size, seq_len, _ = x.shape
+            if timesteps.ndim == 1:
+                t_emb = self.t_embedder(timesteps)
+                t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
+            elif timesteps.ndim == 2:
+                t_flat = timesteps.reshape(-1)
+                t_emb_flat = self.t_embedder(t_flat)
+                t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
+            else:
+                raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
+
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
+            y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
+        else:
+            t_emb = self.t_embedder(timesteps)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
+
+        return x, t_emb + y_emb
+
+    def _run_blocks(
+        self,
+        x: jax.Array,
+        c: jax.Array,
+        *,
+        return_features: bool = False,
+        return_raw_features: bool = False,
+        stop_at_layer: Optional[int] = None,
+    ):
+        zs = None
+        for i, block in enumerate(self.blocks):
+            x = block(x, c)
+
+            if (i + 1) == return_features:
+                zs = self.feature_head(x)
+            elif (i + 1) == return_raw_features:
+                zs = x
+
+            if stop_at_layer is not None and (i + 1) >= stop_at_layer:
+                break
+
+        return x, zs
+
     def __call__(
         self,
         x: jax.Array,
@@ -266,70 +349,46 @@ class SelfFlowDiT(nn.Module):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
 
-        # PyTorch implementation explicitly negates timesteps
-        timesteps = 1.0 - timesteps
+        x, c = self._embed_inputs(x, timesteps, vector, deterministic)
+        x, zs = self._run_blocks(
+            x,
+            c,
+            return_features=return_features,
+            return_raw_features=return_raw_features,
+        )
 
-        # Patch Embedding
-        x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
-        )(x)
-        x = x + self.pos_embed_val
-
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
-
-        if self.per_token:
-            batch_size, seq_len, _ = x.shape
-            if timesteps.ndim == 1:
-                t_emb = t_embedder(timesteps)
-                t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
-            elif timesteps.ndim == 2:
-                t_flat = timesteps.reshape(-1)
-                t_emb_flat = t_embedder(t_flat)
-                t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
-            else:
-                raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
-            y_emb = y_embedder(vector, deterministic=deterministic)
-            y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
-        else:
-            t_emb = t_embedder(timesteps)
-            y_emb = y_embedder(vector, deterministic=deterministic)
-
-        c = t_emb + y_emb
-
-        zs = None
-        for i in range(self.depth):
-            x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
-                mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
-            
-            if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
-
-        x = FinalLayer(
-            hidden_size=self.hidden_size,
-            patch_size=self.patch_size,
-            out_channels=self.out_channels_val,
-            per_token=self.per_token
-        )(x, c)
+        x = self.final_layer(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
         if return_features or return_raw_features:
             return x, zs
         return x
+
+    def extract_raw_features(
+        self,
+        x: jax.Array,
+        timesteps: jax.Array,
+        vector: jax.Array,
+        layer: int,
+        x_ids: Optional[jax.Array] = None,
+        deterministic: bool = True,
+    ) -> jax.Array:
+        """Run only up to the requested layer and return raw hidden states."""
+        if not (1 <= layer <= self.depth):
+            raise ValueError(f"layer must be in [1, {self.depth}], got {layer}")
+
+        x, c = self._embed_inputs(x, timesteps, vector, deterministic)
+        _, raw_features = self._run_blocks(
+            x,
+            c,
+            return_raw_features=layer,
+            stop_at_layer=layer,
+        )
+        return raw_features
 
     def _shufflechannel(self, x):
         """Reorder channels/patches to match expected output format."""
