@@ -620,7 +620,8 @@ def train_step(
         pred_norm = _pf_layer_norm(pred_feats)
         tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
 
-        mse     = jnp.sum((pred_norm - tgt_norm) ** 2, axis=-1)   # [B*4, T_max]
+        # Average over feature width so JEPA scale is comparable across model sizes.
+        mse     = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)  # [B*4, T_max]
         valid_f = tgt_valid_flat.astype(jnp.float32)
         per_block = (
             jnp.sum(mse * valid_f, axis=-1) /
@@ -752,7 +753,8 @@ def eval_step(
 
     pred_norm = _pf_layer_norm(pred_feats)
     tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
-    mse       = jnp.sum((pred_norm - tgt_norm) ** 2, axis=-1)
+    # Match train-time scaling: average feature MSE per target token.
+    mse       = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)
     valid_f   = tgt_valid_flat.astype(jnp.float32)
     per_block = (
         jnp.sum(mse * valid_f, axis=-1) /
