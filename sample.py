@@ -12,6 +12,7 @@ compatible with the ADM evaluation suite.
 import os
 import math
 import argparse
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -20,10 +21,11 @@ import jax.numpy as jnp
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
-import orbax.checkpoint as ocp
+import collections.abc
 
 # Import from local src/ folder
-from src.model import SelfFlowPerTokenDiT
+from flax.training import checkpoints as flax_ckpt
+from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
 
 
@@ -74,10 +76,16 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
 
 
 def load_model(ckpt_path=None, model_size="XL"):
-    """Load the Self-Flow model from checkpoint."""
+    """Load the DiT backbone from a flax.training.checkpoints checkpoint.
+
+    This SiT baseline expects flat parameter trees (both online and EMA).
+    For convenience, we also tolerate a few older shapes when loading:
+      - Nested {"backbone": ...} checkpoints: extract "backbone".
+      - Flat checkpoints that include "feature_head": drop that key.
+    """
     config = _model_config_for_size(model_size)
-    model = SelfFlowPerTokenDiT(**config)
-    
+    model = SelfFlowDiT(**config, per_token=False)
+
     # Initialize parameters with random key
     key = jax.random.PRNGKey(0)
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -85,20 +93,20 @@ def load_model(ckpt_path=None, model_size="XL"):
     dummy_x = jnp.ones((1, n_patches, patch_dim))
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
-    
+
     variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)
     params = variables["params"]
-    
+
     if ckpt_path is not None and os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}")
-        # Assuming Flax native checkpoints via Orbax:
-        options = ocp.CheckpointManagerOptions()
-        checkpoint_manager = ocp.CheckpointManager(ckpt_path, options=options)
-        
-        # Orbax usually requires the target to know the shape
-        restored = checkpoint_manager.restore(checkpoint_manager.latest_step(), args=ocp.args.StandardRestore(params))
-        if restored is not None:
-             params = restored
+
+        raw = flax_ckpt.restore_checkpoint(ckpt_dir=ckpt_path, target=None)
+        if raw is not None:
+            if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
+                raw = dict(raw["backbone"])
+            elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
+                raw = {k: v for k, v in raw.items() if k != "feature_head"}
+            params = raw
     
     return model, params
 
@@ -106,7 +114,7 @@ def load_model(ckpt_path=None, model_size="XL"):
 def build_sample_step(model, vae, scale_factor, shift_factor):
     """Build JIT-compiled sampling function."""
     
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=("batch_size", "num_steps"))
     def sample_batch_jit(
         params,
         vae_params,
@@ -164,7 +172,8 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             cfg_scale=cfg_scale,
             guidance_low=guidance_low,
             guidance_high=guidance_high,
-            mode="SDE"
+            mode="SDE",
+            reverse=False,
         )
         
         if use_cfg:
@@ -194,7 +203,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sample images from Self-Flow model (JAX)")
+    parser = argparse.ArgumentParser(description="Sample images from vanilla SiT model (JAX)")
     parser.add_argument("--ckpt", type=str, default=None, help="Path to model checkpoint")
     parser.add_argument("--output-dir", type=str, default="./samples", help="Output directory")
     parser.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples to generate")
@@ -237,17 +246,18 @@ def main():
     for batch_idx in tqdm(range(num_batches), desc="Sampling"):
         batch_start = batch_idx * args.batch_size
         batch_end = min(batch_start + args.batch_size, total_samples)
-        current_batch_size = batch_end - batch_start
+        needed = batch_end - batch_start
         
         rng, class_rng, step_rng = jax.random.split(rng, 3)
-        class_labels = jax.random.randint(class_rng, (current_batch_size,), 0, 1000)
+        # Keep JIT shapes static: always run with the full batch size, then slice.
+        class_labels = jax.random.randint(class_rng, (args.batch_size,), 0, 1000)
         
         images = sample_step_fn(
             params=params,
             vae_params=vae_params,
             rng=step_rng,
             class_labels=class_labels,
-            batch_size=current_batch_size,
+            batch_size=args.batch_size,
             num_steps=args.num_steps,
             cfg_scale=args.cfg_scale,
             guidance_low=args.guidance_low,
@@ -255,7 +265,7 @@ def main():
         )
         
         # JAX arrays to NumPy
-        images_np = np.asarray(images)
+        images_np = np.asarray(images)[:needed]
         all_samples.append(images_np)
         
         if args.save_images:

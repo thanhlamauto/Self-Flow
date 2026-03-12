@@ -349,3 +349,8 @@ class SelfFlowPerTokenDiT(SelfFlowDiT):
     Main model used for Self-Flow inference on ImageNet.
     """
     per_token: bool = True
+
+
+# Thin alias for clarity in the vanilla SiT baseline.
+# Use as: SiTDiT(..., per_token=False)
+SiTDiT = SelfFlowDiT
