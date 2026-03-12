@@ -1099,6 +1099,16 @@ def main():
     parser.add_argument("--lambda-jepa", type=float, default=0.25,
                         help="Final weight for Ljepa in L = Lgen + lambda_jepa * Ljepa. "
                              "Linearly warmed up from 0 to this value over the first 10k steps.")
+    parser.add_argument("--late-off-jepa", action="store_true", default=False,
+                        help="Enable Late-off JEPA schedule: after warmup, linearly decay "
+                             "lambda_jepa from its full value to 0 over [late_off_start_step, "
+                             "late_off_end_step], then hold at 0 for the rest of training.")
+    parser.add_argument("--late-off-start-step", type=int, default=25000,
+                        help="Step at which the late-off linear decay begins (default: 25000). "
+                             "Only used when --late-off-jepa is enabled.")
+    parser.add_argument("--late-off-end-step", type=int, default=35000,
+                        help="Step at which the late-off linear decay ends and lambda_jepa "
+                             "is fixed at 0 (default: 35000). Only used when --late-off-jepa is enabled.")
     parser.add_argument("--predictor-depth", type=int, default=4,
                         help="Number of Transformer blocks in the I-JEPA predictor (default: 4).")
     parser.add_argument("--student-layer", type=int, default=None,
@@ -1235,10 +1245,28 @@ def main():
         f"depth={depth} heads={config['num_heads']} "
         f"student_layer={student_layer} teacher_layer={teacher_layer}"
     )
+    # Late-off JEPA validation (only enforced when the feature is enabled)
+    if args.late_off_jepa:
+        if args.late_off_start_step < 0:
+            raise ValueError(f"--late-off-start-step must be >= 0, got {args.late_off_start_step}")
+        if args.late_off_end_step <= args.late_off_start_step:
+            raise ValueError(
+                f"--late-off-end-step ({args.late_off_end_step}) must be > "
+                f"--late-off-start-step ({args.late_off_start_step})"
+            )
+
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
         f"predictor_depth={args.predictor_depth} ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
     )
+    if args.late_off_jepa:
+        log_stage(
+            f"Late-off JEPA ENABLED: lambda_jepa will decay linearly from {args.lambda_jepa} "
+            f"to 0.0 over steps [{args.late_off_start_step}, {args.late_off_end_step}], "
+            f"then stay at 0.0 for the remainder of training."
+        )
+    else:
+        log_stage("Late-off JEPA DISABLED: using standard warmup schedule for lambda_jepa.")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1631,7 +1659,17 @@ def main():
             # reaches progress=1.0 and lambda_jepa reaches its target value.
             progress        = (global_step + 1) / max(total_steps, 1)
             ema_decay_val   = min(0.996 + (1.0 - 0.996) * progress, 1.0)
+            # Base warmup: ramp from 0 to args.lambda_jepa over the first 10k steps.
             lambda_jepa_val = args.lambda_jepa * min((global_step + 1) / 10000.0, 1.0)
+            # Late-off phase: optionally decay the coefficient to 0 after warmup.
+            if args.late_off_jepa:
+                if global_step >= args.late_off_end_step:
+                    lambda_jepa_val = 0.0
+                elif global_step >= args.late_off_start_step:
+                    decay_frac = (global_step - args.late_off_start_step) / (
+                        args.late_off_end_step - args.late_off_start_step
+                    )
+                    lambda_jepa_val = args.lambda_jepa * (1.0 - decay_frac)
             ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
             lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
 
