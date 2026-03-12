@@ -266,6 +266,19 @@ class SelfFlowDiT(nn.Module):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
 
+        # Normalise return_raw_features to support multiple 1-based layer indices
+        raw_layers = ()
+        raw_single = False
+        if isinstance(return_raw_features, (tuple, list)):
+            raw_layers = tuple(int(l) for l in return_raw_features)
+            raw_single = len(raw_layers) == 1
+        elif isinstance(return_raw_features, int):
+            raw_layers = (int(return_raw_features),)
+            raw_single = True
+        else:
+            # False / 0 / None → no raw features
+            raw_layers = ()
+
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
@@ -302,6 +315,7 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        raw_zs = [] if raw_layers and not raw_single else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -312,8 +326,11 @@ class SelfFlowDiT(nn.Module):
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+            if raw_layers and (i + 1) in raw_layers:
+                if raw_single:
+                    zs = x
+                else:
+                    raw_zs.append(x)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -327,8 +344,13 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation negates the final prediction
         x = -x
 
-        if return_features or return_raw_features:
+        if return_features:
             return x, zs
+        if raw_layers:
+            if raw_single:
+                return x, zs
+            else:
+                return x, tuple(raw_zs)
         return x
 
     def _shufflechannel(self, x):

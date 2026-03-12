@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+import functools
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -485,7 +486,14 @@ def ema_update(ema_params, new_params, decay):
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    layersync_lambda,
+    weak_layer,
+    strong_layer,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -506,25 +514,51 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        if layersync_lambda > 0.0:
+            pred, zs = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+                return_raw_features=(weak_layer, strong_layer),
+            )
+            z_weak, z_strong = zs
+            z_strong_sg = jax.lax.stop_gradient(z_strong)
+            eps = 1e-8
+            z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
+            z_strong_norm = z_strong_sg / (jnp.linalg.norm(z_strong_sg, axis=-1, keepdims=True) + eps)
+            cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
+            mean_cos = jnp.mean(cos_tokens)
+            loss_layersync = -mean_cos
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            mean_cos = jnp.array(0.0, dtype=jnp.float32)
+            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
+
+        loss_gen = jnp.mean((pred - target) ** 2)
+        loss = loss_gen + layersync_lambda * loss_layersync
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, mean_cos)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cos)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
+    layersync_cos = jax.lax.pmean(layersync_cos, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -535,6 +569,10 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_total": loss,
+        "train/loss_gen": loss_gen,
+        "train/loss_layersync": loss_layersync,
+        "train/layersync_cosine": layersync_cos,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -545,7 +583,13 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    layersync_lambda,
+    weak_layer,
+    strong_layer,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -559,23 +603,52 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    if layersync_lambda > 0.0:
+        pred, zs = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+            return_raw_features=(weak_layer, strong_layer),
+        )
+        z_weak, z_strong = zs
+        z_strong_sg = jax.lax.stop_gradient(z_strong)
+        eps = 1e-8
+        z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
+        z_strong_norm = z_strong_sg / (jnp.linalg.norm(z_strong_sg, axis=-1, keepdims=True) + eps)
+        cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
+        mean_cos = jnp.mean(cos_tokens)
+        loss_layersync = -mean_cos
+    else:
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+        mean_cos = jnp.array(0.0, dtype=jnp.float32)
+        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
+
+    loss_gen = jnp.mean((pred - target) ** 2)
+    loss = loss_gen + layersync_lambda * loss_layersync
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
+    mean_cos = jax.lax.pmean(mean_cos, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_total": loss,
+        "val/loss_gen": loss_gen,
+        "val/loss_layersync": loss_layersync,
+        "val/layersync_cosine": mean_cos,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -909,6 +982,24 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--layersync-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for LayerSync regularizer. 0.0 disables LayerSync and recovers pure velocity loss.",
+    )
+    parser.add_argument(
+        "--layersync-weak-layer",
+        type=int,
+        default=4,
+        help="1-based index of the weaker (shallower) block used for LayerSync.",
+    )
+    parser.add_argument(
+        "--layersync-strong-layer",
+        type=int,
+        default=10,
+        help="1-based index of the stronger (deeper) block used for LayerSync.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1022,6 +1113,24 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
 
+    # ── LayerSync config validation ───────────────────────────────────────────
+    if args.layersync_lambda < 0.0:
+        raise ValueError("--layersync-lambda must be non-negative")
+    depth = config["depth"]
+    if args.layersync_lambda > 0.0:
+        if not (1 <= args.layersync_weak_layer <= depth):
+            raise ValueError(
+                f"--layersync-weak-layer must be in [1, {depth}], got {args.layersync_weak_layer}"
+            )
+        if not (1 <= args.layersync_strong_layer <= depth):
+            raise ValueError(
+                f"--layersync-strong-layer must be in [1, {depth}], got {args.layersync_strong_layer}"
+            )
+        if not (args.layersync_weak_layer < args.layersync_strong_layer):
+            raise ValueError(
+                "--layersync-weak-layer must be strictly less than --layersync-strong-layer"
+            )
+
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
         wandb.init(project=args.wandb_project, config=vars(args))
@@ -1041,8 +1150,24 @@ def main():
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            layersync_lambda=args.layersync_lambda,
+            weak_layer=args.layersync_weak_layer,
+            strong_layer=args.layersync_strong_layer,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            layersync_lambda=args.layersync_lambda,
+            weak_layer=args.layersync_weak_layer,
+            strong_layer=args.layersync_strong_layer,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
