@@ -269,6 +269,7 @@ class SelfFlowDiT(nn.Module):
         # Normalise return_raw_features to support multiple 1-based layer indices
         raw_layers = ()
         raw_single = False
+        raw_positions = None
         if isinstance(return_raw_features, (tuple, list)):
             raw_layers = tuple(int(l) for l in return_raw_features)
             raw_single = len(raw_layers) == 1
@@ -278,6 +279,12 @@ class SelfFlowDiT(nn.Module):
         else:
             # False / 0 / None → no raw features
             raw_layers = ()
+        if any(layer <= 0 for layer in raw_layers):
+            raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+        if raw_layers and not raw_single:
+            raw_positions = {}
+            for idx, layer in enumerate(raw_layers):
+                raw_positions.setdefault(layer, []).append(idx)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -315,7 +322,7 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
-        raw_zs = [] if raw_layers and not raw_single else None
+        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -326,11 +333,12 @@ class SelfFlowDiT(nn.Module):
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
-            if raw_layers and (i + 1) in raw_layers:
+            if raw_layers and ((i + 1) in raw_positions if raw_positions is not None else (i + 1) in raw_layers):
                 if raw_single:
                     zs = x
                 else:
-                    raw_zs.append(x)
+                    for idx in raw_positions[i + 1]:
+                        raw_zs[idx] = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,

@@ -483,6 +483,91 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def parse_layersync_pairs_arg(pairs_arg):
+    if pairs_arg is None:
+        return None
+
+    pairs = []
+    for raw_entry in pairs_arg.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            raise ValueError("--layersync-pairs contains an empty entry")
+        parts = [part.strip() for part in entry.split(":")]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(
+                f"Invalid --layersync-pairs entry '{entry}'. Expected format weak:strong"
+            )
+        try:
+            weak = int(parts[0])
+            strong = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid --layersync-pairs entry '{entry}'. Layer indices must be integers"
+            ) from exc
+        pairs.append((weak, strong))
+
+    if not pairs:
+        raise ValueError("--layersync-pairs cannot be empty")
+    return tuple(pairs)
+
+
+def resolve_layersync_config(args, depth):
+    pairs = parse_layersync_pairs_arg(args.layersync_pairs)
+    if pairs is None:
+        pairs = ((args.layersync_weak_layer, args.layersync_strong_layer),)
+
+    seen_pairs = set()
+    duplicate_pairs = []
+    for pair in pairs:
+        if pair in seen_pairs and pair not in duplicate_pairs:
+            duplicate_pairs.append(pair)
+        seen_pairs.add(pair)
+    if duplicate_pairs:
+        duplicates_str = ", ".join(f"{weak}:{strong}" for weak, strong in duplicate_pairs)
+        raise ValueError(f"Duplicate LayerSync pairs are not allowed: {duplicates_str}")
+
+    if args.layersync_lambda > 0.0:
+        for weak, strong in pairs:
+            if not (1 <= weak <= depth):
+                raise ValueError(f"LayerSync weak layer must be in [1, {depth}], got {weak}")
+            if not (1 <= strong <= depth):
+                raise ValueError(f"LayerSync strong layer must be in [1, {depth}], got {strong}")
+            if weak >= strong:
+                raise ValueError(
+                    f"LayerSync pair {weak}:{strong} is invalid; expected weak < strong"
+                )
+
+    capture_layers = tuple(dict.fromkeys(
+        layer for weak, strong in pairs for layer in (weak, strong)
+    ))
+    return pairs, capture_layers
+
+
+def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs, layersync_mode):
+    if not isinstance(raw_features, (tuple, list)):
+        raw_features = (raw_features,)
+
+    feature_map = {layer: feat for layer, feat in zip(capture_layers, raw_features)}
+    eps = jnp.float32(1e-8)
+    pair_cosines = []
+
+    for weak_layer, strong_layer in layersync_pairs:
+        z_weak = feature_map[weak_layer]
+        z_strong = feature_map[strong_layer]
+        if layersync_mode == "stopgrad":
+            z_strong = jax.lax.stop_gradient(z_strong)
+        elif layersync_mode != "no_stopgrad":
+            raise ValueError(f"Unsupported layersync mode: {layersync_mode}")
+
+        z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
+        z_strong_norm = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
+        cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
+        pair_cosines.append(jnp.mean(cos_tokens))
+
+    mean_cos = pair_cosines[0] if len(pair_cosines) == 1 else jnp.mean(jnp.stack(pair_cosines))
+    return -mean_cos, mean_cos
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
@@ -492,8 +577,9 @@ def train_step(
     rng,
     ema_decay,
     layersync_lambda,
-    weak_layer,
-    strong_layer,
+    layersync_pairs,
+    layersync_capture_layers,
+    layersync_mode,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -522,16 +608,11 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=(weak_layer, strong_layer),
+                return_raw_features=layersync_capture_layers,
             )
-            z_weak, z_strong = zs
-            z_strong_sg = jax.lax.stop_gradient(z_strong)
-            eps = 1e-8
-            z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-            z_strong_norm = z_strong_sg / (jnp.linalg.norm(z_strong_sg, axis=-1, keepdims=True) + eps)
-            cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
-            mean_cos = jnp.mean(cos_tokens)
-            loss_layersync = -mean_cos
+            loss_layersync, mean_cos = compute_layersync_regularizer(
+                zs, layersync_capture_layers, layersync_pairs, layersync_mode
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -588,8 +669,9 @@ def eval_step(
     batch,
     rng,
     layersync_lambda,
-    weak_layer,
-    strong_layer,
+    layersync_pairs,
+    layersync_capture_layers,
+    layersync_mode,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -610,16 +692,11 @@ def eval_step(
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=(weak_layer, strong_layer),
+            return_raw_features=layersync_capture_layers,
         )
-        z_weak, z_strong = zs
-        z_strong_sg = jax.lax.stop_gradient(z_strong)
-        eps = 1e-8
-        z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-        z_strong_norm = z_strong_sg / (jnp.linalg.norm(z_strong_sg, axis=-1, keepdims=True) + eps)
-        cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
-        mean_cos = jnp.mean(cos_tokens)
-        loss_layersync = -mean_cos
+        loss_layersync, mean_cos = compute_layersync_regularizer(
+            zs, layersync_capture_layers, layersync_pairs, layersync_mode
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -992,13 +1069,30 @@ def main():
         "--layersync-weak-layer",
         type=int,
         default=4,
-        help="1-based index of the weaker (shallower) block used for LayerSync.",
+        help="1-based index of the weaker (shallower) block used for LayerSync. "
+             "Used when --layersync-pairs is not set.",
     )
     parser.add_argument(
         "--layersync-strong-layer",
         type=int,
         default=10,
-        help="1-based index of the stronger (deeper) block used for LayerSync.",
+        help="1-based index of the stronger (deeper) block used for LayerSync. "
+             "Used when --layersync-pairs is not set.",
+    )
+    parser.add_argument(
+        "--layersync-pairs",
+        type=str,
+        default=None,
+        help="Comma-separated ordered LayerSync pairs in weak:strong format, e.g. 2:8,4:10. "
+             "Overrides --layersync-weak-layer/--layersync-strong-layer when provided.",
+    )
+    parser.add_argument(
+        "--layersync-mode",
+        type=str,
+        default="stopgrad",
+        choices=["stopgrad", "no_stopgrad"],
+        help="LayerSync alignment mode. 'stopgrad' matches the paper-style strong-target loss; "
+             "'no_stopgrad' is an ablation without detaching the strong branch.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1117,19 +1211,15 @@ def main():
     if args.layersync_lambda < 0.0:
         raise ValueError("--layersync-lambda must be non-negative")
     depth = config["depth"]
+    layersync_pairs, layersync_capture_layers = resolve_layersync_config(args, depth)
     if args.layersync_lambda > 0.0:
-        if not (1 <= args.layersync_weak_layer <= depth):
-            raise ValueError(
-                f"--layersync-weak-layer must be in [1, {depth}], got {args.layersync_weak_layer}"
-            )
-        if not (1 <= args.layersync_strong_layer <= depth):
-            raise ValueError(
-                f"--layersync-strong-layer must be in [1, {depth}], got {args.layersync_strong_layer}"
-            )
-        if not (args.layersync_weak_layer < args.layersync_strong_layer):
-            raise ValueError(
-                "--layersync-weak-layer must be strictly less than --layersync-strong-layer"
-            )
+        pairs_str = ",".join(f"{weak}:{strong}" for weak, strong in layersync_pairs)
+        log_stage(
+            f"LayerSync ENABLED: lambda={args.layersync_lambda} mode={args.layersync_mode} "
+            f"pairs={pairs_str}"
+        )
+    else:
+        log_stage("LayerSync DISABLED: lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1154,8 +1244,9 @@ def main():
         functools.partial(
             train_step,
             layersync_lambda=args.layersync_lambda,
-            weak_layer=args.layersync_weak_layer,
-            strong_layer=args.layersync_strong_layer,
+            layersync_pairs=layersync_pairs,
+            layersync_capture_layers=layersync_capture_layers,
+            layersync_mode=args.layersync_mode,
         ),
         axis_name="batch",
     )
@@ -1163,8 +1254,9 @@ def main():
         functools.partial(
             eval_step,
             layersync_lambda=args.layersync_lambda,
-            weak_layer=args.layersync_weak_layer,
-            strong_layer=args.layersync_strong_layer,
+            layersync_pairs=layersync_pairs,
+            layersync_capture_layers=layersync_capture_layers,
+            layersync_mode=args.layersync_mode,
         ),
         axis_name="batch",
     )
