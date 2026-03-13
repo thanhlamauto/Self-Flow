@@ -543,7 +543,13 @@ def resolve_layersync_config(args, depth):
     return pairs, capture_layers
 
 
-def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs, layersync_mode):
+def compute_layersync_regularizer(
+    raw_features,
+    capture_layers,
+    layersync_pairs,
+    layersync_mode,
+    layersync_stopgrad_side,
+):
     if not isinstance(raw_features, (tuple, list)):
         raw_features = (raw_features,)
 
@@ -556,7 +562,14 @@ def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs,
         z_weak = feature_map[weak_layer]
         z_strong = feature_map[strong_layer]
         if layersync_mode == "stopgrad":
-            z_strong = jax.lax.stop_gradient(z_strong)
+            if layersync_stopgrad_side == "strong":
+                z_strong = jax.lax.stop_gradient(z_strong)
+            elif layersync_stopgrad_side == "weak":
+                z_weak = jax.lax.stop_gradient(z_weak)
+            else:
+                raise ValueError(
+                    f"Unsupported LayerSync stopgrad side: {layersync_stopgrad_side}"
+                )
         elif layersync_mode != "no_stopgrad":
             raise ValueError(f"Unsupported layersync mode: {layersync_mode}")
 
@@ -583,6 +596,7 @@ def train_step(
     layersync_pairs,
     layersync_capture_layers,
     layersync_mode,
+    layersync_stopgrad_side,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -614,7 +628,11 @@ def train_step(
                 return_raw_features=layersync_capture_layers,
             )
             loss_layersync, mean_cos = compute_layersync_regularizer(
-                zs, layersync_capture_layers, layersync_pairs, layersync_mode
+                zs,
+                layersync_capture_layers,
+                layersync_pairs,
+                layersync_mode,
+                layersync_stopgrad_side,
             )
         else:
             pred = state.apply_fn(
@@ -675,6 +693,7 @@ def eval_step(
     layersync_pairs,
     layersync_capture_layers,
     layersync_mode,
+    layersync_stopgrad_side,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -698,7 +717,11 @@ def eval_step(
             return_raw_features=layersync_capture_layers,
         )
         loss_layersync, mean_cos = compute_layersync_regularizer(
-            zs, layersync_capture_layers, layersync_pairs, layersync_mode
+            zs,
+            layersync_capture_layers,
+            layersync_pairs,
+            layersync_mode,
+            layersync_stopgrad_side,
         )
     else:
         pred = state.apply_fn(
@@ -1094,8 +1117,16 @@ def main():
         type=str,
         default="stopgrad",
         choices=["stopgrad", "no_stopgrad"],
-        help="Layer regularizer mode. 'stopgrad' detaches the strong branch before applying "
-             "the cosine-squared penalty; 'no_stopgrad' is an ablation without detaching it.",
+        help="Layer regularizer mode. 'stopgrad' detaches one branch before applying "
+             "the cosine-squared penalty; 'no_stopgrad' is an ablation without detaching either branch.",
+    )
+    parser.add_argument(
+        "--layersync-stopgrad-side",
+        type=str,
+        default="strong",
+        choices=["strong", "weak"],
+        help="Which side to detach when --layersync-mode=stopgrad. "
+             "'strong' matches the previous behavior; 'weak' detaches the shallower branch instead.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1217,9 +1248,12 @@ def main():
     layersync_pairs, layersync_capture_layers = resolve_layersync_config(args, depth)
     if args.layersync_lambda > 0.0:
         pairs_str = ",".join(f"{weak}:{strong}" for weak, strong in layersync_pairs)
+        stopgrad_msg = ""
+        if args.layersync_mode == "stopgrad":
+            stopgrad_msg = f" stopgrad_side={args.layersync_stopgrad_side}"
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} mode={args.layersync_mode} "
-            f"pairs={pairs_str}"
+            f"pairs={pairs_str}{stopgrad_msg}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
@@ -1250,6 +1284,7 @@ def main():
             layersync_pairs=layersync_pairs,
             layersync_capture_layers=layersync_capture_layers,
             layersync_mode=args.layersync_mode,
+            layersync_stopgrad_side=args.layersync_stopgrad_side,
         ),
         axis_name="batch",
     )
@@ -1260,6 +1295,7 @@ def main():
             layersync_pairs=layersync_pairs,
             layersync_capture_layers=layersync_capture_layers,
             layersync_mode=args.layersync_mode,
+            layersync_stopgrad_side=args.layersync_stopgrad_side,
         ),
         axis_name="batch",
     )
