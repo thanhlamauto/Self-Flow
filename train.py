@@ -548,8 +548,8 @@ def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs,
         raw_features = (raw_features,)
 
     feature_map = {layer: feat for layer, feat in zip(capture_layers, raw_features)}
-    eps = jnp.float32(1e-8)
-    pair_cosines = []
+    pair_losses = []
+    pair_alignment = []
 
     for weak_layer, strong_layer in layersync_pairs:
         z_weak = feature_map[weak_layer]
@@ -559,13 +559,13 @@ def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs,
         elif layersync_mode != "no_stopgrad":
             raise ValueError(f"Unsupported layersync mode: {layersync_mode}")
 
-        z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-        z_strong_norm = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
-        cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
-        pair_cosines.append(jnp.mean(cos_tokens))
+        dot_tokens = jnp.sum(z_weak * z_strong, axis=-1)
+        pair_alignment.append(jnp.mean(dot_tokens))
+        pair_losses.append(jnp.mean(jnp.square(dot_tokens)))
 
-    mean_cos = pair_cosines[0] if len(pair_cosines) == 1 else jnp.mean(jnp.stack(pair_cosines))
-    return -mean_cos, mean_cos
+    mean_alignment = pair_alignment[0] if len(pair_alignment) == 1 else jnp.mean(jnp.stack(pair_alignment))
+    loss = pair_losses[0] if len(pair_losses) == 1 else jnp.mean(jnp.stack(pair_losses))
+    return loss, mean_alignment
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -1091,8 +1091,8 @@ def main():
         type=str,
         default="stopgrad",
         choices=["stopgrad", "no_stopgrad"],
-        help="LayerSync alignment mode. 'stopgrad' matches the paper-style strong-target loss; "
-             "'no_stopgrad' is an ablation without detaching the strong branch.",
+        help="Layer regularizer mode. 'stopgrad' detaches the strong branch before applying "
+             "the squared dot-product penalty; 'no_stopgrad' is an ablation without detaching it.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
