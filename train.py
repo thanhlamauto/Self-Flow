@@ -489,13 +489,21 @@ def ema_update(ema_params, new_params, decay):
 
     Operates on backbone params only.  Call as:
       ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
-    EMA decay is scheduled linearly from 0.996 → 1.0 over training.
+    By default EMA decay is scheduled linearly from 0.996 → 1.0 over training.
+    Passing --fixed-ema-decay overrides that schedule with a constant value.
     """
     return jax.tree_util.tree_map(
         lambda ema, new: decay * ema + (1.0 - decay) * new,
         ema_params,
         new_params,
     )
+
+
+def compute_ema_decay(progress, fixed_ema_decay=None):
+    """Return the EMA decay to use at the given normalized training progress."""
+    if fixed_ema_decay is not None:
+        return float(fixed_ema_decay)
+    return min(0.996 + (1.0 - 0.996) * progress, 1.0)
 
 
 def _pf_layer_norm(x):
@@ -655,7 +663,7 @@ def train_step(
 
     state = state.apply_gradients(grads=grads)
 
-    # EMA update: backbone params only; decay scheduled linearly to 1.0.
+    # EMA update: backbone params only; decay comes from the chosen schedule mode.
     ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
 
     metrics = {
@@ -1113,6 +1121,15 @@ def main():
                              "is fixed at 0 (default: 35000). Only used when --late-off-jepa is enabled.")
     parser.add_argument("--predictor-depth", type=int, default=4,
                         help="Number of Transformer blocks in the I-JEPA predictor (default: 4).")
+    parser.add_argument(
+        "--fixed-ema-decay",
+        type=float,
+        default=None,
+        help=(
+            "Use a constant EMA decay instead of the default 0.996→1.0 schedule. "
+            "Example: --fixed-ema-decay 0.9999"
+        ),
+    )
     parser.add_argument("--student-layer", type=int, default=None,
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
@@ -1203,6 +1220,8 @@ def main():
         raise ValueError("--mask-ratio must be in (0, 1)")
     if args.predictor_depth <= 0:
         raise ValueError("--predictor-depth must be greater than 0")
+    if args.fixed_ema_decay is not None and not (0.0 < args.fixed_ema_decay <= 1.0):
+        raise ValueError("--fixed-ema-decay must be in (0, 1]")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1257,9 +1276,13 @@ def main():
                 f"--late-off-start-step ({args.late_off_start_step})"
             )
 
+    if args.fixed_ema_decay is None:
+        ema_desc = "ema_decay 0.996→1.0"
+    else:
+        ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
-        f"predictor_depth={args.predictor_depth} ema_decay 0.996→1.0 grad_clip={args.grad_clip}"
+        f"predictor_depth={args.predictor_depth} {ema_desc} grad_clip={args.grad_clip}"
     )
     if args.late_off_jepa:
         log_stage(
@@ -1492,7 +1515,7 @@ def main():
         # for the memory probe, but matching the real call signature avoids drift.
         probe_progress = 1.0 / max(total_steps, 1)
         probe_ema_decay_rep = jax_utils.replicate(jnp.float32(
-            min(0.996 + (1.0 - 0.996) * probe_progress, 1.0)
+            compute_ema_decay(probe_progress, args.fixed_ema_decay)
         ))
         probe_lambda_jepa_rep = jax_utils.replicate(jnp.float32(
             args.lambda_jepa * min(1.0 / 10000.0, 1.0)
@@ -1660,7 +1683,7 @@ def main():
             # Per-step schedules.  Use (global_step + 1) so the final step
             # reaches progress=1.0 and lambda_jepa reaches its target value.
             progress        = (global_step + 1) / max(total_steps, 1)
-            ema_decay_val   = min(0.996 + (1.0 - 0.996) * progress, 1.0)
+            ema_decay_val   = compute_ema_decay(progress, args.fixed_ema_decay)
             # Base warmup: ramp from 0 to args.lambda_jepa over the first 10k steps.
             lambda_jepa_val = args.lambda_jepa * min((global_step + 1) / 10000.0, 1.0)
             # Late-off phase: optionally decay the coefficient to 0 after warmup.
