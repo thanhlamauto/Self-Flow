@@ -93,7 +93,7 @@ def _sample_one_image(rng, grid_size: int, n_target: int,
     rng_tgts, rng_ctx = jax.random.split(rng)
     tgt_rngs = jax.random.split(rng_tgts, n_target)
 
-    # --- 4 target blocks -------------------------------------------------
+    # --- Target blocks ---------------------------------------------------
     tgt_idx, tgt_valid = jax.vmap(
         lambda r: _sample_block_padded(
             r, grid_size,

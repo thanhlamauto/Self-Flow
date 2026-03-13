@@ -522,7 +522,7 @@ def _pf_layer_norm(x):
 
 def train_step(
     state, ema_params, batch, rng, lambda_jepa, ema_decay,
-    *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
+    *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
 ):
     """Self-Flow + I-JEPA distributed training step.
 
@@ -534,11 +534,11 @@ def train_step(
       - Student forward on full x_tau; teacher EMA forward on x_tau_min.
 
     I-JEPA block prediction (Ljepa):
-      - 4 target blocks sampled per image with static T_max=64 padded indices.
+      - n_target target blocks sampled per image with static T_max=64 padded indices.
       - 1 context block (scale [0.85,1.0], ar=1.0), minus target union → C'.
-      - Shared predictor [B*4, C_max+T_max, 384] predicts teacher target features.
+      - Shared predictor [B*n_target, C_max+T_max, 384] predicts teacher target features.
       - Both sides normalised with parameter-free layer norm before MSE.
-      - Ljepa averaged over valid patches per block, then over 4 blocks.
+      - Ljepa averaged over valid patches per block, then over all target blocks.
 
     lambda_jepa and ema_decay are per-step JAX float32 scalars (replicated).
     backbone and predictor are Python module objects baked in via functools.partial.
@@ -566,9 +566,10 @@ def train_step(
     # --- JEPA spatial masks (static-shape padded; sampled outside loss_fn) ---
     ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
         jepa_rng, local_batch,
+        n_target=jepa_num_targets,
     )
     # ctx_idx   [B, 256], ctx_valid [B, 256]
-    # tgt_idx   [B, 4, 64], tgt_valid [B, 4, 64]
+    # tgt_idx   [B, n_target, 64], tgt_valid [B, n_target, 64]
 
     # --- Teacher forward (EMA backbone, no grad, raw features at layer k) ---
     _, t_feat = backbone.apply(
@@ -596,18 +597,18 @@ def train_step(
         loss_gen = jnp.mean((pred - target) ** 2)
 
         D = s_feat.shape[-1]   # hidden_size (768 for DiT-B)
-        n_tgt = tgt_idx.shape[1]  # 4
+        n_tgt = tgt_idx.shape[1]
         T_max = tgt_idx.shape[2]  # 64
         C_max = ctx_idx.shape[1]  # 256
 
         # Gather context student features: [B, C_max, D]
         ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
 
-        # Repeat context for each of the 4 target blocks → [B*4, C_max, D]
+        # Repeat context for each target block → [B*n_tgt, C_max, D]
         ctx_feats_rep  = jnp.repeat(ctx_feats,  n_tgt, axis=0)
         ctx_valid_rep  = jnp.repeat(ctx_valid,  n_tgt, axis=0)
 
-        # Flatten target block dimension into batch: [B*4, T_max]
+        # Flatten target block dimension into batch: [B*n_tgt, T_max]
         tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
         tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
 
@@ -618,10 +619,10 @@ def train_step(
             ctx_valid_rep,
             tgt_idx_flat,
             tgt_valid_flat,
-        )  # [B*4, T_max, D]
+        )  # [B*n_tgt, T_max, D]
 
-        # Gather teacher targets at target positions: [B*4, T_max, D]
-        t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)   # [B*4, N, D]
+        # Gather teacher targets at target positions: [B*n_tgt, T_max, D]
+        t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)   # [B*n_tgt, N, D]
         t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
 
         # Normalise both sides (parameter-free) then compute MSE over valid patches.
@@ -629,12 +630,12 @@ def train_step(
         tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
 
         # Average over feature width so JEPA scale is comparable across model sizes.
-        mse     = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)  # [B*4, T_max]
+        mse     = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)  # [B*n_tgt, T_max]
         valid_f = tgt_valid_flat.astype(jnp.float32)
         per_block = (
             jnp.sum(mse * valid_f, axis=-1) /
             (jnp.sum(valid_f, axis=-1) + 1e-6)
-        )  # [B*4]
+        )  # [B*n_tgt]
         loss_jepa = jnp.mean(per_block)
 
         loss_total = loss_gen + lambda_jepa * loss_jepa
@@ -683,7 +684,7 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng, lambda_jepa,
-    *, backbone, predictor, mask_ratio, student_layer, teacher_layer,
+    *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
 ):
     """Self-Flow + I-JEPA validation step.
 
@@ -714,6 +715,7 @@ def eval_step(
 
     ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
         jepa_rng, local_batch,
+        n_target=jepa_num_targets,
     )
 
     # Teacher forward (EMA backbone)
@@ -1121,6 +1123,9 @@ def main():
                              "is fixed at 0 (default: 35000). Only used when --late-off-jepa is enabled.")
     parser.add_argument("--predictor-depth", type=int, default=4,
                         help="Number of Transformer blocks in the I-JEPA predictor (default: 4).")
+    parser.add_argument("--jepa-num-targets", type=int, default=4,
+                        help="Number of JEPA target blocks sampled per image. "
+                             "Lower values reduce predictor work and can speed up training (default: 4).")
     parser.add_argument(
         "--fixed-ema-decay",
         type=float,
@@ -1220,6 +1225,8 @@ def main():
         raise ValueError("--mask-ratio must be in (0, 1)")
     if args.predictor_depth <= 0:
         raise ValueError("--predictor-depth must be greater than 0")
+    if args.jepa_num_targets <= 0:
+        raise ValueError("--jepa-num-targets must be greater than 0")
     if args.fixed_ema_decay is not None and not (0.0 < args.fixed_ema_decay <= 1.0):
         raise ValueError("--fixed-ema-decay must be in (0, 1]")
 
@@ -1282,7 +1289,8 @@ def main():
         ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
-        f"predictor_depth={args.predictor_depth} {ema_desc} grad_clip={args.grad_clip}"
+        f"predictor_depth={args.predictor_depth} jepa_num_targets={args.jepa_num_targets} "
+        f"{ema_desc} grad_clip={args.grad_clip}"
     )
     if args.late_off_jepa:
         log_stage(
@@ -1350,6 +1358,7 @@ def main():
         mask_ratio=args.mask_ratio,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
+        jepa_num_targets=args.jepa_num_targets,
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
@@ -1358,6 +1367,7 @@ def main():
         mask_ratio=args.mask_ratio,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
+        jepa_num_targets=args.jepa_num_targets,
     )
     pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
     pmapped_eval_step  = jax.pmap(_selfflow_eval_fn,  axis_name='batch')
