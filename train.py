@@ -548,6 +548,7 @@ def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs,
         raw_features = (raw_features,)
 
     feature_map = {layer: feat for layer, feat in zip(capture_layers, raw_features)}
+    eps = jnp.float32(1e-8)
     pair_losses = []
     pair_alignment = []
 
@@ -559,9 +560,11 @@ def compute_layersync_regularizer(raw_features, capture_layers, layersync_pairs,
         elif layersync_mode != "no_stopgrad":
             raise ValueError(f"Unsupported layersync mode: {layersync_mode}")
 
-        dot_tokens = jnp.sum(z_weak * z_strong, axis=-1)
-        pair_alignment.append(jnp.mean(dot_tokens))
-        pair_losses.append(jnp.mean(jnp.square(dot_tokens)))
+        z_weak_norm = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
+        z_strong_norm = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
+        cos_tokens = jnp.sum(z_weak_norm * z_strong_norm, axis=-1)
+        pair_alignment.append(jnp.mean(cos_tokens))
+        pair_losses.append(jnp.mean(jnp.square(cos_tokens)))
 
     mean_alignment = pair_alignment[0] if len(pair_alignment) == 1 else jnp.mean(jnp.stack(pair_alignment))
     loss = pair_losses[0] if len(pair_losses) == 1 else jnp.mean(jnp.stack(pair_losses))
@@ -1092,7 +1095,7 @@ def main():
         default="stopgrad",
         choices=["stopgrad", "no_stopgrad"],
         help="Layer regularizer mode. 'stopgrad' detaches the strong branch before applying "
-             "the squared dot-product penalty; 'no_stopgrad' is an ablation without detaching it.",
+             "the cosine-squared penalty; 'no_stopgrad' is an ablation without detaching it.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
