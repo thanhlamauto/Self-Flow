@@ -584,6 +584,26 @@ def compute_layersync_regularizer(
     return loss, mean_alignment
 
 
+def compute_layersync_lambda_value(
+    base_lambda,
+    step,
+    late_off_enabled,
+    late_off_start_step,
+    late_off_end_step,
+):
+    if base_lambda <= 0.0:
+        return 0.0
+    if not late_off_enabled:
+        return float(base_lambda)
+    if step < late_off_start_step:
+        return float(base_lambda)
+    if step >= late_off_end_step:
+        return 0.0
+
+    progress = (step - late_off_start_step) / float(late_off_end_step - late_off_start_step)
+    return float(base_lambda) * (1.0 - progress)
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
@@ -593,6 +613,7 @@ def train_step(
     rng,
     ema_decay,
     layersync_lambda,
+    layersync_enabled,
     layersync_pairs,
     layersync_capture_layers,
     layersync_mode,
@@ -617,7 +638,7 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_lambda > 0.0:
+        if layersync_enabled:
             pred, zs = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -661,6 +682,7 @@ def train_step(
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
     layersync_cos = jax.lax.pmean(layersync_cos, axis_name="batch")
+    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -674,6 +696,7 @@ def train_step(
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
         "train/loss_layersync": loss_layersync,
+        "train/layersync_lambda": layersync_lambda,
         "train/layersync_cosine": layersync_cos,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
@@ -690,6 +713,7 @@ def eval_step(
     batch,
     rng,
     layersync_lambda,
+    layersync_enabled,
     layersync_pairs,
     layersync_capture_layers,
     layersync_mode,
@@ -707,7 +731,7 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_lambda > 0.0:
+    if layersync_enabled:
         pred, zs = state.apply_fn(
             {"params": state.params},
             x_tau,
@@ -744,6 +768,7 @@ def eval_step(
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
+    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     mean_cos = jax.lax.pmean(mean_cos, axis_name="batch")
 
     metrics = {
@@ -751,6 +776,7 @@ def eval_step(
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
         "val/loss_layersync": loss_layersync,
+        "val/layersync_lambda": layersync_lambda,
         "val/layersync_cosine": mean_cos,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
@@ -1128,6 +1154,26 @@ def main():
         help="Which side to detach when --layersync-mode=stopgrad. "
              "'strong' matches the previous behavior; 'weak' detaches the shallower branch instead.",
     )
+    parser.add_argument(
+        "--late-off-layersync",
+        action="store_true",
+        default=False,
+        help="Linearly decay LayerSync lambda from its full value to 0 over a configured step interval, "
+             "then keep it at 0 for the rest of training.",
+    )
+    parser.add_argument(
+        "--late-off-layersync-start-step",
+        type=int,
+        default=25000,
+        help="Step at which LayerSync late-off decay begins. Only used when --late-off-layersync is enabled.",
+    )
+    parser.add_argument(
+        "--late-off-layersync-end-step",
+        type=int,
+        default=35000,
+        help="Step at which LayerSync lambda reaches 0 and stays there. "
+             "Only used when --late-off-layersync is enabled.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1244,8 +1290,18 @@ def main():
     # ── LayerSync config validation ───────────────────────────────────────────
     if args.layersync_lambda < 0.0:
         raise ValueError("--layersync-lambda must be non-negative")
+    if args.late_off_layersync:
+        if args.late_off_layersync_start_step < 0:
+            raise ValueError(
+                "--late-off-layersync-start-step must be >= 0"
+            )
+        if args.late_off_layersync_end_step <= args.late_off_layersync_start_step:
+            raise ValueError(
+                "--late-off-layersync-end-step must be > --late-off-layersync-start-step"
+            )
     depth = config["depth"]
     layersync_pairs, layersync_capture_layers = resolve_layersync_config(args, depth)
+    layersync_enabled = args.layersync_lambda > 0.0
     if args.layersync_lambda > 0.0:
         pairs_str = ",".join(f"{weak}:{strong}" for weak, strong in layersync_pairs)
         stopgrad_msg = ""
@@ -1255,6 +1311,14 @@ def main():
             f"LayerSync ENABLED: lambda={args.layersync_lambda} mode={args.layersync_mode} "
             f"pairs={pairs_str}{stopgrad_msg}"
         )
+        if args.late_off_layersync:
+            log_stage(
+                f"LayerSync late-off ENABLED: lambda will decay linearly from {args.layersync_lambda} "
+                f"to 0.0 over steps [{args.late_off_layersync_start_step}, "
+                f"{args.late_off_layersync_end_step}], then stay at 0.0."
+            )
+        else:
+            log_stage("LayerSync late-off DISABLED: lambda stays constant throughout training.")
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
 
@@ -1280,7 +1344,7 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_lambda=args.layersync_lambda,
+            layersync_enabled=layersync_enabled,
             layersync_pairs=layersync_pairs,
             layersync_capture_layers=layersync_capture_layers,
             layersync_mode=args.layersync_mode,
@@ -1291,7 +1355,7 @@ def main():
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_lambda=args.layersync_lambda,
+            layersync_enabled=layersync_enabled,
             layersync_pairs=layersync_pairs,
             layersync_capture_layers=layersync_capture_layers,
             layersync_mode=args.layersync_mode,
@@ -1449,8 +1513,16 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_layersync_lambda = compute_layersync_lambda_value(
+            args.layersync_lambda,
+            step=0,
+            late_off_enabled=args.late_off_layersync,
+            late_off_start_step=args.late_off_layersync_start_step,
+            late_off_end_step=args.late_off_layersync_end_step,
+        )
+        probe_layersync_lambda_rep = jax_utils.replicate(jnp.float32(probe_layersync_lambda))
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_layersync_lambda_rep
         )
         block_pytree(probe_metrics)
 
@@ -1607,10 +1679,23 @@ def main():
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            current_layersync_lambda = compute_layersync_lambda_value(
+                args.layersync_lambda,
+                step=global_step + 1,
+                late_off_enabled=args.late_off_layersync,
+                late_off_start_step=args.late_off_layersync_start_step,
+                late_off_end_step=args.late_off_layersync_end_step,
+            )
+            current_layersync_lambda_rep = jax_utils.replicate(jnp.float32(current_layersync_lambda))
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                current_layersync_lambda_rep,
             )
             global_step += 1
 
@@ -1627,13 +1712,27 @@ def main():
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
+                val_layersync_lambda = compute_layersync_lambda_value(
+                    args.layersync_lambda,
+                    step=global_step,
+                    late_off_enabled=args.late_off_layersync,
+                    late_off_start_step=args.late_off_layersync_start_step,
+                    late_off_end_step=args.late_off_layersync_end_step,
+                )
+                val_layersync_lambda_rep = jax_utils.replicate(jnp.float32(val_layersync_lambda))
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
                         val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    val_metrics, rng = pmapped_eval_step(
+                        state,
+                        ema_params,
+                        (val_x, val_y),
+                        rng,
+                        val_layersync_lambda_rep,
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
