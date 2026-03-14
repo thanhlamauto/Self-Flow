@@ -413,12 +413,20 @@ try:
 except ImportError:
     log_stage("grain not installed. Please `pip install grain-balsa` for ArrayRecord support.")
     raise
-from src.model import SelfFlowPerTokenDiT
+from src.model import SelfFlowPerTokenDiT, apply_mimetic_attention_init
 from src.sampling import denoise_loop
 from src.jepa import JEPAPredictor, sample_jepa_masks
 
 
-def create_train_state(rng, config, backbone, predictor, learning_rate, grad_clip=1.0):
+def create_train_state(
+    rng,
+    config,
+    backbone,
+    predictor,
+    learning_rate,
+    grad_clip=1.0,
+    mimetic_init=None,
+):
     """Initializes optimizer and initial EMA params for the JEPA training setup.
 
     backbone and predictor are passed in from main() so the same module objects
@@ -436,12 +444,12 @@ def create_train_state(rng, config, backbone, predictor, learning_rate, grad_cli
     dummy_t   = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, backbone_rng, drop_rng = jax.random.split(rng, 3)
 
     # Init backbone with return_raw_features=False: all DiTBlock params are
     # materialized, feature_head is never called so it has no params.
     backbone_vars = backbone.init(
-        {'params': rng, 'dropout': drop_rng},
+        {'params': backbone_rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
@@ -449,6 +457,18 @@ def create_train_state(rng, config, backbone, predictor, learning_rate, grad_cli
         return_raw_features=False,
     )
     backbone_params = backbone_vars['params']
+    if mimetic_init is not None:
+        rng, mimetic_rng = jax.random.split(rng)
+        backbone_params = apply_mimetic_attention_init(
+            backbone_params,
+            rng=mimetic_rng,
+            start_layer=mimetic_init["start_layer"],
+            end_layer=mimetic_init["end_layer"],
+            qk_alpha=mimetic_init["qk_alpha"],
+            qk_beta=mimetic_init["qk_beta"],
+            vo_alpha=mimetic_init["vo_alpha"],
+            vo_beta=mimetic_init["vo_beta"],
+        )
 
     # Init predictor with dummy inputs matching expected shapes.
     rng, pred_rng = jax.random.split(rng)
@@ -1139,6 +1159,21 @@ def main():
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
                         help="Layer index for teacher features (default: round(0.7 * depth))")
+    parser.add_argument("--no-mimetic-init", action="store_true", default=False,
+                        help="Disable mimetic self-attention init and keep the default Flax attention init.")
+    parser.add_argument("--mimetic-init-start-layer", type=int, default=1,
+                        help="1-based first backbone block to receive mimetic attention init (default: 1).")
+    parser.add_argument("--mimetic-init-end-layer", type=int, default=None,
+                        help="1-based last backbone block to receive mimetic attention init. "
+                             "Defaults to student_layer for an early-layer bias.")
+    parser.add_argument("--mimetic-qk-alpha", type=float, default=0.7,
+                        help="Noise scale alpha for mimetic query/key init (paper default: 0.7).")
+    parser.add_argument("--mimetic-qk-beta", type=float, default=0.7,
+                        help="Diagonal scale beta for mimetic query/key init (paper default: 0.7).")
+    parser.add_argument("--mimetic-vo-alpha", type=float, default=0.4,
+                        help="Noise scale alpha for mimetic value/out init (paper default: 0.4).")
+    parser.add_argument("--mimetic-vo-beta", type=float, default=0.4,
+                        help="Diagonal scale beta for mimetic value/out init (paper default: 0.4).")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1229,6 +1264,14 @@ def main():
         raise ValueError("--jepa-num-targets must be greater than 0")
     if args.fixed_ema_decay is not None and not (0.0 < args.fixed_ema_decay <= 1.0):
         raise ValueError("--fixed-ema-decay must be in (0, 1]")
+    for name, value in (
+        ("--mimetic-qk-alpha", args.mimetic_qk_alpha),
+        ("--mimetic-qk-beta", args.mimetic_qk_beta),
+        ("--mimetic-vo-alpha", args.mimetic_vo_alpha),
+        ("--mimetic-vo-beta", args.mimetic_vo_beta),
+    ):
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f"{name} must be in [0, 1]")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1268,6 +1311,26 @@ def main():
     if student_layer >= teacher_layer:
         raise ValueError(f"student_layer ({student_layer}) must be < teacher_layer ({teacher_layer})")
 
+    mimetic_end_layer = (
+        args.mimetic_init_end_layer
+        if args.mimetic_init_end_layer is not None
+        else student_layer
+    )
+    if not args.no_mimetic_init:
+        if not (1 <= args.mimetic_init_start_layer <= depth):
+            raise ValueError(
+                f"--mimetic-init-start-layer {args.mimetic_init_start_layer} out of range [1, {depth}]"
+            )
+        if not (1 <= mimetic_end_layer <= depth):
+            raise ValueError(
+                f"--mimetic-init-end-layer {mimetic_end_layer} out of range [1, {depth}]"
+            )
+        if args.mimetic_init_start_layer > mimetic_end_layer:
+            raise ValueError(
+                f"mimetic init start layer ({args.mimetic_init_start_layer}) "
+                f"must be <= end layer ({mimetic_end_layer})"
+            )
+
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']} "
@@ -1287,10 +1350,28 @@ def main():
         ema_desc = "ema_decay 0.996→1.0"
     else:
         ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
+    if args.no_mimetic_init:
+        mimetic_desc = "mimetic_init=disabled"
+        mimetic_init = None
+    else:
+        mimetic_desc = (
+            "mimetic_init="
+            f"layers[{args.mimetic_init_start_layer},{mimetic_end_layer}] "
+            f"qk=({args.mimetic_qk_alpha:.2f},{args.mimetic_qk_beta:.2f}) "
+            f"vo=({args.mimetic_vo_alpha:.2f},{args.mimetic_vo_beta:.2f})"
+        )
+        mimetic_init = {
+            "start_layer": args.mimetic_init_start_layer,
+            "end_layer": mimetic_end_layer,
+            "qk_alpha": args.mimetic_qk_alpha,
+            "qk_beta": args.mimetic_qk_beta,
+            "vo_alpha": args.mimetic_vo_alpha,
+            "vo_beta": args.mimetic_vo_beta,
+        }
     log_stage(
         f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
         f"predictor_depth={args.predictor_depth} jepa_num_targets={args.jepa_num_targets} "
-        f"{ema_desc} grad_clip={args.grad_clip}"
+        f"{ema_desc} {mimetic_desc} grad_clip={args.grad_clip}"
     )
     if args.late_off_jepa:
         log_stage(
@@ -1337,7 +1418,8 @@ def main():
 
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(
-        rng, config, backbone, predictor, args.learning_rate, args.grad_clip
+        rng, config, backbone, predictor, args.learning_rate, args.grad_clip,
+        mimetic_init=mimetic_init,
     )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)

@@ -11,6 +11,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.core import FrozenDict, freeze, unfreeze
 from einops import rearrange
 
 
@@ -66,6 +67,106 @@ def modulate(x, shift, scale):
 def modulate_per_token(x, shift, scale):
     """Per-token modulation for (N, T, D) conditioning."""
     return x * (1 + scale) + shift
+
+
+def _mimetic_target_matrix(rng, width: int, alpha: float, beta: float, diag_sign: float, dtype):
+    z = jax.random.normal(rng, (width, width), dtype=jnp.float32) / jnp.sqrt(float(width))
+    eye = jnp.eye(width, dtype=jnp.float32)
+    target = alpha * z + diag_sign * beta * eye
+    return target.astype(dtype)
+
+
+def _truncated_svd_factors(target, rank: int):
+    """Return A [d, rank], B [rank, d] with A @ B approximating target."""
+    u, s, vh = jnp.linalg.svd(target, full_matrices=False)
+    s_root = jnp.sqrt(jnp.clip(s[:rank], a_min=0.0))
+    left = u[:, :rank] * s_root[None, :]
+    right = s_root[:, None] * vh[:rank, :]
+    return left, right
+
+
+def apply_mimetic_attention_init(
+    params,
+    *,
+    rng,
+    start_layer: int = 1,
+    end_layer: Optional[int] = None,
+    qk_alpha: float = 0.7,
+    qk_beta: float = 0.7,
+    vo_alpha: float = 0.4,
+    vo_beta: float = 0.4,
+):
+    """Apply mimetic self-attention init to a contiguous range of backbone blocks.
+
+    The paper assumes single-head full-rank value/projection matrices. In this
+    multi-head Flax model, each head uses rank-`head_dim` factors, so we apply
+    the same SVD construction per head and keep the top-`head_dim` components.
+    """
+    block_names = sorted(
+        (name for name in params.keys() if name.startswith("DiTBlock_")),
+        key=lambda name: int(name.split("_")[1]),
+    )
+    if not block_names:
+        return params
+
+    total_layers = len(block_names)
+    end_layer = total_layers if end_layer is None else end_layer
+    if not (1 <= start_layer <= total_layers):
+        raise ValueError(f"mimetic start_layer={start_layer} out of range [1, {total_layers}]")
+    if not (1 <= end_layer <= total_layers):
+        raise ValueError(f"mimetic end_layer={end_layer} out of range [1, {total_layers}]")
+    if start_layer > end_layer:
+        raise ValueError(
+            f"mimetic start_layer ({start_layer}) must be <= end_layer ({end_layer})"
+        )
+
+    mutable = unfreeze(params)
+    layer_rngs = jax.random.split(rng, end_layer - start_layer + 1)
+
+    for layer_offset, layer_rng in enumerate(layer_rngs, start=start_layer - 1):
+        block_name = block_names[layer_offset]
+        attn = mutable[block_name]["MultiHeadDotProductAttention_0"]
+
+        query_kernel = attn["query"]["kernel"]
+        value_kernel = attn["value"]["kernel"]
+        width, num_heads, head_dim = query_kernel.shape
+        dtype = query_kernel.dtype
+
+        head_rngs = jax.random.split(layer_rng, num_heads * 2)
+        query_heads = []
+        key_heads = []
+        value_heads = []
+        out_heads = []
+
+        for head in range(num_heads):
+            qk_target = _mimetic_target_matrix(
+                head_rngs[2 * head], width, qk_alpha, qk_beta, +1.0, dtype
+            )
+            q_factor, k_factor_t = _truncated_svd_factors(qk_target, head_dim)
+
+            vo_target = _mimetic_target_matrix(
+                head_rngs[2 * head + 1], width, vo_alpha, vo_beta, -1.0, dtype
+            )
+            v_factor, out_factor = _truncated_svd_factors(vo_target, head_dim)
+
+            query_heads.append(q_factor.astype(dtype))
+            key_heads.append(k_factor_t.T.astype(dtype))
+            value_heads.append(v_factor.astype(dtype))
+            out_heads.append(out_factor.astype(dtype))
+
+        attn["query"]["kernel"] = jnp.stack(query_heads, axis=1)
+        attn["key"]["kernel"] = jnp.stack(key_heads, axis=1)
+        attn["value"]["kernel"] = jnp.stack(value_heads, axis=1)
+        attn["out"]["kernel"] = jnp.stack(out_heads, axis=0)
+
+        attn["query"]["bias"] = jnp.zeros_like(attn["query"]["bias"])
+        attn["key"]["bias"] = jnp.zeros_like(attn["key"]["bias"])
+        attn["value"]["bias"] = jnp.zeros_like(attn["value"]["bias"])
+        attn["out"]["bias"] = jnp.zeros_like(attn["out"]["bias"])
+
+    if isinstance(params, FrozenDict):
+        return freeze(mutable)
+    return mutable
 
 
 class TimestepEmbedder(nn.Module):
@@ -136,7 +237,11 @@ class DiTBlock(nn.Module):
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                )
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
@@ -158,7 +263,11 @@ class DiTBlock(nn.Module):
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                )
             ])(c)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
@@ -189,14 +298,22 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
-        
+        linear = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+        )
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                )
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
@@ -206,7 +323,11 @@ class FinalLayer(nn.Module):
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=jax.nn.initializers.zeros,
+                    bias_init=jax.nn.initializers.zeros,
+                )
             ])(c)
             shift, scale = jnp.split(modulation, 2, axis=1)
             
