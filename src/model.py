@@ -6,6 +6,7 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 """
 
 import math
+from collections.abc import Sequence
 from typing import Optional
 
 import jax
@@ -260,11 +261,33 @@ class SelfFlowDiT(nn.Module):
         vector: jax.Array,
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
-        return_raw_features: bool = False,
+        return_raw_features: bool | int | Sequence[int] = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+
+        raw_layers = ()
+        raw_single = False
+        raw_positions = None
+        if isinstance(return_raw_features, Sequence) and not isinstance(return_raw_features, (str, bytes)):
+            raw_layers = tuple(int(layer) for layer in return_raw_features)
+            raw_single = len(raw_layers) == 1
+        elif isinstance(return_raw_features, int) and not isinstance(return_raw_features, bool):
+            raw_layers = (int(return_raw_features),)
+            raw_single = True
+
+        if raw_layers:
+            if any(layer <= 0 for layer in raw_layers):
+                raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+            if any(layer > self.depth for layer in raw_layers):
+                raise ValueError(
+                    f"return_raw_features layers must be <= model depth ({self.depth}), got {raw_layers}"
+                )
+            if not raw_single:
+                raw_positions = {}
+                for idx, layer in enumerate(raw_layers):
+                    raw_positions.setdefault(layer, []).append(idx)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -302,6 +325,7 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -312,8 +336,12 @@ class SelfFlowDiT(nn.Module):
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+            if raw_layers and ((i + 1) in raw_positions if raw_positions is not None else (i + 1) in raw_layers):
+                if raw_single:
+                    zs = x
+                else:
+                    for idx in raw_positions[i + 1]:
+                        raw_zs[idx] = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -327,7 +355,13 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation negates the final prediction
         x = -x
 
-        if return_features or return_raw_features:
+        if return_features:
+            return x, zs
+        if raw_layers:
+            if raw_single:
+                return x, zs
+            return x, tuple(raw_zs)
+        if return_raw_features:
             return x, zs
         return x
 
