@@ -21,6 +21,7 @@ from src.metrics import (
     gaussian_batch_sums_pmap,
     gaussian_sums_add,
     finalize_gaussian_sums,
+    inception_score_from_probs,
     init_gaussian_sums,
     make_eval_chunk_rngs,
     pearson_corrcoef_rows,
@@ -118,6 +119,15 @@ def test_eval_chunk_rngs_are_unique():
     assert not np.array_equal(np.asarray(jax.device_get(s0)), np.asarray(jax.device_get(s1)))
 
 
+def test_inception_score_helper_runs():
+    probs = np.full((20, 5), 0.2, dtype=np.float32)
+    is_mean, is_std, split_scores = inception_score_from_probs(probs, splits=5)
+    assert np.isfinite(is_mean)
+    assert np.isfinite(is_std)
+    assert split_scores.shape == (5,)
+    assert is_mean > 0.0
+
+
 if __name__ == "__main__":
     test_gaussian_masking_count()
     test_precision_recall_runs()
@@ -125,4 +135,5 @@ if __name__ == "__main__":
     test_reservoir_sampler_deterministic()
     test_pearson_corr_rows()
     test_eval_chunk_rngs_are_unique()
+    test_inception_score_helper_runs()
     print("OK")

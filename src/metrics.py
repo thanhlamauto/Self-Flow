@@ -370,3 +370,40 @@ def precision_recall_knn(
     precision = float(np.mean(d_fr <= r_real[idx_fr]))
     recall = float(np.mean(d_rf <= r_fake[idx_rf]))
     return precision, recall
+
+
+def inception_score_from_probs(
+    probs: np.ndarray,
+    *,
+    splits: int = 10,
+    eps: float = 1e-12,
+) -> Tuple[float, float, np.ndarray]:
+    """Compute Inception Score mean/std from class probabilities."""
+    arr = np.asarray(probs, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected probs with shape (N, C), got {arr.shape}")
+    if arr.shape[0] <= 0:
+        raise ValueError("Cannot compute Inception Score with zero samples")
+    if splits <= 0:
+        raise ValueError("splits must be > 0")
+
+    split_scores = []
+    n = int(arr.shape[0])
+    for sid in range(int(splits)):
+        lo = (sid * n) // int(splits)
+        hi = ((sid + 1) * n) // int(splits)
+        if hi <= lo:
+            continue
+        chunk = arr[lo:hi]
+        p_bar = np.mean(chunk, axis=0)
+        h_pbar = float(np.sum(p_bar * np.log(np.maximum(p_bar, eps))))
+        e_plogp = float(np.mean(np.sum(chunk * np.log(np.maximum(chunk, eps)), axis=1)))
+        split_scores.append(float(np.exp(e_plogp - h_pbar)))
+
+    if not split_scores:
+        raise ValueError("No non-empty splits available for Inception Score")
+
+    split_arr = np.asarray(split_scores, dtype=np.float64)
+    mean = float(np.mean(split_arr))
+    std = float(np.std(split_arr, ddof=1)) if split_arr.shape[0] > 1 else 0.0
+    return mean, std, split_arr
