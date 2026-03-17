@@ -1398,6 +1398,12 @@ def main():
         # Vanilla SiT training
         pmapped_train_step = jax.pmap(train_step, axis_name="batch")
         pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+        # Set to None for vanilla mode (not used)
+        block_out_s_rep = None
+        block_out_t_rep = None
+        t_max_rep = None
+        align_weight_rep = None
+        align_loss_type_rep = None
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1548,9 +1554,17 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
-        )
+
+        if args.use_sra:
+            _, _, probe_metrics, _ = pmapped_train_step(
+                state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
+                block_out_s_rep, block_out_t_rep, t_max_rep,
+                align_weight_rep, align_loss_type_rep,
+            )
+        else:
+            _, _, probe_metrics, _ = pmapped_train_step(
+                state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            )
         block_pytree(probe_metrics)
 
         inception_fn = get_inception()
