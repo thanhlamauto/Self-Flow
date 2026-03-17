@@ -1385,17 +1385,25 @@ def main():
     # ── Build pmapped training/eval steps ────────────────────────────────────
     if args.use_sra:
         # SRA training with EMA teacher alignment
-        # Use functools.partial to bake align_loss_type (string) before pmap
+        # Use functools.partial to bake static args (strings, integers) before pmap
         import functools
-        train_step_sra_partial = functools.partial(train_step_sra, align_loss_type=args.align_loss_type)
-        eval_step_sra_partial = functools.partial(eval_step_sra, align_loss_type=args.align_loss_type)
+        train_step_sra_partial = functools.partial(
+            train_step_sra,
+            block_out_s=args.block_out_s,
+            block_out_t=args.block_out_t,
+            align_loss_type=args.align_loss_type
+        )
+        eval_step_sra_partial = functools.partial(
+            eval_step_sra,
+            block_out_s=args.block_out_s,
+            block_out_t=args.block_out_t,
+            align_loss_type=args.align_loss_type
+        )
 
         pmapped_train_step = jax.pmap(train_step_sra_partial, axis_name="batch")
         pmapped_eval_step = jax.pmap(eval_step_sra_partial, axis_name="batch")
 
-        # Replicate SRA hyperparameters (exclude align_loss_type - already baked in)
-        block_out_s_rep = jax_utils.replicate(args.block_out_s)
-        block_out_t_rep = jax_utils.replicate(args.block_out_t)
+        # Replicate only float hyperparameters (block indices are baked in above)
         t_max_rep = jax_utils.replicate(jnp.float32(args.t_max))
         align_weight_rep = jax_utils.replicate(jnp.float32(args.align_weight))
     else:
@@ -1403,8 +1411,6 @@ def main():
         pmapped_train_step = jax.pmap(train_step, axis_name="batch")
         pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
         # Set to None for vanilla mode (not used)
-        block_out_s_rep = None
-        block_out_t_rep = None
         t_max_rep = None
         align_weight_rep = None
 
@@ -1561,7 +1567,7 @@ def main():
         if args.use_sra:
             _, _, probe_metrics, _ = pmapped_train_step(
                 state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
-                block_out_s_rep, block_out_t_rep, t_max_rep, align_weight_rep,
+                t_max_rep, align_weight_rep,
             )
         else:
             _, _, probe_metrics, _ = pmapped_train_step(
@@ -1727,7 +1733,7 @@ def main():
             if args.use_sra:
                 state, ema_params, metrics, rng = pmapped_train_step(
                     state, ema_params, (batch_x, batch_y), rng, ema_decay_rep,
-                    block_out_s_rep, block_out_t_rep, t_max_rep, align_weight_rep,
+                    t_max_rep, align_weight_rep,
                 )
             else:
                 state, ema_params, metrics, rng = pmapped_train_step(
@@ -1758,7 +1764,7 @@ def main():
                     if args.use_sra:
                         val_metrics, rng = pmapped_eval_step(
                             state, ema_params, (val_x, val_y), rng,
-                            block_out_s_rep, block_out_t_rep, t_max_rep, align_weight_rep,
+                            t_max_rep, align_weight_rep,
                         )
                     else:
                         val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)

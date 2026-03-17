@@ -324,6 +324,8 @@ class SelfFlowDiT(nn.Module):
                 per_token=self.per_token
             )(x, c)
 
+            # Since return_features and return_raw_features are now static (baked via functools.partial),
+            # these comparisons work correctly even in traced context
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
