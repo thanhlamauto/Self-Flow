@@ -416,6 +416,21 @@ except ImportError:
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
 from src.jepa import JEPAPredictor, sample_jepa_masks
+from src.metrics import (
+    ReservoirSampler,
+    apply_inception_to_decoded_sharded,
+    extract_inception_features_host_images,
+    init_gaussian_sums,
+    gaussian_batch_sums_pmap,
+    gaussian_spatial_batch_sums_pmap,
+    gaussian_sums_add,
+    finalize_gaussian_sums,
+    make_eval_chunk_rngs,
+    pearson_corrcoef_rows,
+    precision_recall_knn,
+    trim_sharded_batch_to_host,
+)
+from src.inception_is_subprocess import InceptionISSubprocess
 
 
 def create_train_state(rng, config, backbone, predictor, learning_rate, grad_clip=1.0):
@@ -1009,6 +1024,100 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
+def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+    """Build a sharded (pmap) sampling function for eval.
+
+    Returns a pmapped function:
+      sample_latents_pmap(ema_backbone_params_repl, class_labels_sharded, rng_sharded)
+        ema_backbone_params_repl: replicated pytree (devices, ...)
+        class_labels_sharded: (devices, local_batch) int32
+        rng_sharded: (devices, 2) PRNGKey
+      -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
+    """
+    model = SelfFlowPerTokenDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=True,
+    )
+
+    patch_size = config["patch_size"]
+    latent_channels = config["in_channels"]
+    latent_size = config["input_size"]
+    token_h = latent_size // patch_size
+    token_w = latent_size // patch_size
+
+    def _sample_latents_local(ema_params_local, class_labels_local, rng_local):
+        batch_size = class_labels_local.shape[0]
+        rng_local, noise_rng = jax.random.split(rng_local)
+        noise = jax.random.normal(
+            noise_rng,
+            (batch_size, latent_channels, latent_size, latent_size),
+            dtype=jnp.float32,
+        )
+
+        from einops import rearrange
+        x = rearrange(
+            noise,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=patch_size,
+            p2=patch_size,
+        ).astype(jnp.float32)
+
+        use_cfg = cfg_scale > 1.0
+        if use_cfg:
+            x = jnp.concatenate([x, x], axis=0)
+            class_labels_local = jnp.concatenate(
+                [jnp.full_like(class_labels_local, config["num_classes"] - 1), class_labels_local],
+                axis=0,
+            )
+
+        def model_fn(z_x, t):
+            return model.apply(
+                {"params": ema_params_local},
+                z_x,
+                timesteps=t,
+                vector=class_labels_local,
+                deterministic=True,
+            )
+
+        rng_local, denoise_rng = jax.random.split(rng_local)
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+            reverse=False,
+        )
+
+        if use_cfg:
+            samples = samples[batch_size:]
+
+        samples = rearrange(
+            samples,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h,
+            w=token_w,
+            p1=patch_size,
+            p2=patch_size,
+            c=latent_channels,
+        )
+        return samples.astype(jnp.float32)
+
+    return jax.pmap(_sample_latents_local, axis_name="batch")
+
+
 def run_preflight_checks(
     state,
     ema_params,
@@ -1019,6 +1128,8 @@ def run_preflight_checks(
     real_latents_patchified,
     preflight_sample_count,
     preflight_fid_samples,
+    inception_num_devices,
+    inception_local_batch,
 ):
     """Smoke-test VAE decode and FID pipeline before the training loop.
 
@@ -1062,27 +1173,20 @@ def run_preflight_checks(
         real_latents_nchw = unpatchify_patchified_latents(real_latents_patchified[:fid_count])
         real_images = decode_latents(real_latents_nchw)   # (N, H, W, 3) [0,1]
         fake_images = decode_latents(fake_latents[:fid_count])
-
-        def _imgs_to_acts(imgs_nhwc, n_dev):
-            imgs = list(imgs_nhwc)
-            acts_all = []
-            for start in range(0, len(imgs), n_dev):
-                chunk = imgs[start:start + n_dev]
-                while len(chunk) < n_dev:
-                    chunk.append(chunk[-1])
-                imgs_299 = np.stack([
-                    np.array(jax.image.resize(
-                        img.astype(np.float32) * 2.0 - 1.0,
-                        (299, 299, img.shape[-1]), method="bilinear"
-                    )) for img in chunk
-                ])  # (n_dev, 299, 299, 3)
-                acts = np.array(inception_fn(imgs_299[:, None])).reshape(n_dev, 2048)
-                acts_all.append(acts)
-            return np.concatenate(acts_all, axis=0)
-
-        n_dev = jax.device_count()
-        real_acts = _imgs_to_acts(real_images, n_dev)
-        fake_acts = _imgs_to_acts(fake_images, n_dev)
+        real_acts = extract_inception_features_host_images(
+            real_images,
+            inception_fn,
+            num_devices=inception_num_devices,
+            local_batch=inception_local_batch,
+            mode="pooled",
+        )
+        fake_acts = extract_inception_features_host_images(
+            fake_images,
+            inception_fn,
+            num_devices=inception_num_devices,
+            local_batch=inception_local_batch,
+            mode="pooled",
+        )
         fid_val = fid_from_stats(
             np.mean(real_acts, 0), np.cov(real_acts, rowvar=False),
             np.mean(fake_acts, 0), np.cov(fake_acts, rowvar=False),
@@ -1187,6 +1291,47 @@ def main():
                         help="Number of real/fake samples for FID. "
                              "TPU default: 4000 (monitoring). Paper: 50000.")
     parser.add_argument("--fid-batch-size", type=int, default=32)
+    parser.add_argument("--fid-eval-local-batch", type=int, default=4,
+                        help="Per-device eval micro-batch for FID-bundled metrics. "
+                             "Global eval batch = num_devices * fid_eval_local_batch. "
+                             "Keep this fixed to avoid XLA recompile; prefer multiples of TPU cores.")
+    parser.add_argument(
+        "--inception-score",
+        dest="inception_score",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Inception Score (runs torchvision Inception-v3 in an isolated subprocess).",
+    )
+    parser.add_argument("--inception-score-splits", type=int, default=10)
+    parser.add_argument(
+        "--precision-recall",
+        dest="precision_recall",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Precision/Recall (kNN-manifold) on pooled Inception features.",
+    )
+    parser.add_argument("--pr-k", type=int, default=3)
+    parser.add_argument("--pr-max-samples", type=int, default=5000,
+                        help="Monitoring cap for PR. Uses min(num_fid_samples, pr_max_samples).")
+    parser.add_argument("--pr-full-mode", action="store_true",
+                        help="Allow PR to run on full num_fid_samples (may be O(N^2) heavy).")
+    parser.add_argument(
+        "--linear-probe",
+        dest="linear_probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable linear probe accuracy inference on val representations (same step, not same FID fake pool).",
+    )
+    parser.add_argument("--probe-save-path", type=str, default=None,
+                        help="Path to .npz containing probe weights (W[, b]). Required for --linear-probe.")
+    parser.add_argument("--probe-layer", type=int, default=None,
+                        help="Backbone layer index to probe. Default: teacher_layer.")
+    parser.add_argument("--probe-eval-batches", type=int, default=4,
+                        help="Number of val batches to run probe inference on per eval window.")
+    parser.add_argument("--block-corr-freq", type=int, default=0,
+                        help="Cadence (steps) for EMA block correlation heatmap diagnostic. 0 disables.")
+    parser.add_argument("--block-corr-batches", type=int, default=2,
+                        help="Number of val batches for block correlation diagnostic.")
     parser.add_argument("--fid-num-steps", type=int, default=50,
                         help="Denoising steps for FID generation. "
                              "TPU default: 50 (monitoring). Paper: 250.")
@@ -1219,6 +1364,22 @@ def main():
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
+    if args.fid_freq > 0 and args.fid_eval_local_batch <= 0:
+        raise ValueError("--fid-eval-local-batch must be greater than 0 when FID is enabled")
+    if args.inception_score_splits <= 0:
+        raise ValueError("--inception-score-splits must be greater than 0")
+    if args.pr_k <= 0:
+        raise ValueError("--pr-k must be greater than 0")
+    if args.pr_max_samples <= 0:
+        raise ValueError("--pr-max-samples must be greater than 0")
+    if args.probe_eval_batches <= 0:
+        raise ValueError("--probe-eval-batches must be greater than 0")
+    if args.linear_probe and not args.probe_save_path:
+        raise ValueError("--linear-probe requires --probe-save-path")
+    if args.block_corr_freq < 0:
+        raise ValueError("--block-corr-freq must be >= 0")
+    if args.block_corr_batches <= 0:
+        raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not (0.0 < args.mask_ratio < 1.0):
@@ -1348,6 +1509,22 @@ def main():
 
     total_steps = args.epochs * args.steps_per_epoch
 
+    # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
+    # This is a rough throughput metric for monitoring. It intentionally avoids
+    # any per-step cost analysis. Accumulated TFLOPs count only training steps.
+    def estimate_train_step_flops(cfg, global_batch, n_tokens):
+        # Heuristic DiT block cost: attention + MLP ~ O(D^2 * N) per layer.
+        D = int(cfg["hidden_size"])
+        L = int(cfg["depth"])
+        # Scale factors chosen for stable relative monitoring; not paper-accurate.
+        flops_per_layer = 12.0 * n_tokens * (D * D)
+        fwd = flops_per_layer * L
+        bwd = 2.0 * fwd  # backward ~2x forward (rough)
+        return float(global_batch) * (fwd + bwd)
+
+    flops_per_train_step = estimate_train_step_flops(config, args.batch_size, n_patches)
+    accumulated_train_tflops = 0.0
+
     # ── Build pmapped training step ───────────────────────────────────────────
     # backbone and predictor are Python objects (static); lambda_jepa and
     # ema_decay are per-step JAX float32 arrays (positional, not partialised).
@@ -1386,6 +1563,11 @@ def main():
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
+
+    # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
+    fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
+        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+    )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
@@ -1460,6 +1642,22 @@ def main():
         decode_fn, params_repl = backend
         return _decode_tpu(latents_nchw, decode_fn, params_repl)
 
+    def decode_latents_sharded(latents_nchw_sharded):
+        """Sharded decode: (devices, local_batch, 4, 32, 32) → (devices, local_batch, 256, 256, 3).
+
+        Uses TPU Flax backend if available. If using CPU subprocess backend, this
+        will host-transfer latents and return images sharded back.
+        """
+        backend = _ensure_vae_backend()
+        if isinstance(backend, VAEDecodeSubprocess):
+            # Host bounce fallback: bring latents to host, decode, then reshape back.
+            latents = np.asarray(jax.device_get(latents_nchw_sharded), dtype=np.float32).reshape(-1, 4, 32, 32)
+            imgs = backend.decode(latents)  # (global, 256,256,3)
+            return jnp.array(imgs.reshape(num_devices, -1, 256, 256, 3), dtype=jnp.float32)
+        decode_fn, params_repl = backend
+        latents_bf16 = latents_nchw_sharded.astype(jnp.bfloat16)
+        return decode_fn(latents_bf16, params_repl)
+
     def decode_latents_batched(latents_nchw, decode_batch_size=None):
         """Decode latents theo chunk. Khi dùng TPU backend, chunk_size nên lớn hơn (≥32×num_devices)."""
         latents_nchw = np.asarray(latents_nchw, dtype=np.float32)
@@ -1472,36 +1670,113 @@ def main():
             chunks.append(decode_latents(latents_nchw[start:start + chunk_size]))
         return np.concatenate(chunks, axis=0)
 
-    # ── InceptionV3 for FID: lazy-init, cached across calls ───────────────────
-    _inception_fn = [None]
+    # ── InceptionV3 for FID/sFID: lazy-init, cached per mode ──────────────────
+    _inception_fns = {}  # mode -> apply_fn
 
-    def get_inception():
-        if _inception_fn[0] is None:
-            from src.fid_utils import get_fid_network
-            log_stage("Loading InceptionV3 for FID…")
-            _inception_fn[0] = get_fid_network()
+    def get_inception(mode="pooled"):
+        from src.fid_utils import get_inception_network
+        mode = str(mode)
+        if mode not in _inception_fns:
+            log_stage(f"Loading InceptionV3 ({mode})…")
+            _inception_fns[mode] = get_inception_network(mode=mode)
             log_stage("InceptionV3 ready.")
-        return _inception_fn[0]
+        return _inception_fns[mode]
 
-    # Real image Inception activations cached so we only decode real images once
-    _fid_real_acts = [None]
+    # ── Torchvision Inception-v3 worker for Inception Score (subprocess) ──────
+    _is_worker = [None]
 
-    def imgs_to_acts(imgs_nhwc, inception_fn):
-        imgs = list(imgs_nhwc)
-        acts_all = []
-        for start in range(0, len(imgs), num_devices):
-            chunk = imgs[start:start + num_devices]
-            while len(chunk) < num_devices:
-                chunk.append(chunk[-1])
-            imgs_299 = np.stack([
-                np.array(jax.image.resize(
-                    img.astype(np.float32) * 2.0 - 1.0,
-                    (299, 299, img.shape[-1]), method="bilinear"
-                )) for img in chunk
-            ])
-            acts = np.array(inception_fn(imgs_299[:, None])).reshape(num_devices, 2048)
-            acts_all.append(acts)
-        return np.concatenate(acts_all, axis=0)
+    def get_is_worker():
+        if _is_worker[0] is None:
+            log_stage("Spawning torchvision Inception-v3 worker for Inception Score…")
+            _is_worker[0] = InceptionISSubprocess()
+            log_stage("Inception Score worker ready.")
+        return _is_worker[0]
+
+    # ── Linear probe weights + pmapped inference (inference-only in fid window) ─
+    _probe_weights = [None]  # (W_repl, b_repl)
+    _probe_pmapped = {}      # layer -> pmapped_fn
+
+    def get_probe_weights():
+        if _probe_weights[0] is None:
+            data = np.load(args.probe_save_path)
+            if "W" not in data:
+                raise ValueError(f"Probe file missing key 'W': {args.probe_save_path!r}")
+            W = np.asarray(data["W"], dtype=np.float32)
+            b = np.asarray(data["b"], dtype=np.float32) if "b" in data else np.zeros((W.shape[1],), dtype=np.float32)
+            W_repl = jax.device_put_replicated(jnp.array(W), jax.local_devices())
+            b_repl = jax.device_put_replicated(jnp.array(b), jax.local_devices())
+            _probe_weights[0] = (W_repl, b_repl)
+        return _probe_weights[0]
+
+    def get_probe_pmapped(layer: int):
+        layer = int(layer)
+        if layer not in _probe_pmapped:
+            def _probe_step(ema_params_local, batch_x_local, batch_y_local, W_local, b_local):
+                # Deterministic clean EMA representation for monitoring.
+                local_batch = batch_x_local.shape[0]
+                clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
+                _, feats = backbone.apply(
+                    {"params": ema_params_local},
+                    batch_x_local,
+                    timesteps=clean_t,
+                    vector=batch_y_local,
+                    deterministic=True,
+                    return_raw_features=layer,
+                )
+                reps = jnp.mean(feats, axis=1)  # (B, D)
+                logits = reps @ W_local + b_local
+                pred = jnp.argmax(logits, axis=-1)
+                correct = jnp.sum(pred == batch_y_local)
+                total = jnp.array(batch_y_local.shape[0], dtype=jnp.int32)
+                correct = jax.lax.psum(correct, axis_name="batch")
+                total = jax.lax.psum(total, axis_name="batch")
+                return correct, total
+
+            _probe_pmapped[layer] = jax.pmap(_probe_step, axis_name="batch")
+        return _probe_pmapped[layer]
+
+    # ── EMA block-correlation diagnostic (cadence riêng; async media logging) ─
+    _blockcorr_pmapped = [None]
+
+    def get_blockcorr_pmapped():
+        if _blockcorr_pmapped[0] is None:
+            def _blockcorr_step(ema_params_local, batch_x_local, batch_y_local):
+                local_batch = batch_x_local.shape[0]
+                clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
+                out = backbone.apply(
+                    {"params": ema_params_local},
+                    batch_x_local,
+                    timesteps=clean_t,
+                    vector=batch_y_local,
+                    deterministic=True,
+                    return_block_summaries=True,
+                )
+                _, block_summaries = out
+                return block_summaries
+
+            _blockcorr_pmapped[0] = jax.pmap(_blockcorr_step, axis_name="batch")
+        return _blockcorr_pmapped[0]
+
+    def log_blockcorr_async(corr: np.ndarray, step: int):
+        # Avoid blocking the training loop with WandB media encoding/upload.
+        def _worker():
+            if getattr(wandb, "run", None) is None:
+                return
+            corr_clip = np.clip(corr, -1.0, 1.0)
+            img = ((corr_clip + 1.0) * 0.5 * 255.0).astype(np.uint8)
+            img = np.stack([img, img, img], axis=-1)  # HWC
+            safe_wandb_log(
+                {
+                    "diag/block_corr_mean_offdiag": float(
+                        (np.sum(corr) - np.trace(corr)) / max(corr.size - corr.shape[0], 1)
+                    ),
+                    "diag/block_corr_heatmap": wandb.Image(img, caption=f"step {step}"),
+                    "train/step": step,
+                },
+                step=step,
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def block_pytree(tree):
         jax.tree_util.tree_map(
@@ -1517,6 +1792,7 @@ def main():
             if data_iterator is None:
                 raise RuntimeError("FID memory probe requires real training data.")
             cached_train_batch = next(data_iterator)
+        inception_local_batch = int(args.fid_eval_local_batch)
 
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
@@ -1547,7 +1823,13 @@ def main():
         )
         real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
         real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
-        block_pytree(imgs_to_acts(real_images, inception_fn))
+        extract_inception_features_host_images(
+            real_images,
+            inception_fn,
+            num_devices=num_devices,
+            local_batch=inception_local_batch,
+            mode="pooled",
+        )
 
         fake_bs = min(args.fid_batch_size, args.num_fid_samples)
         log_stage(
@@ -1562,76 +1844,260 @@ def main():
             dtype=np.float32,
         )
         fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
-        block_pytree(imgs_to_acts(fake_images, inception_fn))
+        extract_inception_features_host_images(
+            fake_images,
+            inception_fn,
+            num_devices=num_devices,
+            local_batch=inception_local_batch,
+            mode="pooled",
+        )
 
         log_stage(
             "[FID probe] success: discarded train step + real/fake FID batches completed without OOM."
         )
         return val_data_iter, cached_train_batch
 
-    def compute_fid(step, val_data_iter):
-        """Synchronous FID using EMA params and configurable num_steps.
+    _eval_real_cache = [None]  # dict with pooled/spatial stats and metadata
 
-        TPU deviation: default 50 steps and 4000 samples for fast monitoring.
-        This FID is NOT paper-comparable at default settings.
-        For paper-comparable FID, run with --fid-num-steps 250 --num-fid-samples 50000.
+    def compute_eval_metrics(step, val_data_iter):
+        """Hot-path eval for FID-bundled metrics (streaming, sharded, static shapes).
+
+        Computes FID + sFID in a single shared pass over the same real/fake pools.
+        (IS/PR/LinearProbe are integrated in later metric modules.)
         """
         from src.fid_utils import fid_from_stats
 
-        inception_fn = get_inception()
+        local_b = int(args.fid_eval_local_batch)
+        global_b = num_devices * local_b
+        need = int(args.num_fid_samples)
+        current_val_iter = val_data_iter
 
-        # Build real image stats once; reuse across FID calls
-        if _fid_real_acts[0] is None:
-            log_stage(
-                f"[FID] decoding {args.num_fid_samples} real images "
-                f"(VAE micro-batch {args.vae_decode_batch_size})…"
-            )
-            real_imgs = []
-            while len(real_imgs) < args.num_fid_samples and val_data_iter is not None:
-                try:
-                    vbatch, val_data_iter = next_validation_batch(
-                        val_data_iter, data_pattern=args.val_data_path,
-                        batch_size=args.batch_size,
-                    )
-                except StopIteration:
-                    break
-                latents_nchw = unpatchify_patchified_latents(vbatch[0])
-                for img in decode_latents_batched(latents_nchw, args.vae_decode_batch_size):
-                    real_imgs.append(img)
-                    if len(real_imgs) >= args.num_fid_samples:
+        inception_fn = get_inception("pooled+spatial")
+
+        pr_enabled = bool(args.precision_recall)
+        pr_full = bool(args.pr_full_mode)
+        pr_k = int(args.pr_k)
+        pr_cap = int(args.pr_max_samples)
+        pr_eval_samples = need if pr_full else min(need, pr_cap)
+        pr_mode = "full" if pr_full else ("subset" if pr_eval_samples < need else "full")
+
+        def _update_accumulators(acc_pooled, acc_spatial, pooled_feats, spatial_feats, valid_mask):
+            pooled = pooled_feats.reshape(num_devices, local_b, 2048)
+            spatial = spatial_feats.reshape(num_devices, local_b, spatial_feats.shape[2], spatial_feats.shape[3], 2048)
+            bc, bs, bsxx = gaussian_batch_sums_pmap(pooled, valid_mask)
+            sc, ss, ssxx = gaussian_spatial_batch_sums_pmap(spatial, valid_mask)
+            # Use replica 0 (all replicas identical after psum)
+            acc_pooled = gaussian_sums_add(acc_pooled, bc[0], bs[0], bsxx[0])
+            acc_spatial = gaussian_sums_add(acc_spatial, sc[0], ss[0], ssxx[0])
+            return acc_pooled, acc_spatial
+
+        # ── Real side: build cache once (streaming, no full images kept) ──────
+        if _eval_real_cache[0] is None:
+            log_stage(f"[EVAL] building real cache: {need} samples (batch={global_b})…")
+            acc_real_pooled = init_gaussian_sums(2048)
+            acc_real_spatial = init_gaussian_sums(2048)
+            pr_real_sampler = ReservoirSampler(pr_eval_samples, seed=0) if pr_enabled else None
+            seen = 0
+            while seen < need and current_val_iter is not None:
+                vbatch, current_val_iter = next_validation_batch(
+                    current_val_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                )
+                latents_all = unpatchify_patchified_latents(vbatch[0])  # (B,4,32,32) numpy
+                # Stream through this batch in fixed global_b chunks
+                for start in range(0, latents_all.shape[0], global_b):
+                    if seen >= need:
                         break
-            log_stage(f"[FID] {len(real_imgs)} real images decoded.")
-            real_acts = imgs_to_acts(real_imgs[:args.num_fid_samples], inception_fn)
-            _fid_real_acts[0] = (np.mean(real_acts, 0), np.cov(real_acts, rowvar=False))
+                    chunk = latents_all[start:start + global_b]
+                    valid = min(chunk.shape[0], need - seen, global_b)
+                    if chunk.shape[0] < global_b:
+                        pad = global_b - chunk.shape[0]
+                        chunk = np.concatenate([chunk, np.zeros((pad, 4, 32, 32), dtype=np.float32)], axis=0)
+                    lat_sharded = jnp.array(chunk.reshape(num_devices, local_b, 4, 32, 32), dtype=jnp.float32)
+                    imgs_sharded = decode_latents_sharded(lat_sharded)  # (dev,local,256,256,3)
+                    pooled, spatial, valid_mask = apply_inception_to_decoded_sharded(
+                        imgs_sharded,
+                        inception_fn,
+                        mode="pooled+spatial",
+                        valid_global=valid,
+                    )
+                    acc_real_pooled, acc_real_spatial = _update_accumulators(
+                        acc_real_pooled, acc_real_spatial, pooled, spatial, valid_mask
+                    )
+                    if pr_real_sampler is not None:
+                        pr_real_sampler.add(trim_sharded_batch_to_host(pooled, valid).reshape(valid, -1))
+                    seen += valid
+            mu_r, cov_r, n_r = finalize_gaussian_sums(acc_real_pooled)
+            mu_rs, cov_rs, n_rs = finalize_gaussian_sums(acc_real_spatial)
+            pr_real = pr_real_sampler.get() if pr_real_sampler is not None else None
+            _eval_real_cache[0] = {
+                "pooled": {"mu": mu_r, "cov": cov_r, "count": n_r},
+                "spatial": {"mu": mu_rs, "cov": cov_rs, "count": n_rs},
+                "pr": {
+                    "mode": pr_mode,
+                    "eval_samples": int(pr_eval_samples),
+                    "k": int(pr_k),
+                    "real_feats": pr_real,
+                },
+                "meta": {"num_samples": min(need, n_r), "feature_dim": 2048, "mode": "pooled+spatial"},
+            }
+            log_stage(f"[EVAL] real cache ready: pooled n={n_r}, spatial n={n_rs}.")
 
-        mu_real, sigma_real = _fid_real_acts[0]
+        real = _eval_real_cache[0]
+        mu_real = real["pooled"]["mu"]
+        cov_real = real["pooled"]["cov"]
+        mu_real_s = real["spatial"]["mu"]
+        cov_real_s = real["spatial"]["cov"]
 
-        # Generate fake images using EMA params (consistent with paper eval)
-        log_stage(f"[FID] generating {args.num_fid_samples} fake images @ step {step} "
-                  f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})…")
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
-        gen_imgs = []
-        sample_rng_base = rng[0]
-        gen_bs = min(args.fid_batch_size, args.num_fid_samples)
-        while len(gen_imgs) < args.num_fid_samples:
-            sample_rng_base, sample_rng = jax.random.split(sample_rng_base)
-            needed = min(gen_bs, args.num_fid_samples - len(gen_imgs))
-            classes = jax.random.randint(sample_rng, (needed,), 0, 1000)
-            latents = np.asarray(jax.device_get(
-                fid_sample_latents_jitted(single_ema_params, classes, sample_rng)
-            ), dtype=np.float32)
-            for img in decode_latents_batched(latents, args.vae_decode_batch_size):
-                gen_imgs.append(img)
+        # ── Fake side: one shared pass for FID + sFID (+ reuse images for IS) ─
+        log_stage(f"[EVAL] generating fake pool: {need} samples @ step {step} (batch={global_b})…")
+        acc_fake_pooled = init_gaussian_sums(2048)
+        acc_fake_spatial = init_gaussian_sums(2048)
+        pr_fake_sampler = ReservoirSampler(pr_eval_samples, seed=int(step)) if pr_enabled else None
+        # Inception Score streaming accumulators (host-side; reuse same fake images)
+        is_enabled = bool(args.inception_score)
+        splits = int(args.inception_score_splits)
+        if is_enabled:
+            is_worker = get_is_worker()
+            is_sum_probs = np.zeros((splits, 1000), dtype=np.float64)
+            is_sum_p_log_p = np.zeros((splits,), dtype=np.float64)
+            is_count = np.zeros((splits,), dtype=np.int64)
+        produced = 0
+        chunk_idx = 0
+        eval_rng = jax.vmap(
+            lambda key: jax.random.fold_in(key, jnp.uint32(step & 0xFFFFFFFF))
+        )(rng)
+        while produced < need:
+            valid = min(global_b, need - produced)
+            class_rng, sample_rng = make_eval_chunk_rngs(eval_rng, chunk_idx)
+            classes = jax.random.randint(class_rng, (num_devices, local_b), 0, 1000)
+            latents_sharded = fid_sample_latents_pmapped(ema_params, classes, sample_rng)
+            imgs_sharded = decode_latents_sharded(latents_sharded)
+            if is_enabled:
+                # Device->host exactly once per batch (uint8) and trim pads by `valid`.
+                imgs_u8 = (imgs_sharded * 255.0).clip(0, 255).astype(jnp.uint8)
+                imgs_host = np.asarray(jax.device_get(imgs_u8), dtype=np.uint8).reshape(global_b, 256, 256, 3)
+                imgs_host = imgs_host[:valid]
+                res = is_worker.infer(imgs_host)
+                probs = np.asarray(res.probs, dtype=np.float64)  # (valid, 1000)
+                # Assign samples to splits by global index within this eval window
+                base = produced
+                for i in range(valid):
+                    split_id = int(((base + i) * splits) // need)
+                    p = probs[i]
+                    is_sum_probs[split_id] += p
+                    # sum_y p log p (avoid log(0))
+                    is_sum_p_log_p[split_id] += float(np.sum(p * np.log(np.maximum(p, 1e-12))))
+                    is_count[split_id] += 1
+            pooled, spatial, valid_mask = apply_inception_to_decoded_sharded(
+                imgs_sharded,
+                inception_fn,
+                mode="pooled+spatial",
+                valid_global=valid,
+            )
+            acc_fake_pooled, acc_fake_spatial = _update_accumulators(
+                acc_fake_pooled, acc_fake_spatial, pooled, spatial, valid_mask
+            )
+            if pr_fake_sampler is not None:
+                pr_fake_sampler.add(trim_sharded_batch_to_host(pooled, valid).reshape(valid, -1))
+            produced += valid
+            chunk_idx += 1
 
-        gen_acts = imgs_to_acts(gen_imgs[:args.num_fid_samples], inception_fn)
-        fid_val = fid_from_stats(
-            mu_real, sigma_real,
-            np.mean(gen_acts, 0), np.cov(gen_acts, rowvar=False),
+        mu_f, cov_f, _ = finalize_gaussian_sums(acc_fake_pooled)
+        mu_fs, cov_fs, _ = finalize_gaussian_sums(acc_fake_spatial)
+
+        fid_val = fid_from_stats(mu_real, cov_real, mu_f, cov_f)
+        sfid_val = fid_from_stats(mu_real_s, cov_real_s, mu_fs, cov_fs)
+
+        metrics = {"val/FID": fid_val, "val/sFID": sfid_val, "train/step": step}
+        if pr_enabled:
+            pr_mode = real.get("pr", {}).get("mode", pr_mode)
+            pr_real = real.get("pr", {}).get("real_feats", None)
+            pr_fake = pr_fake_sampler.get() if pr_fake_sampler is not None else None
+            metrics["val/PR_mode"] = pr_mode
+            metrics["val/PR_eval_samples"] = int(pr_eval_samples)
+            if pr_real is not None and pr_fake is not None and pr_real.shape[0] >= (pr_k + 2) and pr_fake.shape[0] >= (pr_k + 2):
+                prec, rec = precision_recall_knn(pr_real, pr_fake, k=pr_k, chunk=512)
+                metrics["val/Precision"] = float(prec)
+                metrics["val/Recall"] = float(rec)
+        if is_enabled:
+            # Compute IS per split: exp(E[p log p] - sum p log p_bar)
+            split_scores = []
+            for sid in range(splits):
+                n = int(is_count[sid])
+                if n <= 0:
+                    continue
+                p_bar = is_sum_probs[sid] / float(n)
+                h_pbar = float(np.sum(p_bar * np.log(np.maximum(p_bar, 1e-12))))
+                e_plogp = float(is_sum_p_log_p[sid] / float(n))
+                split_scores.append(float(np.exp(e_plogp - h_pbar)))
+            if split_scores:
+                metrics["val/InceptionScore"] = float(np.mean(split_scores))
+                if len(split_scores) > 1:
+                    metrics["val/InceptionScore_std"] = float(np.std(split_scores, ddof=1))
+        if args.linear_probe:
+            probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
+            W_repl, b_repl = get_probe_weights()
+            probe_fn = get_probe_pmapped(probe_layer)
+            correct_total = 0
+            count_total = 0
+            probe_iter = current_val_iter
+            for i in range(int(args.probe_eval_batches)):
+                if probe_iter is None:
+                    break
+                vbatch, probe_iter = next_validation_batch(
+                    probe_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                )
+                bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+                corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
+                correct_total += int(jax.device_get(corr[0]))
+                count_total += int(jax.device_get(tot[0]))
+            if count_total > 0:
+                metrics["val/LinearProbeAcc@1"] = float(correct_total / count_total)
+            current_val_iter = probe_iter
+
+        summary_parts = [f"[EVAL] step {step}:", f"FID={fid_val:.2f}", f"sFID={sfid_val:.2f}"]
+        if is_enabled and "val/InceptionScore" in metrics:
+            summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
+        if "val/Precision" in metrics and "val/Recall" in metrics:
+            summary_parts.append(
+                f"PR=({metrics['val/Precision']:.3f},{metrics['val/Recall']:.3f})[{metrics.get('val/PR_mode', pr_mode)} n={metrics.get('val/PR_eval_samples', pr_eval_samples)}]"
+            )
+        if "val/LinearProbeAcc@1" in metrics:
+            summary_parts.append(f"LP@1={metrics['val/LinearProbeAcc@1']:.4f}")
+        summary_parts.append(f"(n={need})")
+        log_stage("  ".join(summary_parts))
+        safe_wandb_log(metrics, step=step)
+        return current_val_iter
+
+    def compute_block_corr(step, val_data_iter):
+        """EMA block correlation diagnostic (cadence riêng)."""
+        if args.block_corr_freq <= 0:
+            return val_data_iter
+        if val_data_iter is None:
+            raise RuntimeError("block correlation requires --val-data-path")
+        bc_fn = get_blockcorr_pmapped()
+        block_batches = []
+        for i in range(int(args.block_corr_batches)):
+            vbatch, val_data_iter = next_validation_batch(
+                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            )
+            bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+            by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+            summaries = bc_fn(ema_params, bx, by)
+            summaries_h = np.asarray(jax.device_get(summaries), dtype=np.float32)
+            summaries_h = np.transpose(summaries_h, (1, 0, 2, 3))
+            summaries_h = summaries_h.reshape(summaries_h.shape[0], -1, summaries_h.shape[3])
+            block_batches.append(summaries_h)
+        if not block_batches:
+            return val_data_iter
+        stacked = np.concatenate(block_batches, axis=1)
+        corr = pearson_corrcoef_rows(stacked.reshape(stacked.shape[0], -1))
+        log_stage(
+            f"[BLOCKCORR] step {step}: computed {corr.shape[0]}x{corr.shape[1]} Pearson heatmap over {stacked.shape[1]} samples."
         )
-        log_stage(f"[FID] step {step}: FID = {fid_val:.2f} "
-                  f"(monitoring mode: {args.fid_num_steps} steps, {args.num_fid_samples} samples — "
-                  f"not paper-comparable at defaults)")
-        safe_wandb_log({"val/FID": fid_val, "train/step": step}, step=step)
+        log_blockcorr_async(corr.astype(np.float32), step=step)
+        return val_data_iter
 
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
@@ -1657,6 +2123,8 @@ def main():
             real_latents_patchified=preflight_real_latents,
             preflight_sample_count=args.preflight_sample_count,
             preflight_fid_samples=args.preflight_fid_samples,
+            inception_num_devices=num_devices,
+            inception_local_batch=args.fid_eval_local_batch,
         )
 
         if args.preflight_fid_memory_probe:
@@ -1714,12 +2182,15 @@ def main():
                 lambda_jepa_rep, ema_decay_rep,
             )
             global_step += 1
+            accumulated_train_tflops += flops_per_train_step / 1e12
 
             # Async metric logging
             if args.log_freq > 0 and global_step % args.log_freq == 0:
                 cpu_metrics = jax.tree_util.tree_map(lambda m: m[0], metrics)
                 t1 = time.time()
                 cpu_metrics["perf/train_step_time"] = (t1 - t0) / args.log_freq
+                cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
+                cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
@@ -1748,9 +2219,15 @@ def main():
             # Synchronous FID (blocks training; see compute_fid docstring)
             if args.fid_freq > 0 and global_step % args.fid_freq == 0:
                 try:
-                    compute_fid(global_step, val_iterator)
+                    val_iterator = compute_eval_metrics(global_step, val_iterator)
                 except Exception as exc:
-                    log_stage(f"FID skipped: {exc}")
+                    log_stage(f"EVAL skipped: {exc}")
+
+            if args.block_corr_freq > 0 and global_step % args.block_corr_freq == 0:
+                try:
+                    val_iterator = compute_block_corr(global_step, val_iterator)
+                except Exception as exc:
+                    log_stage(f"BLOCKCORR skipped: {exc}")
 
             # Sample preview: uses EMA params and configurable num_steps
             if args.sample_freq > 0 and global_step % args.sample_freq == 0:
@@ -1795,6 +2272,8 @@ def main():
     )
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
+    if _is_worker[0] is not None:
+        _is_worker[0].shutdown()
     logger.shutdown()
 
 
