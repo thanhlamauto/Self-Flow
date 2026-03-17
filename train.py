@@ -1134,6 +1134,16 @@ def main():
         default=True,
         help="Enable Inception Score (runs torchvision Inception-v3 in an isolated subprocess).",
     )
+    parser.add_argument(
+        "--inception-score-weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional local path to torchvision Inception-v3 weights "
+            "(e.g. inception_v3_google-0cc3c7bd.pth). If set, the IS worker "
+            "loads this file directly instead of downloading weights."
+        ),
+    )
     parser.add_argument("--inception-score-splits", type=int, default=10)
     parser.add_argument(
         "--precision-recall",
@@ -1426,7 +1436,7 @@ def main():
     def get_is_worker():
         if _is_worker[0] is None:
             log_stage("Spawning torchvision Inception-v3 worker for Inception Score…")
-            _is_worker[0] = InceptionISSubprocess()
+            _is_worker[0] = InceptionISSubprocess(weights_path=args.inception_score_weights)
             log_stage("Inception Score worker ready.")
         return _is_worker[0]
 
