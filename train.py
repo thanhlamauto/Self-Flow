@@ -1289,6 +1289,29 @@ def main():
                         help="Log block similarity every N steps (default: 50000)")
     parser.add_argument("--block-sim-timesteps", type=str, default="1,4,8,32,64,127",
                         help="Comma-separated list of timestep indices to log similarity at (default: 1,4,8,32,64,127)")
+    # ── Evaluation Metrics args ───────────────────────────────────────────────
+    parser.add_argument("--enable-is", action="store_true",
+                        help="Enable Inception Score (IS) evaluation")
+    parser.add_argument("--enable-sfid", action="store_true",
+                        help="Enable Spatial FID (sFID) evaluation")
+    parser.add_argument("--enable-precision-recall", action="store_true",
+                        help="Enable Precision/Recall evaluation")
+    parser.add_argument("--enable-linear-probe", action="store_true",
+                        help="Enable linear probe accuracy evaluation (expensive)")
+    parser.add_argument("--is-freq", type=int, default=10000,
+                        help="Compute IS every N steps (default: 10000)")
+    parser.add_argument("--sfid-freq", type=int, default=10000,
+                        help="Compute sFID every N steps (default: 10000)")
+    parser.add_argument("--pr-freq", type=int, default=10000,
+                        help="Compute Precision/Recall every N steps (default: 10000)")
+    parser.add_argument("--linear-probe-freq", type=int, default=50000,
+                        help="Compute linear probe accuracy every N steps (default: 50000, expensive)")
+    parser.add_argument("--metrics-num-samples", type=int, default=50000,
+                        help="Number of samples for evaluation metrics (default: 50000)")
+    parser.add_argument("--cache-real-features", action="store_true",
+                        help="Cache real image features to avoid recomputation")
+    parser.add_argument("--metrics-cache-dir", type=str, default="./eval_cache",
+                        help="Directory to cache evaluation features")
     args = parser.parse_args()
 
     if args.preflight_only:
