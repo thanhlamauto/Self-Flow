@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import sys
+import time
 import threading
 import struct
 import pickle
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 
 _WORKER_SCRIPT = r"""\
@@ -24,12 +26,20 @@ except Exception as exc:
     raise
 
 try:
-    weights = Inception_V3_Weights.IMAGENET1K_V1
+    weights_path = sys.argv[1] if len(sys.argv) > 1 else ""
     # Torchvision weight loading validates constructor kwargs against the
     # pretrained metadata. For Inception-v3 that means aux_logits must match
     # the weights recipe at construction time, even though eval() later returns
     # only the main logits.
-    model = inception_v3(weights=weights, transform_input=False, aux_logits=True)
+    if weights_path:
+        model = inception_v3(weights=None, transform_input=False, aux_logits=True)
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state)
+    else:
+        weights = Inception_V3_Weights.IMAGENET1K_V1
+        model = inception_v3(weights=weights, progress=False, transform_input=False, aux_logits=True)
     model.eval()
     sys.stdout.buffer.write(b"READY\n")
 except Exception as exc:
@@ -99,12 +109,19 @@ class InceptionISSubprocess:
       - Reply:   8-byte length + pickle(('ok', logits, probs) | ('error', msg))
     """
 
-    def __init__(self):
+    def __init__(self, weights_path: Optional[str] = None):
         import subprocess
 
         self._stderr_tail = deque(maxlen=50)
+        self._startup_stdout = deque(maxlen=20)
+        worker_args = [sys.executable, "-u", "-c", _WORKER_SCRIPT]
+        if weights_path:
+            self._weights_path = os.fspath(weights_path)
+            worker_args.append(self._weights_path)
+        else:
+            self._weights_path = None
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", "-c", _WORKER_SCRIPT],
+            worker_args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -113,14 +130,31 @@ class InceptionISSubprocess:
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
 
-        ready = self._proc.stdout.readline().decode(errors="replace").strip()
+        ready = self._wait_ready()
         if ready != "READY":
             tail = "\n".join(self._stderr_tail)
+            startup = "\n".join(self._startup_stdout)
             raise RuntimeError(
                 "Inception IS worker failed to start.\n"
                 f"stdout: {ready!r}\n"
+                f"startup_stdout:\n{startup}\n"
                 f"stderr_tail:\n{tail}"
             )
+
+    def _wait_ready(self, timeout_s: float = 300.0) -> str:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._proc.poll() is not None:
+                return "<process exited>"
+            if time.monotonic() > deadline:
+                return "<startup timeout>"
+            line = self._proc.stdout.readline()
+            if not line:
+                continue
+            text = line.decode(errors="replace").strip()
+            self._startup_stdout.append(text)
+            if text == "READY" or text.startswith("ERROR "):
+                return text
 
     def _drain_stderr(self):
         try:
