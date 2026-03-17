@@ -25,7 +25,11 @@ except Exception as exc:
 
 try:
     weights = Inception_V3_Weights.IMAGENET1K_V1
-    model = inception_v3(weights=weights, transform_input=False, aux_logits=False)
+    # Torchvision weight loading validates constructor kwargs against the
+    # pretrained metadata. For Inception-v3 that means aux_logits must match
+    # the weights recipe at construction time, even though eval() later returns
+    # only the main logits.
+    model = inception_v3(weights=weights, transform_input=False, aux_logits=True)
     model.eval()
     sys.stdout.buffer.write(b"READY\n")
 except Exception as exc:
@@ -66,7 +70,8 @@ while True:
         x = F.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
         x = (x - mean) / std
         with torch.no_grad():
-            logits = model(x)
+            out = model(x)
+            logits = out.logits if hasattr(out, "logits") else out
             probs = torch.softmax(logits, dim=1)
         logits_np = logits.cpu().numpy().astype(np.float32)
         probs_np = probs.cpu().numpy().astype(np.float32)
@@ -161,4 +166,3 @@ class InceptionISSubprocess:
                 self._proc.kill()
             except Exception:
                 pass
-
