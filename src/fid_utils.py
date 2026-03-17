@@ -43,17 +43,44 @@ Dtype = Any
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_fid_network():
-    """Build and pmap-wrap InceptionV3 with pretrained weights.
+    """Backward-compatible pooled-only Inception for FID.
 
-    Returns a callable:  apply_fn(imgs) where imgs has shape
+    Returns a callable: apply_fn(imgs) where imgs has shape
     (n_devices, batch, 299, 299, 3) with pixel values in [-1, 1].
     Returns activations of shape (n_devices, batch, 1, 1, 2048).
     """
+    apply_fn = get_inception_network(mode="pooled")
+
+    def _pooled_only(imgs):
+        out = apply_fn(imgs)
+        # mode="pooled" returns pooled activations already.
+        return out
+
+    return _pooled_only
+
+
+def get_inception_network(mode: str = "pooled"):
+    """Build and pmap-wrap InceptionV3 with pretrained weights.
+
+    Args:
+        mode:
+          - "pooled": returns pooled activations, shape (n_devices, batch, 1, 1, 2048)
+          - "pooled+spatial": returns (pooled, spatial) where
+              pooled  shape (n_devices, batch, 1, 1, 2048)
+              spatial shape (n_devices, batch, H, W, 2048) (pre-GAP)
+
+    Input imgs: (n_devices, batch, 299, 299, 3) in [-1, 1]
+    """
+    mode = str(mode)
+    if mode not in ("pooled", "pooled+spatial"):
+        raise ValueError(f"Unsupported mode {mode!r}; expected 'pooled' or 'pooled+spatial'")
+
+    return_spatial = mode == "pooled+spatial"
     model = InceptionV3(pretrained=True)
     rng = jax.random.PRNGKey(0)
-    params = model.init(rng, jnp.ones((1, 299, 299, 3)))
+    params = model.init(rng, jnp.ones((1, 299, 299, 3)), return_spatial=return_spatial)
     params = flax.jax_utils.replicate(params, devices=jax.local_devices())
-    apply_fn = jax.pmap(functools.partial(model.apply, train=False))
+    apply_fn = jax.pmap(functools.partial(model.apply, train=False, return_spatial=return_spatial))
     return functools.partial(apply_fn, params)
 
 
@@ -373,7 +400,7 @@ class InceptionV3(nn.Module):
             self.params_dict = None
 
     @nn.compact
-    def __call__(self, x, train=True):
+    def __call__(self, x, train=True, return_spatial: bool = False):
         pd = self.params_dict
         x = _BasicConv2d(32, (3, 3), strides=(2, 2), params_dict=_get(pd, "Conv2d_1a_3x3"), dtype=self.dtype)(x, train)
         x = _BasicConv2d(32, (3, 3), params_dict=_get(pd, "Conv2d_2a_3x3"), dtype=self.dtype)(x, train)
@@ -394,5 +421,8 @@ class InceptionV3(nn.Module):
         x = _InceptionD(_get(pd, "Mixed_7a"), self.dtype)(x, train)
         x = _InceptionE(_avg_pool, _get(pd, "Mixed_7b"), self.dtype)(x, train)
         x = _InceptionE(nn.max_pool, _get(pd, "Mixed_7c"), self.dtype)(x, train)
-        x = jnp.mean(x, axis=(1, 2), keepdims=True)
-        return x
+        spatial = x
+        pooled = jnp.mean(spatial, axis=(1, 2), keepdims=True)
+        if return_spatial:
+            return pooled, spatial
+        return pooled
