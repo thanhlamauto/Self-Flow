@@ -119,6 +119,20 @@ def test_eval_chunk_rngs_are_unique():
     assert not np.array_equal(np.asarray(jax.device_get(s0)), np.asarray(jax.device_get(s1)))
 
 
+def test_batched_class_rng_sampling_runs():
+    local_b = 4
+    base = jax.random.split(jax.random.PRNGKey(0), jax.device_count())
+    class_rng, _ = make_eval_chunk_rngs(base, 0)
+    classes = jax.vmap(
+        lambda key: jax.random.randint(key, (local_b,), 0, 1000),
+        in_axes=0,
+    )(class_rng)
+    host = np.asarray(jax.device_get(classes))
+    assert host.shape == (jax.device_count(), local_b)
+    assert np.all(host >= 0)
+    assert np.all(host < 1000)
+
+
 def test_inception_score_helper_runs():
     probs = np.full((20, 5), 0.2, dtype=np.float32)
     is_mean, is_std, split_scores = inception_score_from_probs(probs, splits=5)
@@ -135,5 +149,6 @@ if __name__ == "__main__":
     test_reservoir_sampler_deterministic()
     test_pearson_corr_rows()
     test_eval_chunk_rngs_are_unique()
+    test_batched_class_rng_sampling_runs()
     test_inception_score_helper_runs()
     print("OK")
