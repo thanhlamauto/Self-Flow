@@ -1706,38 +1706,67 @@ def main():
         gen_imgs_uint8 = np.array([(img * 255).clip(0, 255).astype(np.uint8) for img in gen_imgs[:args.num_fid_samples]])
         real_imgs_uint8 = np.array([(img * 255).clip(0, 255).astype(np.uint8) for img in real_imgs[:args.num_fid_samples]])
 
-        # Inception Score
+        # Create wrapper for pmapped inception that metrics can use
+        def inception_wrapper_for_metrics(images_float32):
+            """
+            Wrapper for pmapped inception_fn that handles batching for metrics.
+
+            Note: The current InceptionV3 model only returns pool3 features (2048-dim).
+            It does NOT support return_logits or return_spatial parameters.
+
+            Args:
+                images_float32: numpy array [N, H, W, C] in range [0, 1]
+
+            Returns:
+                features: [N, 2048] pool3 features
+            """
+            n_images = images_float32.shape[0]
+            all_features = []
+
+            for start in range(0, n_images, num_devices):
+                chunk = images_float32[start:start + num_devices]
+
+                # Pad chunk if needed
+                if len(chunk) < num_devices:
+                    padding = [chunk[-1]] * (num_devices - len(chunk))
+                    chunk = np.concatenate([chunk, np.stack(padding)], axis=0)
+
+                # Resize to 299x299 and normalize to [-1, 1]
+                imgs_299 = np.stack([
+                    np.array(jax.image.resize(
+                        img.astype(np.float32) * 2.0 - 1.0,
+                        (299, 299, img.shape[-1]), method="bilinear"
+                    )) for img in chunk
+                ])
+
+                # Add batch dimension for pmap: [num_devices, 1, 299, 299, 3]
+                imgs_batch = imgs_299[:, None]
+
+                # Call pmapped inception: output is [num_devices, 1, 1, 1, 2048]
+                feats = np.array(inception_fn(imgs_batch)).reshape(num_devices, 2048)
+                all_features.append(feats)
+
+            # Concatenate and trim to original size
+            features = np.concatenate(all_features, axis=0)[:n_images]
+            return features
+
+        # Inception Score - DISABLED (requires logits, not available in current inception model)
         if args.enable_is and step % args.is_freq == 0:
-            from metrics import compute_inception_score
-            log_stage(f"[IS] Computing Inception Score at step {step}...")
-            try:
-                is_mean, is_std = compute_inception_score(
-                    gen_imgs_uint8, inception_fn, batch_size=256, splits=10
-                )
-                metrics_dict["val/IS_mean"] = is_mean
-                metrics_dict["val/IS_std"] = is_std
-                log_stage(f"[IS] step {step}: IS = {is_mean:.2f} ± {is_std:.2f}")
-            except Exception as e:
-                log_stage(f"[IS] Error: {e}")
+            log_stage(f"[IS] Inception Score is not available - current InceptionV3 model only returns pool3 features, not logits.")
+            log_stage(f"[IS] To enable IS, modify InceptionV3 to return logits before the final pooling layer.")
 
-        # Spatial FID
+        # Spatial FID - DISABLED (requires intermediate spatial features, not available in current model)
         if args.enable_sfid and step % args.sfid_freq == 0:
-            from metrics import compute_sfid
-            log_stage(f"[sFID] Computing Spatial FID at step {step}...")
-            try:
-                sfid_val = compute_sfid(real_imgs_uint8, gen_imgs_uint8, inception_fn, batch_size=256)
-                metrics_dict["val/sFID"] = sfid_val
-                log_stage(f"[sFID] step {step}: sFID = {sfid_val:.2f}")
-            except Exception as e:
-                log_stage(f"[sFID] Error: {e}")
+            log_stage(f"[sFID] Spatial FID is not available - current InceptionV3 model only returns pool3 features.")
+            log_stage(f"[sFID] To enable sFID, modify InceptionV3 to return features from Mixed_6e layer.")
 
-        # Precision/Recall
+        # Precision/Recall - Uses pool3 features from inception
         if args.enable_precision_recall and step % args.pr_freq == 0:
             from metrics import compute_precision_recall
             log_stage(f"[P/R] Computing Precision/Recall at step {step}...")
             try:
                 precision, recall = compute_precision_recall(
-                    real_imgs_uint8, gen_imgs_uint8, inception_fn, k=3, batch_size=256
+                    real_imgs_uint8, gen_imgs_uint8, inception_wrapper_for_metrics, k=3, batch_size=256
                 )
                 metrics_dict["val/precision"] = precision
                 metrics_dict["val/recall"] = recall
