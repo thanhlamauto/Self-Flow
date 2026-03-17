@@ -1894,7 +1894,10 @@ def main():
         while produced < need:
             valid = min(global_b, need - produced)
             class_rng, sample_rng = make_eval_chunk_rngs(eval_rng, chunk_idx)
-            classes = jax.random.randint(class_rng, (num_devices, local_b), 0, 1000)
+            classes = jax.vmap(
+                lambda key: jax.random.randint(key, (local_b,), 0, 1000),
+                in_axes=0,
+            )(class_rng)
             latents_sharded = fid_sample_latents_pmapped(ema_params, classes, sample_rng)
             imgs_sharded = decode_latents_sharded(latents_sharded)
             if is_enabled:
