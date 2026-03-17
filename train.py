@@ -1555,6 +1555,7 @@ def main():
 
     # Real image Inception activations cached so we only decode real images once
     _fid_real_acts = [None]
+    _fid_real_imgs = [None]  # Cache decoded real images for metrics
 
     def imgs_to_acts(imgs_nhwc, inception_fn):
         imgs = list(imgs_nhwc)
@@ -1670,6 +1671,10 @@ def main():
             log_stage(f"[FID] {len(real_imgs)} real images decoded.")
             real_acts = imgs_to_acts(real_imgs[:args.num_fid_samples], inception_fn)
             _fid_real_acts[0] = (np.mean(real_acts, 0), np.cov(real_acts, rowvar=False))
+            _fid_real_imgs[0] = real_imgs[:args.num_fid_samples]  # Cache real images for metrics
+        else:
+            # Load cached real images
+            real_imgs = _fid_real_imgs[0]
 
         mu_real, sigma_real = _fid_real_acts[0]
 
