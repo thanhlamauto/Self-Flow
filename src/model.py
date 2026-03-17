@@ -261,10 +261,18 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_block_tokens: bool = False,
         deterministic: bool = True,
     ):
-        """Forward pass with compatibility mode handling."""
+        """Forward pass with compatibility mode handling.
+
+        Args:
+            return_block_tokens: If True, return output tokens of ALL blocks
+                                for block-wise similarity analysis. Cannot be
+                                combined with return_features or return_raw_features.
+        """
         assert not (return_raw_features and return_features)
+        assert not (return_block_tokens and (return_features or return_raw_features))
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -302,18 +310,23 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        block_tokens = [] if return_block_tokens else None
+
         for i in range(self.depth):
             x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
-            
+
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
                 zs = x
+            elif return_block_tokens:
+                # Collect output tokens from each block for similarity analysis
+                block_tokens.append(x)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -323,12 +336,14 @@ class SelfFlowDiT(nn.Module):
         )(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
         if return_features or return_raw_features:
             return x, zs
+        elif return_block_tokens:
+            return x, block_tokens
         return x
 
     def _shufflechannel(self, x):

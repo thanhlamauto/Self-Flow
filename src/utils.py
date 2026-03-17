@@ -202,3 +202,46 @@ def scatter_ids_to_times(x_ids: jax.Array):
         t_ids = pos[:, 0].astype(jnp.int32)
         return ids_to_times(jnp.unique(t_ids))
     return jax.vmap(single_times)(x_ids)
+
+
+def compute_block_cosine_similarity_matrix(block_tokens):
+    """Compute pairwise cosine similarity matrix between block outputs.
+
+    This function computes the cosine similarity between features at the same
+    spatial position (patch index) across different blocks, then averages over
+    batch and spatial dimensions.
+
+    Args:
+        block_tokens: List of block output tensors, each with shape [B, N, D]
+                     where B=batch, N=num_patches, D=hidden_dim
+                     Length of list = L (number of blocks)
+
+    Returns:
+        sim_mat: [L, L] cosine similarity matrix, where sim_mat[a, b] is the
+                average cosine similarity between block a and block b across
+                all patches and batch samples
+
+    Example:
+        For DiT-XL with 28 blocks, returns a [28, 28] symmetric matrix where
+        diagonal values ≈ 1.0 (self-similarity).
+    """
+    if not block_tokens:
+        raise ValueError("block_tokens list is empty")
+
+    # Stack block outputs: [L, B, N, D]
+    H = jnp.stack(block_tokens, axis=0)
+    L, B, N, D = H.shape
+
+    # Normalize along hidden dimension D -> unit vectors
+    H_norm = H / (jnp.linalg.norm(H, axis=-1, keepdims=True) + 1e-8)
+
+    # Compute pairwise cosine similarity
+    # H_norm[a]: [B, N, D], H_norm[b]: [B, N, D]
+    # sim[a, b] = (H_norm[a] * H_norm[b]).sum(dim=-1) -> [B, N]
+    # Use einsum: "abnd,cbnd->acbn" where a,c are block indices, b is batch, n is patch
+    sim = jnp.einsum('lbnd,mbnd->lmbn', H_norm, H_norm)  # [L, L, B, N]
+
+    # Average over batch (B) and patches (N) -> [L, L]
+    sim_mat = jnp.mean(sim, axis=(2, 3))
+
+    return sim_mat

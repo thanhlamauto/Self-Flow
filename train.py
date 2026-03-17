@@ -482,6 +482,30 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+# ── SRA alignment loss helpers ────────────────────────────────────────────────
+
+def compute_align_loss(student_feat, teacher_feat, loss_type="sml1"):
+    """Compute alignment loss between student and teacher features.
+
+    Args:
+        student_feat: [B, N, D] student feature tensor
+        teacher_feat: [B, N, D] teacher feature tensor
+        loss_type: "sml1" (smooth L1), "l1", or "l2"
+
+    Returns:
+        Scalar alignment loss
+    """
+    if loss_type == "sml1":
+        # Smooth L1 (Huber loss) with beta=0.05 matching SRA paper
+        return jnp.mean(optax.huber_loss(student_feat, teacher_feat, delta=0.05))
+    elif loss_type == "l1":
+        return jnp.mean(jnp.abs(student_feat - teacher_feat))
+    elif loss_type == "l2":
+        return jnp.mean((student_feat - teacher_feat) ** 2)
+    else:
+        raise ValueError(f"Unknown align loss type: {loss_type}")
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
@@ -544,6 +568,114 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
+def train_step_sra(
+    state, ema_params, batch, rng, ema_decay, block_out_s, block_out_t, t_max,
+    align_weight, align_loss_type,
+):
+    """SRA training step with EMA teacher alignment loss.
+
+    SRA (Self-Rectifying Alignment) adds a representation alignment loss between
+    student (shallow layer) and teacher (deeper layer, EMA params, cleaner timestep).
+
+    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
+      Student: x_tau   = (1 - tau) * x1 + tau * x0, timestep tau
+      Teacher: x_tau_t = (1 - tau_t) * x1 + tau_t * x0, timestep tau_t = tau + delta
+               (teacher is at a CLEANER timestep, closer to x0)
+
+    Args:
+        block_out_s: Student block index (shallow, e.g., 8)
+        block_out_t: Teacher block index (deeper, e.g., 20)
+        t_max: Maximum teacher time offset (e.g., 0.2)
+        align_weight: Weight for alignment loss
+        align_loss_type: "sml1", "l1", or "l2"
+    """
+    x0, y = batch  # x0: [local_B, N, D], y: [local_B]
+    local_batch = x0.shape[0]
+
+    rng, tau_rng, noise_rng, delta_rng, drop_rng = jax.random.split(rng, 5)
+
+    # Sample timesteps for student and teacher
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
+    delta = jax.random.uniform(delta_rng, shape=(local_batch,), minval=0.0, maxval=t_max)  # [B]
+    tau_teacher = jnp.clip(tau + delta, 0.0, 1.0)  # Teacher at cleaner time
+
+    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+
+    # Student input/target
+    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    target = x0 - x1
+
+    # Teacher input (same noise, cleaner timestep)
+    x_tau_teacher = (1.0 - tau_teacher[:, None, None]) * x1 + tau_teacher[:, None, None] * x0
+
+    # Teacher forward pass (no gradient, EMA params, deeper layer raw features)
+    _, z_teacher = state.apply_fn(
+        {"params": ema_params},
+        x_tau_teacher,
+        timesteps=tau_teacher,
+        vector=y,
+        deterministic=True,
+        return_raw_features=block_out_t,
+    )
+    z_teacher = jax.lax.stop_gradient(z_teacher)
+
+    def loss_fn(params):
+        # Student forward pass (trainable params, shallow layer projected features)
+        pred, z_student = state.apply_fn(
+            {"params": params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+            return_features=block_out_s,
+        )
+
+        # Denoising loss (vanilla SiT objective)
+        denoise_loss = jnp.mean((pred - target) ** 2)
+
+        # Alignment loss (student features → teacher features)
+        align_loss = compute_align_loss(z_student, z_teacher, align_loss_type)
+
+        # Total loss
+        total_loss = denoise_loss + align_weight * align_loss
+
+        v_abs_mean = jnp.mean(jnp.abs(target))
+        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+
+        return total_loss, (denoise_loss, align_loss, v_abs_mean, v_pred_abs_mean)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (total_loss, (denoise_loss, align_loss, v_abs, v_pred)), grads = grad_fn(state.params)
+
+    # Synchronize across devices
+    total_loss = jax.lax.pmean(total_loss, axis_name="batch")
+    denoise_loss = jax.lax.pmean(denoise_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    grads = jax.lax.pmean(grads, axis_name="batch")
+
+    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+
+    state = state.apply_gradients(grads=grads)
+    ema_params = ema_update(ema_params, state.params, ema_decay)
+
+    metrics = {
+        "train/loss": total_loss,
+        "train/denoise_loss": denoise_loss,
+        "train/align_loss": align_loss,
+        "train/ema_decay": ema_decay,
+        "train/grad_norm": grad_norm,
+        "train/param_norm": param_norm,
+        "train/v_abs_mean": v_abs,
+        "train/v_pred_abs_mean": v_pred,
+        "train/align_weight": align_weight,
+    }
+    return state, ema_params, metrics, rng
+
+
 def eval_step(
     state, ema_params, batch, rng,
 ):
@@ -576,6 +708,78 @@ def eval_step(
 
     metrics = {
         "val/loss": loss,
+        "val/v_abs_mean": v_abs_mean,
+        "val/v_pred_abs_mean": v_pred_abs_mean,
+    }
+    return metrics, rng
+
+
+def eval_step_sra(
+    state, ema_params, batch, rng, block_out_s, block_out_t, t_max,
+    align_weight, align_loss_type,
+):
+    """SRA validation step with EMA teacher alignment loss (no gradients).
+
+    Mirrors train_step_sra but in eval mode (deterministic, no grads).
+    """
+    x0, y = batch
+    local_batch = x0.shape[0]
+
+    rng, tau_rng, noise_rng, delta_rng = jax.random.split(rng, 4)
+
+    # Sample timesteps
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+    delta = jax.random.uniform(delta_rng, shape=(local_batch,), minval=0.0, maxval=t_max)
+    tau_teacher = jnp.clip(tau + delta, 0.0, 1.0)
+
+    x1 = jax.random.normal(noise_rng, x0.shape)
+
+    # Student input/target
+    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    target = x0 - x1
+
+    # Teacher input
+    x_tau_teacher = (1.0 - tau_teacher[:, None, None]) * x1 + tau_teacher[:, None, None] * x0
+
+    # Teacher forward (EMA params, deeper layer)
+    _, z_teacher = state.apply_fn(
+        {"params": ema_params},
+        x_tau_teacher,
+        timesteps=tau_teacher,
+        vector=y,
+        deterministic=True,
+        return_raw_features=block_out_t,
+    )
+
+    # Student forward (online params, shallow layer)
+    pred, z_student = state.apply_fn(
+        {"params": state.params},
+        x_tau,
+        timesteps=tau,
+        vector=y,
+        deterministic=True,
+        return_features=block_out_s,
+    )
+
+    # Compute losses
+    denoise_loss = jnp.mean((pred - target) ** 2)
+    align_loss = compute_align_loss(z_student, z_teacher, align_loss_type)
+    total_loss = denoise_loss + align_weight * align_loss
+
+    v_abs_mean = jnp.mean(jnp.abs(target))
+    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+
+    # Synchronize across devices
+    total_loss = jax.lax.pmean(total_loss, axis_name="batch")
+    denoise_loss = jax.lax.pmean(denoise_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+    v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
+    v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+
+    metrics = {
+        "val/loss": total_loss,
+        "val/denoise_loss": denoise_loss,
+        "val/align_loss": align_loss,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -702,6 +906,91 @@ class AsyncWandbLogger:
             return
         self.queue.put(None)
         self.thread.join()
+
+
+def analyze_block_similarities_at_timesteps(
+    model_apply_fn, params, class_labels, latent_shape, timestep_indices, cfg_scale=1.0
+):
+    """Analyze block-wise cosine similarities at specific noise levels.
+
+    Instead of full sampling, runs forward passes at specific timestep indices
+    (which correspond to noise levels from 0 to num_steps-1) and collects
+    block token outputs for similarity analysis.
+
+    Args:
+        model_apply_fn: Model's apply function
+        params: Model parameters (EMA params for stable analysis)
+        class_labels: [batch_size] class labels
+        latent_shape: (batch, channels, h, w) shape for initial noise
+        timestep_indices: List of timestep indices to analyze (e.g., [1,4,8,32,64,127])
+        cfg_scale: CFG scale (if > 1.0, will concatenate uncond/cond)
+
+    Returns:
+        similarities: List of [L, L] similarity matrices, one per timestep
+        timesteps_used: Actual timestep values (tau) used
+    """
+    from src.utils import compute_block_cosine_similarity_matrix
+    from einops import rearrange
+
+    batch_size, channels, h, w = latent_shape
+    patch_size = 2  # Hardcoded for current config
+    token_h = h // patch_size
+    token_w = w // patch_size
+
+    # Generate a fixed noise sample
+    rng = jax.random.PRNGKey(42)  # Fixed seed for reproducibility across runs
+    noise = jax.random.normal(rng, latent_shape)
+
+    # Patchify noise
+    noise_tokens = rearrange(
+        noise,
+        "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+        p1=patch_size,
+        p2=patch_size,
+    )
+
+    num_cfg_classes = 1001  # config['num_classes']
+    use_cfg = cfg_scale > 1.0
+
+    if use_cfg:
+        noise_tokens = jnp.concatenate([noise_tokens, noise_tokens], axis=0)
+        class_labels = jnp.concatenate(
+            [jnp.full_like(class_labels, num_cfg_classes - 1), class_labels],
+            axis=0,
+        )
+
+    similarities = []
+    timesteps_used = []
+
+    # Map timestep indices to tau values (0 to 1, where 0=noise, 1=clean)
+    # For 250 steps: t_idx 0 → tau=0/250, t_idx 127 → tau=127/250, etc.
+    max_idx = 249  # Assuming 250 total steps for mapping
+    for t_idx in timestep_indices:
+        # Convert timestep index to tau (noise level)
+        tau = jnp.array([t_idx / max_idx] * noise_tokens.shape[0])
+        timesteps_used.append(float(tau[0]))
+
+        # Forward pass with return_block_tokens=True
+        _, block_tokens = model_apply_fn(
+            {"params": params},
+            noise_tokens,
+            timesteps=tau,
+            vector=class_labels,
+            deterministic=True,
+            return_block_tokens=True,
+        )
+
+        # If using CFG, only analyze conditional branch
+        if use_cfg:
+            block_tokens_cond = [bt[batch_size:] for bt in block_tokens]
+        else:
+            block_tokens_cond = block_tokens
+
+        # Compute similarity matrix for this timestep
+        sim_mat = compute_block_cosine_similarity_matrix(block_tokens_cond)
+        similarities.append(sim_mat)
+
+    return similarities, timesteps_used
 
 
 def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
@@ -909,6 +1198,20 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    # ── SRA (Self-Rectifying Alignment) args ──────────────────────────────────
+    parser.add_argument("--use-sra", action="store_true",
+                        help="Enable SRA training with EMA teacher alignment loss")
+    parser.add_argument("--block-out-s", type=int, default=8,
+                        help="Student block index for feature extraction (shallow layer)")
+    parser.add_argument("--block-out-t", type=int, default=20,
+                        help="Teacher block index for feature extraction (deeper layer)")
+    parser.add_argument("--t-max", type=float, default=0.2,
+                        help="Maximum teacher timestep offset (teacher is at cleaner time)")
+    parser.add_argument("--align-loss-type", type=str, default="sml1",
+                        choices=["sml1", "l1", "l2"],
+                        help="Alignment loss type: sml1 (smooth L1), l1, or l2")
+    parser.add_argument("--align-weight", type=float, default=2.0,
+                        help="Weight for alignment loss")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -975,10 +1278,25 @@ def main():
                         help="Allow falling back to random mock batches when data is unavailable. "
                              "WARNING: mock batches are not suitable for real training. "
                              "Requires explicit opt-in to prevent silent failures.")
+    # ── Block-wise Similarity Logging args ────────────────────────────────────
+    parser.add_argument("--log-block-similarity", action="store_true",
+                        help="Log block-wise cosine similarity matrices during inference. "
+                             "Logs at specific timesteps (1,4,8,32,64,127) every --block-sim-log-freq steps.")
+    parser.add_argument("--block-sim-log-freq", type=int, default=50000,
+                        help="Log block similarity every N steps (default: 50000)")
+    parser.add_argument("--block-sim-timesteps", type=str, default="1,4,8,32,64,127",
+                        help="Comma-separated list of timestep indices to log similarity at (default: 1,4,8,32,64,127)")
     args = parser.parse_args()
 
     if args.preflight_only:
         args.preflight_checks = True
+
+    # Parse block similarity timesteps
+    if args.log_block_similarity:
+        args.block_sim_timesteps = [int(t.strip()) for t in args.block_sim_timesteps.split(',')]
+        log_stage(f"Block similarity logging enabled at timesteps: {args.block_sim_timesteps}")
+    else:
+        args.block_sim_timesteps = []
 
     # ── Argument validation ───────────────────────────────────────────────────
     if args.eval_batches <= 0:
@@ -1018,15 +1336,39 @@ def main():
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={config['depth']} heads={config['num_heads']}"
     )
-    log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
-    )
+    if args.use_sra:
+        log_stage("=" * 60)
+        log_stage("Training Mode: SiT-SRA (Self-Rectifying Alignment)")
+        log_stage("=" * 60)
+        log_stage(
+            f"SRA Config: block_out_s={args.block_out_s} block_out_t={args.block_out_t} "
+            f"t_max={args.t_max} align_loss={args.align_loss_type} align_weight={args.align_weight}"
+        )
+        log_stage(f"Optimizer: ema_decay={args.ema_decay} grad_clip={args.grad_clip}")
+    else:
+        log_stage("=" * 60)
+        log_stage("Training Mode: Vanilla SiT")
+        log_stage("=" * 60)
+        log_stage(f"Optimizer: ema_decay={args.ema_decay} grad_clip={args.grad_clip}")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
-        wandb.init(project=args.wandb_project, config=vars(args))
+        run_name = f"SiT-SRA-{args.model_size}" if args.use_sra else f"SiT-Vanilla-{args.model_size}"
+        tags = ["SiT-SRA", f"DiT-{args.model_size}"] if args.use_sra else ["Vanilla-SiT", f"DiT-{args.model_size}"]
+
+        wandb.init(
+            project=args.wandb_project,
+            config=vars(args),
+            name=run_name,
+            tags=tags,
+        )
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
+
+        # Log training mode explicitly
+        wandb.config.update({
+            "training_mode": "SiT-SRA" if args.use_sra else "Vanilla SiT",
+        })
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
@@ -1041,8 +1383,21 @@ def main():
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    if args.use_sra:
+        # SRA training with EMA teacher alignment
+        pmapped_train_step = jax.pmap(train_step_sra, axis_name="batch")
+        pmapped_eval_step = jax.pmap(eval_step_sra, axis_name="batch")
+
+        # Replicate SRA hyperparameters
+        block_out_s_rep = jax_utils.replicate(args.block_out_s)
+        block_out_t_rep = jax_utils.replicate(args.block_out_t)
+        t_max_rep = jax_utils.replicate(jnp.float32(args.t_max))
+        align_weight_rep = jax_utils.replicate(jnp.float32(args.align_weight))
+        align_loss_type_rep = args.align_loss_type  # String, no need to replicate
+    else:
+        # Vanilla SiT training
+        pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+        pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1352,10 +1707,17 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
-            )
+            # Training step (vanilla SiT or SRA)
+            if args.use_sra:
+                state, ema_params, metrics, rng = pmapped_train_step(
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep,
+                    block_out_s_rep, block_out_t_rep, t_max_rep,
+                    align_weight_rep, align_loss_type_rep,
+                )
+            else:
+                state, ema_params, metrics, rng = pmapped_train_step(
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                )
             global_step += 1
 
             # Async metric logging
@@ -1367,7 +1729,7 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation: vanilla SiT objective (no grads)
+            # Validation
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
@@ -1377,7 +1739,16 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+
+                    if args.use_sra:
+                        val_metrics, rng = pmapped_eval_step(
+                            state, ema_params, (val_x, val_y), rng,
+                            block_out_s_rep, block_out_t_rep, t_max_rep,
+                            align_weight_rep, align_loss_type_rep,
+                        )
+                    else:
+                        val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -1417,6 +1788,53 @@ def main():
                 threading.Thread(target=_bg_log,
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
+
+                # Block-wise similarity analysis
+                if args.log_block_similarity and global_step % args.block_sim_log_freq == 0:
+                    print(f"Step {global_step}: Analyzing block-wise similarities at timesteps {args.block_sim_timesteps}...")
+                    latent_size = config["input_size"]
+                    latent_channels = config["in_channels"]
+
+                    # Analyze block similarities (uses a fixed noise sample for reproducibility)
+                    similarities, timesteps_used = analyze_block_similarities_at_timesteps(
+                        model_apply_fn=state.apply_fn,
+                        params=single_ema_params,
+                        class_labels=sample_classes,
+                        latent_shape=(len(sample_classes), latent_channels, latent_size, latent_size),
+                        timestep_indices=args.block_sim_timesteps,
+                        cfg_scale=args.sample_cfg_scale,
+                    )
+
+                    # Log similarity matrices to WandB
+                    for t_idx, (sim_mat, tau_val) in enumerate(zip(similarities, timesteps_used)):
+                        sim_mat_np = np.asarray(jax.device_get(sim_mat), dtype=np.float32)
+
+                        # Log as heatmap image
+                        import matplotlib
+                        matplotlib.use('Agg')
+                        import matplotlib.pyplot as plt
+
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        im = ax.imshow(sim_mat_np, cmap='viridis', vmin=0, vmax=1)
+                        ax.set_title(f"Block Similarity Matrix (timestep_idx={args.block_sim_timesteps[t_idx]}, tau={tau_val:.3f})")
+                        ax.set_xlabel("Block Index")
+                        ax.set_ylabel("Block Index")
+                        plt.colorbar(im, ax=ax, label="Cosine Similarity")
+
+                        safe_wandb_log({
+                            f"block_similarity/timestep_idx_{args.block_sim_timesteps[t_idx]}": wandb.Image(fig),
+                            "train/step": global_step,
+                        }, step=global_step)
+                        plt.close(fig)
+
+                    # Also log the full tensor for advanced analysis
+                    all_sims = np.stack([np.asarray(jax.device_get(s), dtype=np.float32) for s in similarities], axis=0)
+                    safe_wandb_log({
+                        "block_similarity/all_matrices": wandb.Histogram(all_sims),
+                        "train/step": global_step,
+                    }, step=global_step)
+
+                    print(f"Step {global_step}: Block similarity analysis complete.")
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
