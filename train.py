@@ -1385,23 +1385,25 @@ def main():
     # ── Build pmapped training/eval steps ────────────────────────────────────
     if args.use_sra:
         # SRA training with EMA teacher alignment
-        # Use functools.partial to bake static args (strings, integers) before pmap
-        import functools
-        train_step_sra_partial = functools.partial(
-            train_step_sra,
-            block_out_s=args.block_out_s,
-            block_out_t=args.block_out_t,
-            align_loss_type=args.align_loss_type
-        )
-        eval_step_sra_partial = functools.partial(
-            eval_step_sra,
-            block_out_s=args.block_out_s,
-            block_out_t=args.block_out_t,
-            align_loss_type=args.align_loss_type
-        )
+        # Create wrapper functions to bake static args before pmap
+        block_out_s_static = args.block_out_s
+        block_out_t_static = args.block_out_t
+        align_loss_type_static = args.align_loss_type
 
-        pmapped_train_step = jax.pmap(train_step_sra_partial, axis_name="batch")
-        pmapped_eval_step = jax.pmap(eval_step_sra_partial, axis_name="batch")
+        def train_step_sra_wrapper(state, ema_params, batch, rng, ema_decay, t_max, align_weight):
+            return train_step_sra(
+                state, ema_params, batch, rng, ema_decay,
+                block_out_s_static, block_out_t_static, t_max, align_weight, align_loss_type_static
+            )
+
+        def eval_step_sra_wrapper(state, ema_params, batch, rng, t_max, align_weight):
+            return eval_step_sra(
+                state, ema_params, batch, rng,
+                block_out_s_static, block_out_t_static, t_max, align_weight, align_loss_type_static
+            )
+
+        pmapped_train_step = jax.pmap(train_step_sra_wrapper, axis_name="batch")
+        pmapped_eval_step = jax.pmap(eval_step_sra_wrapper, axis_name="batch")
 
         # Replicate only float hyperparameters (block indices are baked in above)
         t_max_rep = jax_utils.replicate(jnp.float32(args.t_max))
