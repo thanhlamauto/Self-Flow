@@ -443,12 +443,15 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
+    # Initialize model with return_features to ensure feature_head params are created
+    # This is needed for SRA training even if we start in vanilla mode
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
+        return_features=1,  # Ensure feature_head is initialized
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
