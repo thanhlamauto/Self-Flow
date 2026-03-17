@@ -422,6 +422,7 @@ from src.metrics import (
     gaussian_spatial_batch_sums_pmap,
     gaussian_sums_add,
     finalize_gaussian_sums,
+    inception_score_from_probs,
     make_eval_chunk_rngs,
     pearson_corrcoef_rows,
     precision_recall_knn,
@@ -919,17 +920,27 @@ def run_preflight_checks(
     sample_latents_jitted,
     decode_latents,
     inception_fn,
-    real_latents_patchified,
+    real_eval_batch,
     preflight_sample_count,
     preflight_fid_samples,
     inception_num_devices,
     inception_local_batch,
+    inception_score_enabled=False,
+    inception_score_splits=10,
+    precision_recall_enabled=False,
+    pr_k=3,
+    pr_max_samples=5000,
+    pr_full_mode=False,
+    get_is_worker=None,
+    linear_probe_runner=None,
+    block_corr_runner=None,
 ):
-    """Smoke-test VAE decode and FID pipeline before the training loop.
+    """Smoke-test eval-side decode/metric plumbing before the training loop.
 
     Uses EMA params for sampling (same as training-time eval).
     decode_latents : callable(latents_nchw) → NHWC float32 [0,1]
-    inception_fn   : pmap'd InceptionV3 (from get_fid_network), or None
+    inception_fn   : pmap'd InceptionV3 (from get_inception_network), or None
+    real_eval_batch: tuple(real_latents_patchified, real_labels) or None
     """
     from src.fid_utils import fid_from_stats
 
@@ -953,11 +964,12 @@ def run_preflight_checks(
         log_stage(f"Preflight decode OK: {images.shape}, range [{images.min():.3f}, {images.max():.3f}]")
 
     if preflight_fid_samples > 0:
-        if real_latents_patchified is None:
+        if real_eval_batch is None:
             raise RuntimeError("Preflight FID requested but no real latents are available.")
         if inception_fn is None:
             raise RuntimeError("Preflight FID requested but InceptionV3 is not initialised.")
 
+        real_latents_patchified, real_labels = real_eval_batch
         real_count = min(preflight_fid_samples, len(real_latents_patchified))
         fake_count = min(preflight_fid_samples, len(fake_latents))
         fid_count = min(real_count, fake_count)
@@ -967,25 +979,77 @@ def run_preflight_checks(
         real_latents_nchw = unpatchify_patchified_latents(real_latents_patchified[:fid_count])
         real_images = decode_latents(real_latents_nchw)   # (N, H, W, 3) [0,1]
         fake_images = decode_latents(fake_latents[:fid_count])
-        real_acts = extract_inception_features_host_images(
+        real_pooled, real_spatial = extract_inception_features_host_images(
             real_images,
             inception_fn,
             num_devices=inception_num_devices,
             local_batch=inception_local_batch,
-            mode="pooled",
+            mode="pooled+spatial",
         )
-        fake_acts = extract_inception_features_host_images(
+        fake_pooled, fake_spatial = extract_inception_features_host_images(
             fake_images,
             inception_fn,
             num_devices=inception_num_devices,
             local_batch=inception_local_batch,
-            mode="pooled",
+            mode="pooled+spatial",
         )
         fid_val = fid_from_stats(
-            np.mean(real_acts, 0), np.cov(real_acts, rowvar=False),
-            np.mean(fake_acts, 0), np.cov(fake_acts, rowvar=False),
+            np.mean(real_pooled, 0), np.cov(real_pooled, rowvar=False),
+            np.mean(fake_pooled, 0), np.cov(fake_pooled, rowvar=False),
         )
-        log_stage(f"Preflight FID = {fid_val:.2f}  (n={fid_count}, random weights → expect large value)")
+        real_spatial_flat = real_spatial.reshape(-1, real_spatial.shape[-1])
+        fake_spatial_flat = fake_spatial.reshape(-1, fake_spatial.shape[-1])
+        sfid_val = fid_from_stats(
+            np.mean(real_spatial_flat, 0), np.cov(real_spatial_flat, rowvar=False),
+            np.mean(fake_spatial_flat, 0), np.cov(fake_spatial_flat, rowvar=False),
+        )
+
+        summary_parts = [
+            f"Preflight FID={fid_val:.2f}",
+            f"sFID={sfid_val:.2f}",
+            f"(n={fid_count})",
+        ]
+
+        if precision_recall_enabled:
+            pr_eval_samples = fid_count if pr_full_mode else min(fid_count, int(pr_max_samples))
+            pr_mode = "full" if pr_full_mode else ("subset" if pr_eval_samples < fid_count else "full")
+            if pr_eval_samples >= (int(pr_k) + 2):
+                prec, rec = precision_recall_knn(
+                    real_pooled[:pr_eval_samples],
+                    fake_pooled[:pr_eval_samples],
+                    k=int(pr_k),
+                    chunk=512,
+                )
+                summary_parts.append(f"PR=({prec:.3f},{rec:.3f})[{pr_mode} n={pr_eval_samples}]")
+            else:
+                summary_parts.append(
+                    f"PR=skipped[{pr_mode} n={pr_eval_samples} < k+2]"
+                )
+
+        if inception_score_enabled:
+            if get_is_worker is None:
+                raise RuntimeError("Preflight Inception Score requested but worker factory is unavailable.")
+            probs = np.asarray(get_is_worker().infer(fake_images).probs, dtype=np.float64)
+            is_mean, is_std, _ = inception_score_from_probs(probs, splits=int(inception_score_splits))
+            summary_parts.append(f"IS={is_mean:.2f}")
+            if int(inception_score_splits) > 1:
+                summary_parts.append(f"IS_std={is_std:.2f}")
+
+        log_stage("  ".join(summary_parts))
+
+    if real_eval_batch is not None and linear_probe_runner is not None:
+        real_latents_patchified, real_labels = real_eval_batch
+        lp_acc = float(linear_probe_runner(real_latents_patchified, real_labels))
+        log_stage(f"Preflight LinearProbeAcc@1 = {lp_acc:.4f}  (clean EMA representation)")
+
+    if real_eval_batch is not None and block_corr_runner is not None:
+        real_latents_patchified, real_labels = real_eval_batch
+        corr = np.asarray(block_corr_runner(real_latents_patchified, real_labels), dtype=np.float32)
+        offdiag = float((np.sum(corr) - np.trace(corr)) / max(corr.size - corr.shape[0], 1))
+        log_stage(
+            f"Preflight block correlation OK: {corr.shape[0]}x{corr.shape[1]} Pearson heatmap, "
+            f"mean_offdiag={offdiag:.4f}"
+        )
 
     return rng
 
@@ -1452,6 +1516,28 @@ def main():
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def run_preflight_linear_probe(batch_x_patchified, batch_y):
+        probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
+        W_repl, b_repl = get_probe_weights()
+        probe_fn = get_probe_pmapped(probe_layer)
+        bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
+        corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
+        correct_total = int(jax.device_get(corr[0]))
+        count_total = int(jax.device_get(tot[0]))
+        if count_total <= 0:
+            raise RuntimeError("Preflight linear probe produced zero samples.")
+        return float(correct_total / count_total)
+
+    def run_preflight_block_corr(batch_x_patchified, batch_y):
+        bc_fn = get_blockcorr_pmapped()
+        bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
+        summaries = bc_fn(ema_params, bx, by)  # (devices, local_batch, depth, hidden)
+        summaries_h = np.asarray(jax.device_get(summaries), dtype=np.float32).transpose(2, 0, 1, 3)
+        stacked = summaries_h.reshape(summaries_h.shape[0], -1, summaries_h.shape[-1])
+        return pearson_corrcoef_rows(stacked.reshape(stacked.shape[0], -1))
+
     def block_pytree(tree):
         jax.tree_util.tree_map(
             lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
@@ -1476,7 +1562,7 @@ def main():
         )
         block_pytree(probe_metrics)
 
-        inception_fn = get_inception()
+        inception_fn = get_inception("pooled+spatial")
 
         log_stage(
             f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
@@ -1492,7 +1578,7 @@ def main():
             inception_fn,
             num_devices=num_devices,
             local_batch=inception_local_batch,
-            mode="pooled",
+            mode="pooled+spatial",
         )
 
         fake_bs = min(args.fid_batch_size, args.num_fid_samples)
@@ -1513,11 +1599,11 @@ def main():
             inception_fn,
             num_devices=num_devices,
             local_batch=inception_local_batch,
-            mode="pooled",
+            mode="pooled+spatial",
         )
 
         log_stage(
-            "[FID probe] success: discarded train step + real/fake FID batches completed without OOM."
+            "[FID probe] success: discarded train step + real/fake pooled+spatial metric batches completed without OOM."
         )
         return val_data_iter, cached_train_batch
 
@@ -1766,16 +1852,16 @@ def main():
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
     if args.preflight_checks:
-        inception_fn_for_preflight = get_inception() if args.preflight_fid_samples > 0 else None
-        preflight_real_latents = None
+        inception_fn_for_preflight = get_inception("pooled+spatial") if args.preflight_fid_samples > 0 else None
+        preflight_real_batch = None
         if val_iterator is not None:
             preflight_batch, val_iterator = next_validation_batch(
                 val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
             )
-            preflight_real_latents = preflight_batch[0]
+            preflight_real_batch = preflight_batch
         elif data_iterator is not None:
             prefetched_train_batch = next(data_iterator)
-            preflight_real_latents = prefetched_train_batch[0]
+            preflight_real_batch = prefetched_train_batch
 
         rng = run_preflight_checks(
             state=state,
@@ -1784,11 +1870,20 @@ def main():
             sample_latents_jitted=sample_latents_jitted,
             decode_latents=decode_latents_batched,
             inception_fn=inception_fn_for_preflight,
-            real_latents_patchified=preflight_real_latents,
+            real_eval_batch=preflight_real_batch,
             preflight_sample_count=args.preflight_sample_count,
             preflight_fid_samples=args.preflight_fid_samples,
             inception_num_devices=num_devices,
             inception_local_batch=args.fid_eval_local_batch,
+            inception_score_enabled=bool(args.inception_score),
+            inception_score_splits=int(args.inception_score_splits),
+            precision_recall_enabled=bool(args.precision_recall),
+            pr_k=int(args.pr_k),
+            pr_max_samples=int(args.pr_max_samples),
+            pr_full_mode=bool(args.pr_full_mode),
+            get_is_worker=get_is_worker if args.inception_score else None,
+            linear_probe_runner=run_preflight_linear_probe if args.linear_probe else None,
+            block_corr_runner=run_preflight_block_corr if args.block_corr_freq > 0 else None,
         )
 
         if args.preflight_fid_memory_probe:
