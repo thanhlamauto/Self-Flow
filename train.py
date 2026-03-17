@@ -425,6 +425,7 @@ from src.metrics import (
     gaussian_spatial_batch_sums_pmap,
     gaussian_sums_add,
     finalize_gaussian_sums,
+    inception_score_from_probs,
     make_eval_chunk_rngs,
     pearson_corrcoef_rows,
     precision_recall_knn,
