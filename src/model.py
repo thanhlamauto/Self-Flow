@@ -320,11 +320,16 @@ class SelfFlowDiT(nn.Module):
         *,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_block_summaries: bool = False,
         stop_at_layer: Optional[int] = None,
     ):
         zs = None
+        block_summaries = [] if return_block_summaries else None
         for i, block in enumerate(self.blocks):
             x = block(x, c)
+
+            if return_block_summaries:
+                block_summaries.append(jnp.mean(x, axis=1))
 
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
@@ -334,7 +339,7 @@ class SelfFlowDiT(nn.Module):
             if stop_at_layer is not None and (i + 1) >= stop_at_layer:
                 break
 
-        return x, zs
+        return x, zs, block_summaries
 
     def __call__(
         self,
@@ -344,19 +349,22 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+        # return_block_summaries can be combined with either mode; callers must
+        # handle the expanded return tuple shape.
 
         x, c = self._embed_inputs(x, timesteps, vector, deterministic)
-        x, zs = self._run_blocks(
+        x, zs, block_summaries = self._run_blocks(
             x,
             c,
             return_features=return_features,
             return_raw_features=return_raw_features,
+            return_block_summaries=return_block_summaries,
         )
-
         x = self.final_layer(x, c)
 
         x = self._shufflechannel(x)
@@ -364,8 +372,15 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation negates the final prediction
         x = -x
 
+        if return_block_summaries:
+            block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
         if return_features or return_raw_features:
+            if return_block_summaries:
+                return x, zs, block_summaries
             return x, zs
+        if return_block_summaries:
+            return x, block_summaries
         return x
 
     def extract_raw_features(
