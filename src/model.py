@@ -270,9 +270,13 @@ class SelfFlowDiT(nn.Module):
             return_block_tokens: If True, return output tokens of ALL blocks
                                 for block-wise similarity analysis. Cannot be
                                 combined with return_features or return_raw_features.
+
+        Note:
+            Assertions are omitted because return_features/return_raw_features can be
+            traced values (integers) in JAX pmap/jit context, making boolean checks
+            impossible at compile time.
         """
-        assert not (return_raw_features and return_features)
-        assert not (return_block_tokens and (return_features or return_raw_features))
+        # Assertions removed to support JAX traced values (pmap/jit)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
