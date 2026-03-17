@@ -1698,7 +1698,55 @@ def main():
         log_stage(f"[FID] step {step}: FID = {fid_val:.2f} "
                   f"(monitoring mode: {args.fid_num_steps} steps, {args.num_fid_samples} samples — "
                   f"not paper-comparable at defaults)")
-        safe_wandb_log({"val/FID": fid_val, "train/step": step}, step=step)
+
+        # Prepare metrics dict
+        metrics_dict = {"val/FID": fid_val, "train/step": step}
+
+        # Convert images to uint8 for additional metrics
+        gen_imgs_uint8 = np.array([(img * 255).clip(0, 255).astype(np.uint8) for img in gen_imgs[:args.num_fid_samples]])
+        real_imgs_uint8 = np.array([(img * 255).clip(0, 255).astype(np.uint8) for img in real_imgs[:args.num_fid_samples]])
+
+        # Inception Score
+        if args.enable_is and step % args.is_freq == 0:
+            from metrics import compute_inception_score
+            log_stage(f"[IS] Computing Inception Score at step {step}...")
+            try:
+                is_mean, is_std = compute_inception_score(
+                    gen_imgs_uint8, inception_fn, batch_size=256, splits=10
+                )
+                metrics_dict["val/IS_mean"] = is_mean
+                metrics_dict["val/IS_std"] = is_std
+                log_stage(f"[IS] step {step}: IS = {is_mean:.2f} ± {is_std:.2f}")
+            except Exception as e:
+                log_stage(f"[IS] Error: {e}")
+
+        # Spatial FID
+        if args.enable_sfid and step % args.sfid_freq == 0:
+            from metrics import compute_sfid
+            log_stage(f"[sFID] Computing Spatial FID at step {step}...")
+            try:
+                sfid_val = compute_sfid(real_imgs_uint8, gen_imgs_uint8, inception_fn, batch_size=256)
+                metrics_dict["val/sFID"] = sfid_val
+                log_stage(f"[sFID] step {step}: sFID = {sfid_val:.2f}")
+            except Exception as e:
+                log_stage(f"[sFID] Error: {e}")
+
+        # Precision/Recall
+        if args.enable_precision_recall and step % args.pr_freq == 0:
+            from metrics import compute_precision_recall
+            log_stage(f"[P/R] Computing Precision/Recall at step {step}...")
+            try:
+                precision, recall = compute_precision_recall(
+                    real_imgs_uint8, gen_imgs_uint8, inception_fn, k=3, batch_size=256
+                )
+                metrics_dict["val/precision"] = precision
+                metrics_dict["val/recall"] = recall
+                log_stage(f"[P/R] step {step}: Precision = {precision:.4f}, Recall = {recall:.4f}")
+            except Exception as e:
+                log_stage(f"[P/R] Error: {e}")
+
+        # Log all metrics
+        safe_wandb_log(metrics_dict, step=step)
 
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
