@@ -1432,7 +1432,7 @@ def main():
     parser.add_argument("--probe-save-path", type=str, default=None,
                         help="Path to .npz containing probe weights (W[, b]). Required for --linear-probe.")
     parser.add_argument("--probe-layer", type=int, default=None,
-                        help="Backbone layer index to probe. Default: teacher_layer.")
+                        help="Backbone layer index to probe. Default: final backbone block depth.")
     parser.add_argument("--probe-eval-batches", type=int, default=4,
                         help="Number of val batches to run probe inference on per eval window.")
     parser.add_argument("--block-corr-freq", type=int, default=0,
@@ -1513,10 +1513,11 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    depth = int(config["depth"])
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
-        f"depth={config['depth']} heads={config['num_heads']}"
+        f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
@@ -1783,7 +1784,7 @@ def main():
                 # Deterministic clean EMA representation for monitoring.
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
-                _, feats = backbone.apply(
+                _, feats = state.apply_fn(
                     {"params": ema_params_local},
                     batch_x_local,
                     timesteps=clean_t,
@@ -1811,7 +1812,7 @@ def main():
             def _blockcorr_step(ema_params_local, batch_x_local, batch_y_local):
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
-                out = backbone.apply(
+                out = state.apply_fn(
                     {"params": ema_params_local},
                     batch_x_local,
                     timesteps=clean_t,
@@ -1847,7 +1848,7 @@ def main():
         threading.Thread(target=_worker, daemon=True).start()
 
     def run_preflight_linear_probe(batch_x_patchified, batch_y):
-        probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
+        probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
         W_repl, b_repl = get_probe_weights()
         probe_fn = get_probe_pmapped(probe_layer)
         bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
@@ -2126,7 +2127,7 @@ def main():
                 if len(split_scores) > 1:
                     metrics["val/InceptionScore_std"] = float(np.std(split_scores, ddof=1))
         if args.linear_probe:
-            probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
+            probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
             W_repl, b_repl = get_probe_weights()
             probe_fn = get_probe_pmapped(probe_layer)
             correct_total = 0
