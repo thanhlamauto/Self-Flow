@@ -1031,7 +1031,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
-    model = SelfFlowPerTokenDiT(
+    model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
         in_channels=config["in_channels"],
@@ -1042,7 +1042,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
-        per_token=True,
+        per_token=False,
     )
 
     patch_size = config["patch_size"]
