@@ -1652,7 +1652,7 @@ def main():
                 # Deterministic clean EMA representation for monitoring.
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
-                _, feats = backbone.apply(
+                _, feats = state.apply_fn(
                     {"params": ema_params_local},
                     batch_x_local,
                     timesteps=clean_t,
@@ -1680,7 +1680,7 @@ def main():
             def _blockcorr_step(ema_params_local, batch_x_local, batch_y_local):
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
-                out = backbone.apply(
+                out = state.apply_fn(
                     {"params": ema_params_local},
                     batch_x_local,
                     timesteps=clean_t,
