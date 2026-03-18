@@ -19,6 +19,11 @@ The generated samples can be evaluated using the [ADM evaluation suite](https://
 pip install -r requirements.txt
 ```
 
+## Training Runbook
+
+For branch-specific training commands, including the metric-enabled eval setup
+used in the JAX training branches, see [BRANCH_TRAIN_COMMANDS.md](./BRANCH_TRAIN_COMMANDS.md).
+
 ## Quick Start
 
 ### Download Checkpoint
