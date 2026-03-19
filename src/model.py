@@ -6,7 +6,7 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 """
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -66,6 +66,26 @@ def modulate(x, shift, scale):
 def modulate_per_token(x, shift, scale):
     """Per-token modulation for (N, T, D) conditioning."""
     return x * (1 + scale) + shift
+
+
+def _normalize_layer_request(request, depth, name):
+    """Normalize a layer capture request into a validated tuple of 1-based layers."""
+    if request in (False, None):
+        layers = ()
+    elif isinstance(request, Sequence) and not isinstance(request, (str, bytes)):
+        layers = tuple(int(layer) for layer in request)
+    elif isinstance(request, int) and not isinstance(request, bool):
+        layers = (int(request),)
+    else:
+        raise ValueError(
+            f"{name} must be False/None, an int layer index, or a sequence of layer indices; got {request!r}"
+        )
+
+    if any(layer <= 0 for layer in layers):
+        raise ValueError(f"{name} layers must be >= 1, got {layers}")
+    if any(layer > depth for layer in layers):
+        raise ValueError(f"{name} layers must be <= model depth ({depth}), got {layers}")
+    return layers
 
 
 class TimestepEmbedder(nn.Module):
@@ -261,6 +281,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_denoise_layers: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -268,6 +289,13 @@ class SelfFlowDiT(nn.Module):
         assert not (return_raw_features and return_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+
+        raw_layers = _normalize_layer_request(return_raw_features, self.depth, "return_raw_features")
+        denoise_layers = _normalize_layer_request(return_denoise_layers, self.depth, "return_denoise_layers")
+        raw_single = len(raw_layers) == 1
+        denoise_single = len(denoise_layers) == 1
+        raw_positions = {layer: idx for idx, layer in enumerate(raw_layers)}
+        denoise_positions = {layer: idx for idx, layer in enumerate(denoise_layers)}
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -304,7 +332,9 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
-        zs = None
+        feature_z = None
+        raw_zs = [None] * len(raw_layers) if raw_layers else None
+        denoise_hiddens = [None] * len(denoise_layers) if denoise_layers else None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
@@ -319,31 +349,47 @@ class SelfFlowDiT(nn.Module):
                 block_summaries.append(jnp.mean(x, axis=1))
             
             if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+                feature_z = self.feature_head(x)
+            if raw_layers and (i + 1) in raw_positions:
+                raw_zs[raw_positions[i + 1]] = x
+            if denoise_layers and (i + 1) in denoise_positions:
+                denoise_hiddens[denoise_positions[i + 1]] = x
 
-        x = FinalLayer(
+        final_layer = FinalLayer(
             hidden_size=self.hidden_size,
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
-            per_token=self.per_token
-        )(x, c)
+            per_token=self.per_token,
+            name="FinalLayer_0",
+        )
 
-        x = self._shufflechannel(x)
-        
-        # PyTorch implementation negates the final prediction
-        x = -x
+        def decode_hidden(hidden):
+            pred = final_layer(hidden, c)
+            pred = self._shufflechannel(pred)
+            return -pred
+
+        x = decode_hidden(x)
+
+        denoise_out = None
+        if denoise_layers:
+            denoise_preds = [decode_hidden(hidden) for hidden in denoise_hiddens]
+            denoise_out = denoise_preds[0] if denoise_single else jnp.stack(denoise_preds, axis=0)
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
-        if return_features or return_raw_features:
-            if return_block_summaries:
-                return x, zs, block_summaries
-            return x, zs
+        outputs = [x]
+        if return_features:
+            outputs.append(feature_z)
+        elif raw_layers:
+            raw_out = raw_zs[0] if raw_single else tuple(raw_zs)
+            outputs.append(raw_out)
+        if denoise_layers:
+            outputs.append(denoise_out)
         if return_block_summaries:
-            return x, block_summaries
+            outputs.append(block_summaries)
+        if len(outputs) > 1:
+            return tuple(outputs)
         return x
 
     def _shufflechannel(self, x):

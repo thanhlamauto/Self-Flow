@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -498,10 +499,37 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def resolve_late_exit_layers(depth, last_k):
+    """Return non-final late-exit layers from the last-k block pool."""
+    if last_k < 2:
+        raise ValueError("--late-exit-last-k must be at least 2 so there is an earlier exit block.")
+    if last_k > depth:
+        raise ValueError(f"--late-exit-last-k must be <= model depth ({depth}), got {last_k}")
+    return tuple(range(depth - last_k + 1, depth))
+
+
+def build_late_exit_schedule(total_steps, final_layer_index, late_exit_layers, late_exit_prob, seed):
+    """Precompute a deterministic per-step exit-layer schedule on the host."""
+    schedule_len = max(int(total_steps), 1)
+    schedule = np.full((schedule_len,), int(final_layer_index), dtype=np.int32)
+    if not late_exit_layers or late_exit_prob <= 0.0:
+        return schedule
+
+    rng = np.random.default_rng(int(seed))
+    use_aux = rng.random(schedule_len) < float(late_exit_prob)
+    aux_count = int(np.sum(use_aux))
+    if aux_count > 0:
+        aux_layers = np.asarray(late_exit_layers, dtype=np.int32)
+        aux_idx = rng.integers(0, len(aux_layers), size=aux_count)
+        schedule[use_aux] = aux_layers[aux_idx]
+    return schedule
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state, ema_params, batch, rng, ema_decay, exit_layer,
+    *, late_exit_prob, late_exit_layers, final_layer_index,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -509,9 +537,17 @@ def train_step(
       x_tau   = (1 - tau) * x1 + tau * x0
       target  = x0 - x1
       loss    = E[||v_theta(x_tau, tau) - target||^2]
+
+    Optional scheduled late-exit training:
+      - exit_layer is precomputed on the host before training starts
+      - final block remains the default path
+      - earlier late blocks share the same final denoising head
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+
+    late_exit_enabled = bool(late_exit_layers) and late_exit_prob > 0.0
+    num_aux_exits = len(late_exit_layers)
 
     rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
@@ -521,15 +557,43 @@ def train_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
+    selected_layer = jnp.asarray(exit_layer, dtype=jnp.int32)
+    use_aux_exit = jnp.asarray(late_exit_enabled, dtype=jnp.bool_) & (selected_layer != jnp.int32(final_layer_index))
+    aux_exit_idx = jnp.int32(0)
+    if late_exit_enabled:
+        aux_layer_choices = jnp.asarray(late_exit_layers, dtype=jnp.int32)
+        aux_match = aux_layer_choices == selected_layer
+        aux_exit_idx = jnp.argmax(aux_match.astype(jnp.int32)).astype(jnp.int32)
+
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
+        if late_exit_enabled:
+            final_pred, aux_preds = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                return_denoise_layers=late_exit_layers,
+                rngs={"dropout": drop_rng},
+            )
+            if num_aux_exits == 1:
+                aux_preds = aux_preds[None, ...]
+            chosen_aux_pred = jax.lax.dynamic_index_in_dim(aux_preds, aux_exit_idx, axis=0, keepdims=False)
+            pred = jax.lax.cond(
+                use_aux_exit,
+                lambda _: chosen_aux_pred,
+                lambda _: final_pred,
+                operand=None,
+            )
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
         loss = jnp.mean((pred - target) ** 2)
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -541,6 +605,8 @@ def train_step(
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    late_exit_used = jax.lax.pmean(use_aux_exit.astype(jnp.float32), axis_name="batch")
+    late_exit_layer = jax.lax.pmean(selected_layer.astype(jnp.float32), axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -556,6 +622,9 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/late_exit_prob": jnp.float32(late_exit_prob),
+        "train/late_exit_used": late_exit_used,
+        "train/late_exit_layer": late_exit_layer,
     }
     return state, ema_params, metrics, rng
 
@@ -1075,6 +1144,31 @@ def main():
         help="EMA decay for tracking a smoothed copy of online params (default: 0.9999). "
              "EMA is used only for evaluation/checkpoint convenience, not as a teacher loss.",
     )
+    parser.add_argument(
+        "--late-exit-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-time probability of replacing the final-block readout with a uniformly sampled "
+            "earlier late block from the last-k pool. 0 disables stochastic late exit."
+        ),
+    )
+    parser.add_argument(
+        "--late-exit-last-k",
+        type=int,
+        default=3,
+        help=(
+            "Size of the last-k block pool used for stochastic late exit. "
+            "The final block stays the default path; when late exit triggers, one of the previous K-1 blocks "
+            "is sampled uniformly. Default: 3."
+        ),
+    )
+    parser.add_argument(
+        "--late-exit-seed",
+        type=int,
+        default=42,
+        help="Seed used to precompute the per-step late-exit schedule on the host.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1224,6 +1318,8 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if not (0.0 <= args.late_exit_prob <= 1.0):
+        raise ValueError("--late-exit-prob must be in [0, 1]")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1249,6 +1345,17 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    late_exit_layers = ()
+    if args.late_exit_prob > 0.0:
+        late_exit_layers = resolve_late_exit_layers(depth, args.late_exit_last_k)
+    late_exit_schedule = build_late_exit_schedule(
+        total_steps=args.epochs * args.steps_per_epoch,
+        final_layer_index=depth,
+        late_exit_layers=late_exit_layers,
+        late_exit_prob=args.late_exit_prob,
+        seed=args.late_exit_seed,
+    )
+    late_exit_schedule_steps = late_exit_schedule.shape[0]
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1364,19 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if late_exit_layers:
+        aux_layers_str = ", ".join(str(layer) for layer in late_exit_layers)
+        schedule_unique, schedule_counts = np.unique(late_exit_schedule[:late_exit_schedule_steps], return_counts=True)
+        schedule_summary = ", ".join(
+            f"{int(layer)}:{int(count)}" for layer, count in zip(schedule_unique, schedule_counts)
+        )
+        log_stage(
+            f"Late exit ENABLED: p={args.late_exit_prob:.3f} aux_layers=[{aux_layers_str}] "
+            f"final_layer={depth} seed={args.late_exit_seed}"
+        )
+        log_stage(f"Late exit schedule counts: {schedule_summary}")
+    else:
+        log_stage("Late exit DISABLED: always reading out from the final block.")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1272,6 +1392,7 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
+    late_exit_schedule_rep = jax.device_put_replicated(jnp.asarray(late_exit_schedule, dtype=jnp.int32), jax.local_devices())
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1295,7 +1416,13 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    _train_step_fn = functools.partial(
+        train_step,
+        late_exit_prob=args.late_exit_prob,
+        late_exit_layers=late_exit_layers,
+        final_layer_index=depth,
+    )
+    pmapped_train_step = jax.pmap(_train_step_fn, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -1568,8 +1695,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_exit_layer = late_exit_schedule_rep[:, 0]
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_exit_layer
         )
         block_pytree(probe_metrics)
 
@@ -1930,10 +2058,11 @@ def main():
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            scheduled_exit_layer = late_exit_schedule_rep[:, global_step]
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, scheduled_exit_layer
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
