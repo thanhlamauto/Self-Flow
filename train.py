@@ -534,11 +534,38 @@ def _pf_layer_norm(x):
     return (x - mean) / jnp.sqrt(var + 1e-6)
 
 
+def resolve_late_exit_layers(depth, last_k):
+    """Return non-final late-exit layers from the last-k block pool."""
+    if last_k < 2:
+        raise ValueError("--late-exit-last-k must be at least 2 so there is an earlier exit block.")
+    if last_k > depth:
+        raise ValueError(f"--late-exit-last-k must be <= model depth ({depth}), got {last_k}")
+    return tuple(range(depth - last_k + 1, depth))
+
+
+def build_late_exit_schedule(total_steps, final_layer_index, late_exit_layers, late_exit_prob, seed):
+    """Precompute a deterministic per-step exit-layer schedule on the host."""
+    schedule_len = max(int(total_steps), 1)
+    schedule = np.full((schedule_len,), int(final_layer_index), dtype=np.int32)
+    if not late_exit_layers or late_exit_prob <= 0.0:
+        return schedule
+
+    rng = np.random.default_rng(int(seed))
+    use_aux = rng.random(schedule_len) < float(late_exit_prob)
+    aux_count = int(np.sum(use_aux))
+    if aux_count > 0:
+        aux_layers = np.asarray(late_exit_layers, dtype=np.int32)
+        aux_idx = rng.integers(0, len(aux_layers), size=aux_count)
+        schedule[use_aux] = aux_layers[aux_idx]
+    return schedule
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, lambda_jepa, ema_decay,
+    state, ema_params, batch, rng, lambda_jepa, ema_decay, exit_layer,
     *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
+    late_exit_prob, late_exit_layers, final_layer_index,
 ):
     """Self-Flow + I-JEPA distributed training step.
 
@@ -556,12 +583,19 @@ def train_step(
       - Both sides normalised with parameter-free layer norm before MSE.
       - Ljepa averaged over valid patches per block, then over all target blocks.
 
+    Optional scheduled late-exit training:
+      - exit_layer is precomputed on the host before training starts
+      - final block remains the default path
+      - earlier late blocks share the same final denoising head
+
     lambda_jepa and ema_decay are per-step JAX float32 scalars (replicated).
     backbone and predictor are Python module objects baked in via functools.partial.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
+    late_exit_enabled = bool(late_exit_layers) and late_exit_prob > 0.0
+    num_aux_exits = len(late_exit_layers)
 
     rng, t_rng, s_rng, mask_rng, noise_rng, drop_rng, jepa_rng = jax.random.split(rng, 7)
 
@@ -578,6 +612,13 @@ def train_step(
     x_tau     = (1.0 - tau[:, :, None]) * x1 + tau[:, :, None] * x0
     x_tau_min = (1.0 - t_clean[:, None, None]) * x1 + t_clean[:, None, None] * x0
     target    = x0 - x1   # [B, N, D]
+    selected_layer = jnp.asarray(exit_layer, dtype=jnp.int32)
+    use_aux_exit = jnp.asarray(late_exit_enabled, dtype=jnp.bool_) & (selected_layer != jnp.int32(final_layer_index))
+    aux_exit_idx = jnp.int32(0)
+    if late_exit_enabled:
+        aux_layer_choices = jnp.asarray(late_exit_layers, dtype=jnp.int32)
+        aux_match = aux_layer_choices == selected_layer
+        aux_exit_idx = jnp.argmax(aux_match.astype(jnp.int32)).astype(jnp.int32)
 
     # --- JEPA spatial masks (static-shape padded; sampled outside loss_fn) ---
     ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
@@ -601,15 +642,36 @@ def train_step(
     # --- Student + predictor forward; gradients w.r.t. all params ---
     def loss_fn(params):
         # Student backbone: raw features at layer l for I-JEPA predictor input.
-        pred, s_feat = backbone.apply(
-            {'params': params["backbone"]},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            return_raw_features=student_layer,
-            rngs={'dropout': drop_rng},
-        )
+        if late_exit_enabled:
+            final_pred, s_feat, aux_preds = backbone.apply(
+                {'params': params["backbone"]},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                return_raw_features=student_layer,
+                return_denoise_layers=late_exit_layers,
+                rngs={'dropout': drop_rng},
+            )
+            if num_aux_exits == 1:
+                aux_preds = aux_preds[None, ...]
+            chosen_aux_pred = jax.lax.dynamic_index_in_dim(aux_preds, aux_exit_idx, axis=0, keepdims=False)
+            pred = jax.lax.cond(
+                use_aux_exit,
+                lambda _: chosen_aux_pred,
+                lambda _: final_pred,
+                operand=None,
+            )
+        else:
+            pred, s_feat = backbone.apply(
+                {'params': params["backbone"]},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                return_raw_features=student_layer,
+                rngs={'dropout': drop_rng},
+            )
         loss_gen = jnp.mean((pred - target) ** 2)
 
         D = s_feat.shape[-1]   # hidden_size (768 for DiT-B)
@@ -669,6 +731,8 @@ def train_step(
     loss_jepa  = jax.lax.pmean(loss_jepa,  axis_name='batch')
     v_abs      = jax.lax.pmean(v_abs,      axis_name='batch')
     v_pred     = jax.lax.pmean(v_pred,     axis_name='batch')
+    late_exit_used = jax.lax.pmean(use_aux_exit.astype(jnp.float32), axis_name='batch')
+    late_exit_layer = jax.lax.pmean(selected_layer.astype(jnp.float32), axis_name='batch')
     grads      = jax.lax.pmean(grads,      axis_name='batch')
 
     grad_norm  = jnp.sqrt(sum(
@@ -693,6 +757,9 @@ def train_step(
         "train/param_norm":      param_norm,
         "train/v_abs_mean":      v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/late_exit_prob":  jnp.float32(late_exit_prob),
+        "train/late_exit_used":  late_exit_used,
+        "train/late_exit_layer": late_exit_layer,
     }
 
     return state, ema_params, metrics, rng
@@ -1307,6 +1374,31 @@ def main():
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
                         help="Layer index for teacher features (default: round(0.7 * depth))")
+    parser.add_argument(
+        "--late-exit-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-time probability of replacing the final-block readout with a uniformly sampled "
+            "earlier late block from the last-k pool. 0 disables stochastic late exit."
+        ),
+    )
+    parser.add_argument(
+        "--late-exit-last-k",
+        type=int,
+        default=3,
+        help=(
+            "Size of the last-k block pool used for stochastic late exit. "
+            "The final block stays the default path; when late exit triggers, one of the previous K-1 blocks "
+            "is sampled uniformly. Default: 3."
+        ),
+    )
+    parser.add_argument(
+        "--late-exit-seed",
+        type=int,
+        default=42,
+        help="Seed used to precompute the per-step late-exit schedule on the host.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1464,6 +1556,8 @@ def main():
         raise ValueError("--jepa-num-targets must be greater than 0")
     if args.fixed_ema_decay is not None and not (0.0 < args.fixed_ema_decay <= 1.0):
         raise ValueError("--fixed-ema-decay must be in (0, 1]")
+    if not (0.0 <= args.late_exit_prob <= 1.0):
+        raise ValueError("--late-exit-prob must be in [0, 1]")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1502,6 +1596,18 @@ def main():
         raise ValueError(f"--teacher-layer {teacher_layer} out of range [1, {depth}]")
     if student_layer >= teacher_layer:
         raise ValueError(f"student_layer ({student_layer}) must be < teacher_layer ({teacher_layer})")
+    total_steps = args.epochs * args.steps_per_epoch
+    late_exit_layers = ()
+    if args.late_exit_prob > 0.0:
+        late_exit_layers = resolve_late_exit_layers(depth, args.late_exit_last_k)
+    late_exit_schedule = build_late_exit_schedule(
+        total_steps=total_steps,
+        final_layer_index=depth,
+        late_exit_layers=late_exit_layers,
+        late_exit_prob=args.late_exit_prob,
+        seed=args.late_exit_seed,
+    )
+    late_exit_schedule_steps = late_exit_schedule.shape[0]
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1535,6 +1641,19 @@ def main():
         )
     else:
         log_stage("Late-off JEPA DISABLED: using standard warmup schedule for lambda_jepa.")
+    if late_exit_layers:
+        aux_layers_str = ", ".join(str(layer) for layer in late_exit_layers)
+        schedule_unique, schedule_counts = np.unique(late_exit_schedule[:late_exit_schedule_steps], return_counts=True)
+        schedule_summary = ", ".join(
+            f"{int(layer)}:{int(count)}" for layer, count in zip(schedule_unique, schedule_counts)
+        )
+        log_stage(
+            f"Late exit ENABLED: p={args.late_exit_prob:.3f} aux_layers=[{aux_layers_str}] "
+            f"final_layer={depth} seed={args.late_exit_seed}"
+        )
+        log_stage(f"Late exit schedule counts: {schedule_summary}")
+    else:
+        log_stage("Late exit DISABLED: always reading out from the final block.")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1577,11 +1696,10 @@ def main():
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
+    late_exit_schedule_rep = jax.device_put_replicated(jnp.asarray(late_exit_schedule, dtype=jnp.int32), jax.local_devices())
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-
-    total_steps = args.epochs * args.steps_per_epoch
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1610,6 +1728,9 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
+        late_exit_prob=args.late_exit_prob,
+        late_exit_layers=late_exit_layers,
+        final_layer_index=depth,
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
@@ -1893,6 +2014,7 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_exit_layer = late_exit_schedule_rep[:, 0]
         # Preflight uses the first-step schedule values; only tensor shapes matter
         # for the memory probe, but matching the real call signature avoids drift.
         probe_progress = 1.0 / max(total_steps, 1)
@@ -1904,7 +2026,7 @@ def main():
         ))
         _, _, probe_metrics, _ = pmapped_train_step(
             state, ema_params, (probe_x, probe_y), rng,
-            probe_lambda_jepa_rep, probe_ema_decay_rep,
+            probe_lambda_jepa_rep, probe_ema_decay_rep, probe_exit_layer,
         )
         block_pytree(probe_metrics)
 
@@ -2283,11 +2405,12 @@ def main():
                     lambda_jepa_val = args.lambda_jepa * (1.0 - decay_frac)
             ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
             lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
+            scheduled_exit_layer = late_exit_schedule_rep[:, global_step]
 
             # Self-Flow + JEPA training step
             state, ema_params, metrics, rng = pmapped_train_step(
                 state, ema_params, (batch_x, batch_y), rng,
-                lambda_jepa_rep, ema_decay_rep,
+                lambda_jepa_rep, ema_decay_rep, scheduled_exit_layer,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
