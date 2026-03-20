@@ -578,6 +578,33 @@ def _masked_block_mse(pred_feats, tgt_feats, tgt_valid):
     )
 
 
+def _tree_dot(tree_a, tree_b):
+    """Inner product between two matching pytrees of arrays."""
+    return sum(
+        jnp.sum(jnp.asarray(a) * jnp.asarray(b))
+        for a, b in zip(
+            jax.tree_util.tree_leaves(tree_a),
+            jax.tree_util.tree_leaves(tree_b),
+        )
+    )
+
+
+def _tree_l2_norm(tree):
+    """L2 norm of a pytree of arrays."""
+    return jnp.sqrt(sum(
+        jnp.sum(jnp.square(jnp.asarray(x)))
+        for x in jax.tree_util.tree_leaves(tree)
+    ))
+
+
+def _tree_cosine_similarity(tree_a, tree_b, eps: float = 1e-12):
+    """Cosine similarity between two pytrees of arrays."""
+    dot = _tree_dot(tree_a, tree_b)
+    norm_a = _tree_l2_norm(tree_a)
+    norm_b = _tree_l2_norm(tree_b)
+    return dot / jnp.maximum(norm_a * norm_b, eps)
+
+
 def _predict_parallel_target_blocks(predictor, predictor_params, ctx_feats, ctx_valid, tgt_idx, tgt_valid):
     """Match the original I-JEPA branch: predict all target blocks independently in parallel."""
     local_batch = ctx_feats.shape[0]
@@ -620,7 +647,7 @@ def _fill_hidden_targets(hidden, pred_blocks, tgt_idx, tgt_valid):
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, lambda_jepa, ema_decay,
+    state, ema_params, batch, rng, lambda_jepa, ema_decay, compute_grad_cosine,
     *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
 ):
     """Self-Flow + masked-student I-JEPA with hidden-token writeback.
@@ -636,6 +663,8 @@ def train_step(
         student hidden sequence, and the backbone resumes from student_layer + 1.
 
     mask_ratio is kept only for CLI compatibility and is not used here.
+    compute_grad_cosine is a per-step JAX bool that enables the extra autopsy
+    metric only on selected steps to keep the overhead bounded.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
@@ -671,7 +700,7 @@ def train_step(
     t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, D]
 
     # --- Student + predictor forward; gradients w.r.t. all params ---
-    def loss_fn(params):
+    def loss_terms(params):
         # Student backbone sees the same x_tau but with all sampled target blocks masked.
         mask_token = target_mask.apply(
             {"params": params["target_mask"]},
@@ -721,23 +750,66 @@ def train_step(
         )
         loss_gen = jnp.mean((pred - target) ** 2)
 
-        loss_total = loss_gen + lambda_jepa * loss_jepa
-
         v_abs_mean      = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
+        return loss_gen, loss_jepa, v_abs_mean, v_pred_abs_mean
+
+    def total_loss_fn(params):
+        loss_gen, loss_jepa, v_abs_mean, v_pred_abs_mean = loss_terms(params)
+        loss_total = loss_gen + lambda_jepa * loss_jepa
         return loss_total, (loss_gen, loss_jepa, v_abs_mean, v_pred_abs_mean)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss_total, (loss_gen, loss_jepa, v_abs, v_pred)), grads = grad_fn(state.params)
+    align_block_key = f"block_{student_layer - 1}"
+
+    def compute_with_grad_cosine(params):
+        (loss_gen, loss_jepa, v_abs, v_pred), pullback = jax.vjp(loss_terms, params)
+        zero = jnp.array(0.0, dtype=loss_gen.dtype)
+        one = jnp.array(1.0, dtype=loss_gen.dtype)
+        grads_diff, = pullback((one, zero, zero, zero))
+        grads_jepa, = pullback((zero, one, zero, zero))
+
+        grads_diff = jax.lax.pmean(grads_diff, axis_name='batch')
+        grads_jepa = jax.lax.pmean(grads_jepa, axis_name='batch')
+        grads = jax.tree_util.tree_map(
+            lambda gd, gj: gd + lambda_jepa * gj,
+            grads_diff,
+            grads_jepa,
+        )
+
+        grad_cos_backbone = _tree_cosine_similarity(
+            grads_diff["backbone"],
+            grads_jepa["backbone"],
+        )
+        grad_cos_align_block = _tree_cosine_similarity(
+            grads_diff["backbone"][align_block_key],
+            grads_jepa["backbone"][align_block_key],
+        )
+        loss_total = loss_gen + lambda_jepa * loss_jepa
+        return loss_total, loss_gen, loss_jepa, v_abs, v_pred, grads, grad_cos_backbone, grad_cos_align_block
+
+    def compute_without_grad_cosine(params):
+        grad_fn = jax.value_and_grad(total_loss_fn, has_aux=True)
+        (loss_total, (loss_gen, loss_jepa, v_abs, v_pred)), grads = grad_fn(params)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        nan = jnp.array(jnp.nan, dtype=loss_total.dtype)
+        return loss_total, loss_gen, loss_jepa, v_abs, v_pred, grads, nan, nan
+
+    loss_total, loss_gen, loss_jepa, v_abs, v_pred, grads, grad_cos_backbone, grad_cos_align_block = jax.lax.cond(
+        compute_grad_cosine,
+        compute_with_grad_cosine,
+        compute_without_grad_cosine,
+        state.params,
+    )
 
     loss_total = jax.lax.pmean(loss_total, axis_name='batch')
     loss_gen   = jax.lax.pmean(loss_gen,   axis_name='batch')
     loss_jepa  = jax.lax.pmean(loss_jepa,  axis_name='batch')
     v_abs      = jax.lax.pmean(v_abs,      axis_name='batch')
     v_pred     = jax.lax.pmean(v_pred,     axis_name='batch')
+    grad_cos_backbone = jax.lax.pmean(grad_cos_backbone, axis_name='batch')
+    grad_cos_align_block = jax.lax.pmean(grad_cos_align_block, axis_name='batch')
     target_union_ratio = jax.lax.pmean(jnp.mean(target_union.astype(jnp.float32)), axis_name='batch')
-    grads      = jax.lax.pmean(grads,      axis_name='batch')
 
     grad_norm  = jnp.sqrt(sum(
         jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)
@@ -762,6 +834,8 @@ def train_step(
         "train/v_abs_mean":      v_abs,
         "train/v_pred_abs_mean": v_pred,
         "train/target_union_ratio": target_union_ratio,
+        "train/grad_cos_diff_jepa_backbone": grad_cos_backbone,
+        "train/grad_cos_diff_jepa_align_block": grad_cos_align_block,
     }
 
     return state, ema_params, metrics, rng
@@ -1968,9 +2042,10 @@ def main():
         probe_lambda_jepa_rep = jax_utils.replicate(jnp.float32(
             args.lambda_jepa * min(1.0 / 10000.0, 1.0)
         ))
+        probe_grad_cosine_rep = jax_utils.replicate(jnp.bool_(False))
         _, _, probe_metrics, _ = pmapped_train_step(
             state, ema_params, (probe_x, probe_y), rng,
-            probe_lambda_jepa_rep, probe_ema_decay_rep,
+            probe_lambda_jepa_rep, probe_ema_decay_rep, probe_grad_cosine_rep,
         )
         block_pytree(probe_metrics)
 
@@ -2349,11 +2424,13 @@ def main():
                     lambda_jepa_val = args.lambda_jepa * (1.0 - decay_frac)
             ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
             lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
+            should_log_train = bool(args.log_freq > 0 and (global_step + 1) % args.log_freq == 0)
+            compute_grad_cosine_rep = jax_utils.replicate(jnp.bool_(should_log_train))
 
             # Self-Flow + JEPA training step
             state, ema_params, metrics, rng = pmapped_train_step(
                 state, ema_params, (batch_x, batch_y), rng,
-                lambda_jepa_rep, ema_decay_rep,
+                lambda_jepa_rep, ema_decay_rep, compute_grad_cosine_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
