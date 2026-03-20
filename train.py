@@ -523,10 +523,37 @@ def cosine_sim_loss(a, b, mask):
     return -mean_sim, mean_sim   # (loss, diagnostic)
 
 
+def _tree_dot(tree_a, tree_b):
+    """Inner product between two matching pytrees of arrays."""
+    return sum(
+        jnp.sum(jnp.asarray(a) * jnp.asarray(b))
+        for a, b in zip(
+            jax.tree_util.tree_leaves(tree_a),
+            jax.tree_util.tree_leaves(tree_b),
+        )
+    )
+
+
+def _tree_l2_norm(tree):
+    """L2 norm of a pytree of arrays."""
+    return jnp.sqrt(sum(
+        jnp.sum(jnp.square(jnp.asarray(x)))
+        for x in jax.tree_util.tree_leaves(tree)
+    ))
+
+
+def _tree_cosine_similarity(tree_a, tree_b, eps: float = 1e-12):
+    """Cosine similarity between two pytrees of arrays."""
+    dot = _tree_dot(tree_a, tree_b)
+    norm_a = _tree_l2_norm(tree_a)
+    norm_b = _tree_l2_norm(tree_b)
+    return dot / jnp.maximum(norm_a * norm_b, eps)
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng,
+    state, ema_params, batch, rng, compute_grad_cosine,
     *, mask_ratio, gamma, ema_decay, student_layer, teacher_layer,
 ):
     """Self-Flow distributed training step.
@@ -541,6 +568,9 @@ def train_step(
 
     TPU deviation (intentional for throughput):
       - pmap over data-parallel axis (not model-parallel as in some paper setups)
+
+    compute_grad_cosine is a per-step JAX bool that enables the gradient cosine
+    autopsy only on selected logging steps to keep overhead bounded.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
@@ -588,7 +618,7 @@ def train_step(
     t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, hidden]
 
     # --- Student forward + combined Self-Flow loss ---
-    def loss_fn(params):
+    def loss_terms(params):
         # tau is rank-2 [B, N]; model uses per-token conditioning branch
         pred, s_feat = state.apply_fn(
             {'params': params},
@@ -605,19 +635,64 @@ def train_step(
         # Lrep: negative cosine similarity on masked tokens (paper-faithful)
         loss_rep, mean_cos_sim = cosine_sim_loss(s_feat, t_feat, mask)
 
-        loss_total = loss_gen + gamma * loss_rep
-
         # Auxiliary diagnostics (on-device to avoid host-transfer stalls)
         v_abs_mean      = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         mask_ratio_eff  = jnp.mean(mask.astype(jnp.float32))
 
-        return loss_total, (loss_gen, loss_rep, mean_cos_sim,
-                            v_abs_mean, v_pred_abs_mean, mask_ratio_eff)
+        return loss_gen, loss_rep, mean_cos_sim, v_abs_mean, v_pred_abs_mean, mask_ratio_eff
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss_total, (loss_gen, loss_rep, mean_cos,
-                  v_abs, v_pred, mask_ratio_eff)), grads = grad_fn(state.params)
+    def total_loss_fn(params):
+        loss_gen, loss_rep, mean_cos_sim, v_abs_mean, v_pred_abs_mean, mask_ratio_eff = loss_terms(params)
+        loss_total = loss_gen + gamma * loss_rep
+        return loss_total, (loss_gen, loss_rep, mean_cos_sim, v_abs_mean, v_pred_abs_mean, mask_ratio_eff)
+
+    align_block_key = f"block_{student_layer - 1}"
+
+    def compute_with_grad_cosine(params):
+        (loss_gen, loss_rep, mean_cos, v_abs, v_pred, mask_ratio_eff), pullback = jax.vjp(loss_terms, params)
+        zero = jnp.array(0.0, dtype=loss_gen.dtype)
+        one = jnp.array(1.0, dtype=loss_gen.dtype)
+        grads_diff, = pullback((one, zero, zero, zero, zero, zero))
+        grads_rep, = pullback((zero, one, zero, zero, zero, zero))
+
+        grads_diff = jax.lax.pmean(grads_diff, axis_name='batch')
+        grads_rep = jax.lax.pmean(grads_rep, axis_name='batch')
+        grads = jax.tree_util.tree_map(
+            lambda gd, gr: gd + gamma * gr,
+            grads_diff,
+            grads_rep,
+        )
+
+        grad_cos_backbone = _tree_cosine_similarity(grads_diff, grads_rep)
+        grad_cos_align_block = _tree_cosine_similarity(
+            grads_diff[align_block_key],
+            grads_rep[align_block_key],
+        )
+        loss_total = loss_gen + gamma * loss_rep
+        return (
+            loss_total, loss_gen, loss_rep, mean_cos, v_abs, v_pred,
+            mask_ratio_eff, grads, grad_cos_backbone, grad_cos_align_block,
+        )
+
+    def compute_without_grad_cosine(params):
+        grad_fn = jax.value_and_grad(total_loss_fn, has_aux=True)
+        (loss_total, (loss_gen, loss_rep, mean_cos,
+                      v_abs, v_pred, mask_ratio_eff)), grads = grad_fn(params)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        nan = jnp.array(jnp.nan, dtype=loss_total.dtype)
+        return (
+            loss_total, loss_gen, loss_rep, mean_cos, v_abs, v_pred,
+            mask_ratio_eff, grads, nan, nan,
+        )
+
+    (loss_total, loss_gen, loss_rep, mean_cos, v_abs, v_pred,
+     mask_ratio_eff, grads, grad_cos_backbone, grad_cos_align_block) = jax.lax.cond(
+        compute_grad_cosine,
+        compute_with_grad_cosine,
+        compute_without_grad_cosine,
+        state.params,
+    )
 
     # Cross-device aggregation (TPU v5e-8 data-parallel)
     loss_total     = jax.lax.pmean(loss_total,     axis_name='batch')
@@ -627,7 +702,8 @@ def train_step(
     v_abs          = jax.lax.pmean(v_abs,          axis_name='batch')
     v_pred         = jax.lax.pmean(v_pred,         axis_name='batch')
     mask_ratio_eff = jax.lax.pmean(mask_ratio_eff, axis_name='batch')
-    grads          = jax.lax.pmean(grads,          axis_name='batch')
+    grad_cos_backbone = jax.lax.pmean(grad_cos_backbone, axis_name='batch')
+    grad_cos_align_block = jax.lax.pmean(grad_cos_align_block, axis_name='batch')
 
     grad_norm  = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -647,6 +723,8 @@ def train_step(
         "train/v_abs_mean":           v_abs,
         "train/v_pred_abs_mean":      v_pred,
         "train/mask_ratio_effective": mask_ratio_eff,
+        "train/grad_cos_diff_jepa_backbone": grad_cos_backbone,
+        "train/grad_cos_diff_jepa_align_block": grad_cos_align_block,
     }
 
     return state, ema_params, metrics, rng
@@ -1756,7 +1834,10 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(state, ema_params, (probe_x, probe_y), rng)
+        probe_compute_grad_cosine_rep = jax_utils.replicate(jnp.bool_(False))
+        _, _, probe_metrics, _ = pmapped_train_step(
+            state, ema_params, (probe_x, probe_y), rng, probe_compute_grad_cosine_rep
+        )
         block_pytree(probe_metrics)
 
         inception_fn = get_inception("pooled+spatial")
@@ -2116,10 +2197,12 @@ def main():
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            should_log_train = bool(args.log_freq > 0 and (global_step + 1) % args.log_freq == 0)
+            compute_grad_cosine_rep = jax_utils.replicate(jnp.bool_(should_log_train))
 
             # Self-Flow training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng
+                state, ema_params, (batch_x, batch_y), rng, compute_grad_cosine_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
