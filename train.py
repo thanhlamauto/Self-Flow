@@ -550,6 +550,20 @@ def _tree_cosine_similarity(tree_a, tree_b, eps: float = 1e-12):
     return dot / jnp.maximum(norm_a * norm_b, eps)
 
 
+def _resolve_align_block(tree, layer_idx: int):
+    """Resolve the alignment block subtree across model naming conventions."""
+    candidates = (f"block_{layer_idx}", f"DiTBlock_{layer_idx}")
+    for key in candidates:
+        if key in tree:
+            return tree[key]
+
+    available = list(tree.keys())[:12]
+    raise KeyError(
+        f"Could not resolve alignment block for layer {layer_idx}; "
+        f"tried {candidates}; available top-level keys include {available}"
+    )
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
@@ -647,7 +661,7 @@ def train_step(
         loss_total = loss_gen + gamma * loss_rep
         return loss_total, (loss_gen, loss_rep, mean_cos_sim, v_abs_mean, v_pred_abs_mean, mask_ratio_eff)
 
-    align_block_key = f"block_{student_layer - 1}"
+    align_block_idx = student_layer - 1
 
     def compute_with_grad_cosine(params):
         (loss_gen, loss_rep, mean_cos, v_abs, v_pred, mask_ratio_eff), pullback = jax.vjp(loss_terms, params)
@@ -666,8 +680,8 @@ def train_step(
 
         grad_cos_backbone = _tree_cosine_similarity(grads_diff, grads_rep)
         grad_cos_align_block = _tree_cosine_similarity(
-            grads_diff[align_block_key],
-            grads_rep[align_block_key],
+            _resolve_align_block(grads_diff, align_block_idx),
+            _resolve_align_block(grads_rep, align_block_idx),
         )
         loss_total = loss_gen + gamma * loss_rep
         return (
