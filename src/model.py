@@ -250,9 +250,145 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
-        self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        self.patch_embed = PatchedPatchEmbed(
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
+            name="patch_embed",
+        )
+        self.t_embedder = TimestepEmbedder(hidden_size=self.hidden_size, name="t_embedder")
+        self.y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=0.0,
+            name="y_embedder",
+        )
+        self.blocks = [
+            DiTBlock(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                per_token=self.per_token,
+                name=f"block_{i}",
+            )
+            for i in range(self.depth)
+        ]
+        self.final_layer_mod = FinalLayer(
+            hidden_size=self.hidden_size,
+            patch_size=self.patch_size,
+            out_channels=self.out_channels_val,
+            per_token=self.per_token,
+            name="final_layer_mod",
+        )
+        self.feature_head = SimpleHead(
+            in_dim=self.hidden_size,
+            out_dim=self.hidden_size,
+            name="feature_head",
+        )
 
-    @nn.compact
+    def _embed_condition(self, timesteps: jax.Array, vector: jax.Array, seq_len: int, deterministic: bool):
+        """Build timestep + label conditioning in the same format as __call__."""
+        timesteps = 1.0 - timesteps
+
+        if self.per_token:
+            batch_size = timesteps.shape[0]
+            if timesteps.ndim == 1:
+                t_emb = self.t_embedder(timesteps)
+                t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
+            elif timesteps.ndim == 2:
+                t_flat = timesteps.reshape(-1)
+                t_emb_flat = self.t_embedder(t_flat)
+                t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
+            else:
+                raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
+
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
+            y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
+        else:
+            t_emb = self.t_embedder(timesteps)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
+
+        return t_emb + y_emb
+
+    def _embed_input_tokens(self, x: jax.Array) -> jax.Array:
+        """Project raw patch tokens into the backbone hidden space."""
+        x = self.patch_embed(x)
+        return x + self.pos_embed_val
+
+    def _run_blocks(
+        self,
+        x: jax.Array,
+        c: jax.Array,
+        *,
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+        return_features: bool = False,
+        return_raw_features: bool = False,
+        return_block_summaries: bool = False,
+    ):
+        """Run a contiguous slice of DiT blocks on an existing hidden sequence."""
+        assert not (return_raw_features and return_features)
+        end_layer = self.depth if end_layer is None else int(end_layer)
+
+        zs = None
+        block_summaries = [] if return_block_summaries else None
+        for i in range(start_layer, end_layer):
+            x = self.blocks[i](x, c)
+
+            if return_block_summaries:
+                block_summaries.append(jnp.mean(x, axis=1))
+
+            if return_features and (i + 1) == return_features:
+                zs = self.feature_head(x)
+            elif return_raw_features and (i + 1) == return_raw_features:
+                zs = x
+
+        if return_block_summaries:
+            block_summaries = jnp.stack(block_summaries, axis=0)
+        return x, zs, block_summaries
+
+    def _decode_hidden(self, x: jax.Array, c: jax.Array) -> jax.Array:
+        """Decode final hidden tokens into patch-space flow predictions."""
+        x = self.final_layer_mod(x, c)
+        x = self._shufflechannel(x)
+        return -x
+
+    def extract_raw_features(
+        self,
+        x: jax.Array,
+        timesteps: jax.Array,
+        vector: jax.Array,
+        *,
+        layer: int,
+        deterministic: bool = True,
+    ):
+        """Run the backbone up to `layer` and return the raw hidden tokens there."""
+        if not (1 <= int(layer) <= self.depth):
+            raise ValueError(f"layer must be in [1, {self.depth}], got {layer}")
+
+        x = self._embed_input_tokens(x)
+        c = self._embed_condition(timesteps, vector, x.shape[1], deterministic)
+        x, _, _ = self._run_blocks(x, c, end_layer=layer)
+        return x
+
+    def forward_from_hidden(
+        self,
+        hidden: jax.Array,
+        timesteps: jax.Array,
+        vector: jax.Array,
+        *,
+        start_layer: int,
+        deterministic: bool = True,
+    ):
+        """Resume the backbone from an existing hidden sequence."""
+        if not (0 <= int(start_layer) <= self.depth):
+            raise ValueError(f"start_layer must be in [0, {self.depth}], got {start_layer}")
+
+        c = self._embed_condition(timesteps, vector, hidden.shape[1], deterministic)
+        x, _, _ = self._run_blocks(hidden, c, start_layer=start_layer)
+        return self._decode_hidden(x, c)
+
     def __call__(
         self,
         x: jax.Array,
@@ -265,78 +401,18 @@ class SelfFlowDiT(nn.Module):
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
-        assert not (return_raw_features and return_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
-
-        # PyTorch implementation explicitly negates timesteps
-        timesteps = 1.0 - timesteps
-
-        # Patch Embedding
-        x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
-        )(x)
-        x = x + self.pos_embed_val
-
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
-
-        if self.per_token:
-            batch_size, seq_len, _ = x.shape
-            if timesteps.ndim == 1:
-                t_emb = t_embedder(timesteps)
-                t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
-            elif timesteps.ndim == 2:
-                t_flat = timesteps.reshape(-1)
-                t_emb_flat = t_embedder(t_flat)
-                t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
-            else:
-                raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
-            y_emb = y_embedder(vector, deterministic=deterministic)
-            y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
-        else:
-            t_emb = t_embedder(timesteps)
-            y_emb = y_embedder(vector, deterministic=deterministic)
-
-        c = t_emb + y_emb
-
-        zs = None
-        block_summaries = [] if return_block_summaries else None
-        for i in range(self.depth):
-            x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
-                mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
-
-            if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
-                block_summaries.append(jnp.mean(x, axis=1))
-            
-            if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
-
-        x = FinalLayer(
-            hidden_size=self.hidden_size,
-            patch_size=self.patch_size,
-            out_channels=self.out_channels_val,
-            per_token=self.per_token
-        )(x, c)
-
-        x = self._shufflechannel(x)
-        
-        # PyTorch implementation negates the final prediction
-        x = -x
-
-        if return_block_summaries:
-            block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+        x = self._embed_input_tokens(x)
+        c = self._embed_condition(timesteps, vector, x.shape[1], deterministic)
+        x, zs, block_summaries = self._run_blocks(
+            x,
+            c,
+            return_features=return_features,
+            return_raw_features=return_raw_features,
+            return_block_summaries=return_block_summaries,
+        )
+        x = self._decode_hidden(x, c)
 
         if return_features or return_raw_features:
             if return_block_summaries:

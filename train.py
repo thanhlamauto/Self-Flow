@@ -415,7 +415,7 @@ except ImportError:
     raise
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
-from src.jepa import JEPAPredictor, sample_jepa_masks
+from src.jepa import JEPAPredictor, TargetMaskToken, sample_jepa_masks
 from src.metrics import (
     ReservoirSampler,
     apply_inception_to_decoded_sharded,
@@ -434,13 +434,13 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, backbone, predictor, learning_rate, grad_clip=1.0):
+def create_train_state(rng, config, backbone, predictor, target_mask, learning_rate, grad_clip=1.0):
     """Initializes optimizer and initial EMA params for the JEPA training setup.
 
     backbone and predictor are passed in from main() so the same module objects
     are reused in functools.partial for train_step / eval_step.
 
-    state.params = {"backbone": ..., "predictor": ...}
+    state.params = {"backbone": ..., "predictor": ..., "target_mask": ...}
     ema_params   = backbone params only (predictor is not EMA-tracked).
 
     Returns (state, ema_params); caller replicates both via jax_utils.replicate.
@@ -481,7 +481,15 @@ def create_train_state(rng, config, backbone, predictor, learning_rate, grad_cli
     )
     predictor_params = predictor_vars['params']
 
-    all_params = {"backbone": backbone_params, "predictor": predictor_params}
+    rng, mask_rng = jax.random.split(rng)
+    target_mask_vars = target_mask.init(mask_rng, dummy_x)
+    target_mask_params = target_mask_vars["params"]
+
+    all_params = {
+        "backbone": backbone_params,
+        "predictor": predictor_params,
+        "target_mask": target_mask_params,
+    }
 
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
@@ -534,49 +542,111 @@ def _pf_layer_norm(x):
     return (x - mean) / jnp.sqrt(var + 1e-6)
 
 
+def _gather_tokens(feats, idx):
+    """Gather token features for a batch of padded index tensors."""
+    return jax.vmap(lambda feat, token_idx: feat[token_idx])(feats, idx)
+
+
+def _gather_target_blocks(feats, tgt_idx):
+    """Gather [B, n_target, T_max, D] teacher blocks from [B, N, D] features."""
+    return jax.vmap(
+        lambda feat, block_idx: jax.vmap(lambda token_idx: feat[token_idx])(block_idx)
+    )(feats, tgt_idx)
+
+
+def _build_target_union_mask(tgt_idx, tgt_valid, num_tokens):
+    """Union mask over all sampled target blocks: [B, N] bool."""
+    token_hits = jax.nn.one_hot(tgt_idx, num_tokens, dtype=jnp.float32)
+    weighted_hits = token_hits * tgt_valid[..., None].astype(jnp.float32)
+    return jnp.sum(weighted_hits, axis=(1, 2)) > 0
+
+
+def _apply_student_target_mask(x, target_union, mask_token):
+    """Replace the sampled target union with a learnable patch-space token."""
+    return jnp.where(target_union[:, :, None], mask_token, x)
+
+
+def _masked_block_mse(pred_feats, tgt_feats, tgt_valid):
+    """Per-example JEPA block loss averaged over valid tokens only."""
+    pred_norm = _pf_layer_norm(pred_feats)
+    tgt_norm = _pf_layer_norm(tgt_feats)
+    mse = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)
+    valid_f = tgt_valid.astype(jnp.float32)
+    return (
+        jnp.sum(mse * valid_f, axis=-1) /
+        (jnp.sum(valid_f, axis=-1) + 1e-6)
+    )
+
+
+def _predict_parallel_target_blocks(predictor, predictor_params, ctx_feats, ctx_valid, tgt_idx, tgt_valid):
+    """Match the original I-JEPA branch: predict all target blocks independently in parallel."""
+    local_batch = ctx_feats.shape[0]
+    n_tgt = tgt_idx.shape[1]
+    t_max = tgt_idx.shape[2]
+
+    ctx_feats_rep = jnp.repeat(ctx_feats, n_tgt, axis=0)
+    ctx_valid_rep = jnp.repeat(ctx_valid, n_tgt, axis=0)
+    tgt_idx_flat = tgt_idx.reshape(local_batch * n_tgt, t_max)
+    tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, t_max)
+
+    pred_flat = predictor.apply(
+        {"params": predictor_params},
+        ctx_feats_rep,
+        ctx_valid_rep,
+        tgt_idx_flat,
+        tgt_valid_flat,
+    )
+    pred_blocks = pred_flat.reshape(local_batch, n_tgt, t_max, -1)
+    return pred_blocks, pred_flat, tgt_idx_flat, tgt_valid_flat
+
+
+def _fill_hidden_targets(hidden, pred_blocks, tgt_idx, tgt_valid):
+    """Scatter predicted target blocks back into the student hidden sequence.
+
+    If sampled target blocks overlap, the filled hidden token is the mean of all
+    valid predictions written to that position.
+    """
+    num_tokens = hidden.shape[1]
+    token_weights = jax.nn.one_hot(tgt_idx, num_tokens, dtype=hidden.dtype)
+    token_weights = token_weights * tgt_valid[..., None].astype(hidden.dtype)
+
+    pred_sum = jnp.einsum("bqtn,bqtd->bnd", token_weights, pred_blocks)
+    pred_count = jnp.sum(token_weights, axis=(1, 2))
+    pred_mean = pred_sum / (pred_count[:, :, None] + 1e-6)
+    fill_mask = pred_count > 0
+    return jnp.where(fill_mask[:, :, None], pred_mean, hidden)
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
     state, ema_params, batch, rng, lambda_jepa, ema_decay,
-    *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
+    *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
 ):
-    """Self-Flow + I-JEPA distributed training step.
+    """Self-Flow + masked-student I-JEPA with hidden-token writeback.
 
-    Loss = Lgen (flow-matching velocity MSE) + lambda_jepa * Ljepa (JEPA block MSE).
+    Design for this branch:
+      - Sample a single tau per image; student and teacher share the same x_tau.
+      - Teacher sees the clean noisy view x_tau and provides target features at
+        teacher_layer.
+      - Student sees x_tau with the sampled JEPA target union fully replaced by a
+        learnable patch-space mask token.
+      - Student runs only to student_layer, predictor reconstructs the target
+        blocks in parallel, those predicted blocks are scattered back into the
+        student hidden sequence, and the backbone resumes from student_layer + 1.
 
-    Self-Flow dual-timestep construction is unchanged:
-      - t, s ~ U(0,1); t_clean = max(t,s), tau_clean = max(t,s) for teacher view.
-      - Per-token tau: masked tokens use t_clean, unmasked use t_noisy.
-      - Student forward on full x_tau; teacher EMA forward on x_tau_min.
-
-    I-JEPA block prediction (Ljepa):
-      - n_target target blocks sampled per image with static T_max=64 padded indices.
-      - 1 context block (scale [0.85,1.0], ar=1.0), minus target union → C'.
-      - Shared predictor [B*n_target, C_max+T_max, 384] predicts teacher target features.
-      - Both sides normalised with parameter-free layer norm before MSE.
-      - Ljepa averaged over valid patches per block, then over all target blocks.
-
-    lambda_jepa and ema_decay are per-step JAX float32 scalars (replicated).
-    backbone and predictor are Python module objects baked in via functools.partial.
+    mask_ratio is kept only for CLI compatibility and is not used here.
     """
     x0, y = batch   # x0: [local_B, N, D],  y: [local_B]
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
 
-    rng, t_rng, s_rng, mask_rng, noise_rng, drop_rng, jepa_rng = jax.random.split(rng, 7)
+    del mask_ratio
+    rng, tau_rng, noise_rng, drop_rng, jepa_rng = jax.random.split(rng, 5)
 
-    # --- Dual-timestep sampling (Self-Flow §3.2, unchanged) ---
-    t = jax.random.uniform(t_rng, shape=(local_batch,))
-    s = jax.random.uniform(s_rng, shape=(local_batch,))
-    t_clean = jnp.maximum(t, s)   # [B]
-    t_noisy = jnp.minimum(t, s)   # [B]
-
-    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))
-    tau  = jnp.where(mask, t_clean[:, None], t_noisy[:, None])   # [B, N]
-
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,))
     x1        = jax.random.normal(noise_rng, x0.shape)
-    x_tau     = (1.0 - tau[:, :, None]) * x1 + tau[:, :, None] * x0
-    x_tau_min = (1.0 - t_clean[:, None, None]) * x1 + t_clean[:, None, None] * x0
+    x_tau     = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target    = x0 - x1   # [B, N, D]
 
     # --- JEPA spatial masks (static-shape padded; sampled outside loss_fn) ---
@@ -586,73 +656,70 @@ def train_step(
     )
     # ctx_idx   [B, 256], ctx_valid [B, 256]
     # tgt_idx   [B, n_target, 64], tgt_valid [B, n_target, 64]
+    target_union = _build_target_union_mask(tgt_idx, tgt_valid, num_tokens)
 
-    # --- Teacher forward (EMA backbone, no grad, raw features at layer k) ---
-    _, t_feat = backbone.apply(
+    # --- Teacher forward (EMA backbone, clean x_tau, same tau, no grad) ---
+    t_feat = backbone.apply(
         {'params': ema_params},
-        x_tau_min,
-        timesteps=t_clean,
+        x_tau,
+        timesteps=tau,
         vector=y,
+        layer=teacher_layer,
         deterministic=True,
-        return_raw_features=teacher_layer,
+        method=backbone.extract_raw_features,
     )
     t_feat = jax.lax.stop_gradient(t_feat)   # [B, N, D]
 
     # --- Student + predictor forward; gradients w.r.t. all params ---
     def loss_fn(params):
-        # Student backbone: raw features at layer l for I-JEPA predictor input.
-        pred, s_feat = backbone.apply(
-            {'params': params["backbone"]},
+        # Student backbone sees the same x_tau but with all sampled target blocks masked.
+        mask_token = target_mask.apply(
+            {"params": params["target_mask"]},
             x_tau,
+        )
+        x_student = _apply_student_target_mask(x_tau, target_union, mask_token)
+
+        s_feat = backbone.apply(
+            {'params': params["backbone"]},
+            x_student,
             timesteps=tau,
             vector=y,
+            layer=student_layer,
             deterministic=False,
-            return_raw_features=student_layer,
+            method=backbone.extract_raw_features,
+            rngs={'dropout': drop_rng},
+        )
+
+        ctx_feats = _gather_tokens(s_feat, ctx_idx)
+        pred_blocks, pred_flat, tgt_idx_flat, tgt_valid_flat = _predict_parallel_target_blocks(
+            predictor,
+            params["predictor"],
+            ctx_feats,
+            ctx_valid,
+            tgt_idx,
+            tgt_valid,
+        )
+        teacher_blocks = _gather_target_blocks(t_feat, tgt_idx)
+        teacher_blocks_flat = teacher_blocks.reshape(pred_flat.shape)
+        per_block = _masked_block_mse(
+            pred_flat,
+            jax.lax.stop_gradient(teacher_blocks_flat),
+            tgt_valid_flat,
+        )
+        loss_jepa = jnp.mean(per_block)
+
+        s_filled = _fill_hidden_targets(s_feat, pred_blocks, tgt_idx, tgt_valid)
+        pred = backbone.apply(
+            {'params': params["backbone"]},
+            s_filled,
+            timesteps=tau,
+            vector=y,
+            start_layer=student_layer,
+            deterministic=False,
+            method=backbone.forward_from_hidden,
             rngs={'dropout': drop_rng},
         )
         loss_gen = jnp.mean((pred - target) ** 2)
-
-        D = s_feat.shape[-1]   # hidden_size (768 for DiT-B)
-        n_tgt = tgt_idx.shape[1]
-        T_max = tgt_idx.shape[2]  # 64
-        C_max = ctx_idx.shape[1]  # 256
-
-        # Gather context student features: [B, C_max, D]
-        ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
-
-        # Repeat context for each target block → [B*n_tgt, C_max, D]
-        ctx_feats_rep  = jnp.repeat(ctx_feats,  n_tgt, axis=0)
-        ctx_valid_rep  = jnp.repeat(ctx_valid,  n_tgt, axis=0)
-
-        # Flatten target block dimension into batch: [B*n_tgt, T_max]
-        tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
-        tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
-
-        # Predictor: context features + mask-token queries → predicted target features
-        pred_feats = predictor.apply(
-            {'params': params["predictor"]},
-            ctx_feats_rep,
-            ctx_valid_rep,
-            tgt_idx_flat,
-            tgt_valid_flat,
-        )  # [B*n_tgt, T_max, D]
-
-        # Gather teacher targets at target positions: [B*n_tgt, T_max, D]
-        t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)   # [B*n_tgt, N, D]
-        t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
-
-        # Normalise both sides (parameter-free) then compute MSE over valid patches.
-        pred_norm = _pf_layer_norm(pred_feats)
-        tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
-
-        # Average over feature width so JEPA scale is comparable across model sizes.
-        mse     = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)  # [B*n_tgt, T_max]
-        valid_f = tgt_valid_flat.astype(jnp.float32)
-        per_block = (
-            jnp.sum(mse * valid_f, axis=-1) /
-            (jnp.sum(valid_f, axis=-1) + 1e-6)
-        )  # [B*n_tgt]
-        loss_jepa = jnp.mean(per_block)
 
         loss_total = loss_gen + lambda_jepa * loss_jepa
 
@@ -669,6 +736,7 @@ def train_step(
     loss_jepa  = jax.lax.pmean(loss_jepa,  axis_name='batch')
     v_abs      = jax.lax.pmean(v_abs,      axis_name='batch')
     v_pred     = jax.lax.pmean(v_pred,     axis_name='batch')
+    target_union_ratio = jax.lax.pmean(jnp.mean(target_union.astype(jnp.float32)), axis_name='batch')
     grads      = jax.lax.pmean(grads,      axis_name='batch')
 
     grad_norm  = jnp.sqrt(sum(
@@ -693,6 +761,7 @@ def train_step(
         "train/param_norm":      param_norm,
         "train/v_abs_mean":      v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/target_union_ratio": target_union_ratio,
     }
 
     return state, ema_params, metrics, rng
@@ -700,93 +769,84 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng, lambda_jepa,
-    *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
+    *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
 ):
-    """Self-Flow + I-JEPA validation step.
-
-    Mirrors train_step exactly, but:
-      - No parameter updates or EMA update.
-      - deterministic=True throughout (no dropout).
-      - lambda_jepa is the same per-step scheduled value used in training so
-        val/loss_total tracks the same objective during warmup.
-    """
+    """Validation for the single-noise masked-student hidden-writeback JEPA setup."""
     x0, y = batch
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
 
-    rng, t_rng, s_rng, mask_rng, noise_rng, jepa_rng = jax.random.split(rng, 6)
+    del mask_ratio
+    rng, tau_rng, noise_rng, jepa_rng = jax.random.split(rng, 4)
 
-    t = jax.random.uniform(t_rng, shape=(local_batch,))
-    s = jax.random.uniform(s_rng, shape=(local_batch,))
-    t_clean = jnp.maximum(t, s)
-    t_noisy = jnp.minimum(t, s)
-
-    mask = jax.random.bernoulli(mask_rng, p=mask_ratio, shape=(local_batch, num_tokens))
-    tau  = jnp.where(mask, t_clean[:, None], t_noisy[:, None])
-
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,))
     x1        = jax.random.normal(noise_rng, x0.shape)
-    x_tau     = (1.0 - tau[:, :, None]) * x1 + tau[:, :, None] * x0
-    x_tau_min = (1.0 - t_clean[:, None, None]) * x1 + t_clean[:, None, None] * x0
+    x_tau     = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target    = x0 - x1
 
     ctx_idx, ctx_valid, tgt_idx, tgt_valid = sample_jepa_masks(
         jepa_rng, local_batch,
         n_target=jepa_num_targets,
     )
+    target_union = _build_target_union_mask(tgt_idx, tgt_valid, num_tokens)
 
-    # Teacher forward (EMA backbone)
-    _, t_feat = backbone.apply(
+    # Teacher forward (EMA backbone, clean x_tau)
+    t_feat = backbone.apply(
         {'params': ema_params},
-        x_tau_min,
-        timesteps=t_clean,
-        vector=y,
-        deterministic=True,
-        return_raw_features=teacher_layer,
-    )
-    t_feat = jax.lax.stop_gradient(t_feat)
-
-    # Student backbone (online params, no dropout)
-    pred, s_feat = backbone.apply(
-        {'params': state.params["backbone"]},
         x_tau,
         timesteps=tau,
         vector=y,
+        layer=teacher_layer,
         deterministic=True,
-        return_raw_features=student_layer,
+        method=backbone.extract_raw_features,
+    )
+    t_feat = jax.lax.stop_gradient(t_feat)
+
+    # Student backbone (online params, masked target union, no dropout)
+    mask_token = target_mask.apply(
+        {"params": state.params["target_mask"]},
+        x_tau,
+    )
+    x_student = _apply_student_target_mask(x_tau, target_union, mask_token)
+    s_feat = backbone.apply(
+        {'params': state.params["backbone"]},
+        x_student,
+        timesteps=tau,
+        vector=y,
+        layer=student_layer,
+        deterministic=True,
+        method=backbone.extract_raw_features,
     )
 
-    loss_gen = jnp.mean((pred - target) ** 2)
-
-    n_tgt = tgt_idx.shape[1]
-    T_max = tgt_idx.shape[2]
-
-    ctx_feats = jax.vmap(lambda feat, idx: feat[idx])(s_feat, ctx_idx)
-    ctx_feats_rep  = jnp.repeat(ctx_feats, n_tgt, axis=0)
-    ctx_valid_rep  = jnp.repeat(ctx_valid, n_tgt, axis=0)
-    tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
-    tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
-
-    pred_feats = predictor.apply(
-        {'params': state.params["predictor"]},
-        ctx_feats_rep,
-        ctx_valid_rep,
-        tgt_idx_flat,
+    ctx_feats = _gather_tokens(s_feat, ctx_idx)
+    pred_blocks, pred_flat, _, tgt_valid_flat = _predict_parallel_target_blocks(
+        predictor,
+        state.params["predictor"],
+        ctx_feats,
+        ctx_valid,
+        tgt_idx,
+        tgt_valid,
+    )
+    teacher_blocks = _gather_target_blocks(t_feat, tgt_idx)
+    teacher_blocks_flat = teacher_blocks.reshape(pred_flat.shape)
+    per_block = _masked_block_mse(
+        pred_flat,
+        jax.lax.stop_gradient(teacher_blocks_flat),
         tgt_valid_flat,
     )
-
-    t_feat_rep = jnp.repeat(t_feat, n_tgt, axis=0)
-    t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
-
-    pred_norm = _pf_layer_norm(pred_feats)
-    tgt_norm  = _pf_layer_norm(jax.lax.stop_gradient(t_feat_tgt))
-    # Match train-time scaling: average feature MSE per target token.
-    mse       = jnp.mean((pred_norm - tgt_norm) ** 2, axis=-1)
-    valid_f   = tgt_valid_flat.astype(jnp.float32)
-    per_block = (
-        jnp.sum(mse * valid_f, axis=-1) /
-        (jnp.sum(valid_f, axis=-1) + 1e-6)
-    )
     loss_jepa = jnp.mean(per_block)
+
+    s_filled = _fill_hidden_targets(s_feat, pred_blocks, tgt_idx, tgt_valid)
+    pred = backbone.apply(
+        {'params': state.params["backbone"]},
+        s_filled,
+        timesteps=tau,
+        vector=y,
+        start_layer=student_layer,
+        deterministic=True,
+        method=backbone.forward_from_hidden,
+    )
+    loss_gen = jnp.mean((pred - target) ** 2)
 
     loss_total      = loss_gen + lambda_jepa * loss_jepa
     v_abs_mean      = jnp.mean(jnp.abs(target))
@@ -797,6 +857,7 @@ def eval_step(
     loss_jepa       = jax.lax.pmean(loss_jepa,       axis_name='batch')
     v_abs_mean      = jax.lax.pmean(v_abs_mean,      axis_name='batch')
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name='batch')
+    target_union_ratio = jax.lax.pmean(jnp.mean(target_union.astype(jnp.float32)), axis_name='batch')
 
     metrics = {
         "val/loss_total":      loss_total,
@@ -804,6 +865,7 @@ def eval_step(
         "val/loss_jepa":       loss_jepa,
         "val/v_abs_mean":      v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
+        "val/target_union_ratio": target_union_ratio,
     }
     return metrics, rng
 
@@ -1275,7 +1337,8 @@ def main():
     parser.add_argument("--no-wandb", action="store_true")
     # ── Self-Flow + I-JEPA algorithm args ────────────────────────────────────
     parser.add_argument("--mask-ratio", type=float, default=0.25,
-                        help="Bernoulli mask ratio RM for per-token masking (paper: 0.25)")
+                        help="Legacy compatibility flag. This branch masks the sampled JEPA "
+                             "target union directly, so --mask-ratio is ignored.")
     parser.add_argument("--lambda-jepa", type=float, default=0.25,
                         help="Final weight for Ljepa in L = Lgen + lambda_jepa * Ljepa. "
                              "Linearly warmed up from 0 to this value over the first 10k steps.")
@@ -1456,8 +1519,6 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if not (0.0 < args.mask_ratio < 1.0):
-        raise ValueError("--mask-ratio must be in (0, 1)")
     if args.predictor_depth <= 0:
         raise ValueError("--predictor-depth must be greater than 0")
     if args.jepa_num_targets <= 0:
@@ -1523,7 +1584,7 @@ def main():
     else:
         ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
     log_stage(
-        f"Self-Flow+JEPA: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
+        f"Self-Flow+JEPA: single_tau masked_target_union hidden_writeback lambda_jepa={args.lambda_jepa} "
         f"predictor_depth={args.predictor_depth} jepa_num_targets={args.jepa_num_targets} "
         f"{ema_desc} grad_clip={args.grad_clip}"
     )
@@ -1569,10 +1630,13 @@ def main():
         T_max=64,
         C_max=256,
     )
+    target_mask = TargetMaskToken(
+        token_dim=config["in_channels"] * config["patch_size"] ** 2,
+    )
 
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(
-        rng, config, backbone, predictor, args.learning_rate, args.grad_clip
+        rng, config, backbone, predictor, target_mask, args.learning_rate, args.grad_clip
     )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
@@ -1606,6 +1670,7 @@ def main():
         train_step,
         backbone=backbone,
         predictor=predictor,
+        target_mask=target_mask,
         mask_ratio=args.mask_ratio,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
@@ -1615,6 +1680,7 @@ def main():
         eval_step,
         backbone=backbone,
         predictor=predictor,
+        target_mask=target_mask,
         mask_ratio=args.mask_ratio,
         student_layer=student_layer,
         teacher_layer=teacher_layer,
@@ -2363,7 +2429,7 @@ def main():
                                  daemon=True).start()
 
     # ── Checkpoint save ────────────────────────────────────────────────────────
-    # Online: nested {"backbone": ..., "predictor": ...}
+    # Online: nested {"backbone": ..., "predictor": ..., "target_mask": ...}
     # EMA:    backbone params only (used directly by sampling / sample.py)
     os.makedirs(args.ckpt_dir, exist_ok=True)
     unreplicated_params = jax_utils.unreplicate(state.params)

@@ -3,6 +3,7 @@ I-JEPA block-prediction components for Self-Flow training.
 
 Public API:
   sample_jepa_masks   — pure-JAX static-shape block mask sampler (call inside pmap)
+  TargetMaskToken     — learnable patch-space token used to mask student target blocks
   JEPAPredictor       — Transformer predictor: context tokens → target feature predictions
 """
 
@@ -159,6 +160,21 @@ def sample_jepa_masks(rng, local_batch: int, grid_size: int = 16,
 # JEPA Predictor
 # ---------------------------------------------------------------------------
 
+class TargetMaskToken(nn.Module):
+    """Learnable patch-space token used to fully mask student target blocks."""
+    token_dim: int
+    init_std: float = 0.02
+
+    @nn.compact
+    def __call__(self, x):
+        mask_token = self.param(
+            "mask_token",
+            nn.initializers.normal(stddev=self.init_std),
+            (1, 1, self.token_dim),
+        )
+        return jnp.broadcast_to(mask_token.astype(x.dtype), x.shape)
+
+
 class PredictorBlock(nn.Module):
     """Plain pre-LN Transformer block (no AdaLN, no timestep conditioning)."""
     hidden_size: int
@@ -192,9 +208,9 @@ class JEPAPredictor(nn.Module):
     Takes student context features and target positional queries, returns
     predicted backbone features at target locations.
 
-    Intended usage (B = local_batch * n_target after flattening):
-      ctx_feats  [B, C_max, backbone_dim]  — student features at context positions
-      ctx_valid  [B, C_max]  bool          — True for non-padding context tokens
+    Intended usage:
+      ctx_feats  [B, C_ctx, backbone_dim]  — context memory in backbone feature space
+      ctx_valid  [B, C_ctx]  bool          — True for active context tokens
       tgt_idx    [B, T_max]  int32         — linear grid indices of target tokens
       tgt_valid  [B, T_max]  bool          — True for non-padding target tokens
       → out      [B, T_max, backbone_dim]
@@ -212,9 +228,11 @@ class JEPAPredictor(nn.Module):
     def __call__(self, ctx_feats, ctx_valid, tgt_idx, tgt_valid,
                  deterministic: bool = True):
         B = ctx_feats.shape[0]
+        ctx_len = ctx_feats.shape[1]
+        tgt_len = tgt_idx.shape[1]
 
         # Project context features to predictor width.
-        ctx = nn.Dense(self.hidden_size, name="proj_in")(ctx_feats)  # [B, C_max, H]
+        ctx = nn.Dense(self.hidden_size, name="proj_in")(ctx_feats)  # [B, C_ctx, H]
 
         # Sinusoidal 2-D position embeddings for target queries.
         # Shape: [grid_size^2, hidden_size] — computed at call time (no learnable params).
@@ -230,11 +248,11 @@ class JEPAPredictor(nn.Module):
             (1, 1, self.hidden_size),
         )
         tgt_queries = jnp.broadcast_to(
-            mask_token, (B, self.T_max, self.hidden_size)
+            mask_token, (B, tgt_len, self.hidden_size)
         ) + tgt_pos  # [B, T_max, H]
 
         # Concatenate context and target along sequence axis.
-        x = jnp.concatenate([ctx, tgt_queries], axis=1)  # [B, C_max+T_max, H]
+        x = jnp.concatenate([ctx, tgt_queries], axis=1)  # [B, C_ctx+T_max, H]
 
         # Attention mask: 1 = attend, 0 = ignore padding.
         # All queries attend to all valid keys (context + target).
@@ -250,7 +268,7 @@ class JEPAPredictor(nn.Module):
             )(x, attn_mask)
 
         # Extract the target portion only.
-        tgt_out = x[:, self.C_max:, :]  # [B, T_max, H]
+        tgt_out = x[:, ctx_len:, :]  # [B, T_max, H]
 
         # Project back to backbone dimension.
         out = nn.Dense(self.backbone_dim, name="proj_out")(tgt_out)  # [B, T_max, D]

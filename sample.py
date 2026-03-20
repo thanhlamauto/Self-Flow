@@ -79,7 +79,7 @@ def load_model(ckpt_path=None, model_size="XL"):
     """Load the Self-Flow backbone from a flax.training.checkpoints checkpoint.
 
     Handles three checkpoint shapes written by train.py:
-      1. New nested format  {"backbone": ..., "predictor": ...} — extract "backbone".
+      1. New nested format  {"backbone": ..., ...} — extract "backbone".
       2. Old flat format with "feature_head" key (pre-JEPA)     — strip "feature_head".
       3. Old flat format without "feature_head"                 — use as-is.
 
@@ -104,7 +104,7 @@ def load_model(ckpt_path=None, model_size="XL"):
     if ckpt_path is not None and os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}")
         # Restore raw (target=None) so the loader does not try to match a
-        # flat backbone structure against a nested {"backbone","predictor"} dict.
+        # flat backbone structure against a nested checkpoint dict.
         raw = flax_ckpt.restore_checkpoint(ckpt_dir=ckpt_path, target=None)
         if raw is not None:
             # Normalise checkpoint structure to flat backbone params.

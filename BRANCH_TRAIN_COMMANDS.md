@@ -42,6 +42,20 @@ COMMON_BASE="\
 
 ## Self-Flow Family
 
+### `feat/self-flow-i-jepa-single-noise-hidden-writeback`
+
+```bash
+git checkout feat/self-flow-i-jepa-single-noise-hidden-writeback
+!python train.py $COMMON_BASE \
+  --wandb-project selfflow-jax \
+  --lambda-jepa 0.5 \
+  --fixed-ema-decay 0.9999 \
+  --predictor-depth 4 \
+  --jepa-num-targets 4 \
+  --student-layer 4 \
+  --teacher-layer 8
+```
+
 ### `feat/self-flow-i-jepa-adaln-zero-mimetic-init`
 
 ```bash
@@ -139,6 +153,10 @@ git checkout feat/orthogonal-vanilla-sit
 
 - `--probe-layer` and `--probe-eval-batches` are omitted because all commands
   already use `--no-linear-probe`.
+- `feat/self-flow-i-jepa-single-noise-hidden-writeback` ignores `--mask-ratio`;
+  student masking comes directly from the sampled JEPA target blocks, then the
+  predicted target hidden tokens are written back before the later backbone
+  layers run.
 - `feat/self-flow-online-target-jepa` does not accept `--fixed-ema-decay` or
   `--jepa-num-targets`.
 - `feat/self-flow-jax-original` and `feat/self-flow-jepa` use
