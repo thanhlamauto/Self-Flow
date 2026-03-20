@@ -1635,8 +1635,8 @@ def main():
         raise ValueError(f"--student-layer {student_layer} out of range [1, {depth}]")
     if not (1 <= teacher_layer <= depth):
         raise ValueError(f"--teacher-layer {teacher_layer} out of range [1, {depth}]")
-    if student_layer >= teacher_layer:
-        raise ValueError(f"student_layer ({student_layer}) must be < teacher_layer ({teacher_layer})")
+    if student_layer > teacher_layer:
+        raise ValueError(f"student_layer ({student_layer}) must be <= teacher_layer ({teacher_layer})")
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
