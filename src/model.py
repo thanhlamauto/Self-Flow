@@ -229,6 +229,31 @@ class SimpleHead(nn.Module):
         return x
 
 
+def _build_repeat_segment_routes(segment_len: int, max_repeats: int) -> jax.Array:
+    """Enumerate every legal fixed-length route with exactly one repeated block."""
+    if segment_len < 2:
+        raise ValueError(f"repeat segment must contain at least 2 blocks, got {segment_len}")
+    if max_repeats < 2:
+        raise ValueError(f"max_repeats must be >= 2, got {max_repeats}")
+
+    routes = []
+    base_route = tuple(range(segment_len))
+    for total_repeats in range(2, max_repeats + 1):
+        for repeat_offset in range(segment_len - total_repeats + 1):
+            route = (
+                base_route[:repeat_offset]
+                + (base_route[repeat_offset],) * total_repeats
+                + base_route[repeat_offset + total_repeats:]
+            )
+            routes.append(route)
+
+    if not routes:
+        raise ValueError(
+            f"no legal repeat routes for segment_len={segment_len} max_repeats={max_repeats}"
+        )
+    return jnp.asarray(routes, dtype=jnp.int32)
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -242,6 +267,11 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    repeat_block_route: bool = False
+    repeat_block_start: int = 4
+    repeat_block_end: int = 9
+    repeat_block_prob: float = 0.5
+    repeat_block_max_repeats: int = 3
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -250,9 +280,119 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
-        self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
-    @nn.compact
+        self.patch_embed = PatchedPatchEmbed(
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
+            name="patch_embed",
+        )
+        self.t_embedder = TimestepEmbedder(hidden_size=self.hidden_size, name="t_embedder")
+        self.y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=0.0,
+            name="y_embedder",
+        )
+        self.blocks = tuple(
+            DiTBlock(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                per_token=self.per_token,
+                name=f"block_{i}",
+            )
+            for i in range(self.depth)
+        )
+        self.feature_head = SimpleHead(
+            in_dim=self.hidden_size,
+            out_dim=self.hidden_size,
+            name="feature_head",
+        )
+        self.final_layer_mod = FinalLayer(
+            hidden_size=self.hidden_size,
+            patch_size=self.patch_size,
+            out_channels=self.out_channels_val,
+            per_token=self.per_token,
+            name="final_layer_mod",
+        )
+
+        if self.repeat_block_route:
+            if not (1 <= int(self.repeat_block_start) <= int(self.repeat_block_end) <= self.depth):
+                raise ValueError(
+                    f"repeat block window must satisfy 1 <= start <= end <= depth ({self.depth}), "
+                    f"got {self.repeat_block_start}:{self.repeat_block_end}"
+                )
+            if not (0.0 <= float(self.repeat_block_prob) <= 1.0):
+                raise ValueError(f"repeat_block_prob must be in [0, 1], got {self.repeat_block_prob}")
+            self.repeat_window_start_idx = int(self.repeat_block_start) - 1
+            self.repeat_window_end_idx = int(self.repeat_block_end)
+            self.repeat_window_len = self.repeat_window_end_idx - self.repeat_window_start_idx
+            if self.repeat_window_len < 2:
+                raise ValueError(
+                    f"repeat block window must contain at least 2 blocks, got {self.repeat_block_start}:{self.repeat_block_end}"
+                )
+            if self.repeat_block_max_repeats < 2:
+                raise ValueError(
+                    f"repeat_block_max_repeats must be >= 2, got {self.repeat_block_max_repeats}"
+                )
+            if self.repeat_block_max_repeats > self.repeat_window_len:
+                raise ValueError(
+                    f"repeat_block_max_repeats ({self.repeat_block_max_repeats}) exceeds repeat window length "
+                    f"({self.repeat_window_len})"
+                )
+            self.repeat_segment_base = jnp.arange(self.repeat_window_len, dtype=jnp.int32)
+            self.repeat_segment_bank = _build_repeat_segment_routes(
+                segment_len=self.repeat_window_len,
+                max_repeats=int(self.repeat_block_max_repeats),
+            )
+        else:
+            self.repeat_window_start_idx = 0
+            self.repeat_window_end_idx = 0
+            self.repeat_window_len = 0
+            self.repeat_segment_base = jnp.zeros((0,), dtype=jnp.int32)
+            self.repeat_segment_bank = jnp.zeros((0, 0), dtype=jnp.int32)
+
+    def _resolve_repeat_segment_route(
+        self,
+        repeat_route_index: Optional[jax.Array],
+        deterministic: bool,
+    ) -> jax.Array:
+        if (
+            deterministic
+            or not self.repeat_block_route
+            or self.repeat_window_len == 0
+        ):
+            return self.repeat_segment_base
+
+        if repeat_route_index is None:
+            return self.repeat_segment_base
+
+        repeat_route_index = jnp.asarray(repeat_route_index, dtype=jnp.int32)
+        repeat_route_index = jnp.clip(repeat_route_index, 0, self.repeat_segment_bank.shape[0])
+        use_repeat = repeat_route_index > 0
+        repeat_idx = jnp.maximum(repeat_route_index - 1, 0)
+        repeat_route = self.repeat_segment_bank[repeat_idx]
+        return jnp.where(use_repeat, repeat_route, self.repeat_segment_base)
+
+    def _capture_block_outputs(
+        self,
+        hidden: jax.Array,
+        layer_idx: int,
+        return_features: bool,
+        return_raw_features: bool,
+        block_summaries,
+        zs,
+    ):
+        if block_summaries is not None:
+            block_summaries.append(jnp.mean(hidden, axis=1))
+        if layer_idx == return_features:
+            zs = self.feature_head(hidden)
+        elif layer_idx == return_raw_features:
+            zs = hidden
+        return block_summaries, zs
+
     def __call__(
         self,
         x: jax.Array,
@@ -262,6 +402,7 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
+        repeat_route_index: Optional[jax.Array] = None,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -273,62 +414,80 @@ class SelfFlowDiT(nn.Module):
         timesteps = 1.0 - timesteps
 
         # Patch Embedding
-        x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
-        )(x)
+        x = self.patch_embed(x)
         x = x + self.pos_embed_val
-
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
             if timesteps.ndim == 1:
-                t_emb = t_embedder(timesteps)
+                t_emb = self.t_embedder(timesteps)
                 t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
             elif timesteps.ndim == 2:
                 t_flat = timesteps.reshape(-1)
-                t_emb_flat = t_embedder(t_flat)
+                t_emb_flat = self.t_embedder(t_flat)
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
             
-            y_emb = y_embedder(vector, deterministic=deterministic)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
-            t_emb = t_embedder(timesteps)
-            y_emb = y_embedder(vector, deterministic=deterministic)
+            t_emb = self.t_embedder(timesteps)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
 
         c = t_emb + y_emb
 
         zs = None
         block_summaries = [] if return_block_summaries else None
-        for i in range(self.depth):
-            x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
-                mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
+        layer_idx = 0
 
-            if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
-                block_summaries.append(jnp.mean(x, axis=1))
-            
-            if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+        repeat_start = self.repeat_window_start_idx
+        repeat_end = self.repeat_window_end_idx
 
-        x = FinalLayer(
-            hidden_size=self.hidden_size,
-            patch_size=self.patch_size,
-            out_channels=self.out_channels_val,
-            per_token=self.per_token
-        )(x, c)
+        for block in self.blocks[:repeat_start]:
+            x = block(x, c)
+            layer_idx += 1
+            block_summaries, zs = self._capture_block_outputs(
+                x, layer_idx, return_features, return_raw_features, block_summaries, zs
+            )
+
+        if self.repeat_block_route and self.repeat_window_len > 0:
+            if self.is_mutable_collection("params"):
+                for block in self.blocks[repeat_start:repeat_end]:
+                    _ = block(x, c)
+            segment_route = self._resolve_repeat_segment_route(
+                repeat_route_index=repeat_route_index,
+                deterministic=deterministic,
+            )
+            segment_branches = tuple(
+                (
+                    lambda mdl, hidden, relative_idx=relative_idx:
+                    mdl.blocks[repeat_start + relative_idx](hidden, c)
+                )
+                for relative_idx in range(self.repeat_window_len)
+            )
+            for route_idx in range(self.repeat_window_len):
+                x = nn.switch(segment_route[route_idx], segment_branches, self, x)
+                layer_idx += 1
+                block_summaries, zs = self._capture_block_outputs(
+                    x, layer_idx, return_features, return_raw_features, block_summaries, zs
+                )
+        else:
+            for block in self.blocks[repeat_start:repeat_end]:
+                x = block(x, c)
+                layer_idx += 1
+                block_summaries, zs = self._capture_block_outputs(
+                    x, layer_idx, return_features, return_raw_features, block_summaries, zs
+                )
+
+        for block in self.blocks[repeat_end:]:
+            x = block(x, c)
+            layer_idx += 1
+            block_summaries, zs = self._capture_block_outputs(
+                x, layer_idx, return_features, return_raw_features, block_summaries, zs
+            )
+
+        x = self.final_layer_mod(x, c)
 
         x = self._shufflechannel(x)
         

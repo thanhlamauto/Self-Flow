@@ -367,7 +367,15 @@ DIT_VARIANTS = {
 }
 
 
-def build_model_config(model_size):
+def build_model_config(
+    model_size,
+    *,
+    repeat_block_route=False,
+    repeat_block_start=4,
+    repeat_block_end=9,
+    repeat_block_prob=0.5,
+    repeat_block_max_repeats=3,
+):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -387,6 +395,11 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        repeat_block_route=repeat_block_route,
+        repeat_block_start=repeat_block_start,
+        repeat_block_end=repeat_block_end,
+        repeat_block_prob=repeat_block_prob,
+        repeat_block_max_repeats=repeat_block_max_repeats,
     )
 
 
@@ -411,7 +424,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, _build_repeat_segment_routes
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -449,6 +462,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        repeat_block_route=config["repeat_block_route"],
+        repeat_block_start=config["repeat_block_start"],
+        repeat_block_end=config["repeat_block_end"],
+        repeat_block_prob=config["repeat_block_prob"],
+        repeat_block_max_repeats=config["repeat_block_max_repeats"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -501,7 +519,7 @@ def ema_update(ema_params, new_params, decay):
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state, ema_params, batch, repeat_route_index, rng, ema_decay,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -527,6 +545,7 @@ def train_step(
             x_tau,
             timesteps=tau,
             vector=y,
+            repeat_route_index=repeat_route_index,
             deterministic=False,
             rngs={"dropout": drop_rng},
         )
@@ -542,6 +561,7 @@ def train_step(
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
+    repeat_active = jax.lax.pmean((repeat_route_index > 0).astype(jnp.float32), axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -556,8 +576,58 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/repeat_route_active": repeat_active,
     }
     return state, ema_params, metrics, rng
+
+
+def build_repeat_block_train_plan(
+    *,
+    enabled: bool,
+    total_steps: int,
+    num_devices: int,
+    repeat_block_start: int,
+    repeat_block_end: int,
+    repeat_block_prob: float,
+    repeat_block_max_repeats: int,
+    seed: int,
+):
+    """Precompute one scalar route id per train step and per device.
+
+    Route id 0 means the canonical order. Route ids 1..N index the legal
+    repeated-block routes enumerated by `_build_repeat_segment_routes`.
+    """
+    if total_steps < 0:
+        raise ValueError(f"total_steps must be >= 0, got {total_steps}")
+    if num_devices <= 0:
+        raise ValueError(f"num_devices must be > 0, got {num_devices}")
+
+    plan = np.zeros((total_steps, num_devices), dtype=np.int32)
+    if not enabled or total_steps == 0 or repeat_block_prob <= 0.0:
+        return plan, 0
+
+    repeat_window_len = repeat_block_end - repeat_block_start + 1
+    route_bank = np.asarray(
+        _build_repeat_segment_routes(repeat_window_len, repeat_block_max_repeats),
+        dtype=np.int32,
+    )
+    route_bank_size = int(route_bank.shape[0])
+    if route_bank_size == 0:
+        return plan, 0
+
+    rng = np.random.default_rng(seed)
+    if repeat_block_prob >= 1.0:
+        use_repeat = np.ones((total_steps, num_devices), dtype=bool)
+    else:
+        use_repeat = rng.random((total_steps, num_devices)) < repeat_block_prob
+    sampled_route_ids = rng.integers(
+        low=1,
+        high=route_bank_size + 1,
+        size=(total_steps, num_devices),
+        dtype=np.int32,
+    )
+    plan[use_repeat] = sampled_route_ids[use_repeat]
+    return plan, route_bank_size
 
 
 def eval_step(
@@ -742,6 +812,11 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        repeat_block_route=config["repeat_block_route"],
+        repeat_block_start=config["repeat_block_start"],
+        repeat_block_end=config["repeat_block_end"],
+        repeat_block_prob=config["repeat_block_prob"],
+        repeat_block_max_repeats=config["repeat_block_max_repeats"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -841,6 +916,11 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        repeat_block_route=config["repeat_block_route"],
+        repeat_block_start=config["repeat_block_start"],
+        repeat_block_end=config["repeat_block_end"],
+        repeat_block_prob=config["repeat_block_prob"],
+        repeat_block_max_repeats=config["repeat_block_max_repeats"],
     )
 
     patch_size = config["patch_size"]
@@ -1174,6 +1254,28 @@ def main():
                         help="Cadence (steps) for EMA block correlation heatmap diagnostic. 0 disables.")
     parser.add_argument("--block-corr-batches", type=int, default=2,
                         help="Number of val batches for block correlation diagnostic.")
+    parser.add_argument(
+        "--repeat-block-route",
+        dest="repeat_block_route",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Training-only stochastic route for a contiguous block window. "
+            "When enabled, deterministic=False forwards keep the normal order with probability "
+            "1 - repeat_block_prob and otherwise sample one legal route where exactly one block "
+            "repeats while later blocks are skipped so total block count stays fixed."
+        ),
+    )
+    parser.add_argument("--repeat-block-start", type=int, default=4,
+                        help="1-based first block in the repeatable window.")
+    parser.add_argument("--repeat-block-end", type=int, default=9,
+                        help="1-based last block in the repeatable window.")
+    parser.add_argument("--repeat-block-prob", type=float, default=0.5,
+                        help="Probability of using a repeated-block route instead of the canonical order.")
+    parser.add_argument("--repeat-block-max-repeats", type=int, default=3,
+                        help="Maximum total visits for the repeated block within the window.")
+    parser.add_argument("--repeat-block-plan-seed", type=int, default=42,
+                        help="Seed used to precompute the repeated-block route schedule at startup.")
     parser.add_argument("--fid-num-steps", type=int, default=50,
                         help="Denoising steps for FID generation. "
                              "TPU default: 50 (monitoring). Paper: 250.")
@@ -1222,6 +1324,14 @@ def main():
         raise ValueError("--block-corr-freq must be >= 0")
     if args.block_corr_batches <= 0:
         raise ValueError("--block-corr-batches must be > 0")
+    if args.repeat_block_start < 1:
+        raise ValueError("--repeat-block-start must be >= 1")
+    if args.repeat_block_end < args.repeat_block_start:
+        raise ValueError("--repeat-block-end must be >= --repeat-block-start")
+    if not (0.0 <= args.repeat_block_prob <= 1.0):
+        raise ValueError("--repeat-block-prob must be in [0, 1]")
+    if args.repeat_block_max_repeats < 2:
+        raise ValueError("--repeat-block-max-repeats must be >= 2")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
 
@@ -1247,8 +1357,28 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size)
+    config = build_model_config(
+        args.model_size,
+        repeat_block_route=args.repeat_block_route,
+        repeat_block_start=args.repeat_block_start,
+        repeat_block_end=args.repeat_block_end,
+        repeat_block_prob=args.repeat_block_prob,
+        repeat_block_max_repeats=args.repeat_block_max_repeats,
+    )
     depth = int(config["depth"])
+
+    if args.repeat_block_route:
+        repeat_window_len = args.repeat_block_end - args.repeat_block_start + 1
+        if args.repeat_block_end > depth:
+            raise ValueError(
+                f"--repeat-block-end ({args.repeat_block_end}) exceeds model depth ({depth})"
+            )
+        if repeat_window_len < 2:
+            raise ValueError("repeat block window must contain at least 2 blocks")
+        if args.repeat_block_max_repeats > repeat_window_len:
+            raise ValueError(
+                "--repeat-block-max-repeats cannot exceed the repeat window length"
+            )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1387,14 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.repeat_block_route:
+        log_stage(
+            "Repeat-route training: "
+            f"window={args.repeat_block_start}:{args.repeat_block_end} "
+            f"prob={args.repeat_block_prob} "
+            f"max_repeats={args.repeat_block_max_repeats} "
+            "(deterministic eval/sampling stays canonical)"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1277,6 +1415,25 @@ def main():
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     total_steps = args.epochs * args.steps_per_epoch
+    repeat_route_plan, repeat_route_bank_size = build_repeat_block_train_plan(
+        enabled=bool(args.repeat_block_route),
+        total_steps=total_steps,
+        num_devices=num_devices,
+        repeat_block_start=args.repeat_block_start,
+        repeat_block_end=args.repeat_block_end,
+        repeat_block_prob=args.repeat_block_prob,
+        repeat_block_max_repeats=args.repeat_block_max_repeats,
+        seed=int(args.repeat_block_plan_seed),
+    )
+    repeat_route_probe = jnp.zeros((num_devices,), dtype=jnp.int32)
+    if args.repeat_block_route:
+        planned_repeat_rate = float(np.mean(repeat_route_plan > 0)) if repeat_route_plan.size else 0.0
+        log_stage(
+            "Repeat-route plan: "
+            f"seed={args.repeat_block_plan_seed} "
+            f"legal_routes={repeat_route_bank_size} "
+            f"planned_repeat_rate={planned_repeat_rate:.3f}"
+        )
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1569,7 +1726,7 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), repeat_route_probe, rng, ema_decay_rep
         )
         block_pytree(probe_metrics)
 
@@ -1930,10 +2087,11 @@ def main():
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            repeat_route_step = jnp.asarray(repeat_route_plan[global_step], dtype=jnp.int32)
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), repeat_route_step, rng, ema_decay_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
