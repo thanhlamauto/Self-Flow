@@ -591,6 +591,9 @@ def build_repeat_block_train_plan(
     repeat_block_prob: float,
     repeat_block_max_repeats: int,
     seed: int,
+    early_stop: bool = False,
+    early_stop_start_step: int | None = None,
+    early_stop_step: int | None = None,
 ):
     """Precompute one scalar route id per train step and per device.
 
@@ -615,11 +618,35 @@ def build_repeat_block_train_plan(
     if route_bank_size == 0:
         return plan, 0
 
+    if early_stop:
+        if early_stop_step is None:
+            raise ValueError("early_stop_step must be provided when early_stop=True")
+        early_stop_step = int(np.clip(early_stop_step, 0, total_steps))
+        early_stop_start_step = 1 if early_stop_start_step is None else int(
+            np.clip(early_stop_start_step, 0, early_stop_step)
+        )
+        if early_stop_step <= 0:
+            return plan, route_bank_size
+        per_step_probs = np.zeros((total_steps,), dtype=np.float64)
+        per_step_probs[:early_stop_start_step] = repeat_block_prob
+        if early_stop_step > early_stop_start_step:
+            decay_len = early_stop_step - early_stop_start_step
+            per_step_probs[early_stop_start_step:early_stop_step] = np.linspace(
+                repeat_block_prob,
+                0.0,
+                num=decay_len + 1,
+                endpoint=True,
+                dtype=np.float64,
+            )[1:]
+        per_step_probs = np.clip(per_step_probs, 0.0, 1.0)
+    else:
+        per_step_probs = np.full((total_steps,), repeat_block_prob, dtype=np.float64)
+
     rng = np.random.default_rng(seed)
-    if repeat_block_prob >= 1.0:
+    if np.all(per_step_probs >= 1.0):
         use_repeat = np.ones((total_steps, num_devices), dtype=bool)
     else:
-        use_repeat = rng.random((total_steps, num_devices)) < repeat_block_prob
+        use_repeat = rng.random((total_steps, num_devices)) < per_step_probs[:, None]
     sampled_route_ids = rng.integers(
         low=1,
         high=route_bank_size + 1,
@@ -1276,6 +1303,22 @@ def main():
                         help="Maximum total visits for the repeated block within the window.")
     parser.add_argument("--repeat-block-plan-seed", type=int, default=42,
                         help="Seed used to precompute the repeated-block route schedule at startup.")
+    parser.add_argument(
+        "--repeat-block-early-stop",
+        dest="repeat_block_early_stop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Linearly decay repeat-block probability to zero, then keep the canonical order "
+            "for the rest of training."
+        ),
+    )
+    parser.add_argument("--repeat-block-early-stop-start-step", type=int, default=None,
+                        help="Keep full repeat-block probability through this step, then begin linear decay on the following step.")
+    parser.add_argument("--repeat-block-early-stop-step", type=int, default=None,
+                        help="Step where repeat-block probability reaches zero. Overrides fraction if set.")
+    parser.add_argument("--repeat-block-early-stop-fraction", type=float, default=0.8,
+                        help="If early-stop is enabled and no explicit step is set, decay to zero by this fraction of total training steps.")
     parser.add_argument("--fid-num-steps", type=int, default=50,
                         help="Denoising steps for FID generation. "
                              "TPU default: 50 (monitoring). Paper: 250.")
@@ -1332,6 +1375,18 @@ def main():
         raise ValueError("--repeat-block-prob must be in [0, 1]")
     if args.repeat_block_max_repeats < 2:
         raise ValueError("--repeat-block-max-repeats must be >= 2")
+    if args.repeat_block_early_stop_start_step is not None and args.repeat_block_early_stop_start_step < 0:
+        raise ValueError("--repeat-block-early-stop-start-step must be >= 0")
+    if args.repeat_block_early_stop_step is not None and args.repeat_block_early_stop_step < 0:
+        raise ValueError("--repeat-block-early-stop-step must be >= 0")
+    if (
+        args.repeat_block_early_stop_start_step is not None
+        and args.repeat_block_early_stop_step is not None
+        and args.repeat_block_early_stop_start_step >= args.repeat_block_early_stop_step
+    ):
+        raise ValueError("--repeat-block-early-stop-start-step must be < --repeat-block-early-stop-step")
+    if not (0.0 <= args.repeat_block_early_stop_fraction <= 1.0):
+        raise ValueError("--repeat-block-early-stop-fraction must be in [0, 1]")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
 
@@ -1395,6 +1450,13 @@ def main():
             f"max_repeats={args.repeat_block_max_repeats} "
             "(deterministic eval/sampling stays canonical)"
         )
+        if args.repeat_block_early_stop:
+            log_stage(
+                "Repeat-route early-stop enabled: "
+                f"start_step={args.repeat_block_early_stop_start_step} "
+                f"step={args.repeat_block_early_stop_step} "
+                f"fraction={args.repeat_block_early_stop_fraction}"
+            )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1415,6 +1477,20 @@ def main():
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     total_steps = args.epochs * args.steps_per_epoch
+    repeat_block_early_stop_start_step = None
+    repeat_block_early_stop_step = None
+    if args.repeat_block_route and args.repeat_block_early_stop:
+        if args.repeat_block_early_stop_start_step is not None:
+            repeat_block_early_stop_start_step = min(
+                int(args.repeat_block_early_stop_start_step),
+                total_steps,
+            )
+        else:
+            repeat_block_early_stop_start_step = 1
+        if args.repeat_block_early_stop_step is not None:
+            repeat_block_early_stop_step = min(int(args.repeat_block_early_stop_step), total_steps)
+        else:
+            repeat_block_early_stop_step = int(np.ceil(args.repeat_block_early_stop_fraction * total_steps))
     repeat_route_plan, repeat_route_bank_size = build_repeat_block_train_plan(
         enabled=bool(args.repeat_block_route),
         total_steps=total_steps,
@@ -1424,6 +1500,9 @@ def main():
         repeat_block_prob=args.repeat_block_prob,
         repeat_block_max_repeats=args.repeat_block_max_repeats,
         seed=int(args.repeat_block_plan_seed),
+        early_stop=bool(args.repeat_block_early_stop),
+        early_stop_start_step=repeat_block_early_stop_start_step,
+        early_stop_step=repeat_block_early_stop_step,
     )
     repeat_route_probe = jnp.zeros((num_devices,), dtype=jnp.int32)
     if args.repeat_block_route:
@@ -1434,6 +1513,13 @@ def main():
             f"legal_routes={repeat_route_bank_size} "
             f"planned_repeat_rate={planned_repeat_rate:.3f}"
         )
+        if args.repeat_block_early_stop:
+            log_stage(
+                "Repeat-route decay: "
+                f"start_after_step={repeat_block_early_stop_start_step} "
+                f"zero_by_step={repeat_block_early_stop_step} "
+                f"last_planned_active_step={int(np.max(np.where(np.any(repeat_route_plan > 0, axis=1))[0])) if np.any(repeat_route_plan > 0) else -1}"
+            )
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
