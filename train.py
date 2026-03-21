@@ -644,11 +644,19 @@ def _fill_hidden_targets(hidden, pred_blocks, tgt_idx, tgt_valid):
     return jnp.where(fill_mask[:, :, None], pred_mean, hidden)
 
 
+def _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback: bool):
+    """Optionally detach write-back blocks so Lgen does not update the predictor."""
+    if stopgrad_writeback:
+        return jax.lax.stop_gradient(pred_blocks)
+    return pred_blocks
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
     state, ema_params, batch, rng, lambda_jepa, ema_decay, compute_grad_cosine,
     *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
+    stopgrad_writeback,
 ):
     """Self-Flow + masked-student I-JEPA with hidden-token writeback.
 
@@ -661,6 +669,8 @@ def train_step(
       - Student runs only to student_layer, predictor reconstructs the target
         blocks in parallel, those predicted blocks are scattered back into the
         student hidden sequence, and the backbone resumes from student_layer + 1.
+      - If stopgrad_writeback is enabled, loss_gen does not backpropagate through
+        the predictor write-back path.
 
     mask_ratio is kept only for CLI compatibility and is not used here.
     compute_grad_cosine is a per-step JAX bool that enables the extra autopsy
@@ -737,7 +747,8 @@ def train_step(
         )
         loss_jepa = jnp.mean(per_block)
 
-        s_filled = _fill_hidden_targets(s_feat, pred_blocks, tgt_idx, tgt_valid)
+        pred_blocks_writeback = _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback)
+        s_filled = _fill_hidden_targets(s_feat, pred_blocks_writeback, tgt_idx, tgt_valid)
         pred = backbone.apply(
             {'params': params["backbone"]},
             s_filled,
@@ -844,6 +855,7 @@ def train_step(
 def eval_step(
     state, ema_params, batch, rng, lambda_jepa,
     *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
+    stopgrad_writeback,
 ):
     """Validation for the single-noise masked-student hidden-writeback JEPA setup."""
     x0, y = batch
@@ -910,7 +922,8 @@ def eval_step(
     )
     loss_jepa = jnp.mean(per_block)
 
-    s_filled = _fill_hidden_targets(s_feat, pred_blocks, tgt_idx, tgt_valid)
+    pred_blocks_writeback = _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback)
+    s_filled = _fill_hidden_targets(s_feat, pred_blocks_writeback, tgt_idx, tgt_valid)
     pred = backbone.apply(
         {'params': state.params["backbone"]},
         s_filled,
@@ -1444,6 +1457,13 @@ def main():
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
                         help="Layer index for teacher features (default: round(0.7 * depth))")
+    parser.add_argument(
+        "--stopgrad-writeback",
+        dest="stopgrad_writeback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Detach predictor blocks before hidden write-back so loss_gen does not update the predictor.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1749,6 +1769,7 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
+        stopgrad_writeback=args.stopgrad_writeback,
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
@@ -1759,6 +1780,7 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
+        stopgrad_writeback=args.stopgrad_writeback,
     )
     pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
     pmapped_eval_step  = jax.pmap(_selfflow_eval_fn,  axis_name='batch')
