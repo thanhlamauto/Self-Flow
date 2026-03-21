@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -518,8 +519,18 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+def mean_tokenwise_cosine_similarity(x, y, eps=1e-8):
+    """Mean cosine similarity over tokens and batch."""
+    x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
+    return jnp.mean(jnp.sum(x_norm * y_norm, axis=-1))
+
 def train_step(
     state, ema_params, batch, repeat_route_index, rng, ema_decay,
+    *,
+    feature_separation_lambda: float = 0.0,
+    feature_separation_layer_low: int = 4,
+    feature_separation_layer_high: int = 11,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -540,24 +551,45 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            repeat_route_index=repeat_route_index,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        aux_loss = jnp.array(0.0, dtype=jnp.float32)
+        if feature_separation_lambda > 0.0:
+            pred, raw_features = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                repeat_route_index=repeat_route_index,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+                return_raw_feature_layers=(
+                    feature_separation_layer_low,
+                    feature_separation_layer_high,
+                ),
+            )
+            low_features, high_features = raw_features
+            aux_loss = mean_tokenwise_cosine_similarity(low_features, high_features)
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                repeat_route_index=repeat_route_index,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+        recon_loss = jnp.mean((pred - target) ** 2)
+        loss = recon_loss + feature_separation_lambda * aux_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (recon_loss, aux_loss, v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (recon_loss, aux_loss, v_abs, v_pred)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    recon_loss = jax.lax.pmean(recon_loss, axis_name="batch")
+    aux_loss = jax.lax.pmean(aux_loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -571,6 +603,8 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_recon": recon_loss,
+        "train/loss_feature_separation": aux_loss,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -659,6 +693,10 @@ def build_repeat_block_train_plan(
 
 def eval_step(
     state, ema_params, batch, rng,
+    *,
+    feature_separation_lambda: float = 0.0,
+    feature_separation_layer_low: int = 4,
+    feature_separation_layer_high: int = 11,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -672,23 +710,44 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    aux_loss = jnp.array(0.0, dtype=jnp.float32)
+    if feature_separation_lambda > 0.0:
+        pred, raw_features = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+            return_raw_feature_layers=(
+                feature_separation_layer_low,
+                feature_separation_layer_high,
+            ),
+        )
+        low_features, high_features = raw_features
+        aux_loss = mean_tokenwise_cosine_similarity(low_features, high_features)
+    else:
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+    recon_loss = jnp.mean((pred - target) ** 2)
+    loss = recon_loss + feature_separation_lambda * aux_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    recon_loss = jax.lax.pmean(recon_loss, axis_name="batch")
+    aux_loss = jax.lax.pmean(aux_loss, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_recon": recon_loss,
+        "val/loss_feature_separation": aux_loss,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1319,6 +1378,12 @@ def main():
                         help="Step where repeat-block probability reaches zero. Overrides fraction if set.")
     parser.add_argument("--repeat-block-early-stop-fraction", type=float, default=0.8,
                         help="If early-stop is enabled and no explicit step is set, decay to zero by this fraction of total training steps.")
+    parser.add_argument("--feature-separation-lambda", type=float, default=0.0,
+                        help="Weight for the auxiliary token-wise cosine loss that pushes two backbone layers apart.")
+    parser.add_argument("--feature-separation-layer-low", type=int, default=4,
+                        help="Lower backbone layer index used by the feature-separation auxiliary loss.")
+    parser.add_argument("--feature-separation-layer-high", type=int, default=11,
+                        help="Higher backbone layer index used by the feature-separation auxiliary loss.")
     parser.add_argument("--fid-num-steps", type=int, default=50,
                         help="Denoising steps for FID generation. "
                              "TPU default: 50 (monitoring). Paper: 250.")
@@ -1387,6 +1452,12 @@ def main():
         raise ValueError("--repeat-block-early-stop-start-step must be < --repeat-block-early-stop-step")
     if not (0.0 <= args.repeat_block_early_stop_fraction <= 1.0):
         raise ValueError("--repeat-block-early-stop-fraction must be in [0, 1]")
+    if args.feature_separation_lambda < 0.0:
+        raise ValueError("--feature-separation-lambda must be >= 0")
+    if args.feature_separation_layer_low < 1:
+        raise ValueError("--feature-separation-layer-low must be >= 1")
+    if args.feature_separation_layer_high < 1:
+        raise ValueError("--feature-separation-layer-high must be >= 1")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
 
@@ -1434,6 +1505,13 @@ def main():
             raise ValueError(
                 "--repeat-block-max-repeats cannot exceed the repeat window length"
             )
+    if args.feature_separation_lambda > 0.0:
+        if args.feature_separation_layer_low >= args.feature_separation_layer_high:
+            raise ValueError("--feature-separation-layer-low must be < --feature-separation-layer-high")
+        if args.feature_separation_layer_high > depth:
+            raise ValueError(
+                f"--feature-separation-layer-high ({args.feature_separation_layer_high}) exceeds model depth ({depth})"
+            )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1457,6 +1535,12 @@ def main():
                 f"step={args.repeat_block_early_stop_step} "
                 f"fraction={args.repeat_block_early_stop_fraction}"
             )
+    if args.feature_separation_lambda > 0.0:
+        log_stage(
+            "Feature-separation loss enabled: "
+            f"lambda={args.feature_separation_lambda} "
+            f"layers={args.feature_separation_layer_low}:{args.feature_separation_layer_high}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1538,8 +1622,24 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            feature_separation_lambda=float(args.feature_separation_lambda),
+            feature_separation_layer_low=int(args.feature_separation_layer_low),
+            feature_separation_layer_high=int(args.feature_separation_layer_high),
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            feature_separation_lambda=float(args.feature_separation_lambda),
+            feature_separation_layer_low=int(args.feature_separation_layer_low),
+            feature_separation_layer_high=int(args.feature_separation_layer_high),
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.

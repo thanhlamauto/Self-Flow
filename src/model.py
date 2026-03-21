@@ -382,6 +382,8 @@ class SelfFlowDiT(nn.Module):
         layer_idx: int,
         return_features: bool,
         return_raw_features: bool,
+        return_raw_feature_layers,
+        multi_raw_features,
         block_summaries,
         zs,
     ):
@@ -391,7 +393,11 @@ class SelfFlowDiT(nn.Module):
             zs = self.feature_head(hidden)
         elif layer_idx == return_raw_features:
             zs = hidden
-        return block_summaries, zs
+        if multi_raw_features is not None:
+            for feature_idx, target_layer in enumerate(return_raw_feature_layers):
+                if layer_idx == target_layer:
+                    multi_raw_features[feature_idx] = hidden
+        return block_summaries, zs, multi_raw_features
 
     def __call__(
         self,
@@ -401,14 +407,29 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_raw_feature_layers: Optional[tuple[int, ...]] = None,
         return_block_summaries: bool = False,
         repeat_route_index: Optional[jax.Array] = None,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+        assert not (return_features and return_raw_feature_layers)
+        assert not (return_raw_features and return_raw_feature_layers)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+
+        if return_raw_feature_layers is not None:
+            return_raw_feature_layers = tuple(int(layer) for layer in return_raw_feature_layers)
+            if len(set(return_raw_feature_layers)) != len(return_raw_feature_layers):
+                raise ValueError(
+                    f"return_raw_feature_layers must be unique, got {return_raw_feature_layers}"
+                )
+            for layer in return_raw_feature_layers:
+                if not (1 <= layer <= self.depth):
+                    raise ValueError(
+                        f"return_raw_feature_layers must be in [1, {self.depth}], got {return_raw_feature_layers}"
+                    )
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -438,6 +459,11 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        multi_raw_features = (
+            [None] * len(return_raw_feature_layers)
+            if return_raw_feature_layers is not None
+            else None
+        )
         block_summaries = [] if return_block_summaries else None
         layer_idx = 0
 
@@ -447,8 +473,15 @@ class SelfFlowDiT(nn.Module):
         for block in self.blocks[:repeat_start]:
             x = block(x, c)
             layer_idx += 1
-            block_summaries, zs = self._capture_block_outputs(
-                x, layer_idx, return_features, return_raw_features, block_summaries, zs
+            block_summaries, zs, multi_raw_features = self._capture_block_outputs(
+                x,
+                layer_idx,
+                return_features,
+                return_raw_features,
+                return_raw_feature_layers,
+                multi_raw_features,
+                block_summaries,
+                zs,
             )
 
         if self.repeat_block_route and self.repeat_window_len > 0:
@@ -469,22 +502,43 @@ class SelfFlowDiT(nn.Module):
             for route_idx in range(self.repeat_window_len):
                 x = nn.switch(segment_route[route_idx], segment_branches, self, x)
                 layer_idx += 1
-                block_summaries, zs = self._capture_block_outputs(
-                    x, layer_idx, return_features, return_raw_features, block_summaries, zs
+                block_summaries, zs, multi_raw_features = self._capture_block_outputs(
+                    x,
+                    layer_idx,
+                    return_features,
+                    return_raw_features,
+                    return_raw_feature_layers,
+                    multi_raw_features,
+                    block_summaries,
+                    zs,
                 )
         else:
             for block in self.blocks[repeat_start:repeat_end]:
                 x = block(x, c)
                 layer_idx += 1
-                block_summaries, zs = self._capture_block_outputs(
-                    x, layer_idx, return_features, return_raw_features, block_summaries, zs
+                block_summaries, zs, multi_raw_features = self._capture_block_outputs(
+                    x,
+                    layer_idx,
+                    return_features,
+                    return_raw_features,
+                    return_raw_feature_layers,
+                    multi_raw_features,
+                    block_summaries,
+                    zs,
                 )
 
         for block in self.blocks[repeat_end:]:
             x = block(x, c)
             layer_idx += 1
-            block_summaries, zs = self._capture_block_outputs(
-                x, layer_idx, return_features, return_raw_features, block_summaries, zs
+            block_summaries, zs, multi_raw_features = self._capture_block_outputs(
+                x,
+                layer_idx,
+                return_features,
+                return_raw_features,
+                return_raw_feature_layers,
+                multi_raw_features,
+                block_summaries,
+                zs,
             )
 
         x = self.final_layer_mod(x, c)
@@ -496,6 +550,16 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        if multi_raw_features is not None:
+            multi_raw_features = tuple(multi_raw_features)
+            if any(feature is None for feature in multi_raw_features):
+                raise RuntimeError(
+                    f"Failed to capture all requested raw feature layers: {return_raw_feature_layers}"
+                )
+            if return_block_summaries:
+                return x, multi_raw_features, block_summaries
+            return x, multi_raw_features
 
         if return_features or return_raw_features:
             if return_block_summaries:
