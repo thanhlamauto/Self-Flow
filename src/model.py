@@ -229,6 +229,21 @@ class SimpleHead(nn.Module):
         return x
 
 
+class REPAProjector(nn.Module):
+    """REPA 3-layer MLP projector for aligning SiT hidden states with DINOv2 features."""
+    hidden_dim: int = 2048
+    output_dim: int = 768
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.output_dim)(x)
+        return x
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -242,6 +257,10 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    # REPA fields (encoder_depth=0 disables REPA)
+    encoder_depth: int = 0
+    repa_proj_dim: int = 2048
+    repa_z_dim: int = 768
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -251,6 +270,10 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        if self.encoder_depth > 0:
+            self.repa_projector = REPAProjector(
+                hidden_dim=self.repa_proj_dim, output_dim=self.repa_z_dim
+            )
 
     @nn.compact
     def __call__(
@@ -261,6 +284,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_repa_features: bool = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -305,11 +329,12 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        repa_zs = None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
@@ -317,11 +342,14 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
-            
+
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
                 zs = x
+
+            if return_repa_features and self.encoder_depth > 0 and (i + 1) == self.encoder_depth:
+                repa_zs = self.repa_projector(x)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -338,6 +366,8 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
+        if return_repa_features and repa_zs is not None:
+            return x, repa_zs
         if return_features or return_raw_features:
             if return_block_summaries:
                 return x, zs, block_summaries
