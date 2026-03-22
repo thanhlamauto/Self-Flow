@@ -164,15 +164,62 @@ def _unflatten_params(flat_dict):
     return nested
 
 
-def load_dinov2_params(pkl_path):
+def _interpolate_pos_embed(pos_embed, target_num_patches):
+    """Interpolate pos_embed from source grid to target grid size.
+
+    DINOv2 ViT-B/14 default is img_size=518 → 37x37=1369 patches,
+    but we use img_size=224 → 16x16=256 patches.
+
+    Args:
+        pos_embed: (1, 1+src_patches, dim) — CLS + patch positional embeddings
+        target_num_patches: number of target patches (e.g. 256 for 224/14)
+    Returns:
+        (1, 1+target_num_patches, dim)
+    """
+    cls_pos = pos_embed[:, :1, :]  # (1, 1, dim)
+    patch_pos = pos_embed[:, 1:, :]  # (1, src_patches, dim)
+
+    src_patches = patch_pos.shape[1]
+    if src_patches == target_num_patches:
+        return pos_embed
+
+    src_grid = int(src_patches ** 0.5)
+    tgt_grid = int(target_num_patches ** 0.5)
+    dim = patch_pos.shape[-1]
+
+    # (1, src_grid, src_grid, dim) → resize → (1, tgt_grid, tgt_grid, dim)
+    patch_pos = patch_pos.reshape(1, src_grid, src_grid, dim)
+    patch_pos = jax.image.resize(
+        patch_pos, (1, tgt_grid, tgt_grid, dim), method="bilinear"
+    )
+    patch_pos = patch_pos.reshape(1, target_num_patches, dim)
+
+    return jnp.concatenate([cls_pos, patch_pos], axis=1)
+
+
+def load_dinov2_params(pkl_path, img_size=224, patch_size=14):
     """Load converted DINOv2 Flax params from pickle file.
+
+    Automatically interpolates pos_embed if the source resolution
+    differs from the target (e.g. 518→224).
 
     Args:
         pkl_path: path to dinov2_vitb14_flax.pkl (output of convert_dinov2_weights.py)
+        img_size: target image size (default 224)
+        patch_size: patch size (default 14)
 
     Returns:
         Nested Flax param dict ready for model.apply({"params": params}, ...)
     """
     with open(pkl_path, "rb") as f:
         flat_params = pickle.load(f)
+
+    # Interpolate pos_embed to target resolution
+    target_num_patches = (img_size // patch_size) ** 2  # 256 for 224/14
+    if "pos_embed" in flat_params:
+        pos = jnp.array(flat_params["pos_embed"])
+        if pos.shape[1] != target_num_patches + 1:
+            pos = _interpolate_pos_embed(pos, target_num_patches)
+            flat_params["pos_embed"] = pos
+
     return _unflatten_params(flat_params)
