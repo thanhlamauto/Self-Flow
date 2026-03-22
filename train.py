@@ -470,6 +470,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_repa_features=config.get("encoder_depth", 0) > 0,
         deterministic=False,
     )
 
