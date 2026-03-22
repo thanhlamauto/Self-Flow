@@ -607,14 +607,13 @@ def _tree_cosine_similarity(tree_a, tree_b, eps: float = 1e-12):
 
 def _predict_parallel_target_blocks(predictor, predictor_params, ctx_feats, ctx_valid, tgt_idx, tgt_valid):
     """Match the original I-JEPA branch: predict all target blocks independently in parallel."""
-    local_batch = ctx_feats.shape[0]
     n_tgt = tgt_idx.shape[1]
     t_max = tgt_idx.shape[2]
 
     ctx_feats_rep = jnp.repeat(ctx_feats, n_tgt, axis=0)
     ctx_valid_rep = jnp.repeat(ctx_valid, n_tgt, axis=0)
-    tgt_idx_flat = tgt_idx.reshape(local_batch * n_tgt, t_max)
-    tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, t_max)
+    tgt_idx_flat = tgt_idx.reshape(-1, t_max)
+    tgt_valid_flat = tgt_valid.reshape(-1, t_max)
 
     pred_flat = predictor.apply(
         {"params": predictor_params},
@@ -623,32 +622,7 @@ def _predict_parallel_target_blocks(predictor, predictor_params, ctx_feats, ctx_
         tgt_idx_flat,
         tgt_valid_flat,
     )
-    pred_blocks = pred_flat.reshape(local_batch, n_tgt, t_max, -1)
-    return pred_blocks, pred_flat, tgt_idx_flat, tgt_valid_flat
-
-
-def _fill_hidden_targets(hidden, pred_blocks, tgt_idx, tgt_valid):
-    """Scatter predicted target blocks back into the student hidden sequence.
-
-    If sampled target blocks overlap, the filled hidden token is the mean of all
-    valid predictions written to that position.
-    """
-    num_tokens = hidden.shape[1]
-    token_weights = jax.nn.one_hot(tgt_idx, num_tokens, dtype=hidden.dtype)
-    token_weights = token_weights * tgt_valid[..., None].astype(hidden.dtype)
-
-    pred_sum = jnp.einsum("bqtn,bqtd->bnd", token_weights, pred_blocks)
-    pred_count = jnp.sum(token_weights, axis=(1, 2))
-    pred_mean = pred_sum / (pred_count[:, :, None] + 1e-6)
-    fill_mask = pred_count > 0
-    return jnp.where(fill_mask[:, :, None], pred_mean, hidden)
-
-
-def _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback: bool):
-    """Optionally detach write-back blocks so Lgen does not update the predictor."""
-    if stopgrad_writeback:
-        return jax.lax.stop_gradient(pred_blocks)
-    return pred_blocks
+    return pred_flat, tgt_valid_flat
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
@@ -656,9 +630,8 @@ def _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback: bool):
 def train_step(
     state, ema_params, batch, rng, lambda_jepa, ema_decay, compute_grad_cosine,
     *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
-    stopgrad_writeback,
 ):
-    """Self-Flow + masked-student I-JEPA with hidden-token writeback.
+    """Self-Flow + masked-student I-JEPA without hidden-token writeback.
 
     Design for this branch:
       - Sample a single tau per image; student and teacher share the same x_tau.
@@ -667,10 +640,8 @@ def train_step(
       - Student sees x_tau with the sampled JEPA target union fully replaced by a
         learnable patch-space mask token.
       - Student runs only to student_layer, predictor reconstructs the target
-        blocks in parallel, those predicted blocks are scattered back into the
-        student hidden sequence, and the backbone resumes from student_layer + 1.
-      - If stopgrad_writeback is enabled, loss_gen does not backpropagate through
-        the predictor write-back path.
+        blocks in parallel, and the backbone continues from that masked hidden
+        sequence directly. Predictor updates come only from Ljepa.
 
     mask_ratio is kept only for CLI compatibility and is not used here.
     compute_grad_cosine is a per-step JAX bool that enables the extra autopsy
@@ -730,7 +701,7 @@ def train_step(
         )
 
         ctx_feats = _gather_tokens(s_feat, ctx_idx)
-        pred_blocks, pred_flat, tgt_idx_flat, tgt_valid_flat = _predict_parallel_target_blocks(
+        pred_flat, tgt_valid_flat = _predict_parallel_target_blocks(
             predictor,
             params["predictor"],
             ctx_feats,
@@ -747,11 +718,9 @@ def train_step(
         )
         loss_jepa = jnp.mean(per_block)
 
-        pred_blocks_writeback = _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback)
-        s_filled = _fill_hidden_targets(s_feat, pred_blocks_writeback, tgt_idx, tgt_valid)
         pred = backbone.apply(
             {'params': params["backbone"]},
-            s_filled,
+            s_feat,
             timesteps=tau,
             vector=y,
             start_layer=student_layer,
@@ -855,9 +824,8 @@ def train_step(
 def eval_step(
     state, ema_params, batch, rng, lambda_jepa,
     *, backbone, predictor, target_mask, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
-    stopgrad_writeback,
 ):
-    """Validation for the single-noise masked-student hidden-writeback JEPA setup."""
+    """Validation for the single-noise masked-student no-writeback JEPA setup."""
     x0, y = batch
     local_batch = x0.shape[0]
     num_tokens  = x0.shape[1]
@@ -905,7 +873,7 @@ def eval_step(
     )
 
     ctx_feats = _gather_tokens(s_feat, ctx_idx)
-    pred_blocks, pred_flat, _, tgt_valid_flat = _predict_parallel_target_blocks(
+    pred_flat, tgt_valid_flat = _predict_parallel_target_blocks(
         predictor,
         state.params["predictor"],
         ctx_feats,
@@ -922,11 +890,9 @@ def eval_step(
     )
     loss_jepa = jnp.mean(per_block)
 
-    pred_blocks_writeback = _maybe_stopgrad_writeback(pred_blocks, stopgrad_writeback)
-    s_filled = _fill_hidden_targets(s_feat, pred_blocks_writeback, tgt_idx, tgt_valid)
     pred = backbone.apply(
         {'params': state.params["backbone"]},
-        s_filled,
+        s_feat,
         timesteps=tau,
         vector=y,
         start_layer=student_layer,
@@ -1457,13 +1423,6 @@ def main():
                         help="Layer index for student features (default: round(0.3 * depth))")
     parser.add_argument("--teacher-layer", type=int, default=None,
                         help="Layer index for teacher features (default: round(0.7 * depth))")
-    parser.add_argument(
-        "--stopgrad-writeback",
-        dest="stopgrad_writeback",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Detach predictor blocks before hidden write-back so loss_gen does not update the predictor.",
-    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1678,7 +1637,7 @@ def main():
     else:
         ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
     log_stage(
-        f"Self-Flow+JEPA: single_tau masked_target_union hidden_writeback lambda_jepa={args.lambda_jepa} "
+        f"Self-Flow+JEPA: single_tau masked_target_union no_writeback lambda_jepa={args.lambda_jepa} "
         f"predictor_depth={args.predictor_depth} jepa_num_targets={args.jepa_num_targets} "
         f"{ema_desc} grad_clip={args.grad_clip}"
     )
@@ -1769,7 +1728,6 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
-        stopgrad_writeback=args.stopgrad_writeback,
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
@@ -1780,7 +1738,6 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
-        stopgrad_writeback=args.stopgrad_writeback,
     )
     pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
     pmapped_eval_step  = jax.pmap(_selfflow_eval_fn,  axis_name='batch')
