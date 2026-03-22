@@ -126,7 +126,7 @@ class DiTBlock(nn.Module):
     per_token: bool = False
 
     @nn.compact
-    def __call__(self, x, c):
+    def __call__(self, x, c, *, capture_attention: bool = False):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
@@ -145,7 +145,7 @@ class DiTBlock(nn.Module):
             # Self Attention
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
-            )(x_norm, x_norm)
+            )(x_norm, x_norm, sow_weights=capture_attention)
             x = x + gate_msa * attn
             
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
@@ -165,7 +165,7 @@ class DiTBlock(nn.Module):
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
-            )(x_norm, x_norm)
+            )(x_norm, x_norm, sow_weights=capture_attention)
             x = x + gate_msa[:, None, :] * attn
             
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
@@ -261,6 +261,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_attention_layer: Optional[int] = None,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -312,7 +313,11 @@ class SelfFlowDiT(nn.Module):
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
-            )(x, c)
+            )(
+                x,
+                c,
+                capture_attention=((i + 1) == return_attention_layer),
+            )
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)

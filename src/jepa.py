@@ -166,14 +166,14 @@ class PredictorBlock(nn.Module):
     mlp_ratio: float = 4.0
 
     @nn.compact
-    def __call__(self, x, attn_mask=None):
+    def __call__(self, x, attn_mask=None, *, capture_attention: bool = False):
         residual = x
         x = nn.LayerNorm(epsilon=1e-6)(x)
         x = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.hidden_size,
             out_features=self.hidden_size,
-        )(x, x, mask=attn_mask)
+        )(x, x, mask=attn_mask, sow_weights=capture_attention)
         x = residual + x
 
         residual = x
@@ -210,7 +210,7 @@ class JEPAPredictor(nn.Module):
 
     @nn.compact
     def __call__(self, ctx_feats, ctx_valid, tgt_idx, tgt_valid,
-                 deterministic: bool = True):
+                 deterministic: bool = True, capture_first_attention: bool = False):
         B = ctx_feats.shape[0]
 
         # Project context features to predictor width.
@@ -242,12 +242,16 @@ class JEPAPredictor(nn.Module):
         # Shape required by Flax MHSA: [B, num_heads, q_len, kv_len] or broadcastable.
         attn_mask = key_valid[:, None, None, :].astype(jnp.float32)  # [B,1,1,seq]
 
-        for _ in range(self.depth):
+        for block_idx in range(self.depth):
             x = PredictorBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
-            )(x, attn_mask)
+            )(
+                x,
+                attn_mask,
+                capture_attention=(capture_first_attention and block_idx == 0),
+            )
 
         # Extract the target portion only.
         tgt_out = x[:, self.C_max:, :]  # [B, T_max, H]
