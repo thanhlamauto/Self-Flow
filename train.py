@@ -567,76 +567,82 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
-def train_step_repa(
-    state, ema_params, batch, dinov2_features, rng, ema_decay, proj_coeff,
-):
-    """SiT training step with REPA alignment loss.
+def make_train_step_repa(dinov2_model):
+    """Create a fused REPA train step that runs DINOv2 + SiT in a single pmap.
 
-    Same flow matching objective as train_step, plus cosine alignment between
-    the SiT hidden state (at encoder_depth) and frozen DINOv2 features.
+    DINOv2 runs in bfloat16 for ~2x speedup on TPU; results are cast back to float32.
     """
-    x0, y = batch
-    local_batch = x0.shape[0]
+    def train_step_repa(
+        state, ema_params, batch, images, dinov2_params, rng, ema_decay, proj_coeff,
+    ):
+        x0, y = batch
+        local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+        # Frozen DINOv2 forward in bfloat16 (fused into same pmap — no extra sync)
+        dinov2_features = dinov2_model.apply(
+            dinov2_params, images.astype(jnp.bfloat16)
+        ).astype(jnp.float32)
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
 
-    def loss_fn(params):
-        pred, repa_zs = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            return_repa_features=True,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        diff_loss = jnp.mean((pred - target) ** 2)
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
 
-        # REPA: negative cosine similarity (per-token)
-        proj_n = repa_zs / (jnp.linalg.norm(repa_zs, axis=-1, keepdims=True) + 1e-8)
-        dino_n = jax.lax.stop_gradient(dinov2_features)
-        dino_n = dino_n / (jnp.linalg.norm(dino_n, axis=-1, keepdims=True) + 1e-8)
-        align_loss = -jnp.mean(jnp.sum(proj_n * dino_n, axis=-1))
+        def loss_fn(params):
+            pred, repa_zs = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_repa_features=True,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            diff_loss = jnp.mean((pred - target) ** 2)
 
-        total_loss = diff_loss + proj_coeff * align_loss
+            # REPA: negative cosine similarity (per-token)
+            proj_n = repa_zs / (jnp.linalg.norm(repa_zs, axis=-1, keepdims=True) + 1e-8)
+            dino_n = jax.lax.stop_gradient(dinov2_features)
+            dino_n = dino_n / (jnp.linalg.norm(dino_n, axis=-1, keepdims=True) + 1e-8)
+            align_loss = -jnp.mean(jnp.sum(proj_n * dino_n, axis=-1))
 
-        v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return total_loss, (diff_loss, align_loss, v_abs_mean, v_pred_abs_mean)
+            total_loss = diff_loss + proj_coeff * align_loss
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (diff_loss, align_loss, v_abs, v_pred)), grads = grad_fn(state.params)
+            v_abs_mean = jnp.mean(jnp.abs(target))
+            v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+            return total_loss, (diff_loss, align_loss, v_abs_mean, v_pred_abs_mean)
 
-    total_loss = jax.lax.pmean(total_loss, axis_name="batch")
-    diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
-    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (total_loss, (diff_loss, align_loss, v_abs, v_pred)), grads = grad_fn(state.params)
 
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+        total_loss = jax.lax.pmean(total_loss, axis_name="batch")
+        diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
+        align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        grads = jax.lax.pmean(grads, axis_name="batch")
 
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+        param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
-    metrics = {
-        "train/loss": total_loss,
-        "train/diff_loss": diff_loss,
-        "train/align_loss": align_loss,
-        "train/ema_decay": ema_decay,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
-    }
-    return state, ema_params, metrics, rng
+        state = state.apply_gradients(grads=grads)
+        ema_params = ema_update(ema_params, state.params, ema_decay)
+
+        metrics = {
+            "train/loss": total_loss,
+            "train/diff_loss": diff_loss,
+            "train/align_loss": align_loss,
+            "train/ema_decay": ema_decay,
+            "train/grad_norm": grad_norm,
+            "train/param_norm": param_norm,
+            "train/v_abs_mean": v_abs,
+            "train/v_pred_abs_mean": v_pred,
+        }
+        return state, ema_params, metrics, rng
+    return train_step_repa
 
 
 def eval_step(
@@ -783,8 +789,8 @@ def get_arrayrecord_dataloader_repa(data_pattern, batch_size, is_training=True, 
         data_source=data_source,
         sampler=sampler,
         operations=operations,
-        worker_count=8,
-        read_options=grain.ReadOptions(prefetch_buffer_size=1024),
+        worker_count=16,
+        read_options=grain.ReadOptions(prefetch_buffer_size=2048),
     )
 
     return dataloader
@@ -1457,10 +1463,9 @@ def main():
     pmapped_train_step = jax.pmap(train_step, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
-    # ── REPA: DINOv2 init + pmapped REPA train step ─────────────────────────
+    # ── REPA: DINOv2 init + fused pmapped REPA train step ───────────────────
     repa_enabled = args.encoder_depth > 0
     dinov2_params_rep = None
-    dinov2_forward = None
     pmapped_train_step_repa = None
     proj_coeff_rep = None
 
@@ -1473,11 +1478,9 @@ def main():
         dinov2_params_rep = jax_utils.replicate({"params": dinov2_params})
         log_stage("DINOv2 loaded and replicated.")
 
-        @jax.pmap
-        def dinov2_forward(variables, images):
-            return dinov2_model.apply(variables, images)
-
-        pmapped_train_step_repa = jax.pmap(train_step_repa, axis_name="batch")
+        # Fused train step: DINOv2 (bfloat16) + SiT in single pmap — no extra sync barrier
+        _train_step_repa_fn = make_train_step_repa(dinov2_model)
+        pmapped_train_step_repa = jax.pmap(_train_step_repa_fn, axis_name="batch")
         proj_coeff_rep = jax_utils.replicate(jnp.float32(args.repa_proj_coeff))
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -2119,12 +2122,11 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             if repa_enabled and data_iterator is not None:
-                # REPA path: extract images, run DINOv2 (frozen), then train with alignment
+                # REPA path: fused DINOv2 (bfloat16) + SiT in single pmap
                 batch_img = jnp.array(batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
-                dinov2_feats = dinov2_forward(dinov2_params_rep, batch_img)
                 state, ema_params, metrics, rng = pmapped_train_step_repa(
-                    state, ema_params, (batch_x, batch_y), dinov2_feats,
-                    rng, ema_decay_rep, proj_coeff_rep,
+                    state, ema_params, (batch_x, batch_y), batch_img,
+                    dinov2_params_rep, rng, ema_decay_rep, proj_coeff_rep,
                 )
             else:
                 # Vanilla SiT training step (returns updated EMA params)
