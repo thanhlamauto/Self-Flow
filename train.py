@@ -533,6 +533,14 @@ def mean_tokenwise_squared_cosine_similarity(x, y, eps=1e-8):
     return jnp.mean(jnp.square(cos))
 
 
+def mean_tokenwise_squared_cosine_alignment_loss(x, y, eps=1e-8):
+    """Tokenwise cosine alignment loss with a minimum at cosine similarity 1."""
+    x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
+    cos = jnp.sum(x_norm * y_norm, axis=-1)
+    return jnp.mean(jnp.square(1.0 - cos))
+
+
 def train_step(
     state,
     ema_params,
@@ -644,7 +652,10 @@ def train_step(
                     method=backbone.extract_raw_features,
                 )
                 a1_8 = jax.lax.stop_gradient(a1_8)
-                bridge_loss = jnp.mean((((g_a3 + g_a2) * 0.5) - a1_8) ** 2)
+                bridge_loss = mean_tokenwise_squared_cosine_alignment_loss(
+                    (g_a3 + g_a2) * 0.5,
+                    a1_8,
+                )
 
         loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
@@ -813,7 +824,10 @@ def eval_step(
                 method=backbone.extract_raw_features,
             )
             a1_8 = jax.lax.stop_gradient(a1_8)
-            bridge_loss = jnp.mean((((g_a3 + g_a2) * 0.5) - a1_8) ** 2)
+            bridge_loss = mean_tokenwise_squared_cosine_alignment_loss(
+                (g_a3 + g_a2) * 0.5,
+                a1_8,
+            )
 
     loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
