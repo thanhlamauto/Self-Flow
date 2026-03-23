@@ -533,12 +533,25 @@ def mean_tokenwise_squared_cosine_similarity(x, y, eps=1e-8):
     return jnp.mean(jnp.square(cos))
 
 
+def mean_tokenwise_cosine_similarity(x, y, eps=1e-8):
+    """Mean cosine similarity over tokens and batch."""
+    x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
+    cos = jnp.sum(x_norm * y_norm, axis=-1)
+    return jnp.mean(cos)
+
+
 def mean_tokenwise_squared_cosine_alignment_loss(x, y, eps=1e-8):
     """Tokenwise cosine alignment loss with a minimum at cosine similarity 1."""
     x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
     y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
     cos = jnp.sum(x_norm * y_norm, axis=-1)
     return jnp.mean(jnp.square(1.0 - cos))
+
+
+def mean_tokenwise_feature_norm(x):
+    """Mean L2 norm over tokens and batch."""
+    return jnp.mean(jnp.linalg.norm(x, axis=-1))
 
 
 def train_step(
@@ -637,10 +650,17 @@ def train_step(
 
         bridge_loss = jnp.array(0.0, dtype=jnp.float32)
         orthogonal_loss = jnp.array(0.0, dtype=jnp.float32)
+        bridge_cosine = jnp.array(0.0, dtype=jnp.float32)
+        bridge_avg_proj_norm = jnp.array(0.0, dtype=jnp.float32)
+        bridge_teacher_norm = jnp.array(0.0, dtype=jnp.float32)
+        projected_t2_norm = jnp.array(0.0, dtype=jnp.float32)
+        projected_t3_norm = jnp.array(0.0, dtype=jnp.float32)
         if use_student_features:
             g_a2 = projector.apply({"params": projector_params}, a2_4)
             g_a3 = projector.apply({"params": projector_params}, a3_4)
             orthogonal_loss = mean_tokenwise_squared_cosine_similarity(g_a3, g_a2)
+            projected_t2_norm = mean_tokenwise_feature_norm(g_a2)
+            projected_t3_norm = mean_tokenwise_feature_norm(g_a3)
             if use_teacher_feature:
                 a1_8 = backbone.apply(
                     {"params": ema_params},
@@ -652,10 +672,14 @@ def train_step(
                     method=backbone.extract_raw_features,
                 )
                 a1_8 = jax.lax.stop_gradient(a1_8)
+                avg_projection = (g_a3 + g_a2) * 0.5
                 bridge_loss = mean_tokenwise_squared_cosine_alignment_loss(
-                    (g_a3 + g_a2) * 0.5,
+                    avg_projection,
                     a1_8,
                 )
+                bridge_cosine = mean_tokenwise_cosine_similarity(avg_projection, a1_8)
+                bridge_avg_proj_norm = mean_tokenwise_feature_norm(avg_projection)
+                bridge_teacher_norm = mean_tokenwise_feature_norm(a1_8)
 
         loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
@@ -671,6 +695,11 @@ def train_step(
             diff_t3,
             bridge_loss,
             orthogonal_loss,
+            bridge_cosine,
+            bridge_avg_proj_norm,
+            bridge_teacher_norm,
+            projected_t2_norm,
+            projected_t3_norm,
             v_abs_mean,
             v_pred_abs_mean,
         )
@@ -678,7 +707,21 @@ def train_step(
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (
         loss,
-        (diff_loss, diff_t1, diff_t2, diff_t3, bridge_loss, orthogonal_loss, v_abs, v_pred),
+        (
+            diff_loss,
+            diff_t1,
+            diff_t2,
+            diff_t3,
+            bridge_loss,
+            orthogonal_loss,
+            bridge_cosine,
+            bridge_avg_proj_norm,
+            bridge_teacher_norm,
+            projected_t2_norm,
+            projected_t3_norm,
+            v_abs,
+            v_pred,
+        ),
     ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -688,6 +731,11 @@ def train_step(
     diff_t3 = jax.lax.pmean(diff_t3, axis_name="batch")
     bridge_loss = jax.lax.pmean(bridge_loss, axis_name="batch")
     orthogonal_loss = jax.lax.pmean(orthogonal_loss, axis_name="batch")
+    bridge_cosine = jax.lax.pmean(bridge_cosine, axis_name="batch")
+    bridge_avg_proj_norm = jax.lax.pmean(bridge_avg_proj_norm, axis_name="batch")
+    bridge_teacher_norm = jax.lax.pmean(bridge_teacher_norm, axis_name="batch")
+    projected_t2_norm = jax.lax.pmean(projected_t2_norm, axis_name="batch")
+    projected_t3_norm = jax.lax.pmean(projected_t3_norm, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -707,6 +755,11 @@ def train_step(
         "train/loss_diff_t3": diff_t3,
         "train/loss_bridge": bridge_loss,
         "train/loss_orthogonal": orthogonal_loss,
+        "train/bridge_cosine": bridge_cosine,
+        "train/bridge_avg_proj_norm": bridge_avg_proj_norm,
+        "train/bridge_teacher_norm": bridge_teacher_norm,
+        "train/projected_t2_norm": projected_t2_norm,
+        "train/projected_t3_norm": projected_t3_norm,
         "train/diff_weight_t1": w1,
         "train/diff_weight_t2": w2,
         "train/diff_weight_t3": w3,
@@ -809,10 +862,17 @@ def eval_step(
 
     bridge_loss = jnp.array(0.0, dtype=jnp.float32)
     orthogonal_loss = jnp.array(0.0, dtype=jnp.float32)
+    bridge_cosine = jnp.array(0.0, dtype=jnp.float32)
+    bridge_avg_proj_norm = jnp.array(0.0, dtype=jnp.float32)
+    bridge_teacher_norm = jnp.array(0.0, dtype=jnp.float32)
+    projected_t2_norm = jnp.array(0.0, dtype=jnp.float32)
+    projected_t3_norm = jnp.array(0.0, dtype=jnp.float32)
     if use_student_features:
         g_a2 = projector.apply({"params": projector_params}, a2_4)
         g_a3 = projector.apply({"params": projector_params}, a3_4)
         orthogonal_loss = mean_tokenwise_squared_cosine_similarity(g_a3, g_a2)
+        projected_t2_norm = mean_tokenwise_feature_norm(g_a2)
+        projected_t3_norm = mean_tokenwise_feature_norm(g_a3)
         if use_teacher_feature:
             a1_8 = backbone.apply(
                 {"params": ema_params},
@@ -824,10 +884,14 @@ def eval_step(
                 method=backbone.extract_raw_features,
             )
             a1_8 = jax.lax.stop_gradient(a1_8)
+            avg_projection = (g_a3 + g_a2) * 0.5
             bridge_loss = mean_tokenwise_squared_cosine_alignment_loss(
-                (g_a3 + g_a2) * 0.5,
+                avg_projection,
                 a1_8,
             )
+            bridge_cosine = mean_tokenwise_cosine_similarity(avg_projection, a1_8)
+            bridge_avg_proj_norm = mean_tokenwise_feature_norm(avg_projection)
+            bridge_teacher_norm = mean_tokenwise_feature_norm(a1_8)
 
     loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
@@ -844,6 +908,11 @@ def eval_step(
     diff_t3 = jax.lax.pmean(diff_t3, axis_name="batch")
     bridge_loss = jax.lax.pmean(bridge_loss, axis_name="batch")
     orthogonal_loss = jax.lax.pmean(orthogonal_loss, axis_name="batch")
+    bridge_cosine = jax.lax.pmean(bridge_cosine, axis_name="batch")
+    bridge_avg_proj_norm = jax.lax.pmean(bridge_avg_proj_norm, axis_name="batch")
+    bridge_teacher_norm = jax.lax.pmean(bridge_teacher_norm, axis_name="batch")
+    projected_t2_norm = jax.lax.pmean(projected_t2_norm, axis_name="batch")
+    projected_t3_norm = jax.lax.pmean(projected_t3_norm, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -856,6 +925,11 @@ def eval_step(
         "val/loss_diff_t3": diff_t3,
         "val/loss_bridge": bridge_loss,
         "val/loss_orthogonal": orthogonal_loss,
+        "val/bridge_cosine": bridge_cosine,
+        "val/bridge_avg_proj_norm": bridge_avg_proj_norm,
+        "val/bridge_teacher_norm": bridge_teacher_norm,
+        "val/projected_t2_norm": projected_t2_norm,
+        "val/projected_t3_norm": projected_t3_norm,
         "val/diff_weight_t1": w1,
         "val/diff_weight_t2": w2,
         "val/diff_weight_t3": w3,
