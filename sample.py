@@ -80,7 +80,7 @@ def load_model(ckpt_path=None, model_size="XL"):
 
     This SiT baseline expects flat parameter trees (both online and EMA).
     For convenience, we also tolerate a few older shapes when loading:
-      - Nested {"backbone": ...} checkpoints: extract "backbone".
+      - Nested {"backbone": ..., "projector": ...} checkpoints: extract "backbone".
       - Flat checkpoints that include "feature_head": drop that key.
     """
     config = _model_config_for_size(model_size)

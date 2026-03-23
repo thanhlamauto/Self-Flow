@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -411,7 +412,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, SimpleHead
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -431,25 +432,12 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
-    """Initializes the model, optimizer, and initial EMA params.
+def create_train_state(rng, config, backbone, projector, learning_rate, grad_clip=1.0):
+    """Initializes optimizer state for backbone + projector training.
 
-    Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
+    state.params = {"backbone": ..., "projector": ...}
+    ema_params tracks only the backbone weights used by the EMA teacher.
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -459,13 +447,19 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
-    variables = model.init(
+    backbone_vars = backbone.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
     )
+    backbone_params = backbone_vars["params"]
+
+    rng, projector_rng = jax.random.split(rng)
+    dummy_features = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
+    projector_vars = projector.init(projector_rng, dummy_features)
+    projector_params = projector_vars["params"]
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -473,13 +467,16 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         optax.adamw(learning_rate, weight_decay=0),
     )
 
+    all_params = {
+        "backbone": backbone_params,
+        "projector": projector_params,
+    }
     state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
+        apply_fn=backbone.apply,
+        params=all_params,
         tx=tx,
     )
-    # EMA params start as an exact copy of the initial online params
-    ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
+    ema_params = jax.tree_util.tree_map(lambda x: x, backbone_params)
     return state, ema_params
 
 
@@ -500,45 +497,186 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def train_step(
-    state, ema_params, batch, rng, ema_decay,
-):
-    """Vanilla SiT training step (global timestep; velocity prediction).
+def _sample_truncated_exponential01(rng, shape, rate):
+    rate = jnp.float32(rate)
+    u = jax.random.uniform(rng, shape=shape, minval=0.0, maxval=1.0)
+    return -jnp.log1p(-u * (1.0 - jnp.exp(-rate))) / rate
 
-    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
-      x_tau   = (1 - tau) * x1 + tau * x0
-      target  = x0 - x1
-      loss    = E[||v_theta(x_tau, tau) - target||^2]
-    """
+
+def sample_triple_noise_levels(rng, local_batch, exp_rate=3.0, eps=1e-6):
+    """Sample three ordered noise levels, then convert them to repo tau values."""
+    n1_rng, n2_rng, n3_rng = jax.random.split(rng, 3)
+    z1 = _sample_truncated_exponential01(n1_rng, (local_batch,), exp_rate)
+    z2 = jax.random.beta(n2_rng, a=2.0, b=2.0, shape=(local_batch,))
+    z3 = _sample_truncated_exponential01(n3_rng, (local_batch,), exp_rate)
+
+    eps = jnp.float32(eps)
+    n1 = 0.35 * (1.0 - z1)
+    n2 = 0.35 + 0.30 * z2
+    n3 = 0.65 + 0.35 * z3
+
+    n1 = jnp.clip(n1, eps, jnp.float32(0.35))
+    n2 = jnp.clip(n2, jnp.float32(0.35), jnp.float32(0.65))
+    n3 = jnp.clip(n3, jnp.float32(0.65), 1.0 - eps)
+
+    t1 = 1.0 - n1
+    t2 = 1.0 - n2
+    t3 = 1.0 - n3
+    return n1, n2, n3, t1, t2, t3
+
+
+def mean_tokenwise_squared_cosine_similarity(x, y, eps=1e-8):
+    """Mean squared cosine similarity over tokens and batch."""
+    x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
+    cos = jnp.sum(x_norm * y_norm, axis=-1)
+    return jnp.mean(jnp.square(cos))
+
+
+def train_step(
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    *,
+    backbone,
+    projector,
+    diff_weight_t1: float = 0.75,
+    diff_weight_t2: float = 1.0,
+    diff_weight_t3: float = 1.25,
+    bridge_lambda: float = 0.0,
+    orthogonal_lambda: float = 0.0,
+    student_layer: int = 4,
+    teacher_layer: int = 8,
+):
+    """Triple-noise SiT training step with EMA teacher bridge."""
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, noise_level_rng, noise_rng, drop_t1_rng, drop_t2_rng, drop_t3_rng = jax.random.split(rng, 6)
+    _, _, _, tau1, tau2, tau3 = sample_triple_noise_levels(noise_level_rng, local_batch)
+    x_noise = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+    x_tau1 = (1.0 - tau1[:, None, None]) * x_noise + tau1[:, None, None] * x0
+    x_tau2 = (1.0 - tau2[:, None, None]) * x_noise + tau2[:, None, None] * x0
+    x_tau3 = (1.0 - tau3[:, None, None]) * x_noise + tau3[:, None, None] * x0
+    target = x0 - x_noise
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+    w1 = jnp.float32(diff_weight_t1)
+    w2 = jnp.float32(diff_weight_t2)
+    w3 = jnp.float32(diff_weight_t3)
+    diff_weight_sum = w1 + w2 + w3
+    use_student_features = bridge_lambda > 0.0 or orthogonal_lambda > 0.0
+    use_teacher_feature = bridge_lambda > 0.0
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
+        backbone_params = params["backbone"]
+        projector_params = params["projector"]
+
+        pred_t1 = backbone.apply(
+            {"params": backbone_params},
+            x_tau1,
+            timesteps=tau1,
             vector=y,
             deterministic=False,
-            rngs={"dropout": drop_rng},
+            rngs={"dropout": drop_t1_rng},
         )
-        loss = jnp.mean((pred - target) ** 2)
+
+        if use_student_features:
+            pred_t2, (a2_4,) = backbone.apply(
+                {"params": backbone_params},
+                x_tau2,
+                timesteps=tau2,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_t2_rng},
+                return_raw_feature_layers=(student_layer,),
+            )
+            pred_t3, (a3_4,) = backbone.apply(
+                {"params": backbone_params},
+                x_tau3,
+                timesteps=tau3,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_t3_rng},
+                return_raw_feature_layers=(student_layer,),
+            )
+        else:
+            pred_t2 = backbone.apply(
+                {"params": backbone_params},
+                x_tau2,
+                timesteps=tau2,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_t2_rng},
+            )
+            pred_t3 = backbone.apply(
+                {"params": backbone_params},
+                x_tau3,
+                timesteps=tau3,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_t3_rng},
+            )
+            a2_4 = None
+            a3_4 = None
+
+        diff_t1 = jnp.mean((pred_t1 - target) ** 2)
+        diff_t2 = jnp.mean((pred_t2 - target) ** 2)
+        diff_t3 = jnp.mean((pred_t3 - target) ** 2)
+        diff_loss = (w1 * diff_t1 + w2 * diff_t2 + w3 * diff_t3) / diff_weight_sum
+
+        bridge_loss = jnp.array(0.0, dtype=jnp.float32)
+        orthogonal_loss = jnp.array(0.0, dtype=jnp.float32)
+        if use_student_features:
+            g_a2 = projector.apply({"params": projector_params}, a2_4)
+            g_a3 = projector.apply({"params": projector_params}, a3_4)
+            orthogonal_loss = mean_tokenwise_squared_cosine_similarity(g_a3, g_a2)
+            if use_teacher_feature:
+                a1_8 = backbone.apply(
+                    {"params": ema_params},
+                    x_tau1,
+                    timesteps=tau1,
+                    vector=y,
+                    layer=teacher_layer,
+                    deterministic=True,
+                    method=backbone.extract_raw_features,
+                )
+                a1_8 = jax.lax.stop_gradient(a1_8)
+                bridge_loss = jnp.mean((((g_a3 + g_a2) * 0.5) - a1_8) ** 2)
+
+        loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        v_pred_abs_mean = (
+            jnp.mean(jnp.abs(pred_t1))
+            + jnp.mean(jnp.abs(pred_t2))
+            + jnp.mean(jnp.abs(pred_t3))
+        ) / 3.0
+        return loss, (
+            diff_loss,
+            diff_t1,
+            diff_t2,
+            diff_t3,
+            bridge_loss,
+            orthogonal_loss,
+            v_abs_mean,
+            v_pred_abs_mean,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (
+        loss,
+        (diff_loss, diff_t1, diff_t2, diff_t3, bridge_loss, orthogonal_loss, v_abs, v_pred),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
+    diff_t1 = jax.lax.pmean(diff_t1, axis_name="batch")
+    diff_t2 = jax.lax.pmean(diff_t2, axis_name="batch")
+    diff_t3 = jax.lax.pmean(diff_t3, axis_name="batch")
+    bridge_loss = jax.lax.pmean(bridge_loss, axis_name="batch")
+    orthogonal_loss = jax.lax.pmean(orthogonal_loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -547,10 +685,22 @@ def train_step(
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
     state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+    ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
 
     metrics = {
         "train/loss": loss,
+        "train/loss_total": loss,
+        "train/loss_diff": diff_loss,
+        "train/loss_diff_t1": diff_t1,
+        "train/loss_diff_t2": diff_t2,
+        "train/loss_diff_t3": diff_t3,
+        "train/loss_bridge": bridge_loss,
+        "train/loss_orthogonal": orthogonal_loss,
+        "train/diff_weight_t1": w1,
+        "train/diff_weight_t2": w2,
+        "train/diff_weight_t3": w3,
+        "train/bridge_lambda": jnp.float32(bridge_lambda),
+        "train/orthogonal_lambda": jnp.float32(orthogonal_lambda),
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,37 +711,142 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    *,
+    backbone,
+    projector,
+    diff_weight_t1: float = 0.75,
+    diff_weight_t2: float = 1.0,
+    diff_weight_t3: float = 1.25,
+    bridge_lambda: float = 0.0,
+    orthogonal_lambda: float = 0.0,
+    student_layer: int = 4,
+    teacher_layer: int = 8,
 ):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
+    """Triple-noise SiT validation step with EMA teacher bridge."""
     x0, y = batch
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, noise_level_rng, noise_rng = jax.random.split(rng, 3)
+    _, _, _, tau1, tau2, tau3 = sample_triple_noise_levels(noise_level_rng, local_batch)
+    x_noise = jax.random.normal(noise_rng, x0.shape)
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
+    x_tau1 = (1.0 - tau1[:, None, None]) * x_noise + tau1[:, None, None] * x0
+    x_tau2 = (1.0 - tau2[:, None, None]) * x_noise + tau2[:, None, None] * x0
+    x_tau3 = (1.0 - tau3[:, None, None]) * x_noise + tau3[:, None, None] * x0
+    target = x0 - x_noise
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+    w1 = jnp.float32(diff_weight_t1)
+    w2 = jnp.float32(diff_weight_t2)
+    w3 = jnp.float32(diff_weight_t3)
+    diff_weight_sum = w1 + w2 + w3
+    use_student_features = bridge_lambda > 0.0 or orthogonal_lambda > 0.0
+    use_teacher_feature = bridge_lambda > 0.0
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
+    backbone_params = state.params["backbone"]
+    projector_params = state.params["projector"]
+
+    pred_t1 = backbone.apply(
+        {"params": backbone_params},
+        x_tau1,
+        timesteps=tau1,
         vector=y,
         deterministic=True,
     )
-    loss = jnp.mean((pred - target) ** 2)
+    if use_student_features:
+        pred_t2, (a2_4,) = backbone.apply(
+            {"params": backbone_params},
+            x_tau2,
+            timesteps=tau2,
+            vector=y,
+            deterministic=True,
+            return_raw_feature_layers=(student_layer,),
+        )
+        pred_t3, (a3_4,) = backbone.apply(
+            {"params": backbone_params},
+            x_tau3,
+            timesteps=tau3,
+            vector=y,
+            deterministic=True,
+            return_raw_feature_layers=(student_layer,),
+        )
+    else:
+        pred_t2 = backbone.apply(
+            {"params": backbone_params},
+            x_tau2,
+            timesteps=tau2,
+            vector=y,
+            deterministic=True,
+        )
+        pred_t3 = backbone.apply(
+            {"params": backbone_params},
+            x_tau3,
+            timesteps=tau3,
+            vector=y,
+            deterministic=True,
+        )
+        a2_4 = None
+        a3_4 = None
+
+    diff_t1 = jnp.mean((pred_t1 - target) ** 2)
+    diff_t2 = jnp.mean((pred_t2 - target) ** 2)
+    diff_t3 = jnp.mean((pred_t3 - target) ** 2)
+    diff_loss = (w1 * diff_t1 + w2 * diff_t2 + w3 * diff_t3) / diff_weight_sum
+
+    bridge_loss = jnp.array(0.0, dtype=jnp.float32)
+    orthogonal_loss = jnp.array(0.0, dtype=jnp.float32)
+    if use_student_features:
+        g_a2 = projector.apply({"params": projector_params}, a2_4)
+        g_a3 = projector.apply({"params": projector_params}, a3_4)
+        orthogonal_loss = mean_tokenwise_squared_cosine_similarity(g_a3, g_a2)
+        if use_teacher_feature:
+            a1_8 = backbone.apply(
+                {"params": ema_params},
+                x_tau1,
+                timesteps=tau1,
+                vector=y,
+                layer=teacher_layer,
+                deterministic=True,
+                method=backbone.extract_raw_features,
+            )
+            a1_8 = jax.lax.stop_gradient(a1_8)
+            bridge_loss = jnp.mean((((g_a3 + g_a2) * 0.5) - a1_8) ** 2)
+
+    loss = diff_loss + bridge_lambda * bridge_loss + orthogonal_lambda * orthogonal_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+    v_pred_abs_mean = (
+        jnp.mean(jnp.abs(pred_t1))
+        + jnp.mean(jnp.abs(pred_t2))
+        + jnp.mean(jnp.abs(pred_t3))
+    ) / 3.0
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
+    diff_t1 = jax.lax.pmean(diff_t1, axis_name="batch")
+    diff_t2 = jax.lax.pmean(diff_t2, axis_name="batch")
+    diff_t3 = jax.lax.pmean(diff_t3, axis_name="batch")
+    bridge_loss = jax.lax.pmean(bridge_loss, axis_name="batch")
+    orthogonal_loss = jax.lax.pmean(orthogonal_loss, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_total": loss,
+        "val/loss_diff": diff_loss,
+        "val/loss_diff_t1": diff_t1,
+        "val/loss_diff_t2": diff_t2,
+        "val/loss_diff_t3": diff_t3,
+        "val/loss_bridge": bridge_loss,
+        "val/loss_orthogonal": orthogonal_loss,
+        "val/diff_weight_t1": w1,
+        "val/diff_weight_t2": w2,
+        "val/diff_weight_t3": w3,
+        "val/bridge_lambda": jnp.float32(bridge_lambda),
+        "val/orthogonal_lambda": jnp.float32(orthogonal_lambda),
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1073,10 +1328,20 @@ def main():
         type=float,
         default=0.9999,
         help="EMA decay for tracking a smoothed copy of online params (default: 0.9999). "
-             "EMA is used only for evaluation/checkpoint convenience, not as a teacher loss.",
+             "EMA is used for evaluation/checkpoint convenience and as the layer-8 teacher branch.",
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--diff-weight-t1", type=float, default=0.75,
+                        help="Normalized weighted-diffusion coefficient for the low-noise t1 view.")
+    parser.add_argument("--diff-weight-t2", type=float, default=1.0,
+                        help="Normalized weighted-diffusion coefficient for the mid-noise t2 view.")
+    parser.add_argument("--diff-weight-t3", type=float, default=1.25,
+                        help="Normalized weighted-diffusion coefficient for the high-noise t3 view.")
+    parser.add_argument("--bridge-lambda", type=float, default=0.0,
+                        help="Weight for the EMA-teacher bridge loss.")
+    parser.add_argument("--orthogonal-lambda", type=float, default=0.0,
+                        help="Weight for the projected cosine-squared orthogonal loss.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1167,7 +1432,7 @@ def main():
     parser.add_argument("--probe-save-path", type=str, default=None,
                         help="Path to .npz containing probe weights (W[, b]). Required for --linear-probe.")
     parser.add_argument("--probe-layer", type=int, default=None,
-                        help="Backbone layer index to probe. Default: final backbone block depth.")
+                        help="Backbone layer index to probe. Default: EMA teacher layer (8).")
     parser.add_argument("--probe-eval-batches", type=int, default=4,
                         help="Number of val batches to run probe inference on per eval window.")
     parser.add_argument("--block-corr-freq", type=int, default=0,
@@ -1224,6 +1489,16 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.diff_weight_t1 <= 0.0:
+        raise ValueError("--diff-weight-t1 must be > 0")
+    if args.diff_weight_t2 <= 0.0:
+        raise ValueError("--diff-weight-t2 must be > 0")
+    if args.diff_weight_t3 <= 0.0:
+        raise ValueError("--diff-weight-t3 must be > 0")
+    if args.bridge_lambda < 0.0:
+        raise ValueError("--bridge-lambda must be >= 0")
+    if args.orthogonal_lambda < 0.0:
+        raise ValueError("--orthogonal-lambda must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1249,13 +1524,22 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    student_layer = 4
+    teacher_layer = 8
+    if teacher_layer > depth:
+        raise ValueError(
+            f"teacher_layer ({teacher_layer}) exceeds model depth ({depth})"
+        )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Triple-noise SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
+        f"layers(student={student_layer}, teacher={teacher_layer}) "
+        f"diff_weights=({args.diff_weight_t1:.2f},{args.diff_weight_t2:.2f},{args.diff_weight_t3:.2f}) "
+        f"bridge_lambda={args.bridge_lambda} orthogonal_lambda={args.orthogonal_lambda}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1266,8 +1550,33 @@ def main():
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
+    backbone = SelfFlowDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=False,
+    )
+    projector = SimpleHead(
+        in_dim=config["hidden_size"],
+        out_dim=config["hidden_size"],
+    )
+
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        backbone,
+        projector,
+        args.learning_rate,
+        args.grad_clip,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1295,8 +1604,36 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            backbone=backbone,
+            projector=projector,
+            diff_weight_t1=args.diff_weight_t1,
+            diff_weight_t2=args.diff_weight_t2,
+            diff_weight_t3=args.diff_weight_t3,
+            bridge_lambda=args.bridge_lambda,
+            orthogonal_lambda=args.orthogonal_lambda,
+            student_layer=student_layer,
+            teacher_layer=teacher_layer,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            backbone=backbone,
+            projector=projector,
+            diff_weight_t1=args.diff_weight_t1,
+            diff_weight_t2=args.diff_weight_t2,
+            diff_weight_t3=args.diff_weight_t3,
+            bridge_lambda=args.bridge_lambda,
+            orthogonal_lambda=args.orthogonal_lambda,
+            student_layer=student_layer,
+            teacher_layer=teacher_layer,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1528,7 +1865,7 @@ def main():
         threading.Thread(target=_worker, daemon=True).start()
 
     def run_preflight_linear_probe(batch_x_patchified, batch_y):
-        probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
+        probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
         W_repl, b_repl = get_probe_weights()
         probe_fn = get_probe_pmapped(probe_layer)
         bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
@@ -1799,7 +2136,7 @@ def main():
                 if len(split_scores) > 1:
                     metrics["val/InceptionScore_std"] = float(np.std(split_scores, ddof=1))
         if args.linear_probe:
-            probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
+            probe_layer = int(args.probe_layer if args.probe_layer is not None else teacher_layer)
             W_repl, b_repl = get_probe_weights()
             probe_fn = get_probe_pmapped(probe_layer)
             correct_total = 0
