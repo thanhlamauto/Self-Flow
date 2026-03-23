@@ -541,6 +541,12 @@ def mean_tokenwise_cosine_similarity(x, y, eps=1e-8):
     return jnp.mean(cos)
 
 
+def rms_norm_tokenwise(x, eps=1e-8):
+    """Apply RMS normalization independently to each token embedding."""
+    rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    return x / rms
+
+
 def mean_tokenwise_feature_norm(x):
     """Mean L2 norm over tokens and batch."""
     return jnp.mean(jnp.linalg.norm(x, axis=-1))
@@ -665,7 +671,9 @@ def train_step(
                 )
                 a1_8 = jax.lax.stop_gradient(a1_8)
                 avg_projection = (g_a3 + g_a2) * 0.5
-                bridge_loss = jnp.mean((avg_projection - a1_8) ** 2)
+                avg_projection_rms = rms_norm_tokenwise(avg_projection)
+                a1_8_rms = rms_norm_tokenwise(a1_8)
+                bridge_loss = jnp.mean((avg_projection_rms - a1_8_rms) ** 2)
                 bridge_cosine = mean_tokenwise_cosine_similarity(avg_projection, a1_8)
                 bridge_avg_proj_norm = mean_tokenwise_feature_norm(avg_projection)
                 bridge_teacher_norm = mean_tokenwise_feature_norm(a1_8)
@@ -874,7 +882,9 @@ def eval_step(
             )
             a1_8 = jax.lax.stop_gradient(a1_8)
             avg_projection = (g_a3 + g_a2) * 0.5
-            bridge_loss = jnp.mean((avg_projection - a1_8) ** 2)
+            avg_projection_rms = rms_norm_tokenwise(avg_projection)
+            a1_8_rms = rms_norm_tokenwise(a1_8)
+            bridge_loss = jnp.mean((avg_projection_rms - a1_8_rms) ** 2)
             bridge_cosine = mean_tokenwise_cosine_similarity(avg_projection, a1_8)
             bridge_avg_proj_norm = mean_tokenwise_feature_norm(avg_projection)
             bridge_teacher_norm = mean_tokenwise_feature_norm(a1_8)
