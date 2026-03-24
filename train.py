@@ -9,7 +9,6 @@ import queue
 import functools
 import logging
 import zipfile
-from collections.abc import Mapping
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -557,12 +556,12 @@ def _pf_layer_norm(x):
 
 
 def cosine_sim_loss(a, b, mask):
-    """Negative mean cosine similarity over masked tokens (Lalign).
+    """Mean `(1 - cosine_similarity)` over masked tokens (Lalign).
 
     Returns:
-      loss          : scalar mean negative cosine similarity
+      loss          : scalar mean `(1 - cosine_similarity)`
       mean_sim      : scalar mean cosine similarity
-      loss_per_item : [B] negative cosine similarity averaged over masked tokens
+      loss_per_item : [B] mean `(1 - cosine_similarity)` over masked tokens
     """
     a_norm = a / (jnp.linalg.norm(a, axis=-1, keepdims=True) + 1e-6)
     b_norm = b / (jnp.linalg.norm(b, axis=-1, keepdims=True) + 1e-6)
@@ -571,8 +570,8 @@ def cosine_sim_loss(a, b, mask):
     denom = jnp.sum(mask_f, axis=-1) + 1e-6
     mean_sim_per_item = jnp.sum(cos_sim * mask_f, axis=-1) / denom
     mean_sim = jnp.mean(mean_sim_per_item)
-    loss_per_item = -mean_sim_per_item
-    return -mean_sim, mean_sim, loss_per_item
+    loss_per_item = 1.0 - mean_sim_per_item
+    return jnp.mean(loss_per_item), mean_sim, loss_per_item
 
 
 def _tree_dot(tree_a, tree_b):
@@ -616,107 +615,15 @@ def _resolve_align_block(tree, layer_idx: int):
     )
 
 
-def _collect_attention_weight_leaves(tree):
-    """Recursively collect attention weights from a mutable intermediates tree."""
-    leaves = []
-
-    def visit(node):
-        if isinstance(node, Mapping):
-            for key, value in node.items():
-                if key == "attention_weights":
-                    if isinstance(value, tuple):
-                        leaves.extend(value)
-                    elif isinstance(value, list):
-                        leaves.extend(value)
-                    else:
-                        leaves.append(value)
-                else:
-                    visit(value)
-
-    visit(tree)
-    return leaves
-
-
-def _extract_attention_weights(intermediates, label: str):
-    """Return the single attention weight tensor stored in `intermediates`."""
-    collection = intermediates.get("intermediates", intermediates)
-    leaves = _collect_attention_weight_leaves(collection)
-    if len(leaves) != 1:
-        raise ValueError(
-            f"Expected exactly 1 captured attention tensor for {label}, found {len(leaves)}"
-        )
-    return leaves[0]
-
-
-def _renormalize_attention_rows(attn, ctx_valid, eps: float = 1e-6):
-    """Mask invalid context columns and renormalize each attention row."""
-    masked = attn * ctx_valid[:, None, :].astype(attn.dtype)
-    return masked / (jnp.sum(masked, axis=-1, keepdims=True) + eps)
-
-
-def _gather_teacher_target_to_context_attention(
-    teacher_attn,
-    ctx_idx,
-    ctx_valid,
-    tgt_idx,
-    tgt_valid,
-):
-    """Gather teacher attention rows for target queries against context keys."""
-    teacher_attn = jnp.mean(teacher_attn, axis=1)  # [B, N, N]
-    local_batch, n_tgt, t_max = tgt_idx.shape
-    ctx_max = ctx_idx.shape[1]
-
-    teacher_rep = jnp.repeat(teacher_attn, n_tgt, axis=0)  # [B*n_tgt, N, N]
-    ctx_idx_rep = jnp.repeat(ctx_idx, n_tgt, axis=0)       # [B*n_tgt, C_max]
-    ctx_valid_rep = jnp.repeat(ctx_valid, n_tgt, axis=0)   # [B*n_tgt, C_max]
-    tgt_idx_flat = tgt_idx.reshape(local_batch * n_tgt, t_max)
-    tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, t_max)
-
-    target_rows = jax.vmap(lambda mat, idx: jnp.take(mat, idx, axis=0))(teacher_rep, tgt_idx_flat)
-    teacher_tgt_to_ctx = jax.vmap(
-        lambda mat, idx: jnp.take(mat, idx, axis=1),
-        in_axes=(0, 0),
-    )(target_rows, ctx_idx_rep)
-
-    teacher_tgt_to_ctx = _renormalize_attention_rows(teacher_tgt_to_ctx, ctx_valid_rep)
-    teacher_tgt_to_ctx = jax.lax.stop_gradient(teacher_tgt_to_ctx)
-
-    return teacher_tgt_to_ctx, ctx_valid_rep, tgt_valid_flat
-
-
-def _predictor_target_to_context_attention(pred_attn, ctx_valid, tgt_valid):
-    """Slice predictor attention to target-query/context-key rows and columns."""
-    pred_attn = jnp.mean(pred_attn, axis=1)  # [B*n_tgt, seq, seq]
-    ctx_max = ctx_valid.shape[1]
-    tgt_max = tgt_valid.shape[1]
-    pred_tgt_to_ctx = pred_attn[:, ctx_max:ctx_max + tgt_max, :ctx_max]
-    return _renormalize_attention_rows(pred_tgt_to_ctx, ctx_valid)
-
-
-def _rowwise_masked_kl(teacher_probs, pred_probs, tgt_valid, eps: float = 1e-6):
-    """Average row-wise KL(teacher || predictor) over valid target tokens."""
-    teacher_probs = jax.lax.stop_gradient(teacher_probs)
-    kl = teacher_probs * (
-        jnp.log(jnp.maximum(teacher_probs, eps)) -
-        jnp.log(jnp.maximum(pred_probs, eps))
-    )
-    per_token = jnp.sum(kl, axis=-1)
-    valid = tgt_valid.astype(per_token.dtype)
-    per_block = jnp.sum(per_token * valid, axis=-1) / (jnp.sum(valid, axis=-1) + eps)
-    return jnp.mean(per_block)
-
-
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, lambda_jepa, lambda_attn_align, ema_decay, compute_grad_cosine,
+    state, ema_params, batch, rng, lambda_jepa, lambda_align_multiplier, ema_decay, compute_grad_cosine,
     *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
-    enable_attn_align: bool = False,
 ):
     """Self-Flow + I-JEPA distributed training step with noise-gated DINO align.
 
-    Loss = Lgen + lambda_jepa * (w_align * Lalign + w_pred * Ljepa)
-           + lambda_attn_align * Lattn_align.
+    Loss = Lgen + lambda_jepa * (w_align * lambda_align_multiplier * Lalign + w_pred * Ljepa).
 
     With the repo's convention tau=0 → high noise and tau=1 → clean data:
       - t_clean = max(t, s), t_noisy = min(t, s)
@@ -760,31 +667,15 @@ def train_step(
     # tgt_idx   [B, n_target, 64], tgt_valid [B, n_target, 64]
 
     # --- Teacher forward (EMA backbone, no grad, raw + projected features) ---
-    if enable_attn_align:
-        (_, t_raw_feat, t_align_feat), teacher_intermediates = backbone.apply(
-            {'params': ema_params},
-            x_tau_min,
-            timesteps=t_clean,
-            vector=y,
-            deterministic=True,
-            return_raw_features=teacher_layer,
-            return_features=teacher_layer,
-            return_attention_layer=teacher_layer,
-            mutable=['intermediates'],
-        )
-        teacher_attn = _extract_attention_weights(teacher_intermediates, "teacher")
-        teacher_attn = jax.lax.stop_gradient(teacher_attn)
-    else:
-        _, t_raw_feat, t_align_feat = backbone.apply(
-            {'params': ema_params},
-            x_tau_min,
-            timesteps=t_clean,
-            vector=y,
-            deterministic=True,
-            return_raw_features=teacher_layer,
-            return_features=teacher_layer,
-        )
-        teacher_attn = None
+    _, t_raw_feat, t_align_feat = backbone.apply(
+        {'params': ema_params},
+        x_tau_min,
+        timesteps=t_clean,
+        vector=y,
+        deterministic=True,
+        return_raw_features=teacher_layer,
+        return_features=teacher_layer,
+    )
     t_raw_feat = jax.lax.stop_gradient(t_raw_feat)       # [B, N, D]
     t_align_feat = jax.lax.stop_gradient(t_align_feat)   # [B, N, D]
 
@@ -817,26 +708,13 @@ def train_step(
         tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
 
         # Predictor: context features + mask-token queries → predicted target features
-        if enable_attn_align:
-            pred_feats, predictor_intermediates = predictor.apply(
-                {'params': params["predictor"]},
-                ctx_feats_rep,
-                ctx_valid_rep,
-                tgt_idx_flat,
-                tgt_valid_flat,
-                capture_first_attention=True,
-                mutable=['intermediates'],
-            )
-            predictor_attn = _extract_attention_weights(predictor_intermediates, "predictor")
-        else:
-            pred_feats = predictor.apply(
-                {'params': params["predictor"]},
-                ctx_feats_rep,
-                ctx_valid_rep,
-                tgt_idx_flat,
-                tgt_valid_flat,
-            )  # [B*n_tgt, T_max, D]
-            predictor_attn = None
+        pred_feats = predictor.apply(
+            {'params': params["predictor"]},
+            ctx_feats_rep,
+            ctx_valid_rep,
+            tgt_idx_flat,
+            tgt_valid_flat,
+        )  # [B*n_tgt, T_max, D]
 
         # Gather teacher targets at target positions: [B*n_tgt, T_max, D]
         t_feat_rep = jnp.repeat(t_raw_feat, n_tgt, axis=0)   # [B*n_tgt, N, D]
@@ -862,29 +740,8 @@ def train_step(
             mask,
         )
         loss_jepa_gated = jnp.mean(w_pred * loss_jepa_per_item)
-        loss_align_gated = jnp.mean(w_align * loss_align_per_item)
+        loss_align_gated = jnp.mean(w_align * lambda_align_multiplier * loss_align_per_item)
         loss_aux_blend = loss_jepa_gated + loss_align_gated
-
-        if enable_attn_align:
-            teacher_probs, _, tgt_valid_flat_attn = _gather_teacher_target_to_context_attention(
-                teacher_attn,
-                ctx_idx,
-                ctx_valid,
-                tgt_idx,
-                tgt_valid,
-            )
-            predictor_probs = _predictor_target_to_context_attention(
-                predictor_attn,
-                ctx_valid_rep,
-                tgt_valid_flat_attn,
-            )
-            loss_attn_align = _rowwise_masked_kl(
-                teacher_probs,
-                predictor_probs,
-                tgt_valid_flat_attn,
-            )
-        else:
-            loss_attn_align = jnp.array(0.0, dtype=loss_gen.dtype)
 
         v_abs_mean      = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -898,7 +755,6 @@ def train_step(
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
@@ -914,20 +770,18 @@ def train_step(
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
             v_abs_mean,
             v_pred_abs_mean,
         ) = loss_terms(params)
-        loss_total = loss_gen + lambda_jepa * loss_aux_blend + lambda_attn_align * loss_attn_align
+        loss_total = loss_gen + lambda_jepa * loss_aux_blend
         return loss_total, (
             loss_gen,
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
@@ -945,7 +799,6 @@ def train_step(
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
@@ -956,23 +809,20 @@ def train_step(
         one = jnp.array(1.0, dtype=loss_gen.dtype)
 
         def tangent_tuple(active_idx: int):
-            return tuple(one if idx == active_idx else zero for idx in range(12))
+            return tuple(one if idx == active_idx else zero for idx in range(11))
 
         grads_diff, = pullback(tangent_tuple(0))
         grads_jepa, = pullback(tangent_tuple(1))
         grads_align, = pullback(tangent_tuple(2))
-        grads_attn_align, = pullback(tangent_tuple(6))
 
         grads_diff = jax.lax.pmean(grads_diff, axis_name='batch')
         grads_jepa = jax.lax.pmean(grads_jepa, axis_name='batch')
         grads_align = jax.lax.pmean(grads_align, axis_name='batch')
-        grads_attn_align = jax.lax.pmean(grads_attn_align, axis_name='batch')
         grads = jax.tree_util.tree_map(
-            lambda gd, gj, gl, ga: gd + lambda_jepa * (gj + gl) + lambda_attn_align * ga,
+            lambda gd, gj, gl: gd + lambda_jepa * (gj + lambda_align_multiplier * gl),
             grads_diff,
             grads_jepa,
             grads_align,
-            grads_attn_align,
         )
 
         grad_cos_jepa_backbone = _tree_cosine_similarity(
@@ -991,14 +841,13 @@ def train_step(
             _resolve_align_block(grads_diff["backbone"], align_block_idx),
             _resolve_align_block(grads_align["backbone"], align_block_idx),
         )
-        loss_total = loss_gen + lambda_jepa * loss_aux_blend + lambda_attn_align * loss_attn_align
+        loss_total = loss_gen + lambda_jepa * loss_aux_blend
         return (
             loss_total,
             loss_gen,
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
@@ -1020,7 +869,6 @@ def train_step(
                 loss_jepa,
                 loss_align,
                 loss_aux_blend,
-                loss_attn_align,
                 align_cosine_sim,
                 w_align_mean,
                 w_pred_mean,
@@ -1036,7 +884,6 @@ def train_step(
             loss_jepa,
             loss_align,
             loss_aux_blend,
-            loss_attn_align,
             align_cosine_sim,
             w_align_mean,
             w_pred_mean,
@@ -1055,7 +902,6 @@ def train_step(
         loss_jepa,
         loss_align,
         loss_aux_blend,
-        loss_attn_align,
         align_cosine_sim,
         w_align_mean,
         w_pred_mean,
@@ -1078,7 +924,6 @@ def train_step(
     loss_jepa  = jax.lax.pmean(loss_jepa,  axis_name='batch')
     loss_align = jax.lax.pmean(loss_align, axis_name='batch')
     loss_aux_blend = jax.lax.pmean(loss_aux_blend, axis_name='batch')
-    loss_attn_align = jax.lax.pmean(loss_attn_align, axis_name='batch')
     align_cosine_sim = jax.lax.pmean(align_cosine_sim, axis_name='batch')
     w_align_mean = jax.lax.pmean(w_align_mean, axis_name='batch')
     w_pred_mean = jax.lax.pmean(w_pred_mean, axis_name='batch')
@@ -1107,12 +952,11 @@ def train_step(
         "train/loss_jepa":       loss_jepa,
         "train/loss_align":      loss_align,
         "train/loss_aux_blend":  loss_aux_blend,
-        "train/loss_attn_align": loss_attn_align,
         "train/align_cosine_sim": align_cosine_sim,
         "train/w_align":         w_align_mean,
         "train/w_pred":          w_pred_mean,
         "train/lambda_jepa":     lambda_jepa,
-        "train/lambda_attn_align": lambda_attn_align,
+        "train/lambda_align_multiplier": lambda_align_multiplier,
         "train/ema_decay":       ema_decay,
         "train/grad_norm":       grad_norm,
         "train/param_norm":      param_norm,
@@ -1128,9 +972,8 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng, lambda_jepa, lambda_attn_align,
+    state, ema_params, batch, rng, lambda_jepa, lambda_align_multiplier,
     *, backbone, predictor, mask_ratio, student_layer, teacher_layer, jepa_num_targets,
-    enable_attn_align: bool = False,
 ):
     """Self-Flow + I-JEPA validation step with mask-ratio-aware DINO gating."""
     x0, y = batch
@@ -1161,31 +1004,15 @@ def eval_step(
     )
 
     # Teacher forward (EMA backbone)
-    if enable_attn_align:
-        (_, t_raw_feat, t_align_feat), teacher_intermediates = backbone.apply(
-            {'params': ema_params},
-            x_tau_min,
-            timesteps=t_clean,
-            vector=y,
-            deterministic=True,
-            return_raw_features=teacher_layer,
-            return_features=teacher_layer,
-            return_attention_layer=teacher_layer,
-            mutable=['intermediates'],
-        )
-        teacher_attn = _extract_attention_weights(teacher_intermediates, "teacher")
-        teacher_attn = jax.lax.stop_gradient(teacher_attn)
-    else:
-        _, t_raw_feat, t_align_feat = backbone.apply(
-            {'params': ema_params},
-            x_tau_min,
-            timesteps=t_clean,
-            vector=y,
-            deterministic=True,
-            return_raw_features=teacher_layer,
-            return_features=teacher_layer,
-        )
-        teacher_attn = None
+    _, t_raw_feat, t_align_feat = backbone.apply(
+        {'params': ema_params},
+        x_tau_min,
+        timesteps=t_clean,
+        vector=y,
+        deterministic=True,
+        return_raw_features=teacher_layer,
+        return_features=teacher_layer,
+    )
     t_raw_feat = jax.lax.stop_gradient(t_raw_feat)
     t_align_feat = jax.lax.stop_gradient(t_align_feat)
 
@@ -1211,26 +1038,13 @@ def eval_step(
     tgt_idx_flat   = tgt_idx.reshape(local_batch * n_tgt, T_max)
     tgt_valid_flat = tgt_valid.reshape(local_batch * n_tgt, T_max)
 
-    if enable_attn_align:
-        pred_feats, predictor_intermediates = predictor.apply(
-            {'params': state.params["predictor"]},
-            ctx_feats_rep,
-            ctx_valid_rep,
-            tgt_idx_flat,
-            tgt_valid_flat,
-            capture_first_attention=True,
-            mutable=['intermediates'],
-        )
-        predictor_attn = _extract_attention_weights(predictor_intermediates, "predictor")
-    else:
-        pred_feats = predictor.apply(
-            {'params': state.params["predictor"]},
-            ctx_feats_rep,
-            ctx_valid_rep,
-            tgt_idx_flat,
-            tgt_valid_flat,
-        )
-        predictor_attn = None
+    pred_feats = predictor.apply(
+        {'params': state.params["predictor"]},
+        ctx_feats_rep,
+        ctx_valid_rep,
+        tgt_idx_flat,
+        tgt_valid_flat,
+    )
 
     t_feat_rep = jnp.repeat(t_raw_feat, n_tgt, axis=0)
     t_feat_tgt = jax.vmap(lambda feat, idx: feat[idx])(t_feat_rep, tgt_idx_flat)
@@ -1253,31 +1067,10 @@ def eval_step(
         mask,
     )
     loss_jepa_gated = jnp.mean(w_pred * loss_jepa_per_item)
-    loss_align_gated = jnp.mean(w_align * loss_align_per_item)
+    loss_align_gated = jnp.mean(w_align * lambda_align_multiplier * loss_align_per_item)
     loss_aux_blend = loss_jepa_gated + loss_align_gated
 
-    if enable_attn_align:
-        teacher_probs, _, tgt_valid_flat_attn = _gather_teacher_target_to_context_attention(
-            teacher_attn,
-            ctx_idx,
-            ctx_valid,
-            tgt_idx,
-            tgt_valid,
-        )
-        predictor_probs = _predictor_target_to_context_attention(
-            predictor_attn,
-            ctx_valid_rep,
-            tgt_valid_flat_attn,
-        )
-        loss_attn_align = _rowwise_masked_kl(
-            teacher_probs,
-            predictor_probs,
-            tgt_valid_flat_attn,
-        )
-    else:
-        loss_attn_align = jnp.array(0.0, dtype=loss_gen.dtype)
-
-    loss_total      = loss_gen + lambda_jepa * loss_aux_blend + lambda_attn_align * loss_attn_align
+    loss_total      = loss_gen + lambda_jepa * loss_aux_blend
     v_abs_mean      = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
     w_align_mean    = jnp.mean(w_align)
@@ -1288,7 +1081,6 @@ def eval_step(
     loss_jepa       = jax.lax.pmean(loss_jepa,       axis_name='batch')
     loss_align      = jax.lax.pmean(loss_align,      axis_name='batch')
     loss_aux_blend  = jax.lax.pmean(loss_aux_blend,  axis_name='batch')
-    loss_attn_align = jax.lax.pmean(loss_attn_align, axis_name='batch')
     align_cosine_sim = jax.lax.pmean(align_cosine_sim, axis_name='batch')
     w_align_mean    = jax.lax.pmean(w_align_mean,    axis_name='batch')
     w_pred_mean     = jax.lax.pmean(w_pred_mean,     axis_name='batch')
@@ -1301,10 +1093,10 @@ def eval_step(
         "val/loss_jepa":       loss_jepa,
         "val/loss_align":      loss_align,
         "val/loss_aux_blend":  loss_aux_blend,
-        "val/loss_attn_align": loss_attn_align,
         "val/align_cosine_sim": align_cosine_sim,
         "val/w_align":         w_align_mean,
         "val/w_pred":          w_pred_mean,
+        "val/lambda_align_multiplier": lambda_align_multiplier,
         "val/v_abs_mean":      v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1783,13 +1575,13 @@ def main():
                         help="Bernoulli mask ratio RM for per-token masking (paper: 0.25)")
     parser.add_argument("--lambda-jepa", type=float, default=0.25,
                         help="Final weight for the blended auxiliary term in "
-                             "L = Lgen + lambda_jepa * (w_align * Lalign + w_pred * Ljepa). "
+                             "L = Lgen + lambda_jepa * "
+                             "(w_align * lambda_align_multiplier * Lalign + w_pred * Ljepa). "
                              "Linearly warmed up from 0 to this value over the first 10k steps.")
-    parser.add_argument("--lambda-attn-align", type=float, default=0.0,
-                        help="Final weight for teacher-attention alignment loss. "
-                             "Only supported when --predictor-depth 1; linearly warmed up from 0.")
-    parser.add_argument("--attn-align-warmup-steps", type=int, default=10000,
-                        help="Warmup steps for lambda_attn_align. Use 0 to enable at full weight immediately.")
+    parser.add_argument("--lambda-align-multiplier", type=float, default=1.0,
+                        help="Extra multiplier applied only to the aligned DINO term inside the "
+                             "blended auxiliary objective. Use this to compensate when Lalign is "
+                             "much smaller than Ljepa.")
     parser.add_argument("--late-off-jepa", action="store_true", default=False,
                         help="Enable late-off for the blended auxiliary schedule: after warmup, "
                              "linearly decay lambda_jepa from its full value to 0 over "
@@ -1969,21 +1761,14 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not (0.0 < args.mask_ratio < 1.0):
         raise ValueError("--mask-ratio must be in (0, 1)")
-    if args.lambda_attn_align < 0.0:
-        raise ValueError("--lambda-attn-align must be >= 0")
+    if args.lambda_align_multiplier < 0.0:
+        raise ValueError("--lambda-align-multiplier must be >= 0")
     if args.predictor_depth <= 0:
         raise ValueError("--predictor-depth must be greater than 0")
-    if args.attn_align_warmup_steps < 0:
-        raise ValueError("--attn-align-warmup-steps must be >= 0")
     if args.jepa_num_targets <= 0:
         raise ValueError("--jepa-num-targets must be greater than 0")
     if args.fixed_ema_decay is not None and not (0.0 < args.fixed_ema_decay <= 1.0):
         raise ValueError("--fixed-ema-decay must be in (0, 1]")
-    if args.lambda_attn_align > 0.0 and args.predictor_depth != 1:
-        raise ValueError(
-            "--lambda-attn-align is only supported when --predictor-depth 1 "
-            f"(got predictor_depth={args.predictor_depth})"
-        )
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -2044,7 +1829,7 @@ def main():
         ema_desc = f"ema_decay fixed={args.fixed_ema_decay}"
     log_stage(
         f"Self-Flow+JEPA+DINO-align: mask_ratio={args.mask_ratio} lambda_jepa={args.lambda_jepa} "
-        f"lambda_attn_align={args.lambda_attn_align} "
+        f"lambda_align_multiplier={args.lambda_align_multiplier} "
         f"predictor_depth={args.predictor_depth} jepa_num_targets={args.jepa_num_targets} "
         f"{ema_desc} grad_clip={args.grad_clip}"
     )
@@ -2121,8 +1906,9 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training step ───────────────────────────────────────────
-    # backbone and predictor are Python objects (static); lambda_jepa and
-    # ema_decay are per-step JAX float32 arrays (positional, not partialised).
+    # backbone and predictor are Python objects (static); lambda_jepa,
+    # lambda_align_multiplier, and ema_decay are per-step JAX float32 arrays
+    # (positional, not partialised).
     _selfflow_train_fn = functools.partial(
         train_step,
         backbone=backbone,
@@ -2131,7 +1917,6 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
-        enable_attn_align=(args.lambda_attn_align > 0.0),
     )
     _selfflow_eval_fn = functools.partial(
         eval_step,
@@ -2141,7 +1926,6 @@ def main():
         student_layer=student_layer,
         teacher_layer=teacher_layer,
         jepa_num_targets=args.jepa_num_targets,
-        enable_attn_align=(args.lambda_attn_align > 0.0),
     )
     pmapped_train_step = jax.pmap(_selfflow_train_fn, axis_name='batch')
     pmapped_eval_step  = jax.pmap(_selfflow_eval_fn,  axis_name='batch')
@@ -2425,13 +2209,11 @@ def main():
         probe_lambda_jepa_rep = jax_utils.replicate(jnp.float32(
             compute_linear_warmup(args.lambda_jepa, 0, 10000)
         ))
-        probe_lambda_attn_align_rep = jax_utils.replicate(jnp.float32(
-            compute_linear_warmup(args.lambda_attn_align, 0, args.attn_align_warmup_steps)
-        ))
+        probe_lambda_align_multiplier_rep = jax_utils.replicate(jnp.float32(args.lambda_align_multiplier))
         probe_compute_grad_cosine_rep = jax_utils.replicate(jnp.bool_(False))
         _, _, probe_metrics, _ = pmapped_train_step(
             state, ema_params, (probe_x, probe_y), rng,
-            probe_lambda_jepa_rep, probe_lambda_attn_align_rep,
+            probe_lambda_jepa_rep, probe_lambda_align_multiplier_rep,
             probe_ema_decay_rep, probe_compute_grad_cosine_rep,
         )
         block_pytree(probe_metrics)
@@ -2800,11 +2582,6 @@ def main():
             ema_decay_val   = compute_ema_decay(progress, args.fixed_ema_decay)
             # Base warmup for the blended auxiliary coefficient.
             lambda_jepa_val = compute_linear_warmup(args.lambda_jepa, global_step, 10000)
-            lambda_attn_align_val = compute_linear_warmup(
-                args.lambda_attn_align,
-                global_step,
-                args.attn_align_warmup_steps,
-            )
             # Late-off phase: optionally decay the blended auxiliary coefficient to 0 after warmup.
             if args.late_off_jepa:
                 if global_step >= args.late_off_end_step:
@@ -2816,15 +2593,14 @@ def main():
                     lambda_jepa_val = args.lambda_jepa * (1.0 - decay_frac)
             ema_decay_rep   = jax_utils.replicate(jnp.float32(ema_decay_val))
             lambda_jepa_rep = jax_utils.replicate(jnp.float32(lambda_jepa_val))
-            lambda_attn_align_rep = jax_utils.replicate(jnp.float32(lambda_attn_align_val))
+            lambda_align_multiplier_rep = jax_utils.replicate(jnp.float32(args.lambda_align_multiplier))
             should_log_train = bool(args.log_freq > 0 and (global_step + 1) % args.log_freq == 0)
             compute_grad_cosine_rep = jax_utils.replicate(jnp.bool_(should_log_train))
 
             # Self-Flow + JEPA + DINO-align training step
             state, ema_params, metrics, rng = pmapped_train_step(
                 state, ema_params, (batch_x, batch_y), rng,
-                lambda_jepa_rep, lambda_attn_align_rep,
-                ema_decay_rep, compute_grad_cosine_rep,
+                lambda_jepa_rep, lambda_align_multiplier_rep, ema_decay_rep, compute_grad_cosine_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2852,7 +2628,7 @@ def main():
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(
                         state, ema_params, (val_x, val_y), rng,
-                        lambda_jepa_rep, lambda_attn_align_rep,
+                        lambda_jepa_rep, lambda_align_multiplier_rep,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():

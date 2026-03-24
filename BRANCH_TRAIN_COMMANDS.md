@@ -74,6 +74,22 @@ git checkout feat/self-flow-i-jepa
   --attn-align-warmup-steps 10000
 ```
 
+### `feat/self-flow-i-jepa-noise-gated-align`
+
+```bash
+git checkout feat/self-flow-i-jepa-noise-gated-align
+!python train.py $COMMON_BASE \
+  --wandb-project selfflow-jax \
+  --mask-ratio 0.25 \
+  --lambda-jepa 0.5 \
+  --lambda-align-multiplier 1.0 \
+  --fixed-ema-decay 0.9999 \
+  --predictor-depth 1 \
+  --jepa-num-targets 1 \
+  --student-layer 4 \
+  --teacher-layer 8
+```
+
 ### `feat/self-flow-online-target-jepa`
 
 ```bash
