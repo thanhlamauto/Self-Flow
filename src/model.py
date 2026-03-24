@@ -266,9 +266,9 @@ class SelfFlowDiT(nn.Module):
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
-        assert not (return_raw_features and return_features)
-        # return_block_summaries can be combined with either mode; callers must
-        # handle the expanded return tuple shape.
+        # return_block_summaries can be combined with either feature mode; when
+        # both raw and projected features are requested, callers receive both in
+        # a stable tuple ordering without affecting legacy call sites.
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -305,7 +305,10 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
-        zs = None
+        want_raw_features = bool(return_raw_features)
+        want_projected_features = bool(return_features)
+        raw_zs = None
+        projected_zs = None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
@@ -324,9 +327,9 @@ class SelfFlowDiT(nn.Module):
                 block_summaries.append(jnp.mean(x, axis=1))
             
             if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+                projected_zs = self.feature_head(x)
+            if (i + 1) == return_raw_features:
+                raw_zs = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -343,7 +346,12 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
-        if return_features or return_raw_features:
+        if want_raw_features and want_projected_features:
+            if return_block_summaries:
+                return x, raw_zs, projected_zs, block_summaries
+            return x, raw_zs, projected_zs
+        if want_projected_features or want_raw_features:
+            zs = projected_zs if want_projected_features else raw_zs
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
