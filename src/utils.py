@@ -1,200 +1,204 @@
 """
-Self-Flow Utility Functions.
+Self-Flow Utility Functions (JAX/Flax version).
 
 This module contains utility functions for positional encoding and
 token processing used in Self-Flow inference.
 """
 
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional
 
-import torch
+import jax
+import jax.numpy as jnp
 from einops import rearrange
-from torch import Tensor
-
 
 Axes = Tuple[Literal["t", "h", "w", "l"], ...]
 
 
+def cartesian_prod(*arrays):
+    """JAX equivalent of torch.cartesian_prod."""
+    meshes = jnp.meshgrid(*arrays, indexing='ij')
+    return jnp.stack(meshes, axis=-1).reshape(-1, len(arrays))
+
+
 def prc_vid(
-    x: Tensor, t_coord: Tensor | None = None, l_coord: Tensor | None = None
-) -> tuple[Tensor, Tensor]:
-    c, t, h, w = x.shape
+    x: jax.Array, t_coord: Optional[jax.Array] = None, l_coord: Optional[jax.Array] = None
+) -> tuple[jax.Array, jax.Array]:
+    b_dim = False
+    if x.ndim == 5:
+        b_dim = True
+        b, c, t, h, w = x.shape
+    else:
+        c, t, h, w = x.shape
+
     if t_coord is None:
-        t_coord = torch.arange(t)
-    x_coords = {
-        "t": t_coord,
-        "h": torch.arange(h, device=t_coord.device),
-        "w": torch.arange(w, device=t_coord.device),
-        "l": torch.arange(1) if l_coord is None else l_coord,
-    }
-    x_ids = torch.cartesian_prod(
-        x_coords["t"], x_coords["h"], x_coords["w"], x_coords["l"]
-    )
-    x = rearrange(x, "c t h w -> (t h w) c")
+        t_coord = jnp.arange(t)
+    if l_coord is None:
+        l_coord = jnp.arange(1)
+
+    x_ids = cartesian_prod(t_coord, jnp.arange(h), jnp.arange(w), l_coord)
+    
+    if b_dim:
+        x = rearrange(x, "b c t h w -> b (t h w) c")
+        x_ids = jnp.tile(x_ids[None, ...], (b, 1, 1))
+    else:
+        x = rearrange(x, "c t h w -> (t h w) c")
+        
     return x, x_ids
 
 
 def prc_img(
-    x: Tensor, t_coord: Tensor | None = None, l_coord: Tensor | None = None
-) -> tuple[Tensor, Tensor]:
-    c, h, w = x.shape
-    x_coords = {
-        "t": torch.arange(1) if t_coord is None else t_coord,
-        "h": torch.arange(h),
-        "w": torch.arange(w),
-        "l": torch.arange(1) if l_coord is None else l_coord,
-    }
-    x_ids = torch.cartesian_prod(
-        x_coords["t"], x_coords["h"], x_coords["w"], x_coords["l"]
-    )
-    x = rearrange(x, "c h w -> (h w) c")
+    x: jax.Array, t_coord: Optional[jax.Array] = None, l_coord: Optional[jax.Array] = None
+) -> tuple[jax.Array, jax.Array]:
+    b_dim = False
+    if x.ndim == 4:
+        b_dim = True
+        b, c, h, w = x.shape
+    else:
+        c, h, w = x.shape
+
+    if t_coord is None:
+        t_coord = jnp.arange(1)
+    if l_coord is None:
+        l_coord = jnp.arange(1)
+
+    x_ids = cartesian_prod(t_coord, jnp.arange(h), jnp.arange(w), l_coord)
+    
+    if b_dim:
+        x = rearrange(x, "b c h w -> b (h w) c")
+        x_ids = jnp.tile(x_ids[None, ...], (b, 1, 1))
+    else:
+        x = rearrange(x, "c h w -> (h w) c")
+        
     return x, x_ids
 
 
 def prc_txt(
-    x: Tensor, t_coord: Tensor | None = None, l_coord: Tensor | None = None
-) -> tuple[Tensor, Tensor]:
+    x: jax.Array, t_coord: Optional[jax.Array] = None, l_coord: Optional[jax.Array] = None
+) -> tuple[jax.Array, jax.Array]:
     assert l_coord is None, "l_coord not supported for txts"
+    b_dim = False
+    if x.ndim == 3:
+        b_dim = True
+        b, l, c = x.shape
+    else:
+        l, c = x.shape
 
-    l, c = x.shape
+    if t_coord is None:
+        t_coord = jnp.arange(1)
 
-    coords = {
-        "t": torch.arange(1) if t_coord is None else t_coord,
-        "h": torch.arange(1),
-        "w": torch.arange(1),
-        "l": torch.arange(l),
-    }
-    x_ids = torch.cartesian_prod(coords["t"], coords["h"], coords["w"], coords["l"])
+    x_ids = cartesian_prod(t_coord, jnp.arange(1), jnp.arange(1), jnp.arange(l))
+    
+    if b_dim:
+        x_ids = jnp.tile(x_ids[None, ...], (b, 1, 1))
+        
     return x, x_ids
 
 
 def prc_txts(
-    x: Tensor, t_coord: Tensor | None = None, l_coord: Tensor | None = None
-) -> tuple[Tensor, Tensor]:
+    x: jax.Array, t_coord: Optional[jax.Array] = None, l_coord: Optional[jax.Array] = None
+) -> tuple[jax.Array, jax.Array]:
     assert l_coord is None, "l_coord not supported for txts"
-
-    t, l, c = x.shape
+    b_dim = False
+    if x.ndim == 4:
+        b_dim = True
+        b, t, l, c = x.shape
+    else:
+        t, l, c = x.shape
 
     if t_coord is None:
-        t_coord = torch.arange(t)
-    coords = {
-        "t": t_coord,
-        "h": torch.arange(1, device=t_coord.device),
-        "w": torch.arange(1, device=t_coord.device),
-        "l": torch.arange(l, device=t_coord.device),
-    }
-    x_ids = torch.cartesian_prod(coords["t"], coords["h"], coords["w"], coords["l"])
-    x = rearrange(x, "t l c -> (t l) c")
+        t_coord = jnp.arange(t)
+
+    x_ids = cartesian_prod(t_coord, jnp.arange(1), jnp.arange(1), jnp.arange(l))
+    
+    if b_dim:
+        x = rearrange(x, "b t l c -> b (t l) c")
+        x_ids = jnp.tile(x_ids[None, ...], (b, 1, 1))
+    else:
+        x = rearrange(x, "t l c -> (t l) c")
+        
     return x, x_ids
 
 
-def prc_times(t_coord: Tensor) -> Tensor:
-    coords = {
-        "t": t_coord.to(dtype=int),
-        "h": torch.arange(1, device=t_coord.device),
-        "w": torch.arange(1, device=t_coord.device),
-        "l": torch.arange(1, device=t_coord.device),
-    }
-    x_ids = torch.cartesian_prod(coords["t"], coords["h"], coords["w"], coords["l"])
+def prc_times(t_coord: jax.Array) -> jax.Array:
+    if t_coord.ndim == 0:
+        t_coord = jnp.array([t_coord])
+    x_ids = cartesian_prod(t_coord.astype(jnp.int32), jnp.arange(1), jnp.arange(1), jnp.arange(1))
     return x_ids
 
 
-def batched_wrapper(fn):
-    def batched_prc(
-        x: Tensor, t_coord: Tensor | None = None, l_coord: Tensor | None = None
-    ) -> tuple[Tensor, Tensor]:
-        results = []
-        for i in range(len(x)):
-            results.append(
-                fn(
-                    x[i],
-                    t_coord[i] if t_coord is not None else None,
-                    l_coord[i] if l_coord is not None else None,
-                )
-            )
-        x, x_ids = zip(*results)
-        return torch.stack(x), torch.stack(x_ids)
+# Drop-in replacements for batched wrappers
+def batched_prc_vid(x: jax.Array, t_coord=None, l_coord=None):
+    return prc_vid(x, t_coord, l_coord)
 
-    return batched_prc
+def batched_prc_img(x: jax.Array, t_coord=None, l_coord=None):
+    return prc_img(x, t_coord, l_coord)
+
+def batched_prc_txt(x: jax.Array, t_coord=None, l_coord=None):
+    return prc_txt(x, t_coord, l_coord)
+
+def batched_prc_txts(x: jax.Array, t_coord=None, l_coord=None):
+    return prc_txts(x, t_coord, l_coord)
+
+def batched_prc_times(t_coord: jax.Array) -> jax.Array:
+    return jax.vmap(prc_times)(t_coord)
 
 
-batched_prc_vid = batched_wrapper(prc_vid)
-batched_prc_img = batched_wrapper(prc_img)
-batched_prc_txt = batched_wrapper(prc_txt)
-batched_prc_txts = batched_wrapper(prc_txts)
-
-
-def batched_prc_times(t_coord: Tensor) -> Tensor:
-    x_ids = []
-    for i in range(len(t_coord)):
-        x_ids.append(prc_times(t_coord[i]))
-    return torch.stack(x_ids)
-
-
-def compress_time(t_ids: Tensor) -> Tensor:
+def compress_time(t_ids: jax.Array) -> jax.Array:
     """
     Compressing time ids i.e.:
     [0, 0 ... 4, 4 ... 8, 8 ...] ->  [0, 0 ... 1, 1 ... 2, 2 ...]
     """
     assert t_ids.ndim == 1
-    t_ids_max = torch.max(t_ids)
-    t_remap = torch.zeros((t_ids_max + 1,), device=t_ids.device, dtype=t_ids.dtype)
-    t_unique_sorted_ids = torch.unique(t_ids, sorted=True)
-    t_remap[t_unique_sorted_ids] = torch.arange(
-        len(t_unique_sorted_ids), device=t_ids.device, dtype=t_ids.dtype
-    )
-    t_ids_compressed = t_remap[t_ids]
-    return t_ids_compressed
+    t_unique_sorted_ids = jnp.unique(t_ids, size=len(t_ids))
+    # We must slice the padded unique array if using size in JAX, but simple unique works outside JIT bounds
+    t_unique_sorted_ids_real = jnp.unique(t_ids)
+    return jnp.searchsorted(t_unique_sorted_ids_real, t_ids)
 
 
-def scatter_ids(x: Tensor, x_ids: Tensor) -> list[Tensor]:
+def scatter_ids(x: jax.Array, x_ids: jax.Array) -> jax.Array:
     """
     Using position ids to scatter tokens into place.
+    x: (B, N, C), x_ids: (B, N, 4)
     """
-    x_list = []
-    t_coords = []
-    for data, pos in zip(x, x_ids):
-        l, ch = data.shape
-        t_ids = pos[:, 0].to(torch.int64)
-        h_ids = pos[:, 1].to(torch.int64)
-        w_ids = pos[:, 2].to(torch.int64)
-
-        t_ids_cmpr = compress_time(t_ids)
-
-        t = torch.max(t_ids_cmpr) + 1
-        h = torch.max(h_ids) + 1
-        w = torch.max(w_ids) + 1
-
-        flat_ids = t_ids_cmpr * w * h + h_ids * w + w_ids
-
-        # Optimized: pre-allocate on correct device and use scatter_ for better GPU performance
-        out = torch.zeros((t * h * w, ch), device=data.device, dtype=data.dtype)
-        out.scatter_(0, flat_ids.unsqueeze(1).expand(-1, ch), data)
-
-        x_list.append(rearrange(out, "(t h w) c -> 1 c t h w", t=t, h=h, w=w))
-        t_coords.append(torch.unique(t_ids, sorted=True))
-    return x_list
+    b, n, ch = x.shape
+    
+    def process_single(data, pos):
+        t_c = pos[:, 0].astype(jnp.int32)
+        h_c = pos[:, 1].astype(jnp.int32)
+        w_c = pos[:, 2].astype(jnp.int32)
+        
+        t_cmpr = compress_time(t_c)
+        t_max = jnp.max(t_cmpr) + 1
+        h_max = jnp.max(h_c) + 1
+        w_max = jnp.max(w_c) + 1
+        
+        flat_ids = t_cmpr * w_max * h_max + h_c * w_max + w_c
+        
+        out = jnp.zeros((t_max * h_max * w_max, ch), dtype=data.dtype)
+        out = out.at[flat_ids].set(data)
+        return rearrange(out, "(t h w) c -> c t h w", t=t_max, h=h_max, w=w_max)
+        
+    return jax.vmap(process_single)(x, x_ids)
 
 
-def times_to_ids(time: Tensor) -> Tensor:
+def times_to_ids(time: jax.Array) -> jax.Array:
     """Using a unit of 10 ms per index."""
-    return (time * 1000 // 10).to(dtype=torch.int64)
+    return (time * 100).astype(jnp.int32) # time * 1000 // 10
 
 
-def ids_to_times(ids: Tensor) -> Tensor:
+def ids_to_times(ids: jax.Array) -> jax.Array:
     """Using a unit of 10 ms per index."""
     return ids * 10 / 1000
 
 
-def scattercat(x: torch.Tensor, x_ids: torch.Tensor) -> torch.Tensor:
+def scattercat(x: jax.Array, x_ids: jax.Array) -> jax.Array:
     """Scatter tokens to spatial format and concatenate."""
-    x = scatter_ids(x, x_ids)
-    return torch.cat(x, 0).squeeze(2)
+    scattered = scatter_ids(x, x_ids) # shape (B, C, T, H, W)
+    return scattered.squeeze(2) # return (B, C, H, W)
 
 
-def scatter_ids_to_times(x_ids: Tensor):
-    t_coords = []
-    for pos in x_ids:
-        t_ids = pos[:, 0].to(torch.int64)
-        t_coords.append(ids_to_times(torch.unique(t_ids, sorted=True)))
-    return t_coords
+def scatter_ids_to_times(x_ids: jax.Array):
+    def single_times(pos):
+        t_ids = pos[:, 0].astype(jnp.int32)
+        return ids_to_times(jnp.unique(t_ids))
+    return jax.vmap(single_times)(x_ids)
