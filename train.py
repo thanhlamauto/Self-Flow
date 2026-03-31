@@ -519,11 +519,34 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def mean_tokenwise_cosine_similarity(x, y, eps=1e-8):
-    """Mean cosine similarity over tokens and batch."""
-    x_norm = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
-    y_norm = y / jnp.maximum(jnp.linalg.norm(y, axis=-1, keepdims=True), eps)
-    return jnp.mean(jnp.sum(x_norm * y_norm, axis=-1))
+def compute_feature_separation_regularizer(
+    low_features,
+    high_features,
+    *,
+    mode: str,
+    stopgrad_side: str,
+    eps: float = 1e-8,
+):
+    """Orthogonalize two backbone layers with a token-wise cosine-squared loss."""
+    if mode == "stopgrad":
+        if stopgrad_side == "high":
+            high_features = jax.lax.stop_gradient(high_features)
+        elif stopgrad_side == "low":
+            low_features = jax.lax.stop_gradient(low_features)
+        else:
+            raise ValueError(
+                f"Unsupported feature separation stopgrad side: {stopgrad_side}"
+            )
+    elif mode != "no_stopgrad":
+        raise ValueError(f"Unsupported feature separation mode: {mode}")
+
+    eps = jnp.float32(eps)
+    low_norm = low_features / (jnp.linalg.norm(low_features, axis=-1, keepdims=True) + eps)
+    high_norm = high_features / (jnp.linalg.norm(high_features, axis=-1, keepdims=True) + eps)
+    cosine = jnp.sum(low_norm * high_norm, axis=-1)
+    mean_cosine = jnp.mean(cosine)
+    loss = jnp.mean(jnp.square(cosine))
+    return loss, mean_cosine
 
 def train_step(
     state, ema_params, batch, repeat_route_index, rng, ema_decay,
@@ -531,6 +554,8 @@ def train_step(
     feature_separation_lambda: float = 0.0,
     feature_separation_layer_low: int = 4,
     feature_separation_layer_high: int = 11,
+    feature_separation_mode: str = "stopgrad",
+    feature_separation_stopgrad_side: str = "high",
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -552,6 +577,7 @@ def train_step(
 
     def loss_fn(params):
         aux_loss = jnp.array(0.0, dtype=jnp.float32)
+        aux_cosine = jnp.array(0.0, dtype=jnp.float32)
         if feature_separation_lambda > 0.0:
             pred, raw_features = state.apply_fn(
                 {"params": params},
@@ -567,7 +593,12 @@ def train_step(
                 ),
             )
             low_features, high_features = raw_features
-            aux_loss = mean_tokenwise_cosine_similarity(low_features, high_features)
+            aux_loss, aux_cosine = compute_feature_separation_regularizer(
+                low_features,
+                high_features,
+                mode=feature_separation_mode,
+                stopgrad_side=feature_separation_stopgrad_side,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -582,14 +613,15 @@ def train_step(
         loss = recon_loss + feature_separation_lambda * aux_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (recon_loss, aux_loss, v_abs_mean, v_pred_abs_mean)
+        return loss, (recon_loss, aux_loss, aux_cosine, v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (recon_loss, aux_loss, v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (recon_loss, aux_loss, aux_cosine, v_abs, v_pred)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     recon_loss = jax.lax.pmean(recon_loss, axis_name="batch")
     aux_loss = jax.lax.pmean(aux_loss, axis_name="batch")
+    aux_cosine = jax.lax.pmean(aux_cosine, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -605,6 +637,7 @@ def train_step(
         "train/loss": loss,
         "train/loss_recon": recon_loss,
         "train/loss_feature_separation": aux_loss,
+        "train/feature_separation_cosine": aux_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -697,6 +730,8 @@ def eval_step(
     feature_separation_lambda: float = 0.0,
     feature_separation_layer_low: int = 4,
     feature_separation_layer_high: int = 11,
+    feature_separation_mode: str = "stopgrad",
+    feature_separation_stopgrad_side: str = "high",
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -711,6 +746,7 @@ def eval_step(
     target = x0 - x1
 
     aux_loss = jnp.array(0.0, dtype=jnp.float32)
+    aux_cosine = jnp.array(0.0, dtype=jnp.float32)
     if feature_separation_lambda > 0.0:
         pred, raw_features = state.apply_fn(
             {"params": state.params},
@@ -724,7 +760,12 @@ def eval_step(
             ),
         )
         low_features, high_features = raw_features
-        aux_loss = mean_tokenwise_cosine_similarity(low_features, high_features)
+        aux_loss, aux_cosine = compute_feature_separation_regularizer(
+            low_features,
+            high_features,
+            mode=feature_separation_mode,
+            stopgrad_side=feature_separation_stopgrad_side,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -741,6 +782,7 @@ def eval_step(
     loss = jax.lax.pmean(loss, axis_name="batch")
     recon_loss = jax.lax.pmean(recon_loss, axis_name="batch")
     aux_loss = jax.lax.pmean(aux_loss, axis_name="batch")
+    aux_cosine = jax.lax.pmean(aux_cosine, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -748,6 +790,7 @@ def eval_step(
         "val/loss": loss,
         "val/loss_recon": recon_loss,
         "val/loss_feature_separation": aux_loss,
+        "val/feature_separation_cosine": aux_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1379,11 +1422,25 @@ def main():
     parser.add_argument("--repeat-block-early-stop-fraction", type=float, default=0.8,
                         help="If early-stop is enabled and no explicit step is set, decay to zero by this fraction of total training steps.")
     parser.add_argument("--feature-separation-lambda", type=float, default=0.0,
-                        help="Weight for the auxiliary token-wise cosine loss that pushes two backbone layers apart.")
+                        help="Weight for the auxiliary token-wise cosine-squared loss that orthogonalizes two backbone layers.")
     parser.add_argument("--feature-separation-layer-low", type=int, default=4,
-                        help="Lower backbone layer index used by the feature-separation auxiliary loss.")
+                        help="Lower 1-based backbone layer index used by the feature-separation auxiliary loss.")
     parser.add_argument("--feature-separation-layer-high", type=int, default=11,
-                        help="Higher backbone layer index used by the feature-separation auxiliary loss.")
+                        help="Higher 1-based backbone layer index used by the feature-separation auxiliary loss.")
+    parser.add_argument(
+        "--feature-separation-mode",
+        type=str,
+        default="stopgrad",
+        choices=["stopgrad", "no_stopgrad"],
+        help="Regularizer mode. 'stopgrad' detaches one side before the cosine-squared penalty; 'no_stopgrad' backpropagates through both sides.",
+    )
+    parser.add_argument(
+        "--feature-separation-stopgrad-side",
+        type=str,
+        default="high",
+        choices=["high", "low"],
+        help="Which side to detach when --feature-separation-mode=stopgrad.",
+    )
     parser.add_argument("--fid-num-steps", type=int, default=50,
                         help="Denoising steps for FID generation. "
                              "TPU default: 50 (monitoring). Paper: 250.")
@@ -1536,10 +1593,14 @@ def main():
                 f"fraction={args.repeat_block_early_stop_fraction}"
             )
     if args.feature_separation_lambda > 0.0:
+        stopgrad_msg = ""
+        if args.feature_separation_mode == "stopgrad":
+            stopgrad_msg = f" stopgrad_side={args.feature_separation_stopgrad_side}"
         log_stage(
             "Feature-separation loss enabled: "
             f"lambda={args.feature_separation_lambda} "
-            f"layers={args.feature_separation_layer_low}:{args.feature_separation_layer_high}"
+            f"layers={args.feature_separation_layer_low}:{args.feature_separation_layer_high} "
+            f"mode={args.feature_separation_mode}{stopgrad_msg}"
         )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1628,6 +1689,8 @@ def main():
             feature_separation_lambda=float(args.feature_separation_lambda),
             feature_separation_layer_low=int(args.feature_separation_layer_low),
             feature_separation_layer_high=int(args.feature_separation_layer_high),
+            feature_separation_mode=args.feature_separation_mode,
+            feature_separation_stopgrad_side=args.feature_separation_stopgrad_side,
         ),
         axis_name="batch",
     )
@@ -1637,6 +1700,8 @@ def main():
             feature_separation_lambda=float(args.feature_separation_lambda),
             feature_separation_layer_low=int(args.feature_separation_layer_low),
             feature_separation_layer_high=int(args.feature_separation_layer_high),
+            feature_separation_mode=args.feature_separation_mode,
+            feature_separation_stopgrad_side=args.feature_separation_stopgrad_side,
         ),
         axis_name="batch",
     )
