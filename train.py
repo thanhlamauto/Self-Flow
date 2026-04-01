@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -367,7 +368,7 @@ DIT_VARIANTS = {
 }
 
 
-def build_model_config(model_size):
+def build_model_config(model_size, *, enable_noise_depth_regularizer=False):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -387,6 +388,7 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        enable_noise_depth_regularizer=enable_noise_depth_regularizer,
     )
 
 
@@ -412,6 +414,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.noise_depth_regularizer import NoiseDepthScaleSpaceRegularizer
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -449,6 +452,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        enable_noise_depth_regularizer=config["enable_noise_depth_regularizer"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -464,6 +468,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_reg_tokens=config["enable_noise_depth_regularizer"],
         deterministic=False,
     )
 
@@ -500,8 +505,46 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+def make_zero_noise_depth_reg_stats(depth: int):
+    zeros = jnp.zeros((depth,), dtype=jnp.float32)
+    return {
+        "reg_loss": jnp.array(0.0, dtype=jnp.float32),
+        "per_layer_loss": zeros,
+        "per_layer_beta": zeros,
+        "per_layer_blur": zeros,
+        "per_layer_cosine": zeros,
+        "noise_level_mean": jnp.array(0.0, dtype=jnp.float32),
+    }
+
+
+def flatten_noise_depth_reg_stats(stats, prefix: str):
+    metrics = {
+        f"{prefix}/noise_depth_reg_noise_level_mean": stats["noise_level_mean"],
+    }
+    num_layers = int(stats["per_layer_loss"].shape[0])
+    for layer_idx in range(num_layers):
+        layer_name = f"{layer_idx + 1:02d}"
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_loss"] = stats["per_layer_loss"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_beta"] = stats["per_layer_beta"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_blur"] = stats["per_layer_blur"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_cosine"] = stats["per_layer_cosine"][layer_idx]
+    return metrics
+
+
 def train_step(
     state, ema_params, batch, rng, ema_decay,
+    *,
+    noise_depth_reg_lambda: float = 0.0,
+    noise_depth_reg_target_mode: str = "blend",
+    noise_depth_reg_noise_parameterization: str = "normalized_sigma",
+    noise_depth_reg_sigma_min: float = 0.1,
+    noise_depth_reg_sigma_max: float = 2.0,
+    noise_depth_reg_beta_slope: float = 6.0,
+    noise_depth_reg_eps: float = 1e-6,
+    noise_depth_reg_depth: int = 12,
+    noise_depth_reg_grid_size: int = 16,
+    noise_depth_reg_patch_size: int = 2,
+    noise_depth_reg_latent_channels: int = 4,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -520,28 +563,61 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    regularizer = None
+    if noise_depth_reg_lambda > 0.0:
+        regularizer = NoiseDepthScaleSpaceRegularizer(
+            depth=noise_depth_reg_depth,
+            grid_size=noise_depth_reg_grid_size,
+            patch_size=noise_depth_reg_patch_size,
+            latent_channels=noise_depth_reg_latent_channels,
+            sigma_min=noise_depth_reg_sigma_min,
+            sigma_max=noise_depth_reg_sigma_max,
+            beta_slope=noise_depth_reg_beta_slope,
+            noise_parameterization_mode=noise_depth_reg_noise_parameterization,
+            target_mode=noise_depth_reg_target_mode,
+            eps=noise_depth_reg_eps,
+        )
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        reg_loss = jnp.array(0.0, dtype=jnp.float32)
+        reg_stats = make_zero_noise_depth_reg_stats(noise_depth_reg_depth)
+        if regularizer is not None:
+            pred, projected_layer_tokens = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+                return_reg_tokens=True,
+            )
+            reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, tau)
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+        fm_loss = jnp.mean((pred - target) ** 2)
+        loss = fm_loss + noise_depth_reg_lambda * reg_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (fm_loss, reg_loss, reg_stats, v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (fm_loss, reg_loss, reg_stats, v_abs, v_pred)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    fm_loss = jax.lax.pmean(fm_loss, axis_name="batch")
+    reg_loss = jax.lax.pmean(reg_loss, axis_name="batch")
+    reg_stats = jax.lax.pmean(reg_stats, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
+    reg_lambda = jax.lax.pmean(jnp.asarray(noise_depth_reg_lambda, dtype=jnp.float32), axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -551,17 +627,34 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_fm": fm_loss,
+        "train/loss_noise_depth_reg": reg_loss,
+        "train/noise_depth_reg_lambda": reg_lambda,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
+    if noise_depth_reg_lambda > 0.0:
+        metrics.update(flatten_noise_depth_reg_stats(reg_stats, prefix="train"))
     return state, ema_params, metrics, rng
 
 
 def eval_step(
     state, ema_params, batch, rng,
+    *,
+    noise_depth_reg_lambda: float = 0.0,
+    noise_depth_reg_target_mode: str = "blend",
+    noise_depth_reg_noise_parameterization: str = "normalized_sigma",
+    noise_depth_reg_sigma_min: float = 0.1,
+    noise_depth_reg_sigma_max: float = 2.0,
+    noise_depth_reg_beta_slope: float = 6.0,
+    noise_depth_reg_eps: float = 1e-6,
+    noise_depth_reg_depth: int = 12,
+    noise_depth_reg_grid_size: int = 16,
+    noise_depth_reg_patch_size: int = 2,
+    noise_depth_reg_latent_channels: int = 4,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -574,27 +667,64 @@ def eval_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    regularizer = None
+    if noise_depth_reg_lambda > 0.0:
+        regularizer = NoiseDepthScaleSpaceRegularizer(
+            depth=noise_depth_reg_depth,
+            grid_size=noise_depth_reg_grid_size,
+            patch_size=noise_depth_reg_patch_size,
+            latent_channels=noise_depth_reg_latent_channels,
+            sigma_min=noise_depth_reg_sigma_min,
+            sigma_max=noise_depth_reg_sigma_max,
+            beta_slope=noise_depth_reg_beta_slope,
+            noise_parameterization_mode=noise_depth_reg_noise_parameterization,
+            target_mode=noise_depth_reg_target_mode,
+            eps=noise_depth_reg_eps,
+        )
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    reg_loss = jnp.array(0.0, dtype=jnp.float32)
+    reg_stats = make_zero_noise_depth_reg_stats(noise_depth_reg_depth)
+    if regularizer is not None:
+        pred, projected_layer_tokens = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+            return_reg_tokens=True,
+        )
+        reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, tau)
+    else:
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+    fm_loss = jnp.mean((pred - target) ** 2)
+    loss = fm_loss + noise_depth_reg_lambda * reg_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    fm_loss = jax.lax.pmean(fm_loss, axis_name="batch")
+    reg_loss = jax.lax.pmean(reg_loss, axis_name="batch")
+    reg_stats = jax.lax.pmean(reg_stats, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+    reg_lambda = jax.lax.pmean(jnp.asarray(noise_depth_reg_lambda, dtype=jnp.float32), axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_fm": fm_loss,
+        "val/loss_noise_depth_reg": reg_loss,
+        "val/noise_depth_reg_lambda": reg_lambda,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
+    if noise_depth_reg_lambda > 0.0:
+        metrics.update(flatten_noise_depth_reg_stats(reg_stats, prefix="val"))
     return metrics, rng
 
 
@@ -742,6 +872,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        enable_noise_depth_regularizer=config["enable_noise_depth_regularizer"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -841,6 +972,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        enable_noise_depth_regularizer=config["enable_noise_depth_regularizer"],
     )
 
     patch_size = config["patch_size"]
@@ -1077,6 +1209,34 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--noise-depth-reg-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for the noise-depth scale-space regularizer. Recommended first test: 0.01.",
+    )
+    parser.add_argument(
+        "--noise-depth-reg-target-mode",
+        type=str,
+        default="blend",
+        choices=["blur_only", "blend"],
+        help="Use only blurred targets or the beta-blended coarse-to-fine target.",
+    )
+    parser.add_argument(
+        "--noise-depth-reg-noise-parameterization",
+        type=str,
+        default="normalized_sigma",
+        choices=["normalized_sigma", "raw_timestep", "normalized_logsnr"],
+        help="Noise scalar u(t) used by the regularizer. normalized_sigma is the default for the current linear flow path.",
+    )
+    parser.add_argument("--noise-depth-reg-sigma-min", type=float, default=0.1,
+                        help="Minimum Gaussian blur sigma for the noise-depth regularizer.")
+    parser.add_argument("--noise-depth-reg-sigma-max", type=float, default=2.0,
+                        help="Maximum Gaussian blur sigma for the noise-depth regularizer.")
+    parser.add_argument("--noise-depth-reg-beta-slope", type=float, default=6.0,
+                        help="Sigmoid slope k used in beta(t, y) for the noise-depth regularizer.")
+    parser.add_argument("--noise-depth-reg-eps", type=float, default=1e-6,
+                        help="Numerical epsilon for cosine and blur kernels in the noise-depth regularizer.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1222,6 +1382,16 @@ def main():
         raise ValueError("--block-corr-freq must be >= 0")
     if args.block_corr_batches <= 0:
         raise ValueError("--block-corr-batches must be > 0")
+    if args.noise_depth_reg_lambda < 0.0:
+        raise ValueError("--noise-depth-reg-lambda must be >= 0")
+    if args.noise_depth_reg_sigma_min <= 0.0:
+        raise ValueError("--noise-depth-reg-sigma-min must be > 0")
+    if args.noise_depth_reg_sigma_max < args.noise_depth_reg_sigma_min:
+        raise ValueError("--noise-depth-reg-sigma-max must be >= --noise-depth-reg-sigma-min")
+    if args.noise_depth_reg_beta_slope <= 0.0:
+        raise ValueError("--noise-depth-reg-beta-slope must be > 0")
+    if args.noise_depth_reg_eps <= 0.0:
+        raise ValueError("--noise-depth-reg-eps must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
 
@@ -1247,7 +1417,10 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size)
+    config = build_model_config(
+        args.model_size,
+        enable_noise_depth_regularizer=bool(args.noise_depth_reg_lambda > 0.0),
+    )
     depth = int(config["depth"])
 
     log_stage(
@@ -1257,6 +1430,15 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.noise_depth_reg_lambda > 0.0:
+        log_stage(
+            "Noise-depth regularizer enabled: "
+            f"lambda={args.noise_depth_reg_lambda} "
+            f"target={args.noise_depth_reg_target_mode} "
+            f"noise={args.noise_depth_reg_noise_parameterization} "
+            f"sigma=[{args.noise_depth_reg_sigma_min}, {args.noise_depth_reg_sigma_max}] "
+            f"k={args.noise_depth_reg_beta_slope}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1477,40 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            noise_depth_reg_lambda=float(args.noise_depth_reg_lambda),
+            noise_depth_reg_target_mode=args.noise_depth_reg_target_mode,
+            noise_depth_reg_noise_parameterization=args.noise_depth_reg_noise_parameterization,
+            noise_depth_reg_sigma_min=float(args.noise_depth_reg_sigma_min),
+            noise_depth_reg_sigma_max=float(args.noise_depth_reg_sigma_max),
+            noise_depth_reg_beta_slope=float(args.noise_depth_reg_beta_slope),
+            noise_depth_reg_eps=float(args.noise_depth_reg_eps),
+            noise_depth_reg_depth=int(config["depth"]),
+            noise_depth_reg_grid_size=int(config["input_size"] // config["patch_size"]),
+            noise_depth_reg_patch_size=int(config["patch_size"]),
+            noise_depth_reg_latent_channels=int(config["in_channels"]),
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            noise_depth_reg_lambda=float(args.noise_depth_reg_lambda),
+            noise_depth_reg_target_mode=args.noise_depth_reg_target_mode,
+            noise_depth_reg_noise_parameterization=args.noise_depth_reg_noise_parameterization,
+            noise_depth_reg_sigma_min=float(args.noise_depth_reg_sigma_min),
+            noise_depth_reg_sigma_max=float(args.noise_depth_reg_sigma_max),
+            noise_depth_reg_beta_slope=float(args.noise_depth_reg_beta_slope),
+            noise_depth_reg_eps=float(args.noise_depth_reg_eps),
+            noise_depth_reg_depth=int(config["depth"]),
+            noise_depth_reg_grid_size=int(config["input_size"] // config["patch_size"]),
+            noise_depth_reg_patch_size=int(config["patch_size"]),
+            noise_depth_reg_latent_channels=int(config["in_channels"]),
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.

@@ -242,15 +242,22 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    enable_noise_depth_regularizer: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
+        self.reg_patch_dim = self.in_channels * (self.patch_size ** 2)
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        if self.enable_noise_depth_regularizer:
+            self.noise_depth_reg_heads = tuple(
+                nn.Dense(self.reg_patch_dim, name=f"noise_depth_reg_head_{layer_idx}")
+                for layer_idx in range(self.depth)
+            )
 
     @nn.compact
     def __call__(
@@ -261,13 +268,20 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool = False,
+        return_reg_tokens: bool = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+        assert not (return_reg_tokens and return_features)
+        assert not (return_reg_tokens and return_raw_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+        if return_reg_tokens and not self.enable_noise_depth_regularizer:
+            raise ValueError(
+                "return_reg_tokens=True requires enable_noise_depth_regularizer=True"
+            )
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -305,6 +319,7 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        reg_tokens = [] if return_reg_tokens else None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
@@ -322,6 +337,8 @@ class SelfFlowDiT(nn.Module):
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:
                 zs = x
+            if return_reg_tokens:
+                reg_tokens.append(self.noise_depth_reg_heads[i](x))
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -337,11 +354,17 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+        if return_reg_tokens:
+            reg_tokens = jnp.stack(reg_tokens, axis=0)  # (depth, B, N, patch_dim)
 
         if return_features or return_raw_features:
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
+        if return_reg_tokens:
+            if return_block_summaries:
+                return x, reg_tokens, block_summaries
+            return x, reg_tokens
         if return_block_summaries:
             return x, block_summaries
         return x
