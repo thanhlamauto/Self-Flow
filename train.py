@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -387,6 +388,9 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        enable_vae_structure_guidance=False,
+        vae_guidance_layer=0,
+        vae_guidance_hidden_dim=0,
     )
 
 
@@ -431,13 +435,8 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
-    """Initializes the model, optimizer, and initial EMA params.
-
-    Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
-    """
-    model = SelfFlowDiT(
+def build_dit_model(config):
+    return SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
         in_channels=config["in_channels"],
@@ -449,7 +448,19 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        enable_vae_structure_guidance=config.get("enable_vae_structure_guidance", False),
+        vae_guidance_layer=config.get("vae_guidance_layer", 0),
+        vae_guidance_hidden_dim=config.get("vae_guidance_hidden_dim", 0),
     )
+
+
+def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+    """Initializes the model, optimizer, and initial EMA params.
+
+    Returns (state, ema_params) where ema_params is a copy of the initial
+    online params.  Caller should replicate both via jax_utils.replicate.
+    """
+    model = build_dit_model(config)
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -464,6 +475,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_vae_guidance_tokens=config.get("enable_vae_structure_guidance", False),
         deterministic=False,
     )
 
@@ -498,10 +510,44 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def tree_dot(tree_a, tree_b):
+    leaves_a = jax.tree_util.tree_leaves(tree_a)
+    leaves_b = jax.tree_util.tree_leaves(tree_b)
+    return sum(
+        jnp.vdot(jnp.asarray(a, dtype=jnp.float32), jnp.asarray(b, dtype=jnp.float32))
+        for a, b in zip(leaves_a, leaves_b)
+    )
+
+
+def tree_norm(tree):
+    return jnp.sqrt(jnp.maximum(tree_dot(tree, tree), 0.0))
+
+
+def feature_cosine_mean(pred, target, eps=1e-8):
+    pred = jnp.asarray(pred, dtype=jnp.float32)
+    target = jnp.asarray(target, dtype=jnp.float32)
+    pred = pred / jnp.maximum(jnp.linalg.norm(pred, axis=-1, keepdims=True), eps)
+    target = target / jnp.maximum(jnp.linalg.norm(target, axis=-1, keepdims=True), eps)
+    return jnp.mean(jnp.sum(pred * target, axis=-1))
+
+
+def resolve_vae_guidance_layer(depth, requested_layer):
+    requested_layer = int(requested_layer)
+    if requested_layer == 0:
+        return max(1, int(depth) // 2)
+    return requested_layer
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    vae_structure_guidance_lambda=0.0,
+    vae_structure_guidance_eps=1e-8,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -521,7 +567,7 @@ def train_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    def loss_fn(params):
+    def fm_loss_fn(params):
         pred = state.apply_fn(
             {"params": params},
             x_tau,
@@ -535,14 +581,51 @@ def train_step(
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         return loss, (v_abs_mean, v_pred_abs_mean)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    def align_loss_fn(params):
+        _, align_tokens = state.apply_fn(
+            {"params": params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            return_vae_guidance_tokens=True,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+        )
+        align_loss = jnp.mean((align_tokens - x0) ** 2)
+        align_cosine = feature_cosine_mean(align_tokens, x0, eps=vae_structure_guidance_eps)
+        return align_loss, align_cosine
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
+    fm_grad_fn = jax.value_and_grad(fm_loss_fn, has_aux=True)
+    (fm_loss, (v_abs, v_pred)), fm_grads = fm_grad_fn(state.params)
+
+    if vae_structure_guidance_lambda > 0.0:
+        align_grad_fn = jax.value_and_grad(align_loss_fn, has_aux=True)
+        (align_loss, align_feature_cosine), align_grads = align_grad_fn(state.params)
+    else:
+        align_loss = jnp.array(0.0, dtype=jnp.float32)
+        align_feature_cosine = jnp.array(0.0, dtype=jnp.float32)
+        align_grads = jax.tree_util.tree_map(jnp.zeros_like, fm_grads)
+
+    grads = jax.tree_util.tree_map(
+        lambda fm_g, align_g: fm_g + vae_structure_guidance_lambda * align_g,
+        fm_grads,
+        align_grads,
+    )
+
+    fm_loss = jax.lax.pmean(fm_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    align_feature_cosine = jax.lax.pmean(align_feature_cosine, axis_name="batch")
+    fm_grads = jax.lax.pmean(fm_grads, axis_name="batch")
+    align_grads = jax.lax.pmean(align_grads, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
+    grad_cosine = tree_dot(fm_grads, align_grads) / jnp.maximum(
+        tree_norm(fm_grads) * tree_norm(align_grads),
+        vae_structure_guidance_eps,
+    )
+    total_loss = fm_loss + vae_structure_guidance_lambda * align_loss
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
@@ -550,7 +633,12 @@ def train_step(
     ema_params = ema_update(ema_params, state.params, ema_decay)
 
     metrics = {
-        "train/loss": loss,
+        "train/loss": total_loss,
+        "train/loss_fm": fm_loss,
+        "train/loss_vae_align": align_loss,
+        "train/vae_align_lambda": jnp.asarray(vae_structure_guidance_lambda, dtype=jnp.float32),
+        "train/vae_align_feature_cosine": align_feature_cosine,
+        "train/grad_cosine_vae_align_vs_fm": grad_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,7 +649,12 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    vae_structure_guidance_lambda=0.0,
+    vae_structure_guidance_eps=1e-8,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -575,23 +668,45 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    if vae_structure_guidance_lambda > 0.0:
+        pred, align_tokens = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            return_vae_guidance_tokens=True,
+            deterministic=True,
+        )
+        align_loss = jnp.mean((align_tokens - x0) ** 2)
+        align_feature_cosine = feature_cosine_mean(align_tokens, x0, eps=vae_structure_guidance_eps)
+    else:
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+        align_loss = jnp.array(0.0, dtype=jnp.float32)
+        align_feature_cosine = jnp.array(0.0, dtype=jnp.float32)
+    fm_loss = jnp.mean((pred - target) ** 2)
+    loss = fm_loss + vae_structure_guidance_lambda * align_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    fm_loss = jax.lax.pmean(fm_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+    align_feature_cosine = jax.lax.pmean(align_feature_cosine, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_fm": fm_loss,
+        "val/loss_vae_align": align_loss,
+        "val/vae_align_lambda": jnp.asarray(vae_structure_guidance_lambda, dtype=jnp.float32),
+        "val/vae_align_feature_cosine": align_feature_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -730,19 +845,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
       - Paper-like eval: num_steps=250, cfg_scale=1.0
         (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
+    model = build_dit_model(config)
 
     def sample_latents(params, class_labels, rng):
         """Generate sample latents on TPU using EMA params."""
@@ -829,19 +932,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
+    model = build_dit_model(config)
 
     patch_size = config["patch_size"]
     latent_channels = config["in_channels"]
@@ -1182,6 +1273,30 @@ def main():
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
+    parser.add_argument(
+        "--vae-structure-guidance-lambda",
+        type=float,
+        default=0.0,
+        help="Phase-1 VAE structure guidance weight. 0 disables the auxiliary align loss.",
+    )
+    parser.add_argument(
+        "--vae-structure-guidance-layer",
+        type=int,
+        default=0,
+        help="1-based shallow layer to align with VAE latent. 0 picks depth//2 automatically.",
+    )
+    parser.add_argument(
+        "--vae-structure-guidance-hidden-dim",
+        type=int,
+        default=0,
+        help="Hidden width of the 3-layer MLP head. 0 uses the model hidden size.",
+    )
+    parser.add_argument(
+        "--vae-structure-guidance-eps",
+        type=float,
+        default=1e-8,
+        help="Numerical epsilon for align-feature cosine and grad-cosine logging.",
+    )
     # ── Preflight / safety args ───────────────────────────────────────────────
     parser.add_argument("--preflight-checks", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
@@ -1224,6 +1339,14 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.vae_structure_guidance_lambda < 0:
+        raise ValueError("--vae-structure-guidance-lambda must be >= 0")
+    if args.vae_structure_guidance_layer < 0:
+        raise ValueError("--vae-structure-guidance-layer must be >= 0")
+    if args.vae_structure_guidance_hidden_dim < 0:
+        raise ValueError("--vae-structure-guidance-hidden-dim must be >= 0")
+    if args.vae_structure_guidance_eps <= 0:
+        raise ValueError("--vae-structure-guidance-eps must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1249,6 +1372,20 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    vae_guidance_layer = resolve_vae_guidance_layer(depth, args.vae_structure_guidance_layer)
+    if not (1 <= vae_guidance_layer <= depth):
+        raise ValueError(
+            f"--vae-structure-guidance-layer resolved to {vae_guidance_layer}, "
+            f"but model depth is {depth}"
+        )
+    config["enable_vae_structure_guidance"] = bool(args.vae_structure_guidance_lambda > 0.0)
+    config["vae_guidance_layer"] = vae_guidance_layer if config["enable_vae_structure_guidance"] else 0
+    config["vae_guidance_hidden_dim"] = (
+        int(args.vae_structure_guidance_hidden_dim)
+        if args.vae_structure_guidance_hidden_dim > 0
+        else int(config["hidden_size"])
+    )
+    args.vae_structure_guidance_layer_resolved = vae_guidance_layer
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1394,14 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if config["enable_vae_structure_guidance"]:
+        log_stage(
+            "Phase-1 VAE structure guidance enabled: "
+            f"lambda={args.vae_structure_guidance_lambda} "
+            f"layer={config['vae_guidance_layer']} "
+            f"head_hidden={config['vae_guidance_hidden_dim']} "
+            "(full training; no early stop)"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1440,22 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            vae_structure_guidance_lambda=args.vae_structure_guidance_lambda,
+            vae_structure_guidance_eps=args.vae_structure_guidance_eps,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            vae_structure_guidance_lambda=args.vae_structure_guidance_lambda,
+            vae_structure_guidance_eps=args.vae_structure_guidance_eps,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
