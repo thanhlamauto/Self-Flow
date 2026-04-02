@@ -567,11 +567,33 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
-def make_train_step_repa(dinov2_model):
+def make_train_step_repa(dinov2_model, repa_align_tau_min=0.0, repa_align_tau_max=1.0):
     """Create a fused REPA train step that runs DINOv2 + SiT in a single pmap.
 
     DINOv2 runs in bfloat16 for ~2x speedup on TPU; results are cast back to float32.
     """
+    repa_align_tau_min = float(repa_align_tau_min)
+    repa_align_tau_max = float(repa_align_tau_max)
+    use_open_upper = repa_align_tau_max < 1.0
+
+    def _tree_dot(tree_a, tree_b):
+        return sum(
+            jnp.vdot(a, b)
+            for a, b in zip(
+                jax.tree_util.tree_leaves(tree_a),
+                jax.tree_util.tree_leaves(tree_b),
+            )
+        )
+
+    def _tree_l2_norm(tree):
+        return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)))
+
+    def _tree_cosine_similarity(tree_a, tree_b, eps=1e-12):
+        dot = _tree_dot(tree_a, tree_b)
+        norm_a = _tree_l2_norm(tree_a)
+        norm_b = _tree_l2_norm(tree_b)
+        return dot / jnp.maximum(norm_a * norm_b, eps)
+
     def train_step_repa(
         state, ema_params, batch, images, dinov2_params, rng, ema_decay, proj_coeff,
     ):
@@ -591,7 +613,7 @@ def make_train_step_repa(dinov2_model):
         x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
         target = x0 - x1
 
-        def loss_fn(params):
+        def losses_with_aux(params):
             pred, repa_zs = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -607,26 +629,47 @@ def make_train_step_repa(dinov2_model):
             proj_n = repa_zs / (jnp.linalg.norm(repa_zs, axis=-1, keepdims=True) + 1e-8)
             dino_n = jax.lax.stop_gradient(dinov2_features)
             dino_n = dino_n / (jnp.linalg.norm(dino_n, axis=-1, keepdims=True) + 1e-8)
-            align_loss = -jnp.mean(jnp.sum(proj_n * dino_n, axis=-1))
-
-            total_loss = diff_loss + proj_coeff * align_loss
+            align_scores = jnp.sum(proj_n * dino_n, axis=-1)  # [B, T]
+            if use_open_upper:
+                align_mask = (tau >= repa_align_tau_min) & (tau < repa_align_tau_max)
+            else:
+                align_mask = (tau >= repa_align_tau_min) & (tau <= repa_align_tau_max)
+            align_mask = align_mask.astype(align_scores.dtype)
+            align_loss = -jnp.mean(align_scores * align_mask[:, None])
+            align_active_frac = jnp.mean(align_mask)
 
             v_abs_mean = jnp.mean(jnp.abs(target))
             v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-            return total_loss, (diff_loss, align_loss, v_abs_mean, v_pred_abs_mean)
+            return (diff_loss, align_loss), (align_active_frac, v_abs_mean, v_pred_abs_mean)
 
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (total_loss, (diff_loss, align_loss, v_abs, v_pred)), grads = grad_fn(state.params)
+        (diff_loss, align_loss), pullback, (align_active_frac, v_abs, v_pred) = jax.vjp(
+            losses_with_aux,
+            state.params,
+            has_aux=True,
+        )
+        one = jnp.array(1.0, dtype=diff_loss.dtype)
+        zero = jnp.array(0.0, dtype=diff_loss.dtype)
+        (diff_grads,) = pullback((one, zero))
+        (align_grads,) = pullback((zero, one))
+        diff_grads = jax.lax.pmean(diff_grads, axis_name="batch")
+        align_grads = jax.lax.pmean(align_grads, axis_name="batch")
+        grads = jax.tree_util.tree_map(
+            lambda diff_g, align_g: diff_g + proj_coeff * align_g,
+            diff_grads,
+            align_grads,
+        )
+        total_loss = diff_loss + proj_coeff * align_loss
 
         total_loss = jax.lax.pmean(total_loss, axis_name="batch")
         diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
         align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+        align_active_frac = jax.lax.pmean(align_active_frac, axis_name="batch")
         v_abs = jax.lax.pmean(v_abs, axis_name="batch")
         v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-        grads = jax.lax.pmean(grads, axis_name="batch")
+        grad_cosine_diff_align = _tree_cosine_similarity(diff_grads, align_grads)
 
-        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-        param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+        grad_norm = _tree_l2_norm(grads)
+        param_norm = _tree_l2_norm(state.params)
 
         state = state.apply_gradients(grads=grads)
         ema_params = ema_update(ema_params, state.params, ema_decay)
@@ -635,6 +678,8 @@ def make_train_step_repa(dinov2_model):
             "train/loss": total_loss,
             "train/diff_loss": diff_loss,
             "train/align_loss": align_loss,
+            "train/repa_align_active_frac": align_active_frac,
+            "train/grad_cosine_diff_align": grad_cosine_diff_align,
             "train/ema_decay": ema_decay,
             "train/grad_norm": grad_norm,
             "train/param_norm": param_norm,
@@ -1345,6 +1390,11 @@ def main():
                              "Typical: 4 for SiT-B/12.")
     parser.add_argument("--repa-proj-coeff", type=float, default=0.5,
                         help="Coefficient for REPA alignment loss.")
+    parser.add_argument("--repa-align-tau-min", type=float, default=0.0,
+                        help="Lower tau bound for applying REPA alignment (inclusive).")
+    parser.add_argument("--repa-align-tau-max", type=float, default=1.0,
+                        help="Upper tau bound for applying REPA alignment. "
+                             "Exclusive when < 1.0, inclusive at 1.0.")
     parser.add_argument("--repa-proj-dim", type=int, default=2048,
                         help="Hidden dim of REPA 3-layer MLP projector.")
     parser.add_argument("--repa-z-dim", type=int, default=768,
@@ -1384,6 +1434,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.encoder_depth > 0 and not args.dinov2_weights:
         raise ValueError("--dinov2-weights is required when --encoder-depth > 0")
+    if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
+        raise ValueError("--repa-align-tau-min/--repa-align-tau-max must satisfy 0 <= min < max <= 1")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1479,7 +1531,15 @@ def main():
         log_stage("DINOv2 loaded and replicated.")
 
         # Fused train step: DINOv2 (bfloat16) + SiT in single pmap — no extra sync barrier
-        _train_step_repa_fn = make_train_step_repa(dinov2_model)
+        log_stage(
+            f"REPA tau alignment window: [{args.repa_align_tau_min:.3f}, {args.repa_align_tau_max:.3f}"
+            f"{']' if args.repa_align_tau_max >= 1.0 else ')'}"
+        )
+        _train_step_repa_fn = make_train_step_repa(
+            dinov2_model,
+            repa_align_tau_min=args.repa_align_tau_min,
+            repa_align_tau_max=args.repa_align_tau_max,
+        )
         pmapped_train_step_repa = jax.pmap(_train_step_repa_fn, axis_name="batch")
         proj_coeff_rep = jax_utils.replicate(jnp.float32(args.repa_proj_coeff))
 
