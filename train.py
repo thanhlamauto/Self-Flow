@@ -1130,9 +1130,17 @@ def run_preflight_checks(
     Uses EMA params for sampling (same as training-time eval).
     decode_latents : callable(latents_nchw) → NHWC float32 [0,1]
     inception_fn   : pmap'd InceptionV3 (from get_inception_network), or None
-    real_eval_batch: tuple(real_latents_patchified, real_labels) or None
+    real_eval_batch: tuple(real_latents_patchified, real_labels[, ...]) or None
     """
     from src.fid_utils import fid_from_stats
+
+    def _extract_latents_and_labels(batch):
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise ValueError(
+                "Expected real_eval_batch to contain at least (latents, labels); "
+                f"got {type(batch).__name__} with len={len(batch) if hasattr(batch, '__len__') else 'n/a'}."
+            )
+        return batch[0], batch[1]
 
     requested_fake_samples = max(preflight_sample_count, preflight_fid_samples)
     if requested_fake_samples <= 0:
@@ -1159,7 +1167,7 @@ def run_preflight_checks(
         if inception_fn is None:
             raise RuntimeError("Preflight FID requested but InceptionV3 is not initialised.")
 
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = _extract_latents_and_labels(real_eval_batch)
         real_count = min(preflight_fid_samples, len(real_latents_patchified))
         fake_count = min(preflight_fid_samples, len(fake_latents))
         fid_count = min(real_count, fake_count)
@@ -1228,12 +1236,12 @@ def run_preflight_checks(
         log_stage("  ".join(summary_parts))
 
     if real_eval_batch is not None and linear_probe_runner is not None:
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = _extract_latents_and_labels(real_eval_batch)
         lp_acc = float(linear_probe_runner(real_latents_patchified, real_labels))
         log_stage(f"Preflight LinearProbeAcc@1 = {lp_acc:.4f}  (clean EMA representation)")
 
     if real_eval_batch is not None and block_corr_runner is not None:
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = _extract_latents_and_labels(real_eval_batch)
         corr = np.asarray(block_corr_runner(real_latents_patchified, real_labels), dtype=np.float32)
         offdiag = float((np.sum(corr) - np.trace(corr)) / max(corr.size - corr.shape[0], 1))
         log_stage(
