@@ -262,12 +262,15 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
+        return_hidden_layers=(),
+        return_time_embedding: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+        hidden_layer_ids = tuple(int(layer_id) for layer_id in return_hidden_layers)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -306,6 +309,7 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
+        hidden_layers = [] if hidden_layer_ids else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -317,6 +321,9 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
+
+            if hidden_layer_ids and (i + 1) in hidden_layer_ids:
+                hidden_layers.append(x)
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
@@ -337,14 +344,20 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+        if hidden_layer_ids:
+            hidden_layers = jnp.stack(hidden_layers, axis=0)
+            hidden_layer_ids_arr = jnp.asarray(hidden_layer_ids, dtype=jnp.int32)
 
+        outputs = [x]
         if return_features or return_raw_features:
-            if return_block_summaries:
-                return x, zs, block_summaries
-            return x, zs
+            outputs.append(zs)
         if return_block_summaries:
-            return x, block_summaries
-        return x
+            outputs.append(block_summaries)
+        if hidden_layer_ids:
+            outputs.extend([hidden_layers, hidden_layer_ids_arr])
+        if return_time_embedding:
+            outputs.append(t_emb)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def _shufflechannel(self, x):
         """Reorder channels/patches to match expected output format."""

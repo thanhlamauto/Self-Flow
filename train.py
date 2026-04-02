@@ -8,6 +8,8 @@ import threading
 import queue
 import logging
 import zipfile
+import collections.abc
+from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -390,6 +392,40 @@ def build_model_config(model_size):
     )
 
 
+def parse_align_blocks(spec, depth):
+    spec = str(spec).strip().lower()
+    if spec == "all":
+        return tuple(range(1, depth + 1))
+
+    layer_ids = []
+    seen = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        layer_id = int(token)
+        if not (1 <= layer_id <= depth):
+            raise ValueError(f"--align-blocks entry {layer_id} out of range [1, {depth}]")
+        if layer_id in seen:
+            continue
+        seen.add(layer_id)
+        layer_ids.append(layer_id)
+
+    if not layer_ids:
+        raise ValueError("--align-blocks must be 'all' or a comma-separated list of 1-based block ids")
+    return tuple(layer_ids)
+
+
+def align_oom_fallback_ladders(depth):
+    half_start = depth // 2 + 1
+    late_half = tuple(range(half_start, depth + 1))
+    sparse_start = min(depth, half_start + 1)
+    sparse = tuple(range(sparse_start, depth + 1, 2))
+    if not sparse:
+        sparse = (depth,)
+    return late_half, sparse
+
+
 # diffusers phải được import TRƯỚC jax để tránh xung đột C++ protobuf descriptor.
 # Nếu diffusers được import sau khi JAX/TPU khởi tạo, dynamic linker dlopen một .so
 # mới đăng ký protobuf descriptor trùng với descriptor của XLA → SIGSEGV.
@@ -405,12 +441,18 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.training import train_state, checkpoints
-from flax import jax_utils
+from flax import jax_utils, struct
 import numpy as np
 try:
     import grain.python as grain
 except ImportError:
     grain = None
+from src.align import (
+    LayerTimeProjector,
+    build_layer_token_weights,
+    masked_cosine_loss,
+    token_haar_detail_scores,
+)
 from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -431,13 +473,29 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
+class SiTTrainState(train_state.TrainState):
+    aligner_apply_fn: Callable = struct.field(pytree_node=False)
+
+
+def get_backbone_params(params):
+    if isinstance(params, collections.abc.Mapping) and "backbone" in params:
+        return params["backbone"]
+    return params
+
+
+def get_aligner_params(params):
+    if isinstance(params, collections.abc.Mapping) and "aligner" in params:
+        return params["aligner"]
+    return params
+
+
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
     """
-    model = SelfFlowDiT(
+    backbone = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
         in_channels=config["in_channels"],
@@ -450,6 +508,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
     )
+    aligner = LayerTimeProjector(
+        hidden_dim=config["hidden_size"],
+        out_dim=config["in_channels"] * config["patch_size"] ** 2,
+        num_layers=config["depth"],
+    )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -457,15 +520,19 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_x = jnp.ones((1, n_patches, patch_dim))
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
+    dummy_hidden = jnp.ones((1, 1, n_patches, config["hidden_size"]))
+    dummy_time_embed = jnp.ones((1, config["hidden_size"]))
+    dummy_layers = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
-    variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+    rng, model_rng, drop_rng, align_rng = jax.random.split(rng, 4)
+    backbone_vars = backbone.init(
+        {'params': model_rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
     )
+    aligner_vars = aligner.init(align_rng, dummy_hidden, dummy_time_embed, dummy_layers)
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -473,9 +540,13 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         optax.adamw(learning_rate, weight_decay=0),
     )
 
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
+    state = SiTTrainState.create(
+        apply_fn=backbone.apply,
+        aligner_apply_fn=aligner.apply,
+        params={
+            "backbone": backbone_vars["params"],
+            "aligner": aligner_vars["params"],
+        },
         tx=tx,
     )
     # EMA params start as an exact copy of the initial online params
@@ -502,6 +573,7 @@ def ema_update(ema_params, new_params, decay):
 
 def train_step(
     state, ema_params, batch, rng, ema_decay,
+    *, depth, in_channels, align_enabled, align_layer_ids, lambda_align, align_alpha_max,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -520,25 +592,60 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    teacher_tokens = jax.lax.stop_gradient(x0)
+    if align_enabled:
+        layer_ids_arr = jnp.asarray(align_layer_ids, dtype=jnp.int32)
+        detail_scores = token_haar_detail_scores(teacher_tokens, in_channels=in_channels)
+        layer_weights = build_layer_token_weights(
+            detail_scores,
+            layer_ids_arr,
+            depth=depth,
+            alpha_max=align_alpha_max,
+        )
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        backbone_params = get_backbone_params(params)
+        if align_enabled:
+            pred, hidden_stack, hidden_layer_ids, time_embed = state.apply_fn(
+                {"params": backbone_params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                return_hidden_layers=align_layer_ids,
+                return_time_embedding=True,
+                rngs={"dropout": drop_rng},
+            )
+            projected = state.aligner_apply_fn(
+                {"params": get_aligner_params(params)},
+                hidden_stack,
+                jax.lax.stop_gradient(time_embed),
+                hidden_layer_ids,
+            )
+            loss_align, _ = masked_cosine_loss(projected, teacher_tokens, layer_weights)
+        else:
+            pred = state.apply_fn(
+                {"params": backbone_params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            loss_align = jnp.array(0.0, dtype=jnp.float32)
+
+        loss_gen = jnp.mean((pred - target) ** 2)
+        loss = loss_gen + jnp.asarray(lambda_align, dtype=jnp.float32) * loss_align
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (loss_gen, loss_align, v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (loss_gen, loss_align, v_abs, v_pred)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -551,6 +658,8 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_gen": loss_gen,
+        "train/loss_align": loss_align,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -562,6 +671,7 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng,
+    *, depth, in_channels, align_enabled, align_layer_ids, lambda_align, align_alpha_max,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -574,24 +684,59 @@ def eval_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    teacher_tokens = jax.lax.stop_gradient(x0)
+    if align_enabled:
+        layer_ids_arr = jnp.asarray(align_layer_ids, dtype=jnp.int32)
+        detail_scores = token_haar_detail_scores(teacher_tokens, in_channels=in_channels)
+        layer_weights = build_layer_token_weights(
+            detail_scores,
+            layer_ids_arr,
+            depth=depth,
+            alpha_max=align_alpha_max,
+        )
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    if align_enabled:
+        pred, hidden_stack, hidden_layer_ids, time_embed = state.apply_fn(
+            {"params": get_backbone_params(state.params)},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+            return_hidden_layers=align_layer_ids,
+            return_time_embedding=True,
+        )
+        projected = state.aligner_apply_fn(
+            {"params": get_aligner_params(state.params)},
+            hidden_stack,
+            jax.lax.stop_gradient(time_embed),
+            hidden_layer_ids,
+        )
+        loss_align, _ = masked_cosine_loss(projected, teacher_tokens, layer_weights)
+    else:
+        pred = state.apply_fn(
+            {"params": get_backbone_params(state.params)},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+        loss_align = jnp.array(0.0, dtype=jnp.float32)
+
+    loss_gen = jnp.mean((pred - target) ** 2)
+    loss = loss_gen + jnp.asarray(lambda_align, dtype=jnp.float32) * loss_align
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_gen": loss_gen,
+        "val/loss_align": loss_align,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -949,7 +1094,7 @@ def run_preflight_checks(
         return rng
 
     # Use EMA params for preflight sampling (consistent with training-time eval)
-    single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+    single_ema_params = jax.tree_util.tree_map(lambda w: w[0], get_backbone_params(ema_params))
     sample_rng_base, sample_rng = jax.random.split(rng[0])
     sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
     fake_latents = np.asarray(
@@ -1077,6 +1222,31 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--align-loss",
+        dest="align_loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the train-only wavelet-weighted hidden-state alignment regularizer.",
+    )
+    parser.add_argument(
+        "--lambda-align",
+        type=float,
+        default=0.01,
+        help="Weight for the auxiliary alignment loss when --align-loss is enabled.",
+    )
+    parser.add_argument(
+        "--align-blocks",
+        type=str,
+        default="all",
+        help="Transformer blocks to align. Use 'all' or a comma-separated 1-based list like '7,8,9,10,11,12'.",
+    )
+    parser.add_argument(
+        "--align-alpha-max",
+        type=float,
+        default=0.6,
+        help="Maximum cosine-scheduled detail reweighting strength for the alignment loss.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1224,6 +1394,10 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.lambda_align < 0:
+        raise ValueError("--lambda-align must be >= 0")
+    if args.align_alpha_max < 0:
+        raise ValueError("--align-alpha-max must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1249,6 +1423,7 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    align_layer_ids = parse_align_blocks(args.align_blocks, depth)
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1432,18 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.align_loss:
+        log_stage(
+            f"Alignment regularizer enabled: lambda_align={args.lambda_align} "
+            f"alpha_max={args.align_alpha_max} blocks={','.join(map(str, align_layer_ids))}"
+        )
+        if args.model_size.upper() == "B" and args.batch_size == 128 and num_devices == 8:
+            late_half, sparse = align_oom_fallback_ladders(depth)
+            log_stage(
+                "OOM fallback ladder for B/128 on v5e-8: "
+                f"first retry --align-blocks {','.join(map(str, late_half))}; "
+                f"second retry --align-blocks {','.join(map(str, sparse))}"
+            )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1482,37 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        lambda state, ema_params, batch, rng, ema_decay: train_step(
+            state,
+            ema_params,
+            batch,
+            rng,
+            ema_decay,
+            depth=depth,
+            in_channels=config["in_channels"],
+            align_enabled=bool(args.align_loss),
+            align_layer_ids=align_layer_ids,
+            lambda_align=float(args.lambda_align),
+            align_alpha_max=float(args.align_alpha_max),
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        lambda state, ema_params, batch, rng: eval_step(
+            state,
+            ema_params,
+            batch,
+            rng,
+            depth=depth,
+            in_channels=config["in_channels"],
+            align_enabled=bool(args.align_loss),
+            align_layer_ids=align_layer_ids,
+            lambda_align=float(args.lambda_align),
+            align_alpha_max=float(args.align_alpha_max),
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1465,7 +1681,7 @@ def main():
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
                 _, feats = state.apply_fn(
-                    {"params": ema_params_local},
+                    {"params": get_backbone_params(ema_params_local)},
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
@@ -1493,7 +1709,7 @@ def main():
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
                 out = state.apply_fn(
-                    {"params": ema_params_local},
+                    {"params": get_backbone_params(ema_params_local)},
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
@@ -1597,7 +1813,7 @@ def main():
             f"[FID probe] generating one fake batch of {fake_bs} latents "
             f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
         )
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], get_backbone_params(ema_params))
         probe_rng = jax.random.fold_in(rng[0], 0xF1D)
         probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
         fake_latents = np.asarray(
@@ -1734,7 +1950,7 @@ def main():
                 lambda key: jax.random.randint(key, (local_b,), 0, 1000),
                 in_axes=0,
             )(class_rng)
-            latents_sharded = fid_sample_latents_pmapped(ema_params, classes, sample_rng)
+            latents_sharded = fid_sample_latents_pmapped(get_backbone_params(ema_params), classes, sample_rng)
             imgs_sharded = decode_latents_sharded(latents_sharded)
             if is_enabled:
                 # Device->host exactly once per batch (uint8) and trim pads by `valid`.
@@ -1988,7 +2204,7 @@ def main():
                 sample_rng, = jax.random.split(rng[0], 1)
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
                 # Use EMA params for sample generation (paper-faithful eval)
-                single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+                single_ema_params = jax.tree_util.tree_map(lambda w: w[0], get_backbone_params(ema_params))
                 latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
 
                 def _bg_log(z_dev, classes, target_step):
