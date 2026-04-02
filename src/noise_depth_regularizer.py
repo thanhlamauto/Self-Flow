@@ -138,6 +138,60 @@ def channel_schedule(
     return beta_shape, beta_color, beta_mixed, raw_weights, normalized_budget
 
 
+def haar2x2_token_bands(tokens, *, channels: int, patch_size: int):
+    """Fixed 2x2 Haar transform over each patch token."""
+    if patch_size != 2:
+        raise ValueError(f"haar2x2_token_bands requires patch_size=2, got {patch_size}")
+    patches = rearrange(
+        tokens,
+        "... (p1 p2 c) -> ... c p1 p2",
+        p1=patch_size,
+        p2=patch_size,
+        c=channels,
+    )
+    x00 = patches[..., 0, 0]
+    x01 = patches[..., 0, 1]
+    x10 = patches[..., 1, 0]
+    x11 = patches[..., 1, 1]
+    ll = 0.5 * (x00 + x01 + x10 + x11)
+    lh = 0.5 * (x00 - x01 + x10 - x11)
+    hl = 0.5 * (x00 + x01 - x10 - x11)
+    hh = 0.5 * (x00 - x01 - x10 + x11)
+    return jnp.stack([ll, lh, hl, hh], axis=-1)
+
+
+def wavelet_band_schedule(
+    noise_level,
+    layer_depth,
+    *,
+    beta_slope: float,
+    band_offset: float,
+    hh_offset: float,
+    eps: float,
+):
+    """Return target update budget over local Haar bands [LL, LH, HL, HH]."""
+    edge_gate = jax.nn.sigmoid(
+        beta_slope * (layer_depth[None, :] - noise_level[:, None] - band_offset)
+    )
+    hh_gate = jax.nn.sigmoid(
+        beta_slope * (layer_depth[None, :] - noise_level[:, None] - hh_offset)
+    )
+    raw_weights = jnp.stack(
+        [
+            1.0 - 0.75 * edge_gate,
+            0.5 * edge_gate,
+            0.5 * edge_gate,
+            hh_gate,
+        ],
+        axis=2,
+    )
+    normalized_budget = raw_weights / jnp.maximum(
+        jnp.sum(raw_weights, axis=2, keepdims=True),
+        eps,
+    )
+    return edge_gate, hh_gate, raw_weights, normalized_budget
+
+
 def channel_energy_budget(deltas, *, eps: float):
     """Convert per-layer latent deltas into a channel update budget."""
     channel_energy = jnp.mean(jnp.square(deltas), axis=(3, 4))
@@ -146,6 +200,21 @@ def channel_energy_budget(deltas, *, eps: float):
         eps,
     )
     return predicted_budget, channel_energy
+
+
+def wavelet_band_energy_budget(delta_tokens, *, channels: int, patch_size: int, eps: float):
+    """Convert token-local Haar deltas into an LL/LH/HL/HH update budget."""
+    band_coeffs = haar2x2_token_bands(
+        delta_tokens,
+        channels=channels,
+        patch_size=patch_size,
+    )
+    band_energy = jnp.mean(jnp.square(band_coeffs), axis=(2, 3))
+    predicted_budget = band_energy / jnp.maximum(
+        jnp.sum(band_energy, axis=2, keepdims=True),
+        eps,
+    )
+    return predicted_budget, band_energy
 
 
 def kl_budget_loss(target_budget, predicted_budget, *, eps: float):
@@ -185,6 +254,14 @@ def make_zero_stats(depth: int, noise_level):
         "per_layer_energy_c2": zeros,
         "per_layer_energy_c3": zeros,
         "per_layer_energy_c4": zeros,
+        "band_target_ll_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_lh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_hl_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_hh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_ll_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_lh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_hl_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_hh_mean": jnp.array(0.0, dtype=jnp.float32),
         "noise_level_mean": jnp.mean(noise_level),
     }
 
@@ -200,11 +277,13 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
     sigma_max: float = 2.0
     beta_slope: float = 6.0
     noise_parameterization_mode: str = "normalized_sigma"
-    style: str = "channel_budget"
+    style: str = "wavelet_band_budget"
     target_mode: str = "blend"
     color_offset: float = 0.15
     mixed_offset: float = 0.30
     mixed_scale: float = 0.5
+    band_offset: float = 0.10
+    hh_offset: float = 0.30
     eps: float = 1e-6
     truncate: float = 3.0
 
@@ -219,9 +298,13 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
             raise ValueError(
                 f"Expected {self.depth} layers, got {projected_layer_tokens.shape[0]}"
             )
-        if self.style in {"channel_weighted", "channel_budget"} and self.latent_channels != 4:
+        if self.style in {"channel_weighted", "channel_budget", "wavelet_band_budget"} and self.latent_channels != 4:
             raise ValueError(
                 f"{self.style} assumes 4 latent channels, got {self.latent_channels}"
+            )
+        if self.style == "wavelet_band_budget" and self.patch_size != 2:
+            raise ValueError(
+                f"wavelet_band_budget requires patch_size=2, got {self.patch_size}"
             )
 
         noise_level = noise_parameterize(
@@ -234,6 +317,64 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
         else:
             layer_depth = jnp.linspace(0.0, 1.0, self.depth, dtype=jnp.float32)
 
+        projected_tokens = jnp.transpose(projected_layer_tokens, (1, 0, 2, 3))
+        batch_size = projected_tokens.shape[0]
+
+        stats = make_zero_stats(self.depth, noise_level)
+
+        if self.style == "wavelet_band_budget":
+            edge_gate, hh_gate, _, normalized_band_budget = wavelet_band_schedule(
+                noise_level,
+                layer_depth,
+                beta_slope=self.beta_slope,
+                band_offset=self.band_offset,
+                hh_offset=self.hh_offset,
+                eps=self.eps,
+            )
+            prev_tokens = jnp.concatenate(
+                [
+                    jax.lax.stop_gradient(input_patchified)[:, None, :, :],
+                    jax.lax.stop_gradient(projected_tokens[:, :-1, :, :]),
+                ],
+                axis=1,
+            )
+            delta_tokens = projected_tokens - prev_tokens
+            predicted_band_budget, band_energy = wavelet_band_energy_budget(
+                delta_tokens,
+                channels=self.latent_channels,
+                patch_size=self.patch_size,
+                eps=self.eps,
+            )
+            per_sample_layer_loss = kl_budget_loss(
+                normalized_band_budget,
+                predicted_band_budget,
+                eps=self.eps,
+            )
+            per_layer_loss = jnp.mean(per_sample_layer_loss, axis=0)
+            reg_loss = jnp.mean(per_layer_loss)
+            stats.update(
+                {
+                    "reg_loss": reg_loss,
+                    "per_layer_loss": per_layer_loss,
+                    "per_layer_beta": jnp.mean(edge_gate, axis=0),
+                    "per_layer_color_gate": jnp.mean(edge_gate, axis=0),
+                    "per_layer_mixed_gate": jnp.mean(hh_gate, axis=0),
+                    "band_target_ll_mean": jnp.mean(normalized_band_budget[:, :, 0]),
+                    "band_target_lh_mean": jnp.mean(normalized_band_budget[:, :, 1]),
+                    "band_target_hl_mean": jnp.mean(normalized_band_budget[:, :, 2]),
+                    "band_target_hh_mean": jnp.mean(normalized_band_budget[:, :, 3]),
+                    "band_pred_ll_mean": jnp.mean(predicted_band_budget[:, :, 0]),
+                    "band_pred_lh_mean": jnp.mean(predicted_band_budget[:, :, 1]),
+                    "band_pred_hl_mean": jnp.mean(predicted_band_budget[:, :, 2]),
+                    "band_pred_hh_mean": jnp.mean(predicted_band_budget[:, :, 3]),
+                    "per_layer_energy_c1": jnp.mean(band_energy[:, :, 0], axis=0),
+                    "per_layer_energy_c2": jnp.mean(band_energy[:, :, 1], axis=0),
+                    "per_layer_energy_c3": jnp.mean(band_energy[:, :, 2], axis=0),
+                    "per_layer_energy_c4": jnp.mean(band_energy[:, :, 3], axis=0),
+                }
+            )
+            return reg_loss, stats
+
         projected_latents = jax.vmap(
             lambda tokens: patch_tokens_to_nchw(
                 tokens,
@@ -243,11 +384,8 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
             )
         )(projected_layer_tokens)
         projected_latents = jnp.transpose(projected_latents, (1, 0, 2, 3, 4))
-        batch_size = projected_latents.shape[0]
         latent_h = projected_latents.shape[3]
         latent_w = projected_latents.shape[4]
-
-        stats = make_zero_stats(self.depth, noise_level)
 
         if self.style == "gaussian_scale_space":
             x0_nchw = patch_tokens_to_nchw(

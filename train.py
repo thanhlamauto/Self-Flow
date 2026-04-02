@@ -531,27 +531,50 @@ def make_zero_noise_depth_reg_stats(depth: int):
         "per_layer_energy_c2": zeros,
         "per_layer_energy_c3": zeros,
         "per_layer_energy_c4": zeros,
+        "band_target_ll_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_lh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_hl_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_target_hh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_ll_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_lh_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_hl_mean": jnp.array(0.0, dtype=jnp.float32),
+        "band_pred_hh_mean": jnp.array(0.0, dtype=jnp.float32),
         "noise_level_mean": jnp.array(0.0, dtype=jnp.float32),
     }
 
 
-def flatten_noise_depth_reg_stats(stats, prefix: str):
+def flatten_noise_depth_reg_stats(stats, prefix: str, *, style: str):
     metrics = {
         f"{prefix}/noise_depth_reg_noise_level_mean": stats["noise_level_mean"],
     }
+    if style == "wavelet_band_budget":
+        metrics.update(
+            {
+                f"{prefix}/noise_depth_reg_band_target_ll_mean": stats["band_target_ll_mean"],
+                f"{prefix}/noise_depth_reg_band_target_lh_mean": stats["band_target_lh_mean"],
+                f"{prefix}/noise_depth_reg_band_target_hl_mean": stats["band_target_hl_mean"],
+                f"{prefix}/noise_depth_reg_band_target_hh_mean": stats["band_target_hh_mean"],
+                f"{prefix}/noise_depth_reg_band_pred_ll_mean": stats["band_pred_ll_mean"],
+                f"{prefix}/noise_depth_reg_band_pred_lh_mean": stats["band_pred_lh_mean"],
+                f"{prefix}/noise_depth_reg_band_pred_hl_mean": stats["band_pred_hl_mean"],
+                f"{prefix}/noise_depth_reg_band_pred_hh_mean": stats["band_pred_hh_mean"],
+            }
+        )
     num_layers = int(stats["per_layer_loss"].shape[0])
     for layer_idx in range(num_layers):
         layer_name = f"{layer_idx + 1:02d}"
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_loss"] = stats["per_layer_loss"][layer_idx]
+        if style in {"channel_budget", "wavelet_band_budget"}:
+            continue
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_beta"] = stats["per_layer_beta"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_color_gate"] = stats["per_layer_color_gate"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_mixed_gate"] = stats["per_layer_mixed_gate"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_blur"] = stats["per_layer_blur"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_cosine"] = stats["per_layer_cosine"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_weight_c1"] = stats["per_layer_weight_c1"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_weight_c2"] = stats["per_layer_weight_c2"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_weight_c3"] = stats["per_layer_weight_c3"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_weight_c4"] = stats["per_layer_weight_c4"][layer_idx]
-        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_color_gate"] = stats["per_layer_color_gate"][layer_idx]
-        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_mixed_gate"] = stats["per_layer_mixed_gate"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c1"] = stats["per_layer_budget_target_c1"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c2"] = stats["per_layer_budget_target_c2"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c3"] = stats["per_layer_budget_target_c3"][layer_idx]
@@ -571,7 +594,7 @@ def train_step(
     state, ema_params, batch, rng, ema_decay,
     *,
     noise_depth_reg_lambda: float = 0.0,
-    noise_depth_reg_style: str = "channel_budget",
+    noise_depth_reg_style: str = "wavelet_band_budget",
     noise_depth_reg_target_mode: str = "blend",
     noise_depth_reg_noise_parameterization: str = "normalized_sigma",
     noise_depth_reg_sigma_min: float = 0.1,
@@ -580,6 +603,8 @@ def train_step(
     noise_depth_reg_color_offset: float = 0.15,
     noise_depth_reg_mixed_offset: float = 0.30,
     noise_depth_reg_mixed_scale: float = 0.5,
+    noise_depth_reg_band_offset: float = 0.10,
+    noise_depth_reg_hh_offset: float = 0.30,
     noise_depth_reg_eps: float = 1e-6,
     noise_depth_reg_depth: int = 12,
     noise_depth_reg_grid_size: int = 16,
@@ -619,6 +644,8 @@ def train_step(
             color_offset=noise_depth_reg_color_offset,
             mixed_offset=noise_depth_reg_mixed_offset,
             mixed_scale=noise_depth_reg_mixed_scale,
+            band_offset=noise_depth_reg_band_offset,
+            hh_offset=noise_depth_reg_hh_offset,
             eps=noise_depth_reg_eps,
         )
 
@@ -681,7 +708,13 @@ def train_step(
         "train/v_pred_abs_mean": v_pred,
     }
     if noise_depth_reg_lambda > 0.0:
-        metrics.update(flatten_noise_depth_reg_stats(reg_stats, prefix="train"))
+        metrics.update(
+            flatten_noise_depth_reg_stats(
+                reg_stats,
+                prefix="train",
+                style=noise_depth_reg_style,
+            )
+        )
     return state, ema_params, metrics, rng
 
 
@@ -689,7 +722,7 @@ def eval_step(
     state, ema_params, batch, rng,
     *,
     noise_depth_reg_lambda: float = 0.0,
-    noise_depth_reg_style: str = "channel_budget",
+    noise_depth_reg_style: str = "wavelet_band_budget",
     noise_depth_reg_target_mode: str = "blend",
     noise_depth_reg_noise_parameterization: str = "normalized_sigma",
     noise_depth_reg_sigma_min: float = 0.1,
@@ -698,6 +731,8 @@ def eval_step(
     noise_depth_reg_color_offset: float = 0.15,
     noise_depth_reg_mixed_offset: float = 0.30,
     noise_depth_reg_mixed_scale: float = 0.5,
+    noise_depth_reg_band_offset: float = 0.10,
+    noise_depth_reg_hh_offset: float = 0.30,
     noise_depth_reg_eps: float = 1e-6,
     noise_depth_reg_depth: int = 12,
     noise_depth_reg_grid_size: int = 16,
@@ -731,6 +766,8 @@ def eval_step(
             color_offset=noise_depth_reg_color_offset,
             mixed_offset=noise_depth_reg_mixed_offset,
             mixed_scale=noise_depth_reg_mixed_scale,
+            band_offset=noise_depth_reg_band_offset,
+            hh_offset=noise_depth_reg_hh_offset,
             eps=noise_depth_reg_eps,
         )
 
@@ -776,7 +813,13 @@ def eval_step(
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
     if noise_depth_reg_lambda > 0.0:
-        metrics.update(flatten_noise_depth_reg_stats(reg_stats, prefix="val"))
+        metrics.update(
+            flatten_noise_depth_reg_stats(
+                reg_stats,
+                prefix="val",
+                style=noise_depth_reg_style,
+            )
+        )
     return metrics, rng
 
 
@@ -1270,16 +1313,16 @@ def main():
     parser.add_argument(
         "--noise-depth-reg-style",
         type=str,
-        default="channel_budget",
-        choices=["channel_budget", "channel_weighted", "gaussian_scale_space"],
-        help="Regularizer style. channel_budget is the branch default; the older channel_weighted and gaussian_scale_space variants remain for ablations.",
+        default="wavelet_band_budget",
+        choices=["wavelet_band_budget", "channel_budget", "channel_weighted", "gaussian_scale_space"],
+        help="Regularizer style. wavelet_band_budget is the branch default; the older budget/alignment variants remain for ablations.",
     )
     parser.add_argument(
         "--noise-depth-reg-target-mode",
         type=str,
         default="blend",
         choices=["blur_only", "blend"],
-        help="Target mixing mode used by gaussian_scale_space. Ignored by channel_weighted and channel_budget.",
+        help="Target mixing mode used by gaussian_scale_space. Ignored by wavelet_band_budget, channel_weighted, and channel_budget.",
     )
     parser.add_argument(
         "--noise-depth-reg-noise-parameterization",
@@ -1300,6 +1343,10 @@ def main():
                         help="Extra depth/noise offset before mixed channel c4 turns on in channel_weighted/channel_budget modes.")
     parser.add_argument("--noise-depth-reg-mixed-scale", type=float, default=0.5,
                         help="Relative weight applied to channel c4 in channel_weighted/channel_budget modes.")
+    parser.add_argument("--noise-depth-reg-band-offset", type=float, default=0.10,
+                        help="Extra depth/noise offset before LH/HL wavelet bands turn on in wavelet_band_budget mode.")
+    parser.add_argument("--noise-depth-reg-hh-offset", type=float, default=0.30,
+                        help="Extra depth/noise offset before HH wavelet band turns on in wavelet_band_budget mode.")
     parser.add_argument("--noise-depth-reg-eps", type=float, default=1e-6,
                         help="Numerical epsilon for cosine and blur kernels in the noise-depth regularizer.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1461,6 +1508,10 @@ def main():
         raise ValueError("--noise-depth-reg-mixed-offset must be >= 0")
     if args.noise_depth_reg_mixed_scale < 0.0:
         raise ValueError("--noise-depth-reg-mixed-scale must be >= 0")
+    if args.noise_depth_reg_band_offset < 0.0:
+        raise ValueError("--noise-depth-reg-band-offset must be >= 0")
+    if args.noise_depth_reg_hh_offset < 0.0:
+        raise ValueError("--noise-depth-reg-hh-offset must be >= 0")
     if args.noise_depth_reg_eps <= 0.0:
         raise ValueError("--noise-depth-reg-eps must be > 0")
     if args.vae_decode_batch_size <= 0:
@@ -1508,10 +1559,22 @@ def main():
             f"style={args.noise_depth_reg_style}",
             f"noise={args.noise_depth_reg_noise_parameterization}",
             f"k={args.noise_depth_reg_beta_slope}",
-            f"color_offset={args.noise_depth_reg_color_offset}",
-            f"mixed_offset={args.noise_depth_reg_mixed_offset}",
-            f"mixed_scale={args.noise_depth_reg_mixed_scale}",
         ]
+        if args.noise_depth_reg_style == "wavelet_band_budget":
+            reg_parts.extend(
+                [
+                    f"band_offset={args.noise_depth_reg_band_offset}",
+                    f"hh_offset={args.noise_depth_reg_hh_offset}",
+                ]
+            )
+        else:
+            reg_parts.extend(
+                [
+                    f"color_offset={args.noise_depth_reg_color_offset}",
+                    f"mixed_offset={args.noise_depth_reg_mixed_offset}",
+                    f"mixed_scale={args.noise_depth_reg_mixed_scale}",
+                ]
+            )
         if args.noise_depth_reg_style == "gaussian_scale_space":
             reg_parts.extend(
                 [
@@ -1571,6 +1634,8 @@ def main():
             noise_depth_reg_color_offset=float(args.noise_depth_reg_color_offset),
             noise_depth_reg_mixed_offset=float(args.noise_depth_reg_mixed_offset),
             noise_depth_reg_mixed_scale=float(args.noise_depth_reg_mixed_scale),
+            noise_depth_reg_band_offset=float(args.noise_depth_reg_band_offset),
+            noise_depth_reg_hh_offset=float(args.noise_depth_reg_hh_offset),
             noise_depth_reg_eps=float(args.noise_depth_reg_eps),
             noise_depth_reg_depth=int(config["depth"]),
             noise_depth_reg_grid_size=int(config["input_size"] // config["patch_size"]),
@@ -1592,6 +1657,8 @@ def main():
             noise_depth_reg_color_offset=float(args.noise_depth_reg_color_offset),
             noise_depth_reg_mixed_offset=float(args.noise_depth_reg_mixed_offset),
             noise_depth_reg_mixed_scale=float(args.noise_depth_reg_mixed_scale),
+            noise_depth_reg_band_offset=float(args.noise_depth_reg_band_offset),
+            noise_depth_reg_hh_offset=float(args.noise_depth_reg_hh_offset),
             noise_depth_reg_eps=float(args.noise_depth_reg_eps),
             noise_depth_reg_depth=int(config["depth"]),
             noise_depth_reg_grid_size=int(config["input_size"] // config["patch_size"]),
