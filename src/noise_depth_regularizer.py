@@ -87,6 +87,21 @@ def cosine_loss_per_pixel(prediction, target, *, eps: float):
     return loss, cosine
 
 
+def weighted_cosine_loss_per_pixel(prediction, target, channel_weights, *, eps: float):
+    weights = channel_weights[:, :, :, None, None]
+    weighted_prediction = prediction * weights
+    weighted_target = target * weights
+    pred_norm = weighted_prediction / jnp.maximum(
+        jnp.linalg.norm(weighted_prediction, axis=2, keepdims=True), eps
+    )
+    target_norm = weighted_target / jnp.maximum(
+        jnp.linalg.norm(weighted_target, axis=2, keepdims=True), eps
+    )
+    cosine = jnp.sum(pred_norm * target_norm, axis=2)
+    loss = 1.0 - cosine
+    return loss, cosine
+
+
 class NoiseDepthScaleSpaceRegularizer(nn.Module):
     """Continuous coarse-to-fine target regularizer over all DiT layers."""
 
@@ -98,7 +113,11 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
     sigma_max: float = 2.0
     beta_slope: float = 6.0
     noise_parameterization_mode: str = "normalized_sigma"
+    style: str = "channel_weighted"
     target_mode: str = "blend"
+    color_offset: float = 0.15
+    mixed_offset: float = 0.30
+    mixed_scale: float = 0.5
     eps: float = 1e-6
     truncate: float = 3.0
 
@@ -134,43 +153,10 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
         else:
             layer_depth = jnp.linspace(0.0, 1.0, self.depth, dtype=jnp.float32)
 
-        beta = jax.nn.sigmoid(
-            self.beta_slope * (layer_depth[None, :] - noise_level[:, None])
-        )
-        blur_sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * (1.0 - beta)
-
-        blur_radius = max(1, int(math.ceil(float(self.truncate) * float(self.sigma_max))))
-        x0_tiled = jnp.broadcast_to(
-            x0_stop[:, None, :, :, :],
-            (batch_size, self.depth, self.latent_channels, latent_h, latent_w),
-        ).reshape(batch_size * self.depth, self.latent_channels, latent_h, latent_w)
-        blur_sigma_flat = blur_sigma.reshape(-1)
-        blurred = jax.vmap(
-            lambda image, sigma: gaussian_blur_nchw(
-                image,
-                sigma,
-                radius=blur_radius,
-                eps=self.eps,
-            )
-        )(x0_tiled, blur_sigma_flat).reshape(
-            batch_size,
-            self.depth,
-            self.latent_channels,
-            latent_h,
-            latent_w,
-        )
-
         x0_expanded = jnp.broadcast_to(
             x0_stop[:, None, :, :, :],
             (batch_size, self.depth, self.latent_channels, latent_h, latent_w),
         )
-        if self.target_mode == "blur_only":
-            target = blurred
-        elif self.target_mode == "blend":
-            blend = beta[:, :, None, None, None]
-            target = (1.0 - blend) * blurred + blend * x0_expanded
-        else:
-            raise ValueError(f"Unsupported target_mode: {self.target_mode}")
 
         projected_latents = jax.vmap(
             lambda tokens: patch_tokens_to_nchw(
@@ -182,21 +168,103 @@ class NoiseDepthScaleSpaceRegularizer(nn.Module):
         )(projected_layer_tokens)
         projected_latents = jnp.transpose(projected_latents, (1, 0, 2, 3, 4))
 
-        per_pixel_loss, per_pixel_cosine = cosine_loss_per_pixel(
-            projected_latents,
-            target,
-            eps=self.eps,
-        )
+        if self.style == "gaussian_scale_space":
+            beta = jax.nn.sigmoid(
+                self.beta_slope * (layer_depth[None, :] - noise_level[:, None])
+            )
+            blur_sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * (1.0 - beta)
+            blur_radius = max(1, int(math.ceil(float(self.truncate) * float(self.sigma_max))))
+            x0_tiled = jnp.broadcast_to(
+                x0_stop[:, None, :, :, :],
+                (batch_size, self.depth, self.latent_channels, latent_h, latent_w),
+            ).reshape(batch_size * self.depth, self.latent_channels, latent_h, latent_w)
+            blur_sigma_flat = blur_sigma.reshape(-1)
+            blurred = jax.vmap(
+                lambda image, sigma: gaussian_blur_nchw(
+                    image,
+                    sigma,
+                    radius=blur_radius,
+                    eps=self.eps,
+                )
+            )(x0_tiled, blur_sigma_flat).reshape(
+                batch_size,
+                self.depth,
+                self.latent_channels,
+                latent_h,
+                latent_w,
+            )
+            if self.target_mode == "blur_only":
+                target = blurred
+            elif self.target_mode == "blend":
+                blend = beta[:, :, None, None, None]
+                target = (1.0 - blend) * blurred + blend * x0_expanded
+            else:
+                raise ValueError(f"Unsupported target_mode: {self.target_mode}")
+            per_pixel_loss, per_pixel_cosine = cosine_loss_per_pixel(
+                projected_latents,
+                target,
+                eps=self.eps,
+            )
+            stats = {
+                "reg_loss": jnp.array(0.0, dtype=jnp.float32),
+                "per_layer_loss": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_beta": jnp.mean(beta, axis=0),
+                "per_layer_blur": jnp.mean(blur_sigma, axis=0),
+                "per_layer_cosine": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_weight_c1": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_weight_c2": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_weight_c3": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_weight_c4": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_color_gate": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_mixed_gate": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "noise_level_mean": jnp.mean(noise_level),
+            }
+        elif self.style == "channel_weighted":
+            beta_shape = jax.nn.sigmoid(
+                self.beta_slope * (layer_depth[None, :] - noise_level[:, None])
+            )
+            beta_color = jax.nn.sigmoid(
+                self.beta_slope * (layer_depth[None, :] - noise_level[:, None] - self.color_offset)
+            )
+            beta_mixed = jax.nn.sigmoid(
+                self.beta_slope * (layer_depth[None, :] - noise_level[:, None] - self.mixed_offset)
+            )
+            weight_c1 = 0.5 + 0.5 * beta_shape
+            weight_c2 = 1.0 - 0.5 * beta_shape
+            weight_c3 = beta_color
+            weight_c4 = self.mixed_scale * beta_mixed
+            channel_weights = jnp.stack(
+                [weight_c1, weight_c2, weight_c3, weight_c4],
+                axis=2,
+            )
+            per_pixel_loss, per_pixel_cosine = weighted_cosine_loss_per_pixel(
+                projected_latents,
+                x0_expanded,
+                channel_weights,
+                eps=self.eps,
+            )
+            stats = {
+                "reg_loss": jnp.array(0.0, dtype=jnp.float32),
+                "per_layer_loss": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_beta": jnp.mean(beta_shape, axis=0),
+                "per_layer_blur": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_cosine": jnp.zeros((self.depth,), dtype=jnp.float32),
+                "per_layer_weight_c1": jnp.mean(weight_c1, axis=0),
+                "per_layer_weight_c2": jnp.mean(weight_c2, axis=0),
+                "per_layer_weight_c3": jnp.mean(weight_c3, axis=0),
+                "per_layer_weight_c4": jnp.mean(weight_c4, axis=0),
+                "per_layer_color_gate": jnp.mean(beta_color, axis=0),
+                "per_layer_mixed_gate": jnp.mean(beta_mixed, axis=0),
+                "noise_level_mean": jnp.mean(noise_level),
+            }
+        else:
+            raise ValueError(f"Unsupported regularizer style: {self.style}")
+
         per_layer_loss = jnp.mean(per_pixel_loss, axis=(0, 2, 3))
         per_layer_cosine = jnp.mean(per_pixel_cosine, axis=(0, 2, 3))
         reg_loss = jnp.mean(per_layer_loss)
 
-        stats = {
-            "reg_loss": reg_loss,
-            "per_layer_loss": per_layer_loss,
-            "per_layer_beta": jnp.mean(beta, axis=0),
-            "per_layer_blur": jnp.mean(blur_sigma, axis=0),
-            "per_layer_cosine": per_layer_cosine,
-            "noise_level_mean": jnp.mean(noise_level),
-        }
+        stats["reg_loss"] = reg_loss
+        stats["per_layer_loss"] = per_layer_loss
+        stats["per_layer_cosine"] = per_layer_cosine
         return reg_loss, stats
