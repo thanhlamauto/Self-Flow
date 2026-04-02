@@ -254,9 +254,11 @@ class SelfFlowDiT(nn.Module):
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
         if self.enable_noise_depth_regularizer:
-            self.noise_depth_reg_heads = tuple(
-                nn.Dense(self.reg_patch_dim, name=f"noise_depth_reg_head_{layer_idx}")
-                for layer_idx in range(self.depth)
+            # A shared readout keeps every block in the same latent basis, which
+            # matters for delta-based regularizers over successive layers.
+            self.noise_depth_reg_head = nn.Dense(
+                self.reg_patch_dim,
+                name="noise_depth_reg_head",
             )
 
     @nn.compact
@@ -338,7 +340,7 @@ class SelfFlowDiT(nn.Module):
             elif (i + 1) == return_raw_features:
                 zs = x
             if return_reg_tokens:
-                reg_tokens.append(self.noise_depth_reg_heads[i](x))
+                reg_tokens.append(self.noise_depth_reg_head(x))
 
         x = FinalLayer(
             hidden_size=self.hidden_size,

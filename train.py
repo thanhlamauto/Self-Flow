@@ -519,6 +519,18 @@ def make_zero_noise_depth_reg_stats(depth: int):
         "per_layer_weight_c4": zeros,
         "per_layer_color_gate": zeros,
         "per_layer_mixed_gate": zeros,
+        "per_layer_budget_target_c1": zeros,
+        "per_layer_budget_target_c2": zeros,
+        "per_layer_budget_target_c3": zeros,
+        "per_layer_budget_target_c4": zeros,
+        "per_layer_budget_pred_c1": zeros,
+        "per_layer_budget_pred_c2": zeros,
+        "per_layer_budget_pred_c3": zeros,
+        "per_layer_budget_pred_c4": zeros,
+        "per_layer_energy_c1": zeros,
+        "per_layer_energy_c2": zeros,
+        "per_layer_energy_c3": zeros,
+        "per_layer_energy_c4": zeros,
         "noise_level_mean": jnp.array(0.0, dtype=jnp.float32),
     }
 
@@ -540,6 +552,18 @@ def flatten_noise_depth_reg_stats(stats, prefix: str):
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_weight_c4"] = stats["per_layer_weight_c4"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_color_gate"] = stats["per_layer_color_gate"][layer_idx]
         metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_mixed_gate"] = stats["per_layer_mixed_gate"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c1"] = stats["per_layer_budget_target_c1"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c2"] = stats["per_layer_budget_target_c2"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c3"] = stats["per_layer_budget_target_c3"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_target_c4"] = stats["per_layer_budget_target_c4"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_pred_c1"] = stats["per_layer_budget_pred_c1"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_pred_c2"] = stats["per_layer_budget_pred_c2"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_pred_c3"] = stats["per_layer_budget_pred_c3"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_budget_pred_c4"] = stats["per_layer_budget_pred_c4"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_energy_c1"] = stats["per_layer_energy_c1"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_energy_c2"] = stats["per_layer_energy_c2"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_energy_c3"] = stats["per_layer_energy_c3"][layer_idx]
+        metrics[f"{prefix}/noise_depth_reg_layer_{layer_name}_energy_c4"] = stats["per_layer_energy_c4"][layer_idx]
     return metrics
 
 
@@ -547,7 +571,7 @@ def train_step(
     state, ema_params, batch, rng, ema_decay,
     *,
     noise_depth_reg_lambda: float = 0.0,
-    noise_depth_reg_style: str = "channel_weighted",
+    noise_depth_reg_style: str = "channel_budget",
     noise_depth_reg_target_mode: str = "blend",
     noise_depth_reg_noise_parameterization: str = "normalized_sigma",
     noise_depth_reg_sigma_min: float = 0.1,
@@ -611,7 +635,7 @@ def train_step(
                 rngs={"dropout": drop_rng},
                 return_reg_tokens=True,
             )
-            reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, tau)
+            reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, x_tau, tau)
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -665,7 +689,7 @@ def eval_step(
     state, ema_params, batch, rng,
     *,
     noise_depth_reg_lambda: float = 0.0,
-    noise_depth_reg_style: str = "channel_weighted",
+    noise_depth_reg_style: str = "channel_budget",
     noise_depth_reg_target_mode: str = "blend",
     noise_depth_reg_noise_parameterization: str = "normalized_sigma",
     noise_depth_reg_sigma_min: float = 0.1,
@@ -721,7 +745,7 @@ def eval_step(
             deterministic=True,
             return_reg_tokens=True,
         )
-        reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, tau)
+        reg_loss, reg_stats = regularizer.apply({}, projected_layer_tokens, x0, x_tau, tau)
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -1241,21 +1265,21 @@ def main():
         "--noise-depth-reg-lambda",
         type=float,
         default=0.0,
-        help="Weight for the noise-depth scale-space regularizer. Recommended first test: 0.01.",
+        help="Weight for the noise-depth latent regularizer. Recommended first test: 0.01.",
     )
     parser.add_argument(
         "--noise-depth-reg-style",
         type=str,
-        default="channel_weighted",
-        choices=["channel_weighted", "gaussian_scale_space"],
-        help="Regularizer style. channel_weighted is the branch default; gaussian_scale_space preserves the older blur-based variant.",
+        default="channel_budget",
+        choices=["channel_budget", "channel_weighted", "gaussian_scale_space"],
+        help="Regularizer style. channel_budget is the branch default; the older channel_weighted and gaussian_scale_space variants remain for ablations.",
     )
     parser.add_argument(
         "--noise-depth-reg-target-mode",
         type=str,
         default="blend",
         choices=["blur_only", "blend"],
-        help="Target mixing mode used by gaussian_scale_space. Ignored by channel_weighted.",
+        help="Target mixing mode used by gaussian_scale_space. Ignored by channel_weighted and channel_budget.",
     )
     parser.add_argument(
         "--noise-depth-reg-noise-parameterization",
@@ -1271,11 +1295,11 @@ def main():
     parser.add_argument("--noise-depth-reg-beta-slope", type=float, default=6.0,
                         help="Sigmoid slope k used in beta(t, y) for the noise-depth regularizer.")
     parser.add_argument("--noise-depth-reg-color-offset", type=float, default=0.15,
-                        help="Extra depth/noise offset before chroma channel c3 turns on in channel_weighted mode.")
+                        help="Extra depth/noise offset before chroma channel c3 turns on in channel_weighted/channel_budget modes.")
     parser.add_argument("--noise-depth-reg-mixed-offset", type=float, default=0.30,
-                        help="Extra depth/noise offset before mixed channel c4 turns on in channel_weighted mode.")
+                        help="Extra depth/noise offset before mixed channel c4 turns on in channel_weighted/channel_budget modes.")
     parser.add_argument("--noise-depth-reg-mixed-scale", type=float, default=0.5,
-                        help="Relative weight applied to channel c4 in channel_weighted mode.")
+                        help="Relative weight applied to channel c4 in channel_weighted/channel_budget modes.")
     parser.add_argument("--noise-depth-reg-eps", type=float, default=1e-6,
                         help="Numerical epsilon for cosine and blur kernels in the noise-depth regularizer.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
@@ -1478,18 +1502,24 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
     if args.noise_depth_reg_lambda > 0.0:
-        log_stage(
-            "Noise-depth regularizer enabled: "
-            f"lambda={args.noise_depth_reg_lambda} "
-            f"style={args.noise_depth_reg_style} "
-            f"target={args.noise_depth_reg_target_mode} "
-            f"noise={args.noise_depth_reg_noise_parameterization} "
-            f"sigma=[{args.noise_depth_reg_sigma_min}, {args.noise_depth_reg_sigma_max}] "
-            f"k={args.noise_depth_reg_beta_slope} "
-            f"color_offset={args.noise_depth_reg_color_offset} "
-            f"mixed_offset={args.noise_depth_reg_mixed_offset} "
-            f"mixed_scale={args.noise_depth_reg_mixed_scale}"
-        )
+        reg_parts = [
+            "Noise-depth regularizer enabled:",
+            f"lambda={args.noise_depth_reg_lambda}",
+            f"style={args.noise_depth_reg_style}",
+            f"noise={args.noise_depth_reg_noise_parameterization}",
+            f"k={args.noise_depth_reg_beta_slope}",
+            f"color_offset={args.noise_depth_reg_color_offset}",
+            f"mixed_offset={args.noise_depth_reg_mixed_offset}",
+            f"mixed_scale={args.noise_depth_reg_mixed_scale}",
+        ]
+        if args.noise_depth_reg_style == "gaussian_scale_space":
+            reg_parts.extend(
+                [
+                    f"target={args.noise_depth_reg_target_mode}",
+                    f"sigma=[{args.noise_depth_reg_sigma_min}, {args.noise_depth_reg_sigma_max}]",
+                ]
+            )
+        log_stage(" ".join(reg_parts))
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
