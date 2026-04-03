@@ -605,20 +605,17 @@ def gaussian_blur_2d(x, sigma, kernel_size=9):
 
     def apply_single(img, k):
         # img: (H, W, C), k: (ks, ks)
-        # Use depthwise convolution: vmap over channels
-        k_hw11 = k[:, :, None, None] # (ks, ks, 1, 1)
-
-        def conv_channel(c_img):
-            # c_img: (H, W)
-            return jax.lax.conv_general_dilated(
-                c_img[None, :, :, None], # (1, H, W, 1)
-                k_hw11, # (ks, ks, 1, 1)
-                (1, 1),
-                "SAME",
-                dimension_numbers=("NHWC", "HWIO", "NHWC"),
-            )[0, :, :, 0]
-
-        return jax.vmap(conv_channel, in_axes=-1, out_axes=-1)(img)
+        # Depthwise convolution over all channels at once.
+        channels = img.shape[-1]
+        k_hwio = jnp.broadcast_to(k[:, :, None, None], (kernel_size, kernel_size, 1, channels))
+        return jax.lax.conv_general_dilated(
+            img[None, :, :, :],  # (1, H, W, C)
+            k_hwio,              # (ks, ks, 1, C)
+            (1, 1),
+            "SAME",
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            feature_group_count=channels,
+        )[0]
 
     return jax.vmap(apply_single)(x, kernels)
 
