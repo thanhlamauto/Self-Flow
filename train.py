@@ -581,6 +581,47 @@ def spatial_normalize_tokens(x, gamma=1.0, eps=1e-6):
     return x / jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps)
 
 
+def gaussian_blur_2d(x, sigma, kernel_size=9):
+    """
+    Apply 2D Gaussian blur to a batch of images.
+    x: (B, H, W, C) NHWC
+    sigma: (B,) scalar sigma per image in batch
+    """
+    # Create a grid of offsets
+    ax = jnp.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+    xx, yy = jnp.meshgrid(ax, ax)
+
+    def make_kernel(s):
+        # Handle sigma=0 as a point delta
+        safe_s = jnp.maximum(s, 1e-4) # Avoid division by zero
+        k = jnp.exp(-(xx**2 + yy**2) / (2. * safe_s**2))
+        k = k / jnp.sum(k)
+        # If sigma is very small, use an identity kernel (Dirac delta)
+        # Note: at s=1e-4, the exp will be 0 except at (0,0) where it's 1.
+        return k
+
+    # kernels: (B, ks, ks)
+    kernels = jax.vmap(make_kernel)(sigma)
+
+    def apply_single(img, k):
+        # img: (H, W, C), k: (ks, ks)
+        # Use depthwise convolution: vmap over channels
+        k_hw11 = k[:, :, None, None] # (ks, ks, 1, 1)
+
+        def conv_channel(c_img):
+            # c_img: (H, W)
+            return jax.lax.conv_general_dilated(
+                c_img[None, :, :, None], # (1, H, W, 1)
+                k_hw11,
+                (1, 1),
+                "SAME"
+            )[0, :, :, 0]
+
+        return jax.vmap(conv_channel, in_axes=-1, out_axes=-1)(img)
+
+    return jax.vmap(apply_single)(x, kernels)
+
+
 def make_train_step_repa(
     dinov2_model,
     repa_align_tau_min=0.0,
@@ -623,8 +664,13 @@ def make_train_step_repa(
         local_batch = x0.shape[0]
 
         # Frozen DINOv2 forward in bfloat16 (fused into same pmap — no extra sync)
+        # Feature request: Gaussian blur based on noise level (tau)
+        # tau=0 (noise) -> max blur, tau=1 (clean) -> no blur
+        blur_sigma = (1.0 - tau) * 3.0
+        images_blurred = gaussian_blur_2d(images, blur_sigma)
+
         dinov2_features = dinov2_model.apply(
-            dinov2_params, images.astype(jnp.bfloat16)
+            dinov2_params, images_blurred.astype(jnp.bfloat16)
         ).astype(jnp.float32)
 
         rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
