@@ -628,6 +628,7 @@ def make_train_step_repa(
     repa_align_tau_max=1.0,
     repa_spatial_norm=False,
     repa_spatial_gamma=1.0,
+    repa_blur_sigma=0.0,
 ):
     """Create a fused REPA train step that runs DINOv2 + SiT in a single pmap.
 
@@ -666,8 +667,10 @@ def make_train_step_repa(
         # Frozen DINOv2 forward in bfloat16 (fused into same pmap — no extra sync)
         # Feature request: Gaussian blur based on noise level (tau)
         # tau=0 (noise) -> max blur, tau=1 (clean) -> no blur
-        blur_sigma = (1.0 - tau) * 3.0
-        images_blurred = gaussian_blur_2d(images, blur_sigma)
+        images_blurred = images
+        if repa_blur_sigma > 0:
+            blur_sigma = (1.0 - tau) * repa_blur_sigma
+            images_blurred = gaussian_blur_2d(images, blur_sigma)
 
         dinov2_features = dinov2_model.apply(
             dinov2_params, images_blurred.astype(jnp.bfloat16)
@@ -1499,6 +1502,9 @@ def main():
     parser.add_argument("--dinov2-weights", type=str, default=None,
                         help="Path to dinov2_vitb14_flax.pkl (output of convert_dinov2_weights.py). "
                              "Required when --encoder-depth > 0.")
+    parser.add_argument("--repa-blur-sigma", type=float, default=0.0,
+                        help="Maximum Gaussian blur sigma for DINO images at tau=0. "
+                             "Blur scales linearly to 0 at tau=1.")
     args = parser.parse_args()
 
     if args.preflight_only:
@@ -1651,6 +1657,7 @@ def main():
             repa_align_tau_max=args.repa_align_tau_max,
             repa_spatial_norm=args.irepa_spatial_norm,
             repa_spatial_gamma=args.irepa_spatial_gamma,
+            repa_blur_sigma=args.repa_blur_sigma,
         )
         pmapped_train_step_repa = jax.pmap(_train_step_repa_fn, axis_name="batch")
         proj_coeff_rep = jax_utils.replicate(jnp.float32(args.repa_proj_coeff))
