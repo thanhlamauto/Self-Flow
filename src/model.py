@@ -244,6 +244,30 @@ class REPAProjector(nn.Module):
         return x
 
 
+class REPAConvProjector(nn.Module):
+    """iREPA conv projector that preserves spatial locality on the token grid."""
+    grid_size: int
+    output_dim: int = 768
+    kernel_size: int = 3
+
+    @nn.compact
+    def __call__(self, x):
+        b, num_tokens, channels = x.shape
+        expected_tokens = self.grid_size * self.grid_size
+        if num_tokens != expected_tokens:
+            raise ValueError(
+                f"REPAConvProjector expected {expected_tokens} tokens for a "
+                f"{self.grid_size}x{self.grid_size} grid, got {num_tokens}"
+            )
+        x = x.reshape(b, self.grid_size, self.grid_size, channels)
+        x = nn.Conv(
+            features=self.output_dim,
+            kernel_size=(self.kernel_size, self.kernel_size),
+            padding="SAME",
+        )(x)
+        return x.reshape(b, num_tokens, self.output_dim)
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -261,6 +285,7 @@ class SelfFlowDiT(nn.Module):
     encoder_depth: int = 0
     repa_proj_dim: int = 2048
     repa_z_dim: int = 768
+    repa_conv_proj: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -271,9 +296,15 @@ class SelfFlowDiT(nn.Module):
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
         if self.encoder_depth > 0:
-            self.repa_projector = REPAProjector(
-                hidden_dim=self.repa_proj_dim, output_dim=self.repa_z_dim
-            )
+            if self.repa_conv_proj:
+                self.repa_projector = REPAConvProjector(
+                    grid_size=self.grid_size,
+                    output_dim=self.repa_z_dim,
+                )
+            else:
+                self.repa_projector = REPAProjector(
+                    hidden_dim=self.repa_proj_dim, output_dim=self.repa_z_dim
+                )
 
     @nn.compact
     def __call__(

@@ -367,7 +367,13 @@ DIT_VARIANTS = {
 }
 
 
-def build_model_config(model_size, encoder_depth=0, repa_proj_dim=2048, repa_z_dim=768):
+def build_model_config(
+    model_size,
+    encoder_depth=0,
+    repa_proj_dim=2048,
+    repa_z_dim=768,
+    repa_conv_proj=False,
+):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -390,6 +396,7 @@ def build_model_config(model_size, encoder_depth=0, repa_proj_dim=2048, repa_z_d
         encoder_depth=encoder_depth,
         repa_proj_dim=repa_proj_dim,
         repa_z_dim=repa_z_dim,
+        repa_conv_proj=repa_conv_proj,
     )
 
 
@@ -455,6 +462,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         encoder_depth=config.get("encoder_depth", 0),
         repa_proj_dim=config.get("repa_proj_dim", 2048),
         repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -567,7 +575,19 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
-def make_train_step_repa(dinov2_model, repa_align_tau_min=0.0, repa_align_tau_max=1.0):
+def spatial_normalize_tokens(x, gamma=1.0, eps=1e-6):
+    """iREPA spatial normalization over the token dimension."""
+    x = x - gamma * jnp.mean(x, axis=1, keepdims=True)
+    return x / jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps)
+
+
+def make_train_step_repa(
+    dinov2_model,
+    repa_align_tau_min=0.0,
+    repa_align_tau_max=1.0,
+    repa_spatial_norm=False,
+    repa_spatial_gamma=1.0,
+):
     """Create a fused REPA train step that runs DINOv2 + SiT in a single pmap.
 
     DINOv2 runs in bfloat16 for ~2x speedup on TPU; results are cast back to float32.
@@ -575,6 +595,8 @@ def make_train_step_repa(dinov2_model, repa_align_tau_min=0.0, repa_align_tau_ma
     repa_align_tau_min = float(repa_align_tau_min)
     repa_align_tau_max = float(repa_align_tau_max)
     use_open_upper = repa_align_tau_max < 1.0
+    repa_spatial_norm = bool(repa_spatial_norm)
+    repa_spatial_gamma = float(repa_spatial_gamma)
 
     def _tree_dot(tree_a, tree_b):
         return sum(
@@ -627,7 +649,10 @@ def make_train_step_repa(dinov2_model, repa_align_tau_min=0.0, repa_align_tau_ma
 
             # REPA: negative cosine similarity (per-token)
             proj_n = repa_zs / (jnp.linalg.norm(repa_zs, axis=-1, keepdims=True) + 1e-8)
-            dino_n = jax.lax.stop_gradient(dinov2_features)
+            dino_targets = dinov2_features
+            if repa_spatial_norm:
+                dino_targets = spatial_normalize_tokens(dino_targets, gamma=repa_spatial_gamma)
+            dino_n = jax.lax.stop_gradient(dino_targets)
             dino_n = dino_n / (jnp.linalg.norm(dino_n, axis=-1, keepdims=True) + 1e-8)
             align_scores = jnp.sum(proj_n * dino_n, axis=-1)  # [B, T]
             if use_open_upper:
@@ -932,6 +957,10 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1031,6 +1060,10 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
     )
 
     patch_size = config["patch_size"]
@@ -1398,13 +1431,23 @@ def main():
                              "Typical: 4 for SiT-B/12.")
     parser.add_argument("--repa-proj-coeff", type=float, default=0.5,
                         help="Coefficient for REPA alignment loss.")
+    parser.add_argument("--irepa", action="store_true",
+                        help="Enable both iREPA changes for REPA: conv projector + spatial normalization.")
+    parser.add_argument("--irepa-conv-proj", action=argparse.BooleanOptionalAction, default=None,
+                        help="Use a 3x3 conv projector instead of the baseline 3-layer MLP. "
+                             "Defaults to the value of --irepa.")
+    parser.add_argument("--irepa-spatial-norm", action=argparse.BooleanOptionalAction, default=None,
+                        help="Apply iREPA spatial normalization to teacher patch tokens before alignment. "
+                             "Defaults to the value of --irepa.")
+    parser.add_argument("--irepa-spatial-gamma", type=float, default=1.0,
+                        help="Gamma coefficient in iREPA spatial normalization: x <- x - gamma * mean(x_tokens).")
     parser.add_argument("--repa-align-tau-min", type=float, default=0.0,
                         help="Lower tau bound for applying REPA alignment (inclusive).")
     parser.add_argument("--repa-align-tau-max", type=float, default=1.0,
                         help="Upper tau bound for applying REPA alignment. "
                              "Exclusive when < 1.0, inclusive at 1.0.")
     parser.add_argument("--repa-proj-dim", type=int, default=2048,
-                        help="Hidden dim of REPA 3-layer MLP projector.")
+                        help="Hidden dim of the baseline REPA 3-layer MLP projector.")
     parser.add_argument("--repa-z-dim", type=int, default=768,
                         help="Output dim of REPA projector (must match DINOv2 embed_dim).")
     parser.add_argument("--dinov2-weights", type=str, default=None,
@@ -1414,6 +1457,10 @@ def main():
 
     if args.preflight_only:
         args.preflight_checks = True
+    if args.irepa_conv_proj is None:
+        args.irepa_conv_proj = args.irepa
+    if args.irepa_spatial_norm is None:
+        args.irepa_spatial_norm = args.irepa
 
     # ── Argument validation ───────────────────────────────────────────────────
     if args.eval_batches <= 0:
@@ -1442,6 +1489,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.encoder_depth > 0 and not args.dinov2_weights:
         raise ValueError("--dinov2-weights is required when --encoder-depth > 0")
+    if args.irepa_spatial_gamma < 0.0:
+        raise ValueError("--irepa-spatial-gamma must be >= 0")
     if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
         raise ValueError("--repa-align-tau-min/--repa-align-tau-max must satisfy 0 <= min < max <= 1")
 
@@ -1472,6 +1521,7 @@ def main():
         encoder_depth=args.encoder_depth,
         repa_proj_dim=args.repa_proj_dim,
         repa_z_dim=args.repa_z_dim,
+        repa_conv_proj=args.irepa_conv_proj,
     )
     depth = int(config["depth"])
 
@@ -1540,6 +1590,12 @@ def main():
 
         # Fused train step: DINOv2 (bfloat16) + SiT in single pmap — no extra sync barrier
         log_stage(
+            "REPA recipe: "
+            f"conv_proj={bool(args.irepa_conv_proj)} "
+            f"spatial_norm={bool(args.irepa_spatial_norm)} "
+            f"gamma={float(args.irepa_spatial_gamma):.3f}"
+        )
+        log_stage(
             f"REPA tau alignment window: [{args.repa_align_tau_min:.3f}, {args.repa_align_tau_max:.3f}"
             f"{']' if args.repa_align_tau_max >= 1.0 else ')'}"
         )
@@ -1547,6 +1603,8 @@ def main():
             dinov2_model,
             repa_align_tau_min=args.repa_align_tau_min,
             repa_align_tau_max=args.repa_align_tau_max,
+            repa_spatial_norm=args.irepa_spatial_norm,
+            repa_spatial_gamma=args.irepa_spatial_gamma,
         )
         pmapped_train_step_repa = jax.pmap(_train_step_repa_fn, axis_name="batch")
         proj_coeff_rep = jax_utils.replicate(jnp.float32(args.repa_proj_coeff))
