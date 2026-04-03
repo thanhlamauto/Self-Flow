@@ -612,9 +612,10 @@ def gaussian_blur_2d(x, sigma, kernel_size=9):
             # c_img: (H, W)
             return jax.lax.conv_general_dilated(
                 c_img[None, :, :, None], # (1, H, W, 1)
-                k_hw11,
+                k_hw11, # (ks, ks, 1, 1)
                 (1, 1),
-                "SAME"
+                "SAME",
+                dimension_numbers=("NHWC", "HWIO", "NHWC"),
             )[0, :, :, 0]
 
         return jax.vmap(conv_channel, in_axes=-1, out_axes=-1)(img)
