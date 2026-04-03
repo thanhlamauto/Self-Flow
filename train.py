@@ -664,6 +664,10 @@ def make_train_step_repa(
         x0, y = batch
         local_batch = x0.shape[0]
 
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
+
         # Frozen DINOv2 forward in bfloat16 (fused into same pmap — no extra sync)
         # Feature request: Gaussian blur based on noise level (tau)
         # tau=0 (noise) -> max blur, tau=1 (clean) -> no blur
@@ -675,11 +679,6 @@ def make_train_step_repa(
         dinov2_features = dinov2_model.apply(
             dinov2_params, images_blurred.astype(jnp.bfloat16)
         ).astype(jnp.float32)
-
-        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
-
-        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-        x1 = jax.random.normal(noise_rng, x0.shape)
 
         x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
         target = x0 - x1
