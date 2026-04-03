@@ -1388,6 +1388,11 @@ def main():
         raise ValueError("--probe-eval-batches must be greater than 0")
     if args.linear_probe and not args.probe_save_path:
         raise ValueError("--linear-probe requires --probe-save-path")
+    if args.linear_probe and not os.path.exists(args.probe_save_path):
+        raise FileNotFoundError(
+            "--linear-probe requires an existing probe weights file. "
+            f"Could not find: {args.probe_save_path!r}"
+        )
     if args.block_corr_freq < 0:
         raise ValueError("--block-corr-freq must be >= 0")
     if args.block_corr_batches <= 0:
@@ -1398,6 +1403,8 @@ def main():
         raise ValueError("--lambda-align must be >= 0")
     if args.align_alpha_max < 0:
         raise ValueError("--align-alpha-max must be >= 0")
+
+    args.ckpt_dir = os.path.abspath(os.path.expanduser(args.ckpt_dir))
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
