@@ -366,6 +366,91 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
+PHASE2_MODES = (
+    "none",
+    "s1_full",
+    "s2_midlate_delta",
+    "s3_allblocks_delta",
+    "s4_allblocks_delta_div",
+)
+DELTA_PHASE2_MODES = frozenset({
+    "s2_midlate_delta",
+    "s3_allblocks_delta",
+    "s4_allblocks_delta_div",
+})
+PHASE2_MODE_TO_ID = {mode: idx for idx, mode in enumerate(PHASE2_MODES)}
+DELTA_LAYER_PATHS = (
+    ("attn", "qkv"),
+    ("attn", "proj"),
+    ("mlp", "fc1"),
+    ("mlp", "fc2"),
+)
+
+
+def phase2_uses_delta_backbone(phase2_mode):
+    return phase2_mode in DELTA_PHASE2_MODES
+
+
+def phase2_delta_block_indices(phase2_mode, depth):
+    if phase2_mode == "s2_midlate_delta":
+        if depth != 12:
+            raise ValueError(
+                "--phase2-mode=s2_midlate_delta is only defined for 12-block backbones in this v1 ablation."
+            )
+        return tuple(range(4, depth))
+    if phase2_mode in {"s3_allblocks_delta", "s4_allblocks_delta_div"}:
+        return tuple(range(depth))
+    return ()
+
+
+def make_optimizer(learning_rate, grad_clip=1.0):
+    return optax.chain(
+        optax.clip_by_global_norm(grad_clip),
+        optax.adamw(learning_rate, weight_decay=0),
+    )
+
+
+def build_delta_only_mask(params):
+    flat_params = traverse_util.flatten_dict(flax_core.unfreeze(params))
+    flat_mask = {
+        path: (path[-1] == "delta_kernel")
+        for path in flat_params
+    }
+    return traverse_util.unflatten_dict(flat_mask)
+
+
+def apply_trainable_mask(grads, trainable_mask):
+    if trainable_mask is None:
+        return grads
+    if isinstance(trainable_mask, flax_core.FrozenDict):
+        trainable_mask = flax_core.unfreeze(trainable_mask)
+    return jax.tree_util.tree_map(
+        lambda grad, keep: grad if keep else jnp.zeros_like(grad),
+        grads,
+        trainable_mask,
+    )
+
+
+def count_params_with_mask(params, trainable_mask=None):
+    flat_params = traverse_util.flatten_dict(flax_core.unfreeze(params))
+    total = int(sum(np.prod(leaf.shape) for leaf in flat_params.values()))
+    if trainable_mask is None:
+        return total, total
+    if isinstance(trainable_mask, flax_core.FrozenDict):
+        trainable_mask = flax_core.unfreeze(trainable_mask)
+    flat_mask = traverse_util.flatten_dict(trainable_mask)
+    trainable = int(
+        sum(np.prod(flat_params[path].shape) for path, keep in flat_mask.items() if keep)
+    )
+    return total, trainable
+
+
+def reset_optimizer_state(state, learning_rate, grad_clip):
+    tx = make_optimizer(learning_rate, grad_clip)
+    params_single = jax_utils.unreplicate(state.params)
+    opt_state = jax_utils.replicate(tx.init(params_single))
+    return state.replace(tx=tx, opt_state=opt_state)
+
 
 def build_model_config(
     model_size,
@@ -373,6 +458,7 @@ def build_model_config(
     repa_proj_dim=2048,
     repa_z_dim=768,
     repa_conv_proj=False,
+    phase2_mode="none",
 ):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -382,12 +468,13 @@ def build_model_config(
         )
 
     variant = DIT_VARIANTS[model_size]
+    depth = int(variant["depth"])
     return dict(
         input_size=32,
         patch_size=2,
         in_channels=4,
         hidden_size=variant["hidden_size"],
-        depth=variant["depth"],
+        depth=depth,
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
         num_classes=1001,
@@ -397,6 +484,8 @@ def build_model_config(
         repa_proj_dim=repa_proj_dim,
         repa_z_dim=repa_z_dim,
         repa_conv_proj=repa_conv_proj,
+        phase2_mode=phase2_mode,
+        delta_block_indices=phase2_delta_block_indices(phase2_mode, depth),
     )
 
 
@@ -415,7 +504,8 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.training import train_state, checkpoints
-from flax import jax_utils
+from flax import core as flax_core
+from flax import jax_utils, traverse_util
 import numpy as np
 try:
     import grain.python as grain
@@ -463,6 +553,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         repa_proj_dim=config.get("repa_proj_dim", 2048),
         repa_z_dim=config.get("repa_z_dim", 768),
         repa_conv_proj=config.get("repa_conv_proj", False),
+        phase2_mode=config.get("phase2_mode", "none"),
+        delta_block_indices=config.get("delta_block_indices", ()),
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -482,11 +574,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         deterministic=False,
     )
 
-    # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
-    tx = optax.chain(
-        optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate, weight_decay=0),
-    )
+    tx = make_optimizer(learning_rate, grad_clip)
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
@@ -515,64 +603,147 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def train_step(
-    state, ema_params, batch, rng, ema_decay,
+def _tree_l2_norm(tree):
+    return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)))
+
+
+def make_train_step(
+    *,
+    delta_active=False,
+    trainable_mask=None,
+    lambda_div=0.0,
+    delta_metric_blocks=(),
 ):
-    """Vanilla SiT training step (global timestep; velocity prediction).
+    """Build a training step with optional phase-2 ΔW behavior."""
+    delta_active = bool(delta_active)
+    lambda_div = float(lambda_div)
+    delta_metric_blocks = tuple(int(block_idx) for block_idx in delta_metric_blocks)
+    collect_block_summaries = lambda_div > 0.0 and len(delta_metric_blocks) > 1
 
-    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
-      x_tau   = (1 - tau) * x1 + tau * x0
-      target  = x0 - x1
-      loss    = E[||v_theta(x_tau, tau) - target||^2]
-    """
-    x0, y = batch  # x0: [local_B, N, D], y: [local_B]
-    local_batch = x0.shape[0]
+    def _maybe_get(tree, path):
+        node = tree
+        for key in path:
+            if key not in node:
+                return None
+            node = node[key]
+        return node
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    def _diversity_stats(block_summaries):
+        if not collect_block_summaries:
+            zero = jnp.array(0.0, dtype=block_summaries.dtype)
+            return zero, zero
+        selected = jnp.take(block_summaries, jnp.array(delta_metric_blocks), axis=0)
+        selected = selected / (jnp.linalg.norm(selected, axis=-1, keepdims=True) + 1e-8)
+        pairwise_cos = []
+        pairwise_sq = []
+        for i in range(len(delta_metric_blocks)):
+            for j in range(i + 1, len(delta_metric_blocks)):
+                cos_ij = jnp.sum(selected[i] * selected[j], axis=-1)
+                pairwise_cos.append(jnp.mean(cos_ij))
+                pairwise_sq.append(jnp.mean(jnp.square(cos_ij)))
+        if not pairwise_cos:
+            zero = jnp.array(0.0, dtype=selected.dtype)
+            return zero, zero
+        return jnp.mean(jnp.stack(pairwise_sq)), jnp.mean(jnp.stack(pairwise_cos))
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+    def _delta_block_metrics(params, grads):
+        if not delta_metric_blocks:
+            return {}
+        metrics = {}
+        for block_idx in delta_metric_blocks:
+            block_name = f"blocks_{block_idx}"
+            delta_sq = jnp.array(0.0, dtype=jnp.float32)
+            base_sq = jnp.array(0.0, dtype=jnp.float32)
+            grad_sq = jnp.array(0.0, dtype=jnp.float32)
+            for layer_path in DELTA_LAYER_PATHS:
+                delta_kernel = _maybe_get(params, (block_name, *layer_path, "delta_kernel"))
+                base_kernel = _maybe_get(params, (block_name, *layer_path, "kernel"))
+                grad_kernel = _maybe_get(grads, (block_name, *layer_path, "delta_kernel"))
+                if delta_kernel is not None:
+                    delta_sq = delta_sq + jnp.sum(jnp.square(delta_kernel))
+                if base_kernel is not None:
+                    base_sq = base_sq + jnp.sum(jnp.square(base_kernel))
+                if grad_kernel is not None:
+                    grad_sq = grad_sq + jnp.sum(jnp.square(grad_kernel))
+            block_label = f"block_{block_idx + 1:02d}"
+            delta_norm = jnp.sqrt(delta_sq)
+            base_norm = jnp.sqrt(base_sq)
+            metrics[f"train/delta_norm/{block_label}"] = delta_norm
+            metrics[f"train/delta_ratio/{block_label}"] = delta_norm / jnp.maximum(base_norm, 1e-8)
+            metrics[f"train/delta_grad_norm/{block_label}"] = jnp.sqrt(grad_sq)
+        return metrics
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+    def train_step(state, ema_params, batch, rng, ema_decay):
+        """Vanilla SiT training step with optional phase-2 ΔW terms."""
+        x0, y = batch
+        local_batch = x0.shape[0]
 
-    def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
-        v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
 
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+        def loss_fn(params):
+            out = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_block_summaries=collect_block_summaries,
+                delta_active=delta_active,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            if collect_block_summaries:
+                pred, block_summaries = out
+                div_loss, mean_pairwise_cos = _diversity_stats(block_summaries)
+            else:
+                pred = out
+                div_loss = jnp.array(0.0, dtype=target.dtype)
+                mean_pairwise_cos = jnp.array(0.0, dtype=target.dtype)
+            diff_loss = jnp.mean((pred - target) ** 2)
+            total_loss = diff_loss + lambda_div * div_loss
+            v_abs_mean = jnp.mean(jnp.abs(target))
+            v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+            return total_loss, (diff_loss, div_loss, mean_pairwise_cos, v_abs_mean, v_pred_abs_mean)
 
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (diff_loss, div_loss, mean_pairwise_cos, v_abs, v_pred)), grads = grad_fn(state.params)
 
-    metrics = {
-        "train/loss": loss,
-        "train/ema_decay": ema_decay,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
-    }
-    return state, ema_params, metrics, rng
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
+        div_loss = jax.lax.pmean(div_loss, axis_name="batch")
+        mean_pairwise_cos = jax.lax.pmean(mean_pairwise_cos, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        grads = jax.lax.pmean(grads, axis_name="batch")
+        grads = apply_trainable_mask(grads, trainable_mask)
+
+        grad_norm = _tree_l2_norm(grads)
+        param_norm = _tree_l2_norm(state.params)
+        delta_metrics = _delta_block_metrics(state.params, grads)
+
+        state = state.apply_gradients(grads=grads)
+        ema_params = ema_update(ema_params, state.params, ema_decay)
+
+        metrics = {
+            "train/loss": loss,
+            "train/diff_loss": diff_loss,
+            "train/div_loss": div_loss,
+            "train/div_mean_pairwise_cos": mean_pairwise_cos,
+            "train/ema_decay": ema_decay,
+            "train/grad_norm": grad_norm,
+            "train/param_norm": param_norm,
+            "train/v_abs_mean": v_abs,
+            "train/v_pred_abs_mean": v_pred,
+        }
+        metrics.update(delta_metrics)
+        return state, ema_params, metrics, rng
+
+    return train_step
 
 
 def spatial_normalize_tokens(x, gamma=1.0, eps=1e-6):
@@ -587,6 +758,7 @@ def make_train_step_repa(
     repa_align_tau_max=1.0,
     repa_spatial_norm=False,
     repa_spatial_gamma=1.0,
+    delta_active=False,
 ):
     """Create a fused REPA train step that runs DINOv2 + SiT in a single pmap.
 
@@ -597,6 +769,7 @@ def make_train_step_repa(
     use_open_upper = repa_align_tau_max < 1.0
     repa_spatial_norm = bool(repa_spatial_norm)
     repa_spatial_gamma = float(repa_spatial_gamma)
+    delta_active = bool(delta_active)
 
     def _tree_dot(tree_a, tree_b):
         return sum(
@@ -606,9 +779,6 @@ def make_train_step_repa(
                 jax.tree_util.tree_leaves(tree_b),
             )
         )
-
-    def _tree_l2_norm(tree):
-        return jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(tree)))
 
     def _tree_cosine_similarity(tree_a, tree_b, eps=1e-12):
         dot = _tree_dot(tree_a, tree_b)
@@ -642,6 +812,7 @@ def make_train_step_repa(
                 timesteps=tau,
                 vector=y,
                 return_repa_features=True,
+                delta_active=delta_active,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
@@ -715,42 +886,47 @@ def make_train_step_repa(
     return train_step_repa
 
 
-def eval_step(
-    state, ema_params, batch, rng,
-):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
-    x0, y = batch
-    local_batch = x0.shape[0]
+def make_eval_step(delta_active=False):
+    delta_active = bool(delta_active)
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    def eval_step(state, ema_params, batch, rng):
+        """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
+        del ema_params
+        x0, y = batch
+        local_batch = x0.shape[0]
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
+        rng, tau_rng, noise_rng = jax.random.split(rng, 3)
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
-    v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
-    v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            delta_active=delta_active,
+            deterministic=True,
+        )
+        loss = jnp.mean((pred - target) ** 2)
+        v_abs_mean = jnp.mean(jnp.abs(target))
+        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
-    metrics = {
-        "val/loss": loss,
-        "val/v_abs_mean": v_abs_mean,
-        "val/v_pred_abs_mean": v_pred_abs_mean,
-    }
-    return metrics, rng
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
+        v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+
+        metrics = {
+            "val/loss": loss,
+            "val/v_abs_mean": v_abs_mean,
+            "val/v_pred_abs_mean": v_pred_abs_mean,
+        }
+        return metrics, rng
+
+    return eval_step
 
 
 def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=42):
@@ -961,9 +1137,11 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         repa_proj_dim=config.get("repa_proj_dim", 2048),
         repa_z_dim=config.get("repa_z_dim", 768),
         repa_conv_proj=config.get("repa_conv_proj", False),
+        phase2_mode=config.get("phase2_mode", "none"),
+        delta_block_indices=config.get("delta_block_indices", ()),
     )
 
-    def sample_latents(params, class_labels, rng):
+    def sample_latents(params, class_labels, rng, delta_active=False):
         """Generate sample latents on TPU using EMA params."""
         batch_size = class_labels.shape[0]
         latent_channels = config["in_channels"]
@@ -1004,6 +1182,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
                 z_x,
                 timesteps=t,
                 vector=class_labels,
+                delta_active=delta_active,
                 deterministic=True,
             )
 
@@ -1035,7 +1214,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         )
         return samples
 
-    return jax.jit(sample_latents)
+    return jax.jit(sample_latents, static_argnums=(3,))
 
 
 def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
@@ -1064,6 +1243,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         repa_proj_dim=config.get("repa_proj_dim", 2048),
         repa_z_dim=config.get("repa_z_dim", 768),
         repa_conv_proj=config.get("repa_conv_proj", False),
+        phase2_mode=config.get("phase2_mode", "none"),
+        delta_block_indices=config.get("delta_block_indices", ()),
     )
 
     patch_size = config["patch_size"]
@@ -1072,7 +1253,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
     token_h = latent_size // patch_size
     token_w = latent_size // patch_size
 
-    def _sample_latents_local(ema_params_local, class_labels_local, rng_local):
+    def _sample_latents_local(ema_params_local, class_labels_local, rng_local, delta_active=False):
         batch_size = class_labels_local.shape[0]
         rng_local, noise_rng = jax.random.split(rng_local)
         noise = jax.random.normal(
@@ -1103,6 +1284,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
                 z_x,
                 timesteps=t,
                 vector=class_labels_local,
+                delta_active=delta_active,
                 deterministic=True,
             )
 
@@ -1133,7 +1315,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         )
         return samples.astype(jnp.float32)
 
-    return jax.pmap(_sample_latents_local, axis_name="batch")
+    return jax.pmap(_sample_latents_local, axis_name="batch", static_broadcasted_argnums=(3,))
 
 
 def run_preflight_checks(
@@ -1184,7 +1366,7 @@ def run_preflight_checks(
     sample_rng_base, sample_rng = jax.random.split(rng[0])
     sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
     fake_latents = np.asarray(
-        jax.device_get(sample_latents_jitted(single_ema_params, sample_classes, sample_rng)),
+        jax.device_get(sample_latents_jitted(single_ema_params, sample_classes, sample_rng, False)),
         dtype=np.float32,
     )
     rng = rng.at[0].set(sample_rng_base)
@@ -1431,6 +1613,9 @@ def main():
                              "Typical: 4 for SiT-B/12.")
     parser.add_argument("--repa-proj-coeff", type=float, default=0.5,
                         help="Coefficient for REPA alignment loss.")
+    parser.add_argument("--repa-stop-step", type=int, default=-1,
+                        help="Stop REPA alignment at this global step and continue with vanilla SiT updates. "
+                             "Use -1 to keep REPA active for the full run.")
     parser.add_argument("--irepa", action="store_true",
                         help="Enable both iREPA changes for REPA: conv projector + spatial normalization.")
     parser.add_argument("--irepa-conv-proj", action=argparse.BooleanOptionalAction, default=None,
@@ -1450,6 +1635,20 @@ def main():
                         help="Hidden dim of the baseline REPA 3-layer MLP projector.")
     parser.add_argument("--repa-z-dim", type=int, default=768,
                         help="Output dim of REPA projector (must match DINOv2 embed_dim).")
+    parser.add_argument(
+        "--phase2-mode",
+        type=str,
+        default="none",
+        choices=PHASE2_MODES,
+        help="Phase-2 ablation mode triggered at --repa-stop-step. "
+             "Use 'none' to preserve the original branch behavior.",
+    )
+    parser.add_argument(
+        "--lambda-div",
+        type=float,
+        default=0.01,
+        help="Diversity loss coefficient for --phase2-mode=s4_allblocks_delta_div.",
+    )
     parser.add_argument("--dinov2-weights", type=str, default=None,
                         help="Path to dinov2_vitb14_flax.pkl (output of convert_dinov2_weights.py). "
                              "Required when --encoder-depth > 0.")
@@ -1489,10 +1688,18 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.encoder_depth > 0 and not args.dinov2_weights:
         raise ValueError("--dinov2-weights is required when --encoder-depth > 0")
+    if args.repa_stop_step < -1:
+        raise ValueError("--repa-stop-step must be >= -1")
     if args.irepa_spatial_gamma < 0.0:
         raise ValueError("--irepa-spatial-gamma must be >= 0")
+    if args.lambda_div < 0.0:
+        raise ValueError("--lambda-div must be >= 0")
     if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
         raise ValueError("--repa-align-tau-min/--repa-align-tau-max must satisfy 0 <= min < max <= 1")
+    if args.phase2_mode != "none" and args.encoder_depth <= 0:
+        raise ValueError("--phase2-mode requires REPA/iREPA to be enabled via --encoder-depth > 0")
+    if args.phase2_mode != "none" and args.repa_stop_step < 0:
+        raise ValueError("--phase2-mode requires --repa-stop-step >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1522,8 +1729,11 @@ def main():
         repa_proj_dim=args.repa_proj_dim,
         repa_z_dim=args.repa_z_dim,
         repa_conv_proj=args.irepa_conv_proj,
+        phase2_mode=args.phase2_mode,
     )
     depth = int(config["depth"])
+    delta_block_indices = tuple(config.get("delta_block_indices", ()))
+    phase2_uses_delta = phase2_uses_delta_backbone(args.phase2_mode)
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1532,6 +1742,13 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.phase2_mode != "none":
+        log_stage(
+            f"Phase-2 recipe: mode={args.phase2_mode} stop_step={args.repa_stop_step} "
+            f"delta_blocks={[idx + 1 for idx in delta_block_indices]}"
+        )
+        if args.phase2_mode == "s4_allblocks_delta_div":
+            log_stage(f"Phase-2 diversity loss: lambda_div={args.lambda_div:.4f}")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1543,10 +1760,21 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    delta_only_mask = build_delta_only_mask(state.params) if phase2_uses_delta else None
+    total_param_count, delta_param_count = count_params_with_mask(
+        state.params,
+        delta_only_mask if phase2_uses_delta else None,
+    )
+    phase1_trainable_param_count = total_param_count - delta_param_count if phase2_uses_delta else total_param_count
+    phase2_trainable_param_count = delta_param_count if phase2_uses_delta else total_param_count
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
+    phase2_active_rep = jax_utils.replicate(jnp.float32(1.0))
+    phase2_inactive_rep = jax_utils.replicate(jnp.float32(0.0))
+    phase2_mode_id_rep = jax_utils.replicate(jnp.float32(PHASE2_MODE_TO_ID[args.phase2_mode]))
+    phase2_current_trainable_param_count = phase1_trainable_param_count if phase2_uses_delta else total_param_count
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1570,14 +1798,35 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(make_train_step(), axis_name="batch")
+    pmapped_eval_step = jax.pmap(make_eval_step(delta_active=False), axis_name="batch")
+    pmapped_train_step_phase2_delta = None
+    pmapped_eval_step_phase2 = pmapped_eval_step
+    if phase2_uses_delta:
+        pmapped_train_step_phase2_delta = jax.pmap(
+            make_train_step(
+                delta_active=True,
+                trainable_mask=delta_only_mask,
+                lambda_div=args.lambda_div if args.phase2_mode == "s4_allblocks_delta_div" else 0.0,
+                delta_metric_blocks=delta_block_indices,
+            ),
+            axis_name="batch",
+        )
+        pmapped_eval_step_phase2 = jax.pmap(make_eval_step(delta_active=True), axis_name="batch")
 
     # ── REPA: DINOv2 init + fused pmapped REPA train step ───────────────────
     repa_enabled = args.encoder_depth > 0
     dinov2_params_rep = None
     pmapped_train_step_repa = None
     proj_coeff_rep = None
+    repa_active_rep = jax_utils.replicate(jnp.float32(1.0))
+    repa_inactive_rep = jax_utils.replicate(jnp.float32(0.0))
+
+    def phase2_is_active(step):
+        return args.phase2_mode != "none" and args.repa_stop_step >= 0 and step >= args.repa_stop_step
+
+    def delta_eval_active(step):
+        return phase2_uses_delta and phase2_is_active(step)
 
     if repa_enabled:
         from src.dinov2_flax import DINOv2ViT, load_dinov2_params
@@ -1599,6 +1848,8 @@ def main():
             f"REPA tau alignment window: [{args.repa_align_tau_min:.3f}, {args.repa_align_tau_max:.3f}"
             f"{']' if args.repa_align_tau_max >= 1.0 else ')'}"
         )
+        if args.repa_stop_step >= 0:
+            log_stage(f"REPA early-stop schedule: disable alignment from step {args.repa_stop_step}.")
         _train_step_repa_fn = make_train_step_repa(
             dinov2_model,
             repa_align_tau_min=args.repa_align_tau_min,
@@ -1759,7 +2010,7 @@ def main():
 
     # ── Linear probe weights + pmapped inference (inference-only in fid window) ─
     _probe_weights = [None]  # (W_repl, b_repl)
-    _probe_pmapped = {}      # layer -> pmapped_fn
+    _probe_pmapped = {}      # (layer, delta_active) -> pmapped_fn
 
     def get_probe_weights():
         if _probe_weights[0] is None:
@@ -1773,9 +2024,10 @@ def main():
             _probe_weights[0] = (W_repl, b_repl)
         return _probe_weights[0]
 
-    def get_probe_pmapped(layer: int):
+    def get_probe_pmapped(layer: int, delta_active: bool = False):
         layer = int(layer)
-        if layer not in _probe_pmapped:
+        key = (layer, bool(delta_active))
+        if key not in _probe_pmapped:
             def _probe_step(ema_params_local, batch_x_local, batch_y_local, W_local, b_local):
                 # Deterministic clean EMA representation for monitoring.
                 local_batch = batch_x_local.shape[0]
@@ -1785,6 +2037,7 @@ def main():
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
+                    delta_active=bool(delta_active),
                     deterministic=True,
                     return_raw_features=layer,
                 )
@@ -1797,14 +2050,15 @@ def main():
                 total = jax.lax.psum(total, axis_name="batch")
                 return correct, total
 
-            _probe_pmapped[layer] = jax.pmap(_probe_step, axis_name="batch")
-        return _probe_pmapped[layer]
+            _probe_pmapped[key] = jax.pmap(_probe_step, axis_name="batch")
+        return _probe_pmapped[key]
 
     # ── EMA block-correlation diagnostic (cadence riêng; async media logging) ─
-    _blockcorr_pmapped = [None]
+    _blockcorr_pmapped = {}
 
-    def get_blockcorr_pmapped():
-        if _blockcorr_pmapped[0] is None:
+    def get_blockcorr_pmapped(delta_active: bool = False):
+        key = bool(delta_active)
+        if key not in _blockcorr_pmapped:
             def _blockcorr_step(ema_params_local, batch_x_local, batch_y_local):
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
@@ -1813,14 +2067,15 @@ def main():
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
+                    delta_active=bool(delta_active),
                     deterministic=True,
                     return_block_summaries=True,
                 )
                 _, block_summaries = out
                 return block_summaries
 
-            _blockcorr_pmapped[0] = jax.pmap(_blockcorr_step, axis_name="batch")
-        return _blockcorr_pmapped[0]
+            _blockcorr_pmapped[key] = jax.pmap(_blockcorr_step, axis_name="batch")
+        return _blockcorr_pmapped[key]
 
     def log_blockcorr_async(corr: np.ndarray, step: int):
         # Avoid blocking the training loop with WandB media encoding/upload.
@@ -1846,7 +2101,7 @@ def main():
     def run_preflight_linear_probe(batch_x_patchified, batch_y):
         probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
         W_repl, b_repl = get_probe_weights()
-        probe_fn = get_probe_pmapped(probe_layer)
+        probe_fn = get_probe_pmapped(probe_layer, delta_active=False)
         bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
         corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
@@ -1857,7 +2112,7 @@ def main():
         return float(correct_total / count_total)
 
     def run_preflight_block_corr(batch_x_patchified, batch_y):
-        bc_fn = get_blockcorr_pmapped()
+        bc_fn = get_blockcorr_pmapped(delta_active=False)
         bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
         summaries = bc_fn(ema_params, bx, by)  # (devices, local_batch, depth, hidden)
@@ -1917,7 +2172,14 @@ def main():
         probe_rng = jax.random.fold_in(rng[0], 0xF1D)
         probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
         fake_latents = np.asarray(
-            jax.device_get(fid_sample_latents_jitted(single_ema_params, probe_classes, probe_rng)),
+            jax.device_get(
+                fid_sample_latents_jitted(
+                    single_ema_params,
+                    probe_classes,
+                    probe_rng,
+                    False,
+                )
+            ),
             dtype=np.float32,
         )
         fake_images = decode_latents_batched(fake_latents, args.vae_decode_batch_size)
@@ -2050,7 +2312,12 @@ def main():
                 lambda key: jax.random.randint(key, (local_b,), 0, 1000),
                 in_axes=0,
             )(class_rng)
-            latents_sharded = fid_sample_latents_pmapped(ema_params, classes, sample_rng)
+            latents_sharded = fid_sample_latents_pmapped(
+                ema_params,
+                classes,
+                sample_rng,
+                delta_eval_active(step),
+            )
             imgs_sharded = decode_latents_sharded(latents_sharded)
             if is_enabled:
                 # Device->host exactly once per batch (uint8) and trim pads by `valid`.
@@ -2117,7 +2384,7 @@ def main():
         if args.linear_probe:
             probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
             W_repl, b_repl = get_probe_weights()
-            probe_fn = get_probe_pmapped(probe_layer)
+            probe_fn = get_probe_pmapped(probe_layer, delta_active=delta_eval_active(step))
             correct_total = 0
             count_total = 0
             probe_iter = current_val_iter
@@ -2156,7 +2423,7 @@ def main():
             return val_data_iter
         if val_data_iter is None:
             raise RuntimeError("block correlation requires --val-data-path")
-        bc_fn = get_blockcorr_pmapped()
+        bc_fn = get_blockcorr_pmapped(delta_active=delta_eval_active(step))
         block_batches = []
         for i in range(int(args.block_corr_batches)):
             vbatch, val_data_iter = next_validation_batch(
@@ -2225,6 +2492,8 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     global_step = 0
+    repa_stop_logged = False
+    phase2_switch_done = False
     t0 = time.time()
 
     for epoch in range(args.epochs):
@@ -2247,18 +2516,59 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            if repa_enabled and data_iterator is not None:
+            phase2_active = phase2_is_active(global_step)
+            if phase2_active and not phase2_switch_done:
+                state = reset_optimizer_state(state, args.learning_rate, args.grad_clip)
+                phase2_current_trainable_param_count = (
+                    phase2_trainable_param_count if phase2_uses_delta else total_param_count
+                )
+                log_stage(
+                    f"Phase-2 activated at step {global_step}: mode={args.phase2_mode}, "
+                    f"trainable_params={phase2_current_trainable_param_count}/{total_param_count}."
+                )
+                phase2_switch_done = True
+
+            repa_train_active = (
+                repa_enabled and data_iterator is not None
+                and not phase2_active
+                and (args.repa_stop_step < 0 or global_step < args.repa_stop_step)
+            )
+            if repa_enabled and args.repa_stop_step >= 0 and global_step >= args.repa_stop_step and not repa_stop_logged:
+                log_stage(
+                    f"REPA alignment disabled at step {global_step}; continuing with "
+                    f"{'phase-2 training' if phase2_active else 'vanilla SiT updates'}."
+                )
+                repa_stop_logged = True
+
+            if repa_train_active:
                 # REPA path: fused DINOv2 (bfloat16) + SiT in single pmap
                 batch_img = jnp.array(batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
                 state, ema_params, metrics, rng = pmapped_train_step_repa(
                     state, ema_params, (batch_x, batch_y), batch_img,
                     dinov2_params_rep, rng, ema_decay_rep, proj_coeff_rep,
                 )
+            elif phase2_active and phase2_uses_delta:
+                state, ema_params, metrics, rng = pmapped_train_step_phase2_delta(
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                )
             else:
                 # Vanilla SiT training step (returns updated EMA params)
                 state, ema_params, metrics, rng = pmapped_train_step(
                     state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
                 )
+            if "train/align_loss" not in metrics:
+                metrics["train/align_loss"] = repa_inactive_rep
+                metrics["train/repa_align_active_frac"] = repa_inactive_rep
+                metrics["train/grad_cosine_diff_align"] = repa_inactive_rep
+            if "train/div_loss" not in metrics:
+                metrics["train/div_loss"] = phase2_inactive_rep
+                metrics["train/div_mean_pairwise_cos"] = phase2_inactive_rep
+            metrics["train/repa_active"] = repa_active_rep if repa_train_active else repa_inactive_rep
+            metrics["train/repa_proj_coeff_effective"] = (
+                proj_coeff_rep if repa_train_active and proj_coeff_rep is not None else repa_inactive_rep
+            )
+            metrics["train/phase2_active"] = phase2_active_rep if phase2_active else phase2_inactive_rep
+            metrics["train/phase2_mode_id"] = phase2_mode_id_rep
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
 
@@ -2270,6 +2580,9 @@ def main():
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
                 cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
+                cpu_metrics["train/phase2_mode"] = args.phase2_mode
+                cpu_metrics["train/total_param_count"] = total_param_count
+                cpu_metrics["train/trainable_param_count"] = phase2_current_trainable_param_count if phase2_active else phase1_trainable_param_count
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -2283,7 +2596,8 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    eval_step_fn = pmapped_eval_step_phase2 if delta_eval_active(global_step) else pmapped_eval_step
+                    val_metrics, rng = eval_step_fn(state, ema_params, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -2313,7 +2627,12 @@ def main():
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
                 # Use EMA params for sample generation (paper-faithful eval)
                 single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
-                latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
+                latents_dev = sample_latents_jitted(
+                    single_ema_params,
+                    sample_classes,
+                    sample_rng,
+                    delta_eval_active(global_step),
+                )
 
                 def _bg_log(z_dev, classes, target_step):
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)

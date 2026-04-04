@@ -35,9 +35,28 @@ DIT_VARIANTS = {
     "L":  {"hidden_size": 1024, "depth": 24, "num_heads": 16},
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
+PHASE2_MODES = (
+    "none",
+    "s1_full",
+    "s2_midlate_delta",
+    "s3_allblocks_delta",
+    "s4_allblocks_delta_div",
+)
 
 
-def _model_config_for_size(model_size):
+def phase2_delta_block_indices(phase2_mode, depth):
+    if phase2_mode == "s2_midlate_delta":
+        if depth != 12:
+            raise ValueError(
+                "--phase2-mode=s2_midlate_delta is only defined for 12-block backbones in this v1 ablation."
+            )
+        return tuple(range(4, depth))
+    if phase2_mode in {"s3_allblocks_delta", "s4_allblocks_delta_div"}:
+        return tuple(range(depth))
+    return ()
+
+
+def _model_config_for_size(model_size, phase2_mode="none"):
     """Return the full model-init config dict for a DiT variant name (S/B/L/XL)."""
     variant = DIT_VARIANTS[model_size.upper()]
     return dict(
@@ -51,6 +70,8 @@ def _model_config_for_size(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        phase2_mode=phase2_mode,
+        delta_block_indices=phase2_delta_block_indices(phase2_mode, variant["depth"]),
     )
 
 
@@ -75,7 +96,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL"):
+def load_model(ckpt_path=None, model_size="XL", phase2_mode="none"):
     """Load the DiT backbone from a flax.training.checkpoints checkpoint.
 
     This SiT baseline expects flat parameter trees (both online and EMA).
@@ -84,7 +105,7 @@ def load_model(ckpt_path=None, model_size="XL"):
       - Flat checkpoints that include train-only heads (e.g. "feature_head",
         "repa_projector"): drop those keys.
     """
-    config = _model_config_for_size(model_size)
+    config = _model_config_for_size(model_size, phase2_mode=phase2_mode)
     model = SelfFlowDiT(**config, per_token=False)
 
     # Initialize parameters with random key
@@ -118,7 +139,7 @@ def load_model(ckpt_path=None, model_size="XL"):
 def build_sample_step(model, vae, scale_factor, shift_factor):
     """Build JIT-compiled sampling function."""
     
-    @functools.partial(jax.jit, static_argnames=("batch_size", "num_steps"))
+    @functools.partial(jax.jit, static_argnames=("batch_size", "num_steps", "delta_active"))
     def sample_batch_jit(
         params,
         vae_params,
@@ -129,6 +150,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         cfg_scale,
         guidance_low,
         guidance_high,
+        delta_active,
     ):
         latent_channels = 4
         latent_size = 32
@@ -164,6 +186,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
                 z_x,
                 timesteps=t,
                 vector=class_labels,
+                delta_active=delta_active,
                 deterministic=True
             )
             
@@ -218,6 +241,11 @@ def main():
     parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
     parser.add_argument("--no-save-images", action="store_false", dest="save_images")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument("--phase2-mode", type=str, default="none", choices=PHASE2_MODES,
+                        help="Backbone variant to instantiate when loading phase-2 ΔW checkpoints.")
+    parser.add_argument("--delta-active", action=argparse.BooleanOptionalAction, default=None,
+                        help="Whether to enable the ΔW branch at sampling time. "
+                             "Defaults to True for ΔW modes and False otherwise.")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
                         help="HuggingFace VAE model ID")
@@ -237,7 +265,10 @@ def main():
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
         
-    model, params = load_model(args.ckpt, model_size=args.model_size)
+    if args.delta_active is None:
+        args.delta_active = args.phase2_mode in {"s2_midlate_delta", "s3_allblocks_delta", "s4_allblocks_delta_div"}
+
+    model, params = load_model(args.ckpt, model_size=args.model_size, phase2_mode=args.phase2_mode)
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
     sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)
@@ -266,6 +297,7 @@ def main():
             cfg_scale=args.cfg_scale,
             guidance_low=args.guidance_low,
             guidance_high=args.guidance_high,
+            delta_active=args.delta_active,
         )
         
         # JAX arrays to NumPy

@@ -118,6 +118,108 @@ class LabelEmbedder(nn.Module):
         return embedding_table(labels)
 
 
+DELTA_PHASE2_MODES = frozenset({
+    "s2_midlate_delta",
+    "s3_allblocks_delta",
+    "s4_allblocks_delta_div",
+})
+
+
+class ResidualDense(nn.Module):
+    """Dense layer with an optional zero-init residual weight branch."""
+    features: int
+    use_bias: bool = True
+    enable_delta: bool = False
+
+    @nn.compact
+    def __call__(self, x, delta_active: bool = False):
+        in_features = x.shape[-1]
+        kernel = self.param(
+            "kernel",
+            nn.initializers.lecun_normal(),
+            (in_features, self.features),
+        )
+        y = jnp.einsum("...d,df->...f", x, kernel)
+        if self.enable_delta:
+            delta_kernel = self.param(
+                "delta_kernel",
+                nn.initializers.zeros_init(),
+                (in_features, self.features),
+            )
+            if delta_active:
+                y = y + jnp.einsum("...d,df->...f", x, delta_kernel)
+        if self.use_bias:
+            bias = self.param(
+                "bias",
+                nn.initializers.zeros_init(),
+                (self.features,),
+            )
+            y = y + bias
+        return y
+
+
+class ResidualSelfAttention(nn.Module):
+    """Self-attention with explicit qkv/proj linear layers for ΔW injection."""
+    hidden_size: int
+    num_heads: int
+    enable_delta: bool = False
+
+    @nn.compact
+    def __call__(self, x, delta_active: bool = False):
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_size={self.hidden_size} must be divisible by num_heads={self.num_heads}"
+            )
+        head_dim = self.hidden_size // self.num_heads
+        batch_size, seq_len, _ = x.shape
+
+        qkv = ResidualDense(
+            3 * self.hidden_size,
+            enable_delta=self.enable_delta,
+            name="qkv",
+        )(x, delta_active=delta_active)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, head_dim)
+        q = jnp.transpose(qkv[:, :, 0], (0, 2, 1, 3))
+        k = jnp.transpose(qkv[:, :, 1], (0, 2, 1, 3))
+        v = jnp.transpose(qkv[:, :, 2], (0, 2, 1, 3))
+
+        scale = head_dim ** -0.5
+        attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q * scale, k)
+        attn = nn.softmax(attn_logits, axis=-1)
+        attn_out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        attn_out = jnp.transpose(attn_out, (0, 2, 1, 3)).reshape(
+            batch_size, seq_len, self.hidden_size
+        )
+
+        return ResidualDense(
+            self.hidden_size,
+            enable_delta=self.enable_delta,
+            name="proj",
+        )(attn_out, delta_active=delta_active)
+
+
+class ResidualMLP(nn.Module):
+    """Two-layer MLP with optional ΔW on fc1/fc2."""
+    hidden_size: int
+    mlp_hidden_dim: int
+    enable_delta: bool = False
+
+    @nn.compact
+    def __call__(self, x, delta_active: bool = False):
+        x = ResidualDense(
+            self.mlp_hidden_dim,
+            enable_delta=self.enable_delta,
+            name="fc1",
+        )(x, delta_active=delta_active)
+        x = nn.gelu(x, approximate=True)
+        x = ResidualDense(
+            self.hidden_size,
+            enable_delta=self.enable_delta,
+            name="fc2",
+        )(x, delta_active=delta_active)
+        return x
+
+
 class DiTBlock(nn.Module):
     """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
     hidden_size: int
@@ -176,6 +278,77 @@ class DiTBlock(nn.Module):
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
             
+        return x
+
+
+class DeltaDiTBlock(nn.Module):
+    """DiT block variant with explicit linear layers for phase-2 ΔW ablations."""
+    hidden_size: int
+    num_heads: int
+    mlp_ratio: float = 4.0
+    per_token: bool = False
+    enable_delta: bool = False
+
+    @nn.compact
+    def __call__(self, x, c, delta_active: bool = False):
+        norm1 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            name="norm1",
+        )
+        norm2 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            name="norm2",
+        )
+        mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
+        attn = ResidualSelfAttention(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            enable_delta=self.enable_delta,
+            name="attn",
+        )
+        mlp = ResidualMLP(
+            hidden_size=self.hidden_size,
+            mlp_hidden_dim=mlp_hidden_dim,
+            enable_delta=self.enable_delta,
+            name="mlp",
+        )
+
+        if self.per_token:
+            batch_size, seq_len, hidden_dim = c.shape
+            c_flat = c.reshape(-1, hidden_dim)
+            modulation_flat = nn.Sequential(
+                [nn.swish, nn.Dense(6 * self.hidden_size)],
+                name="adaLN_modulation",
+            )(c_flat)
+            modulation = modulation_flat.reshape(batch_size, seq_len, -1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
+                modulation, 6, axis=-1
+            )
+
+            x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
+            x = x + gate_msa * attn(x_norm, delta_active=delta_active)
+
+            x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp * mlp(x_norm2, delta_active=delta_active)
+        else:
+            modulation = nn.Sequential(
+                [nn.swish, nn.Dense(6 * self.hidden_size)],
+                name="adaLN_modulation",
+            )(c)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
+                modulation, 6, axis=1
+            )
+
+            x_norm = modulate(norm1(x), shift_msa, scale_msa)
+            x = x + gate_msa[:, None, :] * attn(x_norm, delta_active=delta_active)
+
+            x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp[:, None, :] * mlp(x_norm2, delta_active=delta_active)
+
         return x
 
 
@@ -286,6 +459,8 @@ class SelfFlowDiT(nn.Module):
     repa_proj_dim: int = 2048
     repa_z_dim: int = 768
     repa_conv_proj: bool = False
+    phase2_mode: str = "none"
+    delta_block_indices: tuple[int, ...] = ()
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -317,6 +492,7 @@ class SelfFlowDiT(nn.Module):
         return_raw_features: bool = False,
         return_repa_features: bool = False,
         return_block_summaries: bool = False,
+        delta_active: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -362,13 +538,25 @@ class SelfFlowDiT(nn.Module):
         zs = None
         repa_zs = None
         block_summaries = [] if return_block_summaries else None
+        use_delta_backbone = self.phase2_mode in DELTA_PHASE2_MODES and len(self.delta_block_indices) > 0
+        delta_block_set = frozenset(self.delta_block_indices)
         for i in range(self.depth):
-            x = DiTBlock(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
+            if use_delta_backbone:
+                x = DeltaDiTBlock(
+                    hidden_size=self.hidden_size,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    per_token=self.per_token,
+                    enable_delta=i in delta_block_set,
+                    name=f"blocks_{i}",
+                )(x, c, delta_active=delta_active)
+            else:
+                x = DiTBlock(
+                    hidden_size=self.hidden_size,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    per_token=self.per_token
+                )(x, c)
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
@@ -398,6 +586,8 @@ class SelfFlowDiT(nn.Module):
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
         if return_repa_features and repa_zs is not None:
+            if return_block_summaries:
+                return x, repa_zs, block_summaries
             return x, repa_zs
         if return_features or return_raw_features:
             if return_block_summaries:
