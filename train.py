@@ -388,7 +388,7 @@ def build_model_config(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
+        num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
     )
@@ -894,7 +894,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels = jnp.concatenate(
-                [jnp.full_like(class_labels, config["num_classes"] - 1), class_labels],
+                [jnp.full_like(class_labels, config["num_classes"]), class_labels],
                 axis=0,
             )
 
@@ -989,7 +989,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels_local = jnp.concatenate(
-                [jnp.full_like(class_labels_local, config["num_classes"] - 1), class_labels_local],
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
                 axis=0,
             )
 
@@ -1250,8 +1250,7 @@ def main():
                         help="Denoising steps for sample previews. "
                              "TPU-friendly default: 50. Paper-like eval: 250.")
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
-                        help="CFG scale for sample previews. Default 1.0 (no CFG; "
-                             "classifier-free training not implemented).")
+                        help="CFG scale for sample previews. Default 1.0 (paper setting).")
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -1465,8 +1464,7 @@ def main():
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
-    # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
-    #       not implemented; default is 1.0 for all eval modes.
+    # Default remains cfg_scale=1.0 to match the paper evaluation setting.
     sample_latents_jitted = make_sample_latents_fn(
         config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
     )
