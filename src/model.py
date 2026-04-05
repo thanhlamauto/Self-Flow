@@ -137,7 +137,12 @@ class DiTBlock(nn.Module):
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=nn.initializers.zeros,
+                    bias_init=nn.initializers.zeros,
+                    name="adaLN_modulation"
+                )
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
@@ -159,7 +164,12 @@ class DiTBlock(nn.Module):
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=nn.initializers.zeros,
+                    bias_init=nn.initializers.zeros,
+                    name="adaLN_modulation"
+                )
             ])(c)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
@@ -181,13 +191,20 @@ class DiTBlock(nn.Module):
 
 
 class LongSkipFusion(nn.Module):
-    """Fuses the current hidden state with a mirrored early-block residual."""
+    """Fuses the current hidden state with a mirrored early-block residual.
+
+    Matches DiverseDiT ResidualLinear + FP32_Layernorm:
+      - LayerNorm is computed in float32 for mixed-precision stability.
+      - No residual addition (linear projection only, no skip-add).
+    """
     hidden_size: int
 
     @nn.compact
     def __call__(self, x, skip):
         fused = jnp.concatenate([x, skip], axis=-1)
-        fused = nn.LayerNorm(epsilon=1e-6)(fused)
+        # Cast to float32 for LayerNorm stability (mirrors FP32_Layernorm in pT repo)
+        orig_dtype = fused.dtype
+        fused = nn.LayerNorm(epsilon=1e-6)(fused.astype(jnp.float32)).astype(orig_dtype)
         return nn.Dense(self.hidden_size)(fused)
 
 
@@ -201,14 +218,24 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
+        linear = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name="linear"
+        )
         
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=nn.initializers.zeros,
+                    bias_init=nn.initializers.zeros,
+                    name="adaLN_modulation"
+                )
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
@@ -218,7 +245,12 @@ class FinalLayer(nn.Module):
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=nn.initializers.zeros,
+                    bias_init=nn.initializers.zeros,
+                    name="adaLN_modulation"
+                )
             ])(c)
             shift, scale = jnp.split(modulation, 2, axis=1)
             
@@ -368,6 +400,15 @@ class SelfFlowDiT(nn.Module):
         cached_skip_inputs = [] if self.skip_layer_connection else None
         first_half_depth = self.depth // 2
         for i in range(self.depth):
+            # Run the block first (matches DiverseDiT order: block → skip_norm → skip_linear)
+            x = DiTBlock(
+                hidden_size=self.hidden_size, 
+                num_heads=self.num_heads, 
+                mlp_ratio=self.mlp_ratio,
+                per_token=self.per_token
+            )(x, c)
+
+            # After the block: fuse with the mirrored early-block skip
             if self.skip_layer_connection and i >= first_half_depth:
                 mirror_idx = self.depth - 1 - i
                 if 0 <= mirror_idx < len(cached_skip_inputs):
@@ -376,13 +417,7 @@ class SelfFlowDiT(nn.Module):
                         name=f"skip_fusion_{i}",
                     )(x, cached_skip_inputs[mirror_idx])
 
-            x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
-                mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
-
+            # Cache output of first-half blocks for later skip connections
             if self.skip_layer_connection and i < first_half_depth:
                 cached_skip_inputs.append(x)
 
@@ -406,10 +441,9 @@ class SelfFlowDiT(nn.Module):
             per_token=self.per_token
         )(x, c)
 
-        x = self._shufflechannel(x)
-        
-        # PyTorch implementation negates the final prediction
-        x = -x
+        if self.learn_sigma:
+            # Match original behavior: split and return only the first half (velocity/mean)
+            x, _ = jnp.split(x, 2, axis=-1)
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
@@ -431,13 +465,6 @@ class SelfFlowDiT(nn.Module):
             return x, block_summaries
         return x
 
-    def _shufflechannel(self, x):
-        """Reorder channels/patches to match expected output format."""
-        p = self.patch_size
-        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val) # equivalent to rearranging in torch
-        # wait, the PyTorch implementation says:
-        # x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels)
-        x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)
         if self.learn_sigma:
             x, _ = jnp.split(x, 2, axis=2)
         return x

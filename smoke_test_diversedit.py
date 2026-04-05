@@ -59,6 +59,30 @@ def test_model_smoke():
         assert has_skip_fusion is skip_layer_connection
 
 
+def test_model_initialization_zero():
+    """Verifies that a newly initialized model predicts zero velocity.
+    
+    This is because all adaLN-Zero modulation gates and the final linear layer
+    are initialized to zero, making each block an identity transform and the
+    final output zero.
+    """
+    config = tiny_config()
+    x, t, y = model_inputs(config)
+    model = SelfFlowDiT(
+        **model_init_kwargs_from_config(
+            config,
+            per_token=False,
+            skip_layer_connection=True,
+        )
+    )
+    variables = model.init(jax.random.PRNGKey(42), x, timesteps=t, vector=y, deterministic=True)
+    pred = model.apply(variables, x, timesteps=t, vector=y, deterministic=True)
+    
+    # Due to zero-init, the velocity prediction should be exactly zero
+    np.testing.assert_allclose(pred, 0.0, atol=1e-6)
+    print("test_model_initialization_zero: passed")
+
+
 def test_multi_layer_raw_features():
     config = tiny_config()
     x, t, y = model_inputs(config)
@@ -232,6 +256,7 @@ def test_sample_load_smoke():
 
 def main():
     test_model_smoke()
+    test_model_initialization_zero()
     test_multi_layer_raw_features()
     test_diversity_loss_helpers()
     test_train_step_smoke()

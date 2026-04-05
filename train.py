@@ -558,8 +558,9 @@ def compute_diversity_loss(
 
         z_early_norm = z_early / (jnp.linalg.norm(z_early, axis=-1, keepdims=True) + eps)
         z_late_norm = z_late / (jnp.linalg.norm(z_late, axis=-1, keepdims=True) + eps)
+        # Match DiverseDiT: use absolute value of token-wise cosine similarity as MI proxy
         token_cos = jnp.sum(z_early_norm * z_late_norm, axis=-1)
-        mi_terms.append(jnp.mean(token_cos))
+        mi_terms.append(jnp.mean(jnp.abs(token_cos)))
 
     orth_loss = jnp.mean(jnp.stack(orth_terms))
     mi_loss = jnp.mean(jnp.stack(mi_terms))
@@ -569,18 +570,30 @@ def compute_diversity_loss(
     for layer in capture_layers:
         z = feature_map[layer]
         flat = z.reshape(-1, z.shape[-1])
+        # Normalized by sample dimension (dim=0)
         flat = flat / (jnp.linalg.norm(flat, axis=0, keepdims=True) + eps)
-        activations.append(jnp.mean(flat, axis=0))
-    activation = jnp.mean(jnp.stack(activations), axis=0)
-    activation = activation / jnp.maximum(jnp.max(jnp.abs(activation)), eps)
-    disp_loss = -jnp.mean(jnp.square(activation - jnp.mean(activation)))
+        # Match DiverseDiT: use mean(abs(x)) for activation strength
+        activations.append(jnp.mean(jnp.abs(flat), axis=0))
+    
+    feature_usage = jnp.mean(jnp.stack(activations), axis=0) # (D,)
+    # Normalize to [0, 1] as in the original repo
+    feature_usage = feature_usage / (jnp.max(feature_usage) + eps)
+    
+    # Normalized variance: Max variance is 0.25 (two-point distribution)
+    # Match DiverseDiT: variance / 0.25 for [0, 1] range; then negate to minimize.
+    mean_usage = jnp.mean(feature_usage)
+    variance = jnp.mean((feature_usage - mean_usage) ** 2)
+    normalized_variance = variance / 0.25
+    disp_loss = -jnp.clip(normalized_variance, 0.0, 1.0)
 
-    div_loss = (
-        orth_weight * orth_loss
-        + mi_weight * mi_loss
-        + disp_weight * disp_loss
-    )
-    gate = compute_diversity_gate(div_loss, gate_low, gate_high)
+    # Match DiverseDiT: simple average of the three components
+    div_loss = (orth_loss + mi_loss + disp_loss) / 3.0
+    
+    # Match DiverseDiT: use a static clamp instead of an adaptive gate
+    div_loss = jnp.clip(div_loss, a_max=5.0)
+    
+    # Return 1.0 as a placeholder for the legacy gate variable used in the training loop
+    gate = jnp.array(1.0, dtype=jnp.float32)
     return div_loss, orth_loss, mi_loss, disp_loss, gate, mean_pairwise_similarity
 
 
@@ -660,7 +673,7 @@ def train_step(
             mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + loss_div_gate * loss_div
+        loss = loss_gen + loss_div  # loss_div is already combined and clamped internally
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         return loss, (
@@ -792,7 +805,7 @@ def eval_step(
         mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + loss_div_gate * loss_div
+    loss = loss_gen + loss_div
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
