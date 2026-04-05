@@ -25,7 +25,7 @@ import collections.abc
 
 # Import from local src/ folder
 from flax.training import checkpoints as flax_ckpt
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, model_init_kwargs_from_config
 from src.sampling import denoise_loop
 
 
@@ -75,7 +75,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL"):
+def load_model(ckpt_path=None, model_size="XL", skip_layer_connection=False):
     """Load the DiT backbone from a flax.training.checkpoints checkpoint.
 
     This SiT baseline expects flat parameter trees (both online and EMA).
@@ -84,7 +84,13 @@ def load_model(ckpt_path=None, model_size="XL"):
       - Flat checkpoints that include "feature_head": drop that key.
     """
     config = _model_config_for_size(model_size)
-    model = SelfFlowDiT(**config, per_token=False)
+    model = SelfFlowDiT(
+        **model_init_kwargs_from_config(
+            config,
+            per_token=False,
+            skip_layer_connection=skip_layer_connection,
+        )
+    )
 
     # Initialize parameters with random key
     key = jax.random.PRNGKey(0)
@@ -214,6 +220,11 @@ def main():
     parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
     parser.add_argument("--no-save-images", action="store_false", dest="save_images")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument(
+        "--skip-layer-connection",
+        action="store_true",
+        help="Enable DiverseDiT long residual connections when loading the checkpoint.",
+    )
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
                         help="HuggingFace VAE model ID")
@@ -233,7 +244,11 @@ def main():
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
         
-    model, params = load_model(args.ckpt, model_size=args.model_size)
+    model, params = load_model(
+        args.ckpt,
+        model_size=args.model_size,
+        skip_layer_connection=args.skip_layer_connection,
+    )
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
     sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)

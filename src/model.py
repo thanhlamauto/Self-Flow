@@ -6,7 +6,8 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 """
 
 import math
-from typing import Optional
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -179,6 +180,17 @@ class DiTBlock(nn.Module):
         return x
 
 
+class LongSkipFusion(nn.Module):
+    """Fuses the current hidden state with a mirrored early-block residual."""
+    hidden_size: int
+
+    @nn.compact
+    def __call__(self, x, skip):
+        fused = jnp.concatenate([x, skip], axis=-1)
+        fused = nn.LayerNorm(epsilon=1e-6)(fused)
+        return nn.Dense(self.hidden_size)(fused)
+
+
 class FinalLayer(nn.Module):
     """The final layer of DiT."""
     hidden_size: int
@@ -229,6 +241,29 @@ class SimpleHead(nn.Module):
         return x
 
 
+def model_init_kwargs_from_config(
+    config: Mapping[str, Any],
+    *,
+    per_token: bool = False,
+    skip_layer_connection: bool = False,
+) -> dict[str, Any]:
+    """Build a shared model-init kwargs dict from a standard config mapping."""
+    return dict(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=per_token,
+        skip_layer_connection=skip_layer_connection,
+    )
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -242,6 +277,7 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    skip_layer_connection: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -260,7 +296,7 @@ class SelfFlowDiT(nn.Module):
         vector: jax.Array,
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
-        return_raw_features: bool = False,
+        return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -268,6 +304,28 @@ class SelfFlowDiT(nn.Module):
         assert not (return_raw_features and return_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+
+        raw_layers = ()
+        raw_single = False
+        raw_positions = None
+        if isinstance(return_raw_features, Sequence) and not isinstance(return_raw_features, (str, bytes)):
+            raw_layers = tuple(int(layer) for layer in return_raw_features)
+            raw_single = len(raw_layers) == 1
+        elif isinstance(return_raw_features, int) and not isinstance(return_raw_features, bool):
+            raw_layers = (int(return_raw_features),)
+            raw_single = True
+
+        if raw_layers:
+            if any(layer <= 0 for layer in raw_layers):
+                raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+            if any(layer > self.depth for layer in raw_layers):
+                raise ValueError(
+                    f"return_raw_features layers must be <= model depth ({self.depth}), got {raw_layers}"
+                )
+            if not raw_single:
+                raw_positions = {}
+                for idx, layer in enumerate(raw_layers):
+                    raw_positions.setdefault(layer, []).append(idx)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -305,8 +363,19 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
+        cached_skip_inputs = [] if self.skip_layer_connection else None
+        first_half_depth = self.depth // 2
         for i in range(self.depth):
+            if self.skip_layer_connection and i >= first_half_depth:
+                mirror_idx = self.depth - 1 - i
+                if 0 <= mirror_idx < len(cached_skip_inputs):
+                    x = LongSkipFusion(
+                        hidden_size=self.hidden_size,
+                        name=f"skip_fusion_{i}",
+                    )(x, cached_skip_inputs[mirror_idx])
+
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
@@ -314,14 +383,21 @@ class SelfFlowDiT(nn.Module):
                 per_token=self.per_token
             )(x, c)
 
+            if self.skip_layer_connection and i < first_half_depth:
+                cached_skip_inputs.append(x)
+
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+            if raw_layers and ((i + 1) in raw_positions if raw_positions is not None else (i + 1) in raw_layers):
+                if raw_single:
+                    zs = x
+                else:
+                    for idx in raw_positions[i + 1]:
+                        raw_zs[idx] = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -338,7 +414,16 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
-        if return_features or return_raw_features:
+        if return_features:
+            if return_block_summaries:
+                return x, zs, block_summaries
+            return x, zs
+        if raw_layers:
+            raw_out = zs if raw_single else tuple(raw_zs)
+            if return_block_summaries:
+                return x, raw_out, block_summaries
+            return x, raw_out
+        if return_raw_features:
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs

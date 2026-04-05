@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -411,7 +412,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, model_init_kwargs_from_config
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -431,24 +432,24 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    skip_layer_connection=False,
+):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
     """
     model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
+        **model_init_kwargs_from_config(
+            config,
+            per_token=False,
+            skip_layer_connection=skip_layer_connection,
+        )
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -498,10 +499,108 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def resolve_diversity_pairs(depth, pair_mode):
+    """Resolve the block pairs and feature-capture layers for diversity loss."""
+    if pair_mode != "mirror":
+        raise ValueError(f"Unsupported diversity pair mode: {pair_mode}")
+
+    pairs = tuple((i, depth - 1 - i) for i in range(depth // 2))
+    capture_layers = tuple(sorted({layer + 1 for pair in pairs for layer in pair}))
+    return pairs, capture_layers
+
+
+def compute_diversity_gate(div_loss, gate_low, gate_high):
+    """Adaptive gate used to stabilize the diversity loss."""
+    return jnp.where(
+        div_loss > gate_high,
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.where(
+            div_loss > gate_low,
+            (div_loss - gate_low) / gate_high,
+            jnp.array(0.0, dtype=jnp.float32),
+        ),
+    )
+
+
+def compute_diversity_loss(
+    raw_features,
+    capture_layers,
+    diversity_pairs,
+    *,
+    orth_weight,
+    mi_weight,
+    disp_weight,
+    gate_low,
+    gate_high,
+):
+    """Compute DiverseDiT's orthogonality, proxy-MI, and dispersion losses."""
+    if not diversity_pairs:
+        zero = jnp.array(0.0, dtype=jnp.float32)
+        return zero, zero, zero, zero, zero, zero
+
+    if not isinstance(raw_features, (tuple, list)):
+        raw_features = (raw_features,)
+
+    feature_map = {layer: feat for layer, feat in zip(capture_layers, raw_features)}
+    eps = jnp.float32(1e-8)
+
+    orth_terms = []
+    mi_terms = []
+    for early_idx, late_idx in diversity_pairs:
+        z_early = feature_map[early_idx + 1]
+        z_late = feature_map[late_idx + 1]
+
+        mu_early = jnp.mean(z_early, axis=(0, 1))
+        mu_late = jnp.mean(z_late, axis=(0, 1))
+        mu_early = mu_early / (jnp.linalg.norm(mu_early) + eps)
+        mu_late = mu_late / (jnp.linalg.norm(mu_late) + eps)
+        orth_terms.append(jnp.sum(mu_early * mu_late))
+
+        z_early_norm = z_early / (jnp.linalg.norm(z_early, axis=-1, keepdims=True) + eps)
+        z_late_norm = z_late / (jnp.linalg.norm(z_late, axis=-1, keepdims=True) + eps)
+        token_cos = jnp.sum(z_early_norm * z_late_norm, axis=-1)
+        mi_terms.append(jnp.mean(token_cos))
+
+    orth_loss = jnp.mean(jnp.stack(orth_terms))
+    mi_loss = jnp.mean(jnp.stack(mi_terms))
+    mean_pairwise_similarity = mi_loss
+
+    activations = []
+    for layer in capture_layers:
+        z = feature_map[layer]
+        flat = z.reshape(-1, z.shape[-1])
+        flat = flat / (jnp.linalg.norm(flat, axis=0, keepdims=True) + eps)
+        activations.append(jnp.mean(flat, axis=0))
+    activation = jnp.mean(jnp.stack(activations), axis=0)
+    activation = activation / jnp.maximum(jnp.max(jnp.abs(activation)), eps)
+    disp_loss = -jnp.mean(jnp.square(activation - jnp.mean(activation)))
+
+    div_loss = (
+        orth_weight * orth_loss
+        + mi_weight * mi_loss
+        + disp_weight * disp_loss
+    )
+    gate = compute_diversity_gate(div_loss, gate_low, gate_high)
+    return div_loss, orth_loss, mi_loss, disp_loss, gate, mean_pairwise_similarity
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    *,
+    block_diversity_loss=False,
+    diversity_capture_layers=(),
+    diversity_pairs=(),
+    diversity_orth_weight=0.33,
+    diversity_mi_weight=0.33,
+    diversity_disp_weight=0.33,
+    diversity_gate_low=0.1,
+    diversity_gate_high=0.5,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -522,25 +621,86 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        if block_diversity_loss:
+            pred, raw_features = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_raw_features=diversity_capture_layers,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            loss_div, loss_div_orth, loss_div_mi, loss_div_disp, loss_div_gate, mean_pairwise_similarity = (
+                compute_diversity_loss(
+                    raw_features,
+                    diversity_capture_layers,
+                    diversity_pairs,
+                    orth_weight=diversity_orth_weight,
+                    mi_weight=diversity_mi_weight,
+                    disp_weight=diversity_disp_weight,
+                    gate_low=diversity_gate_low,
+                    gate_high=diversity_gate_high,
+                )
+            )
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            loss_div = jnp.array(0.0, dtype=target.dtype)
+            loss_div_orth = jnp.array(0.0, dtype=target.dtype)
+            loss_div_mi = jnp.array(0.0, dtype=target.dtype)
+            loss_div_disp = jnp.array(0.0, dtype=target.dtype)
+            loss_div_gate = jnp.array(0.0, dtype=target.dtype)
+            mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
+
+        loss_gen = jnp.mean((pred - target) ** 2)
+        loss = loss_gen + loss_div_gate * loss_div
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_div,
+            loss_div_orth,
+            loss_div_mi,
+            loss_div_disp,
+            loss_div_gate,
+            mean_pairwise_similarity,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_div,
+            loss_div_orth,
+            loss_div_mi,
+            loss_div_disp,
+            loss_div_gate,
+            mean_pairwise_similarity,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_div = jax.lax.pmean(loss_div, axis_name="batch")
+    loss_div_orth = jax.lax.pmean(loss_div_orth, axis_name="batch")
+    loss_div_mi = jax.lax.pmean(loss_div_mi, axis_name="batch")
+    loss_div_disp = jax.lax.pmean(loss_div_disp, axis_name="batch")
+    loss_div_gate = jax.lax.pmean(loss_div_gate, axis_name="batch")
+    mean_pairwise_similarity = jax.lax.pmean(mean_pairwise_similarity, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -551,6 +711,14 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_total": loss,
+        "train/loss_gen": loss_gen,
+        "train/loss_div": loss_div,
+        "train/loss_div_orth": loss_div_orth,
+        "train/loss_div_mi": loss_div_mi,
+        "train/loss_div_disp": loss_div_disp,
+        "train/loss_div_gate": loss_div_gate,
+        "train/mean_pairwise_similarity": mean_pairwise_similarity,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,7 +729,19 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    *,
+    block_diversity_loss=False,
+    diversity_capture_layers=(),
+    diversity_pairs=(),
+    diversity_orth_weight=0.33,
+    diversity_mi_weight=0.33,
+    diversity_disp_weight=0.33,
+    diversity_gate_low=0.1,
+    diversity_gate_high=0.5,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -575,23 +755,68 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
+    if block_diversity_loss:
+        pred, raw_features = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            return_raw_features=diversity_capture_layers,
+            deterministic=True,
+        )
+        loss_div, loss_div_orth, loss_div_mi, loss_div_disp, loss_div_gate, mean_pairwise_similarity = (
+            compute_diversity_loss(
+                raw_features,
+                diversity_capture_layers,
+                diversity_pairs,
+                orth_weight=diversity_orth_weight,
+                mi_weight=diversity_mi_weight,
+                disp_weight=diversity_disp_weight,
+                gate_low=diversity_gate_low,
+                gate_high=diversity_gate_high,
+            )
+        )
+    else:
+        pred = state.apply_fn(
+            {"params": state.params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=True,
+        )
+        loss_div = jnp.array(0.0, dtype=target.dtype)
+        loss_div_orth = jnp.array(0.0, dtype=target.dtype)
+        loss_div_mi = jnp.array(0.0, dtype=target.dtype)
+        loss_div_disp = jnp.array(0.0, dtype=target.dtype)
+        loss_div_gate = jnp.array(0.0, dtype=target.dtype)
+        mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
+
+    loss_gen = jnp.mean((pred - target) ** 2)
+    loss = loss_gen + loss_div_gate * loss_div
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_div = jax.lax.pmean(loss_div, axis_name="batch")
+    loss_div_orth = jax.lax.pmean(loss_div_orth, axis_name="batch")
+    loss_div_mi = jax.lax.pmean(loss_div_mi, axis_name="batch")
+    loss_div_disp = jax.lax.pmean(loss_div_disp, axis_name="batch")
+    loss_div_gate = jax.lax.pmean(loss_div_gate, axis_name="batch")
+    mean_pairwise_similarity = jax.lax.pmean(mean_pairwise_similarity, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_total": loss,
+        "val/loss_gen": loss_gen,
+        "val/loss_div": loss_div,
+        "val/loss_div_orth": loss_div_orth,
+        "val/loss_div_mi": loss_div_mi,
+        "val/loss_div_disp": loss_div_disp,
+        "val/loss_div_gate": loss_div_gate,
+        "val/mean_pairwise_similarity": mean_pairwise_similarity,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -720,7 +945,12 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
-def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    skip_layer_connection=False,
+):
     """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
     XLA's scan requires a static sequence length, so num_steps cannot be a
@@ -731,17 +961,11 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
     """
     model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
+        **model_init_kwargs_from_config(
+            config,
+            per_token=False,
+            skip_layer_connection=skip_layer_connection,
+        )
     )
 
     def sample_latents(params, class_labels, rng):
@@ -819,7 +1043,12 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    skip_layer_connection=False,
+):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -830,17 +1059,11 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
     model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
+        **model_init_kwargs_from_config(
+            config,
+            per_token=False,
+            skip_layer_connection=skip_layer_connection,
+        )
     )
 
     patch_size = config["patch_size"]
@@ -1077,6 +1300,53 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--skip-layer-connection",
+        action="store_true",
+        help="Enable DiverseDiT long residual connections between mirrored early/late blocks.",
+    )
+    parser.add_argument(
+        "--block-diversity-loss",
+        action="store_true",
+        help="Enable DiverseDiT's block-level diversity regularizer.",
+    )
+    parser.add_argument(
+        "--diversity-pair-mode",
+        type=str,
+        default="mirror",
+        choices=["mirror"],
+        help="Block-pair subset used by the diversity loss.",
+    )
+    parser.add_argument(
+        "--diversity-orth-weight",
+        type=float,
+        default=0.33,
+        help="Weight for the diversity orthogonality term.",
+    )
+    parser.add_argument(
+        "--diversity-mi-weight",
+        type=float,
+        default=0.33,
+        help="Weight for the diversity proxy-MI term.",
+    )
+    parser.add_argument(
+        "--diversity-disp-weight",
+        type=float,
+        default=0.33,
+        help="Weight for the diversity dispersion term.",
+    )
+    parser.add_argument(
+        "--diversity-gate-low",
+        type=float,
+        default=0.1,
+        help="Lower threshold for the adaptive diversity-loss gate.",
+    )
+    parser.add_argument(
+        "--diversity-gate-high",
+        type=float,
+        default=0.5,
+        help="Upper threshold for the adaptive diversity-loss gate.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1216,6 +1486,18 @@ def main():
         raise ValueError("--pr-max-samples must be greater than 0")
     if args.probe_eval_batches <= 0:
         raise ValueError("--probe-eval-batches must be greater than 0")
+    if args.diversity_orth_weight < 0.0:
+        raise ValueError("--diversity-orth-weight must be non-negative")
+    if args.diversity_mi_weight < 0.0:
+        raise ValueError("--diversity-mi-weight must be non-negative")
+    if args.diversity_disp_weight < 0.0:
+        raise ValueError("--diversity-disp-weight must be non-negative")
+    if args.diversity_gate_low < 0.0:
+        raise ValueError("--diversity-gate-low must be non-negative")
+    if args.diversity_gate_high <= 0.0:
+        raise ValueError("--diversity-gate-high must be greater than 0")
+    if args.diversity_gate_high <= args.diversity_gate_low:
+        raise ValueError("--diversity-gate-high must be greater than --diversity-gate-low")
     if args.linear_probe and not args.probe_save_path:
         raise ValueError("--linear-probe requires --probe-save-path")
     if args.block_corr_freq < 0:
@@ -1257,6 +1539,25 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.skip_layer_connection:
+        log_stage("DiverseDiT long residual connections: ENABLED")
+
+    diversity_pairs = ()
+    diversity_capture_layers = ()
+    if args.block_diversity_loss:
+        diversity_pairs, diversity_capture_layers = resolve_diversity_pairs(
+            depth,
+            args.diversity_pair_mode,
+        )
+        if not diversity_pairs:
+            raise ValueError("Block diversity loss requires at least one block pair.")
+        log_stage(
+            "DiverseDiT block diversity loss: "
+            f"pair_mode={args.diversity_pair_mode} pairs={len(diversity_pairs)} "
+            f"weights=({args.diversity_orth_weight:.2f},"
+            f"{args.diversity_mi_weight:.2f},{args.diversity_disp_weight:.2f}) "
+            f"gate=({args.diversity_gate_low:.2f},{args.diversity_gate_high:.2f})"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1267,7 +1568,13 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        skip_layer_connection=args.skip_layer_connection,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1295,27 +1602,62 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            block_diversity_loss=args.block_diversity_loss,
+            diversity_capture_layers=diversity_capture_layers,
+            diversity_pairs=diversity_pairs,
+            diversity_orth_weight=args.diversity_orth_weight,
+            diversity_mi_weight=args.diversity_mi_weight,
+            diversity_disp_weight=args.diversity_disp_weight,
+            diversity_gate_low=args.diversity_gate_low,
+            diversity_gate_high=args.diversity_gate_high,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            block_diversity_loss=args.block_diversity_loss,
+            diversity_capture_layers=diversity_capture_layers,
+            diversity_pairs=diversity_pairs,
+            diversity_orth_weight=args.diversity_orth_weight,
+            diversity_mi_weight=args.diversity_mi_weight,
+            diversity_disp_weight=args.diversity_disp_weight,
+            diversity_gate_low=args.diversity_gate_low,
+            diversity_gate_high=args.diversity_gate_high,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
     # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
     #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
-        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+        config,
+        num_steps=args.sample_num_steps,
+        cfg_scale=args.sample_cfg_scale,
+        skip_layer_connection=args.skip_layer_connection,
     )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
-            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            skip_layer_connection=args.skip_layer_connection,
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
 
     # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
-        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        config,
+        num_steps=args.fid_num_steps,
+        cfg_scale=args.fid_cfg_scale,
+        skip_layer_connection=args.skip_layer_connection,
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
