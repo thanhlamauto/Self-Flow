@@ -845,9 +845,9 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     XLA's scan requires a static sequence length, so num_steps cannot be a
     dynamic argument — it is compiled in.  Provide different values for
     different eval modes:
-      - Fast TPU monitoring default: num_steps=50, cfg_scale=1.0
-      - Paper-like eval: num_steps=250, cfg_scale=1.0
-        (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
+        - Fast TPU monitoring default: num_steps=50, cfg_scale=1.0
+        - Paper-like eval: num_steps=250, cfg_scale=1.0
+        (paper eval keeps cfg_scale=1.0; higher CFG remains a deviation)
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
