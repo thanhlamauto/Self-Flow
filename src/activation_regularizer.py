@@ -32,7 +32,8 @@ def safe_cosine_similarity(x: jax.Array, y: jax.Array, eps: float) -> jax.Array:
     numerator = jnp.sum(x * y, axis=-1)
     x_norm = jnp.maximum(jnp.linalg.norm(x, axis=-1), eps_arr)
     y_norm = jnp.maximum(jnp.linalg.norm(y, axis=-1), eps_arr)
-    return numerator / (x_norm * y_norm)
+    sim = numerator / (x_norm * y_norm)
+    return jnp.clip(sim, -1.0, 1.0)
 
 
 def normalize_hidden(x: jax.Array, eps: float) -> jax.Array:
@@ -51,26 +52,26 @@ def decompose_pair(
     y2: jax.Array,
     eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Project a layer pair into common and private token-wise directions."""
+    """Project each layer onto the counterpart direction, then take the residual."""
     yhat1 = normalize_hidden(y1, eps)
     yhat2 = normalize_hidden(y2, eps)
-    common = _safe_l2_normalize(yhat1 + yhat2, eps)
-
-    a1 = jnp.sum(yhat1 * common, axis=-1, keepdims=True) * common
-    a2 = jnp.sum(yhat2 * common, axis=-1, keepdims=True) * common
+    a1 = jnp.sum(yhat1 * yhat2, axis=-1, keepdims=True) * yhat2
+    a2 = jnp.sum(yhat2 * yhat1, axis=-1, keepdims=True) * yhat1
     b1 = yhat1 - a1
     b2 = yhat2 - a2
     return a1, a2, b1, b2
 
 
 def compute_pair_losses(y1: jax.Array, y2: jax.Array, eps: float) -> dict[str, jax.Array]:
-    """Compute shared, private, and separation losses for one hidden-state pair."""
+    """Compute shared, private, and cross-separation losses for one hidden-state pair."""
     a1, a2, b1, b2 = decompose_pair(y1, y2, eps)
 
     shared_cos = safe_cosine_similarity(a1, a2, eps)
     private_cos = safe_cosine_similarity(b1, b2, eps)
-    sep1_cos = safe_cosine_similarity(a1, b1, eps)
-    sep2_cos = safe_cosine_similarity(a2, b2, eps)
+    # Cross-layer separation avoids the trivial zero loss that arises when
+    # comparing a layer's shared component against its own residual.
+    sep1_cos = safe_cosine_similarity(a1, b2, eps)
+    sep2_cos = safe_cosine_similarity(a2, b1, eps)
 
     return {
         "loss_shared": jnp.mean(1.0 - shared_cos),
