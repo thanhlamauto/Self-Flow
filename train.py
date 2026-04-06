@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -8,6 +9,7 @@ import threading
 import queue
 import logging
 import zipfile
+from itertools import combinations
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -411,7 +413,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, model_init_kwargs_from_config
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -437,19 +439,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
+    model = SelfFlowDiT(**model_init_kwargs_from_config(config, per_token=False))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -498,10 +488,190 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def parse_selected_ffn_layers(spec, depth):
+    """Parse a 1-based FFN layer list from CLI."""
+    if spec is None:
+        return ()
+
+    spec = str(spec).strip()
+    if not spec:
+        return ()
+    if spec.lower() == "all":
+        return tuple(range(1, depth + 1))
+
+    layers = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        layer = int(chunk)
+        if layer < 1 or layer > depth:
+            raise ValueError(
+                f"--selected-ffn-layers must be within [1, {depth}], got {layer}"
+            )
+        layers.append(layer)
+    return tuple(sorted(set(layers)))
+
+
+def make_layer_pair_candidates(num_layers):
+    return tuple(combinations(range(num_layers), 2))
+
+
+def collect_selected_residual_weights(params, selected_ffn_layers):
+    """Stack dW1 and dW2 from the selected DiT blocks."""
+    if not selected_ffn_layers:
+        return None, None
+
+    dw1 = []
+    dw2 = []
+    for layer in selected_ffn_layers:
+        block_name = f"DiTBlock_{layer - 1}"
+        block_params = params[block_name]
+        if "dw1" not in block_params or "dw2" not in block_params:
+            raise ValueError(
+                f"Selected FFN layer {layer} does not have decomposed residual weights."
+            )
+        dw1.append(block_params["dw1"])
+        dw2.append(block_params["dw2"])
+    return jnp.stack(dw1, axis=0), jnp.stack(dw2, axis=0)
+
+
+def sample_candidates(rng, candidates, num_samples):
+    """Sample candidate rows without replacement."""
+    if not candidates or num_samples <= 0:
+        return jnp.zeros((0, 2), dtype=jnp.int32)
+
+    candidate_array = jnp.asarray(candidates, dtype=jnp.int32)
+    take = min(int(num_samples), int(candidate_array.shape[0]))
+    if take <= 0:
+        return jnp.zeros((0, 2), dtype=jnp.int32)
+    indices = jax.random.permutation(rng, candidate_array.shape[0])[:take]
+    return candidate_array[indices]
+
+
+def mean_abs_pairwise_cosine(weights, sampled_pairs):
+    """Mean absolute cosine similarity over sampled weight pairs."""
+    if weights is None or sampled_pairs.shape[0] == 0:
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    eps = jnp.float32(1e-8)
+    flat = weights.reshape(weights.shape[0], -1).astype(jnp.float32)
+    flat = flat / (jnp.linalg.norm(flat, axis=-1, keepdims=True) + eps)
+    lhs = flat[sampled_pairs[:, 0]]
+    rhs = flat[sampled_pairs[:, 1]]
+    return jnp.mean(jnp.abs(jnp.sum(lhs * rhs, axis=-1)))
+
+
+def channel_layer_norm(x, eps=1e-6):
+    x = x.astype(jnp.float32)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    return (x - mean) / jnp.sqrt(var + eps)
+
+
+def normalized_token_gram(q):
+    eps = jnp.float32(1e-8)
+    qn = channel_layer_norm(q)
+    gram = jnp.einsum("...td,...sd->...ts", qn, qn) / qn.shape[-1]
+    return gram / (jnp.linalg.norm(gram, axis=(-2, -1), keepdims=True) + eps)
+
+
+def compute_gram_weight(tau):
+    eps = jnp.float32(1e-8)
+    tau = tau.astype(jnp.float32)
+    alpha_sq = tau ** 2
+    sigma_sq = (1.0 - tau) ** 2
+    snr = alpha_sq / (sigma_sq + eps)
+    return snr / (snr + 1.0)
+
+
+def compute_decomposition_losses(
+    apply_fn,
+    params,
+    x0,
+    tau,
+    ffn_inputs,
+    rng,
+    *,
+    selected_ffn_layers=(),
+    orth_pair_candidates=(),
+    num_orth_pairs=0,
+    num_gram_layers=0,
+    lambda_orth1=0.0,
+    lambda_orth2=0.0,
+    flow_to_attention=True,
+    gram_token_subsample=0,
+):
+    """Compute residual orthogonality and Gram alignment losses."""
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    loss_orth1 = zero
+    loss_orth2 = zero
+    loss_orth = zero
+    loss_gram = zero
+    gram_weight_mean = zero
+
+    if selected_ffn_layers and num_orth_pairs > 0:
+        rng, orth_rng = jax.random.split(rng)
+        dw1, dw2 = collect_selected_residual_weights(params, selected_ffn_layers)
+        sampled_pairs = sample_candidates(orth_rng, orth_pair_candidates, num_orth_pairs)
+        loss_orth1 = mean_abs_pairwise_cosine(dw1, sampled_pairs)
+        loss_orth2 = mean_abs_pairwise_cosine(dw2, sampled_pairs)
+        loss_orth = lambda_orth1 * loss_orth1 + lambda_orth2 * loss_orth2
+
+    if ffn_inputs is not None and ffn_inputs.shape[0] > 0 and num_gram_layers > 0:
+        rng, gram_layer_rng = jax.random.split(rng)
+        num_selected = int(ffn_inputs.shape[0])
+        take_layers = min(int(num_gram_layers), num_selected)
+        layer_indices = jax.random.permutation(gram_layer_rng, num_selected)[:take_layers]
+        hidden = ffn_inputs[layer_indices]
+        if not flow_to_attention:
+            hidden = jax.lax.stop_gradient(hidden)
+
+        z0_tokens = x0
+        if gram_token_subsample > 0 and gram_token_subsample < x0.shape[1]:
+            rng, gram_token_rng = jax.random.split(rng)
+            token_indices = jax.random.permutation(gram_token_rng, x0.shape[1])[:gram_token_subsample]
+            hidden = hidden[:, :, token_indices, :]
+            z0_tokens = z0_tokens[:, token_indices, :]
+
+        common_proj = apply_fn(
+            {"params": params},
+            hidden,
+            method=SelfFlowDiT.project_gram_common_from_hidden,
+        )
+        target_proj = apply_fn(
+            {"params": params},
+            jax.lax.stop_gradient(z0_tokens),
+            method=SelfFlowDiT.project_gram_target,
+        )
+        common_gram = normalized_token_gram(common_proj)
+        target_gram = normalized_token_gram(target_proj)[None, ...]
+        gram_error = jnp.mean((common_gram - target_gram) ** 2, axis=(-2, -1))
+        gram_weight = compute_gram_weight(tau)[None, :]
+        loss_gram = jnp.mean(gram_weight * gram_error)
+        gram_weight_mean = jnp.mean(gram_weight)
+
+    return loss_orth, loss_orth1, loss_orth2, loss_gram, gram_weight_mean
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    *,
+    selected_ffn_layers=(),
+    orth_pair_candidates=(),
+    num_orth_pairs=0,
+    num_gram_layers=0,
+    lambda_orth1=0.0,
+    lambda_orth2=0.0,
+    lambda_gram=0.0,
+    flow_to_attention=True,
+    gram_token_subsample=0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -520,27 +690,79 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    use_gram_loss = bool(selected_ffn_layers) and lambda_gram > 0.0 and num_gram_layers > 0
 
     def loss_fn(params):
-        pred = state.apply_fn(
+        model_out = state.apply_fn(
             {"params": params},
             x_tau,
             timesteps=tau,
             vector=y,
+            return_ffn_inputs=use_gram_loss,
             deterministic=False,
             rngs={"dropout": drop_rng},
         )
-        loss = jnp.mean((pred - target) ** 2)
+        if use_gram_loss:
+            pred, ffn_inputs = model_out
+        else:
+            pred = model_out
+            ffn_inputs = None
+
+        loss_diff = jnp.mean((pred - target) ** 2)
+        loss_orth, loss_orth1, loss_orth2, loss_gram, gram_weight_mean = compute_decomposition_losses(
+            state.apply_fn,
+            params,
+            x0,
+            tau,
+            ffn_inputs,
+            rng,
+            selected_ffn_layers=selected_ffn_layers,
+            orth_pair_candidates=orth_pair_candidates,
+            num_orth_pairs=num_orth_pairs,
+            num_gram_layers=num_gram_layers,
+            lambda_orth1=lambda_orth1,
+            lambda_orth2=lambda_orth2,
+            flow_to_attention=flow_to_attention,
+            gram_token_subsample=gram_token_subsample,
+        )
+        loss = loss_diff + loss_orth + lambda_gram * loss_gram
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_diff,
+            loss_orth,
+            loss_orth1,
+            loss_orth2,
+            loss_gram,
+            gram_weight_mean,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_diff,
+            loss_orth,
+            loss_orth1,
+            loss_orth2,
+            loss_gram,
+            gram_weight_mean,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    loss_diff = jax.lax.pmean(loss_diff, axis_name="batch")
+    loss_orth = jax.lax.pmean(loss_orth, axis_name="batch")
+    loss_orth1 = jax.lax.pmean(loss_orth1, axis_name="batch")
+    loss_orth2 = jax.lax.pmean(loss_orth2, axis_name="batch")
+    loss_gram = jax.lax.pmean(loss_gram, axis_name="batch")
+    gram_weight_mean = jax.lax.pmean(gram_weight_mean, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -551,6 +773,15 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_total": loss,
+        "train/loss_diff": loss_diff,
+        "train/loss_orth": loss_orth,
+        "train/loss_orth1": loss_orth1,
+        "train/loss_orth2": loss_orth2,
+        "train/loss_gram": loss_gram,
+        "train/mean_abs_cosine_dw1": loss_orth1,
+        "train/mean_abs_cosine_dw2": loss_orth2,
+        "train/gram_weight_mean": gram_weight_mean,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,7 +792,20 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    *,
+    selected_ffn_layers=(),
+    orth_pair_candidates=(),
+    num_orth_pairs=0,
+    num_gram_layers=0,
+    lambda_orth1=0.0,
+    lambda_orth2=0.0,
+    lambda_gram=0.0,
+    flow_to_attention=True,
+    gram_token_subsample=0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -574,24 +818,64 @@ def eval_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    use_gram_loss = bool(selected_ffn_layers) and lambda_gram > 0.0 and num_gram_layers > 0
 
-    pred = state.apply_fn(
+    model_out = state.apply_fn(
         {"params": state.params},
         x_tau,
         timesteps=tau,
         vector=y,
+        return_ffn_inputs=use_gram_loss,
         deterministic=True,
     )
-    loss = jnp.mean((pred - target) ** 2)
+    if use_gram_loss:
+        pred, ffn_inputs = model_out
+    else:
+        pred = model_out
+        ffn_inputs = None
+
+    loss_diff = jnp.mean((pred - target) ** 2)
+    loss_orth, loss_orth1, loss_orth2, loss_gram, gram_weight_mean = compute_decomposition_losses(
+        state.apply_fn,
+        state.params,
+        x0,
+        tau,
+        ffn_inputs,
+        rng,
+        selected_ffn_layers=selected_ffn_layers,
+        orth_pair_candidates=orth_pair_candidates,
+        num_orth_pairs=num_orth_pairs,
+        num_gram_layers=num_gram_layers,
+        lambda_orth1=lambda_orth1,
+        lambda_orth2=lambda_orth2,
+        flow_to_attention=flow_to_attention,
+        gram_token_subsample=gram_token_subsample,
+    )
+    loss = loss_diff + loss_orth + lambda_gram * loss_gram
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    loss_diff = jax.lax.pmean(loss_diff, axis_name="batch")
+    loss_orth = jax.lax.pmean(loss_orth, axis_name="batch")
+    loss_orth1 = jax.lax.pmean(loss_orth1, axis_name="batch")
+    loss_orth2 = jax.lax.pmean(loss_orth2, axis_name="batch")
+    loss_gram = jax.lax.pmean(loss_gram, axis_name="batch")
+    gram_weight_mean = jax.lax.pmean(gram_weight_mean, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/loss_total": loss,
+        "val/loss_diff": loss_diff,
+        "val/loss_orth": loss_orth,
+        "val/loss_orth1": loss_orth1,
+        "val/loss_orth2": loss_orth2,
+        "val/loss_gram": loss_gram,
+        "val/mean_abs_cosine_dw1": loss_orth1,
+        "val/mean_abs_cosine_dw2": loss_orth2,
+        "val/gram_weight_mean": gram_weight_mean,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -730,19 +1014,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
       - Paper-like eval: num_steps=250, cfg_scale=1.0
         (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
+    model = SelfFlowDiT(**model_init_kwargs_from_config(config, per_token=False))
 
     def sample_latents(params, class_labels, rng):
         """Generate sample latents on TPU using EMA params."""
@@ -829,19 +1101,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
-    model = SelfFlowDiT(
-        input_size=config["input_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_size=config["hidden_size"],
-        depth=config["depth"],
-        num_heads=config["num_heads"],
-        mlp_ratio=config["mlp_ratio"],
-        num_classes=config["num_classes"],
-        learn_sigma=config["learn_sigma"],
-        compatibility_mode=config["compatibility_mode"],
-        per_token=False,
-    )
+    model = SelfFlowDiT(**model_init_kwargs_from_config(config, per_token=False))
 
     patch_size = config["patch_size"]
     latent_channels = config["in_channels"]
@@ -1077,6 +1337,73 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--selected-ffn-layers",
+        type=str,
+        default="",
+        help="1-based comma-separated FFN block indices to decompose, or 'all'. Empty keeps the baseline MLP.",
+    )
+    parser.add_argument(
+        "--rank-r1",
+        type=int,
+        default=0,
+        help="Shared low-rank dimension for the first FFN linear decomposition.",
+    )
+    parser.add_argument(
+        "--rank-r2",
+        type=int,
+        default=0,
+        help="Shared low-rank dimension for the second FFN linear decomposition.",
+    )
+    parser.add_argument(
+        "--gram-dim",
+        type=int,
+        default=0,
+        help="Projection dimension used by the Gram alignment heads.",
+    )
+    parser.add_argument(
+        "--num-orth-pairs",
+        type=int,
+        default=0,
+        help="Number of random selected-layer pairs sampled each step for residual orthogonality.",
+    )
+    parser.add_argument(
+        "--num-gram-layers",
+        type=int,
+        default=0,
+        help="Number of selected layers sampled each step for Gram alignment.",
+    )
+    parser.add_argument(
+        "--lambda-orth1",
+        type=float,
+        default=0.0,
+        help="Weight for the dW1 residual orthogonality loss.",
+    )
+    parser.add_argument(
+        "--lambda-orth2",
+        type=float,
+        default=0.0,
+        help="Weight for the dW2 residual orthogonality loss.",
+    )
+    parser.add_argument(
+        "--lambda-gram",
+        type=float,
+        default=0.0,
+        help="Weight for the timestep-weighted Gram alignment loss.",
+    )
+    parser.add_argument(
+        "--flow-to-attention",
+        dest="flow_to_attention",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If false, stop Gram gradients at the FFN input so only A1/B1/Pg receive them.",
+    )
+    parser.add_argument(
+        "--gram-token-subsample",
+        type=int,
+        default=0,
+        help="Optional token count to subsample before Gram computation. 0 disables subsampling.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1216,6 +1543,24 @@ def main():
         raise ValueError("--pr-max-samples must be greater than 0")
     if args.probe_eval_batches <= 0:
         raise ValueError("--probe-eval-batches must be greater than 0")
+    if args.rank_r1 < 0:
+        raise ValueError("--rank-r1 must be >= 0")
+    if args.rank_r2 < 0:
+        raise ValueError("--rank-r2 must be >= 0")
+    if args.gram_dim < 0:
+        raise ValueError("--gram-dim must be >= 0")
+    if args.num_orth_pairs < 0:
+        raise ValueError("--num-orth-pairs must be >= 0")
+    if args.num_gram_layers < 0:
+        raise ValueError("--num-gram-layers must be >= 0")
+    if args.lambda_orth1 < 0.0:
+        raise ValueError("--lambda-orth1 must be non-negative")
+    if args.lambda_orth2 < 0.0:
+        raise ValueError("--lambda-orth2 must be non-negative")
+    if args.lambda_gram < 0.0:
+        raise ValueError("--lambda-gram must be non-negative")
+    if args.gram_token_subsample < 0:
+        raise ValueError("--gram-token-subsample must be >= 0")
     if args.linear_probe and not args.probe_save_path:
         raise ValueError("--linear-probe requires --probe-save-path")
     if args.block_corr_freq < 0:
@@ -1249,6 +1594,62 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    mlp_hidden_dim = int(config["hidden_size"] * config["mlp_ratio"])
+    selected_ffn_layers = parse_selected_ffn_layers(args.selected_ffn_layers, depth)
+    orth_pair_candidates = make_layer_pair_candidates(len(selected_ffn_layers))
+
+    if selected_ffn_layers:
+        if args.rank_r1 <= 0 or args.rank_r2 <= 0:
+            raise ValueError(
+                "Selected FFN layers require both --rank-r1 and --rank-r2 to be > 0."
+            )
+        if args.rank_r1 > min(config["hidden_size"], mlp_hidden_dim):
+            raise ValueError(
+                f"--rank-r1 must be <= min(hidden_size, mlp_hidden_dim) = "
+                f"{min(config['hidden_size'], mlp_hidden_dim)}"
+            )
+        if args.rank_r2 > min(mlp_hidden_dim, config["hidden_size"]):
+            raise ValueError(
+                f"--rank-r2 must be <= min(mlp_hidden_dim, hidden_size) = "
+                f"{min(mlp_hidden_dim, config['hidden_size'])}"
+            )
+    else:
+        if any(
+            value > 0
+            for value in (
+                args.rank_r1,
+                args.rank_r2,
+                args.num_orth_pairs,
+                args.num_gram_layers,
+                args.lambda_orth1,
+                args.lambda_orth2,
+                args.lambda_gram,
+                args.gram_dim,
+                args.gram_token_subsample,
+            )
+        ):
+            raise ValueError(
+                "FFN decomposition regularizers require --selected-ffn-layers to be set."
+            )
+
+    if args.lambda_gram > 0.0:
+        if args.gram_dim <= 0:
+            raise ValueError("--gram-dim must be > 0 when --lambda-gram is enabled")
+        if args.num_gram_layers <= 0:
+            raise ValueError("--num-gram-layers must be > 0 when --lambda-gram is enabled")
+    if (args.lambda_orth1 > 0.0 or args.lambda_orth2 > 0.0) and args.num_orth_pairs <= 0:
+        raise ValueError("--num-orth-pairs must be > 0 when orthogonality loss is enabled")
+    if args.gram_token_subsample > 0 and args.gram_token_subsample > (config["input_size"] // config["patch_size"]) ** 2:
+        raise ValueError(
+            "--gram-token-subsample cannot exceed the token count of the patchified latent."
+        )
+
+    config.update(
+        selected_ffn_layers=selected_ffn_layers,
+        rank_r1=args.rank_r1,
+        rank_r2=args.rank_r2,
+        gram_dim=args.gram_dim,
+    )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1658,19 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if selected_ffn_layers:
+        log_stage(
+            "FFN decomposition: "
+            f"layers={selected_ffn_layers} rank_r1={args.rank_r1} rank_r2={args.rank_r2}"
+        )
+        log_stage(
+            "FFN regularizers: "
+            f"num_orth_pairs={args.num_orth_pairs} lambda_orth=({args.lambda_orth1:.4f},"
+            f"{args.lambda_orth2:.4f}) num_gram_layers={args.num_gram_layers} "
+            f"lambda_gram={args.lambda_gram:.4f} gram_dim={args.gram_dim} "
+            f"flow_to_attention={args.flow_to_attention} "
+            f"gram_token_subsample={args.gram_token_subsample}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1709,36 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            selected_ffn_layers=selected_ffn_layers,
+            orth_pair_candidates=orth_pair_candidates,
+            num_orth_pairs=args.num_orth_pairs,
+            num_gram_layers=args.num_gram_layers,
+            lambda_orth1=args.lambda_orth1,
+            lambda_orth2=args.lambda_orth2,
+            lambda_gram=args.lambda_gram,
+            flow_to_attention=args.flow_to_attention,
+            gram_token_subsample=args.gram_token_subsample,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        functools.partial(
+            eval_step,
+            selected_ffn_layers=selected_ffn_layers,
+            orth_pair_candidates=orth_pair_candidates,
+            num_orth_pairs=args.num_orth_pairs,
+            num_gram_layers=args.num_gram_layers,
+            lambda_orth1=args.lambda_orth1,
+            lambda_orth2=args.lambda_orth2,
+            lambda_gram=args.lambda_gram,
+            flow_to_attention=args.flow_to_attention,
+            gram_token_subsample=args.gram_token_subsample,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
