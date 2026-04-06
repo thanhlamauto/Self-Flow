@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from itertools import combinations
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -373,6 +374,10 @@ PHASE2_MODES = (
     "s3_allblocks_delta",
     "s4_allblocks_delta_div",
 )
+DIVERSITY_BLOCK_SCOPES = (
+    "all_blocks",
+    "mid_only",
+)
 DELTA_PHASE2_MODES = frozenset({
     "s2_midlate_delta",
     "s3_allblocks_delta",
@@ -401,6 +406,59 @@ def phase2_delta_block_indices(phase2_mode, depth):
     if phase2_mode in {"s3_allblocks_delta", "s4_allblocks_delta_div"}:
         return tuple(range(depth))
     return ()
+
+
+def resolve_diversity_block_indices(depth, candidate_blocks, scope):
+    """Filter diversity blocks without changing which blocks own ΔW modules."""
+    blocks = tuple(sorted(set(int(block_idx) for block_idx in candidate_blocks)))
+    if not blocks:
+        return ()
+    if scope == "all_blocks":
+        return blocks
+    if scope == "mid_only":
+        start = depth // 4
+        stop = (3 * depth) // 4
+        return tuple(
+            block_idx for block_idx in blocks
+            if start <= block_idx < stop
+        )
+    raise ValueError(f"Unsupported diversity_block_scope={scope!r}")
+
+
+def make_diversity_pair_candidates(block_indices, exclude_adjacent=True):
+    """Build valid diversity pairs from 0-based block indices."""
+    pairs = []
+    for lhs, rhs in combinations(tuple(int(block_idx) for block_idx in block_indices), 2):
+        if exclude_adjacent and abs(rhs - lhs) == 1:
+            continue
+        pairs.append((lhs, rhs))
+    return tuple(pairs)
+
+
+def sample_diversity_pairs(rng, pair_candidates, pair_capacity):
+    """Sample a fixed-shape batch of valid block pairs for the current step."""
+    pair_capacity = int(pair_capacity)
+    if pair_capacity <= 0 or not pair_candidates:
+        return rng, np.zeros((0, 2), dtype=np.int32)
+
+    if pair_capacity >= len(pair_candidates):
+        return rng, np.asarray(pair_candidates, dtype=np.int32)
+
+    rng, pair_rng = jax.random.split(rng)
+    candidate_indices = jax.random.permutation(pair_rng, len(pair_candidates))[:pair_capacity]
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int32)
+    sampled = np.asarray(pair_candidates, dtype=np.int32)[candidate_indices]
+    return rng, sampled
+
+
+def format_block_indices_1based(block_indices):
+    return "[" + ", ".join(str(int(block_idx) + 1) for block_idx in block_indices) + "]"
+
+
+def format_block_pairs_1based(block_pairs):
+    return "[" + ", ".join(
+        f"({int(lhs) + 1}, {int(rhs) + 1})" for lhs, rhs in block_pairs
+    ) + "]"
 
 
 def make_optimizer(learning_rate, grad_clip=1.0):
@@ -613,12 +671,14 @@ def make_train_step(
     trainable_mask=None,
     lambda_div=0.0,
     delta_metric_blocks=(),
+    diversity_block_indices=(),
 ):
     """Build a training step with optional phase-2 ΔW behavior."""
     delta_active = bool(delta_active)
     lambda_div = float(lambda_div)
     delta_metric_blocks = tuple(int(block_idx) for block_idx in delta_metric_blocks)
-    collect_block_summaries = lambda_div > 0.0 and len(delta_metric_blocks) > 1
+    diversity_block_indices = tuple(int(block_idx) for block_idx in diversity_block_indices)
+    collect_block_summaries = lambda_div > 0.0 and len(diversity_block_indices) > 1
 
     def _maybe_get(tree, path):
         node = tree
@@ -628,23 +688,21 @@ def make_train_step(
             node = node[key]
         return node
 
-    def _diversity_stats(block_summaries):
+    def _diversity_stats(block_summaries, diversity_pairs):
         if not collect_block_summaries:
             zero = jnp.array(0.0, dtype=block_summaries.dtype)
             return zero, zero
-        selected = jnp.take(block_summaries, jnp.array(delta_metric_blocks), axis=0)
-        selected = selected / (jnp.linalg.norm(selected, axis=-1, keepdims=True) + 1e-8)
-        pairwise_cos = []
-        pairwise_sq = []
-        for i in range(len(delta_metric_blocks)):
-            for j in range(i + 1, len(delta_metric_blocks)):
-                cos_ij = jnp.sum(selected[i] * selected[j], axis=-1)
-                pairwise_cos.append(jnp.mean(cos_ij))
-                pairwise_sq.append(jnp.mean(jnp.square(cos_ij)))
-        if not pairwise_cos:
-            zero = jnp.array(0.0, dtype=selected.dtype)
+        if diversity_pairs is None or diversity_pairs.shape[0] == 0:
+            zero = jnp.array(0.0, dtype=block_summaries.dtype)
             return zero, zero
-        return jnp.mean(jnp.stack(pairwise_sq)), jnp.mean(jnp.stack(pairwise_cos))
+        lhs = jnp.take(block_summaries, diversity_pairs[:, 0], axis=0)
+        rhs = jnp.take(block_summaries, diversity_pairs[:, 1], axis=0)
+        lhs = lhs / (jnp.linalg.norm(lhs, axis=-1, keepdims=True) + 1e-8)
+        rhs = rhs / (jnp.linalg.norm(rhs, axis=-1, keepdims=True) + 1e-8)
+        pairwise_cos = jnp.sum(lhs * rhs, axis=-1)
+        pairwise_sq = jnp.mean(jnp.square(pairwise_cos), axis=-1)
+        pairwise_cos = jnp.mean(pairwise_cos, axis=-1)
+        return jnp.mean(pairwise_sq), jnp.mean(pairwise_cos)
 
     def _delta_block_metrics(params, grads):
         if not delta_metric_blocks:
@@ -673,7 +731,7 @@ def make_train_step(
             metrics[f"train/delta_grad_norm/{block_label}"] = jnp.sqrt(grad_sq)
         return metrics
 
-    def train_step(state, ema_params, batch, rng, ema_decay):
+    def train_step(state, ema_params, batch, rng, ema_decay, diversity_pairs=None):
         """Vanilla SiT training step with optional phase-2 ΔW terms."""
         x0, y = batch
         local_batch = x0.shape[0]
@@ -699,7 +757,7 @@ def make_train_step(
             )
             if collect_block_summaries:
                 pred, block_summaries = out
-                div_loss, mean_pairwise_cos = _diversity_stats(block_summaries)
+                div_loss, mean_pairwise_cos = _diversity_stats(block_summaries, diversity_pairs)
             else:
                 pred = out
                 div_loss = jnp.array(0.0, dtype=target.dtype)
@@ -734,6 +792,11 @@ def make_train_step(
             "train/diff_loss": diff_loss,
             "train/div_loss": div_loss,
             "train/div_mean_pairwise_cos": mean_pairwise_cos,
+            "train/div_active_block_count": jnp.array(len(diversity_block_indices), dtype=jnp.float32),
+            "train/div_active_pair_count": jnp.array(
+                0 if diversity_pairs is None else diversity_pairs.shape[0],
+                dtype=jnp.float32,
+            ),
             "train/ema_decay": ema_decay,
             "train/grad_norm": grad_norm,
             "train/param_norm": param_norm,
@@ -1649,6 +1712,28 @@ def main():
         default=0.01,
         help="Diversity loss coefficient for --phase2-mode=s4_allblocks_delta_div.",
     )
+    parser.add_argument(
+        "--diversity-block-scope",
+        type=str,
+        default="mid_only",
+        choices=DIVERSITY_BLOCK_SCOPES,
+        help="Which transformer blocks contribute to phase-2 diversity loss. "
+             "'mid_only' keeps only blocks in [L/4, 3L/4).",
+    )
+    parser.add_argument(
+        "--diversity-exclude-adjacent-pairs",
+        dest="diversity_exclude_adjacent_pairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude adjacent transformer block pairs from phase-2 diversity loss.",
+    )
+    parser.add_argument(
+        "--diversity-max-pairs-per-step",
+        type=int,
+        default=8,
+        help="Maximum number of valid block pairs sampled per step for phase-2 diversity. "
+             "Use 0 to include all valid pairs.",
+    )
     parser.add_argument("--dinov2-weights", type=str, default=None,
                         help="Path to dinov2_vitb14_flax.pkl (output of convert_dinov2_weights.py). "
                              "Required when --encoder-depth > 0.")
@@ -1694,6 +1779,8 @@ def main():
         raise ValueError("--irepa-spatial-gamma must be >= 0")
     if args.lambda_div < 0.0:
         raise ValueError("--lambda-div must be >= 0")
+    if args.diversity_max_pairs_per_step < 0:
+        raise ValueError("--diversity-max-pairs-per-step must be >= 0")
     if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
         raise ValueError("--repa-align-tau-min/--repa-align-tau-max must satisfy 0 <= min < max <= 1")
     if args.phase2_mode != "none" and args.encoder_depth <= 0:
@@ -1734,6 +1821,33 @@ def main():
     depth = int(config["depth"])
     delta_block_indices = tuple(config.get("delta_block_indices", ()))
     phase2_uses_delta = phase2_uses_delta_backbone(args.phase2_mode)
+    phase2_diversity_enabled = args.phase2_mode == "s4_allblocks_delta_div" and args.lambda_div > 0.0
+    diversity_block_indices = ()
+    diversity_pair_candidates = ()
+    diversity_pair_capacity = 0
+    if args.phase2_mode == "s4_allblocks_delta_div":
+        diversity_block_indices = resolve_diversity_block_indices(
+            depth,
+            delta_block_indices,
+            args.diversity_block_scope,
+        )
+        diversity_pair_candidates = make_diversity_pair_candidates(
+            diversity_block_indices,
+            exclude_adjacent=args.diversity_exclude_adjacent_pairs,
+        )
+        if args.diversity_max_pairs_per_step > 0:
+            diversity_pair_capacity = min(args.diversity_max_pairs_per_step, len(diversity_pair_candidates))
+        else:
+            diversity_pair_capacity = len(diversity_pair_candidates)
+        if phase2_diversity_enabled and len(diversity_block_indices) < 2:
+            raise ValueError(
+                "Phase-2 diversity requires at least two active blocks after applying "
+                f"--diversity-block-scope={args.diversity_block_scope!r}."
+            )
+        if phase2_diversity_enabled and diversity_pair_capacity == 0:
+            raise ValueError(
+                "Phase-2 diversity has no valid block pairs after applying the current scope/pair filters."
+            )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1748,7 +1862,17 @@ def main():
             f"delta_blocks={[idx + 1 for idx in delta_block_indices]}"
         )
         if args.phase2_mode == "s4_allblocks_delta_div":
-            log_stage(f"Phase-2 diversity loss: lambda_div={args.lambda_div:.4f}")
+            log_stage(
+                "Phase-2 diversity loss: "
+                f"lambda_div={args.lambda_div:.4f} scope={args.diversity_block_scope} "
+                f"exclude_adjacent_pairs={bool(args.diversity_exclude_adjacent_pairs)} "
+                f"max_pairs_per_step={diversity_pair_capacity if args.diversity_max_pairs_per_step > 0 else 'all'}"
+            )
+            log_stage(
+                "Phase-2 diversity blocks: "
+                f"active_blocks_1based={format_block_indices_1based(diversity_block_indices)} "
+                f"valid_pair_candidates={len(diversity_pair_candidates)}"
+            )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1769,12 +1893,16 @@ def main():
     phase2_trainable_param_count = delta_param_count if phase2_uses_delta else total_param_count
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
+    diversity_pair_rng = jax.random.PRNGKey(314159)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
     phase2_active_rep = jax_utils.replicate(jnp.float32(1.0))
     phase2_inactive_rep = jax_utils.replicate(jnp.float32(0.0))
     phase2_mode_id_rep = jax_utils.replicate(jnp.float32(PHASE2_MODE_TO_ID[args.phase2_mode]))
     phase2_current_trainable_param_count = phase1_trainable_param_count if phase2_uses_delta else total_param_count
+    diversity_pairs_rep_default = jax_utils.replicate(
+        jnp.zeros((diversity_pair_capacity, 2), dtype=jnp.int32)
+    )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1807,8 +1935,9 @@ def main():
             make_train_step(
                 delta_active=True,
                 trainable_mask=delta_only_mask,
-                lambda_div=args.lambda_div if args.phase2_mode == "s4_allblocks_delta_div" else 0.0,
+                lambda_div=args.lambda_div if phase2_diversity_enabled else 0.0,
                 delta_metric_blocks=delta_block_indices,
+                diversity_block_indices=diversity_block_indices,
             ),
             axis_name="batch",
         )
@@ -2498,6 +2627,8 @@ def main():
 
     for epoch in range(args.epochs):
         for step in range(args.steps_per_epoch):
+            diversity_step_blocks_text = None
+            diversity_step_pairs_text = None
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
@@ -2548,8 +2679,21 @@ def main():
                     dinov2_params_rep, rng, ema_decay_rep, proj_coeff_rep,
                 )
             elif phase2_active and phase2_uses_delta:
+                diversity_pairs_rep = diversity_pairs_rep_default
+                if phase2_diversity_enabled:
+                    diversity_pair_rng, sampled_diversity_pairs = sample_diversity_pairs(
+                        diversity_pair_rng,
+                        diversity_pair_candidates,
+                        diversity_pair_capacity,
+                    )
+                    diversity_pairs_rep = jax.device_put_replicated(
+                        jnp.asarray(sampled_diversity_pairs, dtype=jnp.int32),
+                        jax.local_devices(),
+                    )
+                    diversity_step_blocks_text = format_block_indices_1based(diversity_block_indices)
+                    diversity_step_pairs_text = format_block_pairs_1based(sampled_diversity_pairs)
                 state, ema_params, metrics, rng = pmapped_train_step_phase2_delta(
-                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, diversity_pairs_rep
                 )
             else:
                 # Vanilla SiT training step (returns updated EMA params)
@@ -2563,12 +2707,20 @@ def main():
             if "train/div_loss" not in metrics:
                 metrics["train/div_loss"] = phase2_inactive_rep
                 metrics["train/div_mean_pairwise_cos"] = phase2_inactive_rep
+                metrics["train/div_active_block_count"] = phase2_inactive_rep
+                metrics["train/div_active_pair_count"] = phase2_inactive_rep
             metrics["train/repa_active"] = repa_active_rep if repa_train_active else repa_inactive_rep
             metrics["train/repa_proj_coeff_effective"] = (
                 proj_coeff_rep if repa_train_active and proj_coeff_rep is not None else repa_inactive_rep
             )
             metrics["train/phase2_active"] = phase2_active_rep if phase2_active else phase2_inactive_rep
             metrics["train/phase2_mode_id"] = phase2_mode_id_rep
+            if diversity_step_blocks_text is not None and diversity_step_pairs_text is not None:
+                log_stage(
+                    f"[DIV] step {global_step + 1}: "
+                    f"active_blocks_1based={diversity_step_blocks_text} "
+                    f"active_pairs_1based={diversity_step_pairs_text}"
+                )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
 
@@ -2583,6 +2735,10 @@ def main():
                 cpu_metrics["train/phase2_mode"] = args.phase2_mode
                 cpu_metrics["train/total_param_count"] = total_param_count
                 cpu_metrics["train/trainable_param_count"] = phase2_current_trainable_param_count if phase2_active else phase1_trainable_param_count
+                if diversity_step_blocks_text is not None and diversity_step_pairs_text is not None:
+                    cpu_metrics["train/div_active_blocks"] = diversity_step_blocks_text
+                    cpu_metrics["train/div_active_pairs"] = diversity_step_pairs_text
+                    cpu_metrics["train/diversity_block_scope"] = args.diversity_block_scope
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
