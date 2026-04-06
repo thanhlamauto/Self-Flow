@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import functools
 import glob
 import pickle
 import time
@@ -8,6 +9,7 @@ import threading
 import queue
 import logging
 import zipfile
+import random
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -412,6 +414,12 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.activation_regularizer import (
+    build_layer_pairs,
+    compute_regularizer_metrics,
+    regularizer_is_active,
+    zero_regularizer_metrics,
+)
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -429,6 +437,180 @@ from src.metrics import (
     trim_sharded_batch_to_host,
 )
 from src.inception_is_subprocess import InceptionISSubprocess
+
+
+def parse_selected_layers(spec, depth, *, arg_name="--regularizer-selected-layers"):
+    """Parse a 1-based block layer list from CLI."""
+    if spec is None:
+        return ()
+
+    spec = str(spec).strip()
+    if not spec:
+        return ()
+
+    if spec.lower() == "all":
+        return tuple(range(1, depth + 1))
+
+    if spec.lower() == "random":
+        # Select 1/3 of total layers, ensured to be even.
+        n = (depth // 3)
+        if n % 2 != 0:
+            n -= 1
+        n = max(2, n)
+        layers = random.sample(range(1, depth + 1), n)
+        return tuple(sorted(layers))
+
+    layers = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            layer = int(chunk)
+        except ValueError:
+            raise ValueError(f"Invalid layer index '{chunk}' in {arg_name}")
+        if layer < 1 or layer > depth:
+            raise ValueError(f"{arg_name} must be within [1, {depth}], got {layer}")
+        layers.append(layer)
+    return tuple(sorted(set(layers)))
+
+
+def build_activation_regularizer_config(args, depth):
+    """Build the optional activation-only regularizer config from CLI flags."""
+    selected_layers = parse_selected_layers(
+        args.regularizer_selected_layers,
+        depth,
+        arg_name="--regularizer-selected-layers",
+    )
+    layer_pairs = build_layer_pairs(selected_layers, args.regularizer_pair_stride)
+    regularizer_config = {
+        "enabled": bool(args.regularizer_enabled),
+        "selected_layers": selected_layers,
+        "pair_stride": int(args.regularizer_pair_stride),
+        "layer_pairs": layer_pairs,
+        "lambda_shared": float(args.regularizer_lambda_shared),
+        "lambda_private": float(args.regularizer_lambda_private),
+        "lambda_sep": float(args.regularizer_lambda_sep),
+        "start_step": int(args.regularizer_start_step),
+        "end_step": (
+            None if args.regularizer_end_step is None else int(args.regularizer_end_step)
+        ),
+        "apply_every": int(args.regularizer_apply_every),
+        "eps": float(args.regularizer_eps),
+    }
+    if regularizer_config["enabled"]:
+        if len(selected_layers) < 2:
+            log_stage("WARNING: Activation regularizer requires at least two layers. Disabling.")
+            regularizer_config["enabled"] = False
+        elif not layer_pairs:
+            log_stage("WARNING: Activation regularizer produced no layer pairs. Disabling.")
+            regularizer_config["enabled"] = False
+    return regularizer_config
+
+
+def compute_training_loss_components(
+    apply_fn,
+    params,
+    x_tau,
+    tau,
+    y,
+    target,
+    drop_rng,
+    global_step,
+    *,
+    hidden_size,
+    regularizer_config=None,
+):
+    """Compute flow-matching loss and optional activation regularizer losses."""
+    regularizer_config = regularizer_config or {}
+    zero_metrics = zero_regularizer_metrics()
+    selected_layers = tuple(regularizer_config.get("selected_layers", ()))
+    layer_pairs = tuple(regularizer_config.get("layer_pairs", ()))
+    regularizer_enabled = bool(
+        regularizer_config.get("enabled", False) and selected_layers and layer_pairs
+    )
+
+    if regularizer_enabled:
+        active_regularizer = regularizer_is_active(
+            global_step,
+            enabled=True,
+            start_step=int(regularizer_config["start_step"]),
+            end_step=regularizer_config["end_step"],
+            apply_every=int(regularizer_config["apply_every"]),
+            num_pairs=len(layer_pairs),
+        )
+        hidden_shape = (
+            len(selected_layers),
+            x_tau.shape[0],
+            x_tau.shape[1],
+            hidden_size,
+        )
+
+        def forward_with_capture(_):
+            res = apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                capture_hidden_layers=selected_layers,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            # res is (pred, captured_layers) because we don't have return_features/summaries active here
+            pred, hidden_layers = res
+            hidden_states = jnp.stack(hidden_layers, axis=0) if isinstance(hidden_layers, (list, tuple)) else hidden_layers
+            return pred, hidden_states
+
+        def forward_without_capture(_):
+            pred = apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            hidden_states = jnp.zeros(hidden_shape, dtype=jnp.float32)
+            return pred, hidden_states
+
+        pred, hidden_states = jax.lax.cond(
+            active_regularizer,
+            forward_with_capture,
+            forward_without_capture,
+            operand=None,
+        )
+        regularizer_metrics = jax.lax.cond(
+            active_regularizer,
+            lambda hs: compute_regularizer_metrics(
+                hs,
+                selected_layers=selected_layers,
+                layer_pairs=layer_pairs,
+                lambda_shared=float(regularizer_config["lambda_shared"]),
+                lambda_private=float(regularizer_config["lambda_private"]),
+                lambda_sep=float(regularizer_config["lambda_sep"]),
+                eps=float(regularizer_config["eps"]),
+            ),
+            lambda _: zero_metrics,
+            hidden_states,
+        )
+    else:
+        pred = apply_fn(
+            {"params": params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+        )
+        regularizer_metrics = zero_metrics
+
+    loss_diff = jnp.mean((pred - target) ** 2)
+    loss_total = loss_diff + regularizer_metrics["loss_reg"]
+    return loss_total, pred, {
+        "loss_total": loss_total,
+        "loss_diff": loss_diff,
+        **regularizer_metrics,
+    }
 
 
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
@@ -501,7 +683,15 @@ def ema_update(ema_params, new_params, decay):
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    global_step,
+    *,
+    hidden_size,
+    regularizer_config=None,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -522,25 +712,31 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
+        loss, pred, loss_metrics = compute_training_loss_components(
+            state.apply_fn,
+            params,
             x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
+            tau,
+            y,
+            target,
+            drop_rng,
+            global_step,
+            hidden_size=hidden_size,
+            regularizer_config=regularizer_config,
         )
-        loss = jnp.mean((pred - target) ** 2)
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, {
+            "v_abs_mean": v_abs_mean,
+            "v_pred_abs_mean": v_pred_abs_mean,
+            **loss_metrics,
+        }
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, aux_metrics), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    aux_metrics = jax.lax.pmean(aux_metrics, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -551,11 +747,18 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/loss_total": aux_metrics["loss_total"],
+        "train/loss_diff": aux_metrics["loss_diff"],
+        "train/loss_reg": aux_metrics["loss_reg"],
+        "train/loss_shared": aux_metrics["loss_shared"],
+        "train/loss_private": aux_metrics["loss_private"],
+        "train/loss_sep": aux_metrics["loss_sep"],
+        "train/num_pairs_used": aux_metrics["num_pairs_used"],
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
+        "train/v_abs_mean": aux_metrics["v_abs_mean"],
+        "train/v_pred_abs_mean": aux_metrics["v_pred_abs_mean"],
     }
     return state, ema_params, metrics, rng
 
@@ -585,6 +788,7 @@ def eval_step(
     loss = jnp.mean((pred - target) ** 2)
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+    regularizer_metrics = zero_regularizer_metrics()
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
@@ -592,6 +796,13 @@ def eval_step(
 
     metrics = {
         "val/loss": loss,
+        "val/loss_total": loss,
+        "val/loss_diff": loss,
+        "val/loss_reg": regularizer_metrics["loss_reg"],
+        "val/loss_shared": regularizer_metrics["loss_shared"],
+        "val/loss_private": regularizer_metrics["loss_private"],
+        "val/loss_sep": regularizer_metrics["loss_sep"],
+        "val/num_pairs_used": regularizer_metrics["num_pairs_used"],
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1115,6 +1326,67 @@ def main():
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
                         help="CFG scale for sample previews. Default 1.0 (no CFG; "
                              "classifier-free training not implemented).")
+    # ── Activation-only regularizer args ──────────────────────────────────────
+    parser.add_argument(
+        "--regularizer-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable activation-only regularizer (decomposes hidden states into shared/private).",
+    )
+    parser.add_argument(
+        "--regularizer-selected-layers",
+        type=str,
+        default="all",
+        help="Comma-separated 1-based block indices (e.g. '1,4,8,12') or 'all' or 'random'.",
+    )
+    parser.add_argument(
+        "--regularizer-pair-stride",
+        type=int,
+        default=1,
+        help="Stride for creating layer pairs from --regularizer-selected-layers (default: 1).",
+    )
+    parser.add_argument(
+        "--regularizer-lambda-shared",
+        type=float,
+        default=0.01,
+        help="Weight for shared alignment loss.",
+    )
+    parser.add_argument(
+        "--regularizer-lambda-private",
+        type=float,
+        default=0.01,
+        help="Weight for private diversity loss.",
+    )
+    parser.add_argument(
+        "--regularizer-lambda-sep",
+        type=float,
+        default=0.01,
+        help="Weight for internal separation loss.",
+    )
+    parser.add_argument(
+        "--regularizer-start-step",
+        type=int,
+        default=0,
+        help="Step to start applying the regularizer.",
+    )
+    parser.add_argument(
+        "--regularizer-end-step",
+        type=int,
+        default=None,
+        help="Step to stop applying the regularizer (None for never).",
+    )
+    parser.add_argument(
+        "--regularizer-apply-every",
+        type=int,
+        default=1,
+        help="Apply regularizer every N steps.",
+    )
+    parser.add_argument(
+        "--regularizer-eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for numerical stability in normalization/cosine.",
+    )
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -1250,6 +1522,13 @@ def main():
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
 
+    regularizer_config = build_activation_regularizer_config(args, depth)
+    if regularizer_config["enabled"]:
+        log_stage(f"Activation regularizer ENABLED on layers: {regularizer_config['selected_layers']}")
+        log_stage(f"Layer pairs ({len(regularizer_config['layer_pairs'])}): {regularizer_config['layer_pairs']}")
+    else:
+        log_stage("Activation regularizer DISABLED.")
+
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
@@ -1295,7 +1574,14 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            hidden_size=config["hidden_size"],
+            regularizer_config=regularizer_config,
+        ),
+        axis_name="batch",
+    )
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -1932,8 +2218,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            global_step_rep = jax_utils.replicate(jnp.array(global_step, dtype=jnp.int32))
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, global_step_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12

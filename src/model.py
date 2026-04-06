@@ -6,7 +6,7 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 """
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -262,6 +262,7 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
+        capture_hidden_layers: Optional[Sequence[int]] = None,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -306,7 +307,10 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
+        captured_layers = [] if capture_hidden_layers else None
+        
         for i in range(self.depth):
+            layer_idx = i + 1
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
@@ -318,9 +322,12 @@ class SelfFlowDiT(nn.Module):
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
             
-            if (i + 1) == return_features:
+            if capture_hidden_layers and layer_idx in capture_hidden_layers:
+                captured_layers.append(x)
+            
+            if layer_idx == return_features:
                 zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
+            elif layer_idx == return_raw_features:
                 zs = x
 
         x = FinalLayer(
@@ -335,16 +342,19 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation negates the final prediction
         x = -x
 
-        if return_block_summaries:
-            block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
-
+        # Logic to return multiple auxiliary outputs in a deterministic order.
+        # Format: (prediction, [features_if_requested], [summaries_if_requested], [captured_layers_if_requested])
+        out = (x,)
         if return_features or return_raw_features:
-            if return_block_summaries:
-                return x, zs, block_summaries
-            return x, zs
+            out += (zs,)
         if return_block_summaries:
-            return x, block_summaries
-        return x
+            out += (jnp.stack(block_summaries, axis=0),)
+        if capture_hidden_layers:
+            out += (tuple(captured_layers),)
+            
+        if len(out) == 1:
+            return out[0]
+        return out
 
     def _shufflechannel(self, x):
         """Reorder channels/patches to match expected output format."""
