@@ -914,12 +914,16 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, ctae_config=No
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
 
-    When ctae_config is provided and enabled, the model is constructed with
-    non-zero ctae_shared_dim / ctae_private_dim so that CTAEBottleneck params
-    are allocated during model.init() — before any training step runs.
+    When ctae_config is enabled, model.init() is called with ctae_enabled=True
+    and the actual layer pairs so that CTAEBottleneck is executed during init
+    and all its params are allocated before the first training step.
+    In Flax, params are only created when a submodule is first *called*, not
+    merely when it is defined in setup().
     """
     ctae_config = ctae_config or {}
     ctae_active = bool(ctae_config.get("enabled", False))
+    ctae_layer_pairs = tuple(ctae_config.get("layer_pairs", ())) if ctae_active else ()
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -945,13 +949,27 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, ctae_config=No
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
-    variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
-        x=dummy_x,
-        timesteps=dummy_t,
-        vector=dummy_vec,
-        deterministic=False,
-    )
+
+    if ctae_active and ctae_layer_pairs:
+        # Pass ctae_enabled=True so CTAEBottleneck is actually called during
+        # init and all its Dense kernel/bias params are created immediately.
+        variables = model.init(
+            {'params': rng, 'dropout': drop_rng},
+            x=dummy_x,
+            timesteps=dummy_t,
+            vector=dummy_vec,
+            deterministic=False,
+            ctae_enabled=True,
+            ctae_layer_pairs=ctae_layer_pairs,
+        )
+    else:
+        variables = model.init(
+            {'params': rng, 'dropout': drop_rng},
+            x=dummy_x,
+            timesteps=dummy_t,
+            vector=dummy_vec,
+            deterministic=False,
+        )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
