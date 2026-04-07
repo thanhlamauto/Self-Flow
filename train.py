@@ -1715,7 +1715,7 @@ def main():
     parser.add_argument(
         "--diversity-block-scope",
         type=str,
-        default="mid_only",
+        default="all_blocks",
         choices=DIVERSITY_BLOCK_SCOPES,
         help="Which transformer blocks contribute to phase-2 diversity loss. "
              "'mid_only' keeps only blocks in [L/4, 3L/4).",
@@ -1724,13 +1724,13 @@ def main():
         "--diversity-exclude-adjacent-pairs",
         dest="diversity_exclude_adjacent_pairs",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Exclude adjacent transformer block pairs from phase-2 diversity loss.",
     )
     parser.add_argument(
         "--diversity-max-pairs-per-step",
         type=int,
-        default=8,
+        default=10,
         help="Maximum number of valid block pairs sampled per step for phase-2 diversity. "
              "Use 0 to include all valid pairs.",
     )
