@@ -413,12 +413,14 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, parse_layer_pairs_from_string
 from src.activation_regularizer import (
     build_layer_pairs,
     compute_regularizer_metrics,
     regularizer_is_active,
     zero_regularizer_metrics,
+    zero_ctae_metrics,
+    compute_ctae_losses,
 )
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -508,6 +510,79 @@ def build_activation_regularizer_config(args, depth):
     return regularizer_config
 
 
+def build_ctae_config(args, depth: int) -> dict:
+    """Build the CTAE feature bottleneck config from CLI flags.
+
+    When ``--ctae-feature-enabled`` is False (default), returns
+    ``{"enabled": False}`` and all other fields are absent.  This ensures
+    existing training behavior is fully preserved.
+
+    Args:
+        args:  Parsed argparse namespace.
+        depth: Backbone transformer depth (number of DiT blocks).
+
+    Returns:
+        Config dict consumed by ``compute_training_loss_components``.
+    """
+    if not bool(args.ctae_feature_enabled):
+        return {"enabled": False}
+
+    raw_pairs_spec = args.ctae_selected_layer_pairs
+    if not raw_pairs_spec:
+        log_stage(
+            "WARNING: --ctae-feature-enabled is set but --ctae-selected-layer-pairs "
+            "is empty. Disabling CTAE."
+        )
+        return {"enabled": False}
+
+    try:
+        layer_pairs = parse_layer_pairs_from_string(raw_pairs_spec)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --ctae-selected-layer-pairs '{raw_pairs_spec}': {exc}"
+        ) from exc
+
+    if not layer_pairs:
+        log_stage("WARNING: --ctae-selected-layer-pairs produced no valid pairs. Disabling CTAE.")
+        return {"enabled": False}
+
+    # Validate all referenced layer indices are within backbone depth.
+    for la, lb in layer_pairs:
+        if la < 1 or la > depth:
+            raise ValueError(
+                f"--ctae-selected-layer-pairs: layer {la} is out of range [1, {depth}]."
+            )
+        if lb < 1 or lb > depth:
+            raise ValueError(
+                f"--ctae-selected-layer-pairs: layer {lb} is out of range [1, {depth}]."
+            )
+
+    orth_start = int(args.ctae_orth_start_step)
+    if orth_start == 0:
+        log_stage(
+            "WARNING: --ctae-orth-start-step is 0. "
+            "Cross-block orthogonality will be active from step 0. "
+            "The plan requires orthogonality must NOT be enabled from step 0; "
+            "set --ctae-orth-start-step >= 1."
+        )
+
+    return {
+        "enabled": True,
+        "layer_pairs": tuple(layer_pairs),
+        "shared_dim": int(args.ctae_shared_dim),
+        "private_dim": int(args.ctae_private_dim),
+        "lambda_shared": float(args.ctae_lambda_shared),
+        "lambda_align": float(args.ctae_lambda_align),
+        "lambda_orth": float(args.ctae_lambda_orth),
+        "start_step": int(args.ctae_start_step),
+        "align_start_step": int(args.ctae_align_start_step),
+        "orth_start_step": orth_start,
+        "apply_every": int(args.ctae_apply_every),
+        # aux heads always built in v1 for monitoring; loss never added to total.
+        "use_aux_heads": True,
+    }
+
+
 def compute_training_loss_components(
     apply_fn,
     params,
@@ -520,48 +595,141 @@ def compute_training_loss_components(
     *,
     hidden_size,
     regularizer_config=None,
+    ctae_config=None,
 ):
-    """Compute flow-matching loss and optional activation regularizer losses."""
+    """Compute flow-matching loss and optional activation regularizer losses.
+
+    Supports two independent auxiliary regularizer paths:
+
+    * **Legacy cosine regularizer** (``regularizer_config``): unchanged from the
+      ``feat/sit-activation-only-regularizer`` branch.
+    * **CTAE feature bottleneck** (``ctae_config``): new explicit-slot routing
+      losses.  Aux A/B prediction metrics are computed but **never** added to
+      ``loss_total``.
+
+    Warmup phases for CTAE:
+        phase 1 (step < ctae_start_step):        diffusion loss only
+        phase 2 (step >= ctae_start_step):       + shared + align
+        phase 3 (step >= ctae_orth_start_step):  + orth
+
+    Args:
+        apply_fn:            ``model.apply`` bound function.
+        params:              Current online model parameters.
+        x_tau:               Noisy latent.  Shape: [B, T, D].
+        tau:                 Flow timesteps.  Shape: [B].
+        y:                   Class labels.  Shape: [B].
+        target:              Denoising velocity target.  Shape: [B, T, D].
+        drop_rng:            PRNG key for dropout.
+        global_step:         Current training step (JAX scalar).
+        hidden_size:         Backbone hidden dimension.
+        regularizer_config:  Legacy cosine-regularizer config dict or None.
+        ctae_config:         CTAE config dict from ``build_ctae_config`` or None.
+
+    Returns:
+        ``(loss_total, pred, metrics_dict)``
+    """
     regularizer_config = regularizer_config or {}
-    zero_metrics = zero_regularizer_metrics()
+    ctae_config = ctae_config or {}
+
+    zero_reg_metrics = zero_regularizer_metrics()
+    zero_ctae = zero_ctae_metrics()
+
+    # ── Legacy cosine regularizer ─────────────────────────────────────────────
     selected_layers = tuple(regularizer_config.get("selected_layers", ()))
     layer_pairs = tuple(regularizer_config.get("layer_pairs", ()))
     regularizer_enabled = bool(
         regularizer_config.get("enabled", False) and selected_layers and layer_pairs
     )
 
-    if regularizer_enabled:
-        active_regularizer = regularizer_is_active(
-            global_step,
-            enabled=True,
-            start_step=int(regularizer_config["start_step"]),
-            end_step=regularizer_config["end_step"],
-            apply_every=int(regularizer_config["apply_every"]),
-            num_pairs=len(layer_pairs),
-        )
-        hidden_shape = (
-            len(selected_layers),
-            x_tau.shape[0],
-            x_tau.shape[1],
-            hidden_size,
-        )
+    # ── CTAE feature bottleneck ───────────────────────────────────────────────
+    ctae_enabled = bool(ctae_config.get("enabled", False))
+    ctae_layer_pairs = tuple(ctae_config.get("layer_pairs", ())) if ctae_enabled else ()
+    ctae_shared_dim = int(ctae_config.get("shared_dim", 256))
+    ctae_private_dim = int(ctae_config.get("private_dim", 128))
+    ctae_use_aux_heads = bool(ctae_config.get("use_aux_heads", False))
+    ctae_start_step = int(ctae_config.get("start_step", 0))
+    ctae_align_start_step = int(ctae_config.get("align_start_step", 0))
+    ctae_orth_start_step = int(ctae_config.get("orth_start_step", 1000))
+    ctae_apply_every = int(ctae_config.get("apply_every", 1))
 
-        def forward_with_capture(_):
-            res = apply_fn(
-                {"params": params},
-                x_tau,
+    step = jnp.asarray(global_step)
+
+    # CTAE is active on this step if enabled and past start_step (and apply_every check).
+    if ctae_enabled and ctae_layer_pairs:
+        ctae_active_base = step >= jnp.asarray(ctae_start_step, dtype=step.dtype)
+        if ctae_apply_every > 1:
+            delta = step - jnp.asarray(ctae_start_step, dtype=step.dtype)
+            ctae_active_base = jnp.logical_and(
+                ctae_active_base,
+                jnp.equal(jnp.mod(delta, ctae_apply_every), 0),
+            )
+        # Alignment: active when past align_start_step
+        ctae_align_active = jnp.logical_and(
+            ctae_active_base,
+            step >= jnp.asarray(ctae_align_start_step, dtype=step.dtype),
+        )
+        # Orthogonality: only active past orth_start_step (must not be step 0)
+        ctae_orth_active = jnp.logical_and(
+            ctae_active_base,
+            step >= jnp.asarray(ctae_orth_start_step, dtype=step.dtype),
+        )
+    else:
+        ctae_active_base = jnp.asarray(False)
+        ctae_align_active = jnp.asarray(False)
+        ctae_orth_active = jnp.asarray(False)
+
+    # ── Single model forward pass ─────────────────────────────────────────────
+    # We run the forward pass once, requesting all necessary captures.
+    # The legacy regularizer path and the CTAE path may both need hidden states;
+    # we request union of required layers to avoid a second forward pass.
+
+    if regularizer_enabled or ctae_enabled:
+        # Determine which CTAE pairs to pass at trace time (static; no JAX dynamic)
+        ctae_pairs_for_call = ctae_layer_pairs if (ctae_enabled and ctae_layer_pairs) else None
+
+        def _forward_full(_):
+            """Forward with hidden capture and CTAE (if enabled)."""
+            call_kwargs = dict(
                 timesteps=tau,
                 vector=y,
-                capture_hidden_layers=selected_layers,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            # res is (pred, captured_layers) because we don't have return_features/summaries active here
-            pred, hidden_layers = res
-            hidden_states = jnp.stack(hidden_layers, axis=0) if isinstance(hidden_layers, (list, tuple)) else hidden_layers
-            return pred, hidden_states
+            if regularizer_enabled:
+                call_kwargs["capture_hidden_layers"] = selected_layers
+            if ctae_enabled and ctae_pairs_for_call:
+                call_kwargs["ctae_enabled"] = True
+                call_kwargs["ctae_layer_pairs"] = ctae_pairs_for_call
+                call_kwargs["ctae_shared_dim"] = ctae_shared_dim
+                call_kwargs["ctae_private_dim"] = ctae_private_dim
+                call_kwargs["ctae_use_aux_heads"] = ctae_use_aux_heads
 
-        def forward_without_capture(_):
+            res = apply_fn({"params": params}, x_tau, **call_kwargs)
+
+            # res tuple layout (all optional extras are appended in fixed order):
+            #   (pred, [zs], [block_summaries], [legacy_captured], [ctae_outputs])
+            # We only ever set capture_hidden_layers and ctae_enabled here, so:
+            #   - return_features / return_block_summaries are NOT set
+            #   - Order: pred [, legacy_captured] [, ctae_outputs]
+            if not isinstance(res, tuple):
+                # No extras requested
+                pred = res
+                hidden_layers = ()
+                ctae_out = None
+            else:
+                pred = res[0]
+                rest = res[1:]
+                hidden_layers = ()
+                ctae_out = None
+                for elem in rest:
+                    if isinstance(elem, (list, tuple)):
+                        hidden_layers = elem
+                    elif isinstance(elem, dict):
+                        ctae_out = elem
+            return pred, hidden_layers, ctae_out
+
+        def _forward_plain(_):
+            """Plain forward (regularizer not active this step)."""
             pred = apply_fn(
                 {"params": params},
                 x_tau,
@@ -570,30 +738,153 @@ def compute_training_loss_components(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            hidden_states = jnp.zeros(hidden_shape, dtype=jnp.float32)
-            return pred, hidden_states
+            return pred, (), None
 
-        pred, hidden_states = jax.lax.cond(
-            active_regularizer,
-            forward_with_capture,
-            forward_without_capture,
+        # Determine whether we need to do the full capture forward.
+        needs_full = jnp.logical_or(
+            regularizer_is_active(
+                global_step,
+                enabled=regularizer_enabled,
+                start_step=int(regularizer_config.get("start_step", 0)),
+                end_step=regularizer_config.get("end_step"),
+                apply_every=int(regularizer_config.get("apply_every", 1)),
+                num_pairs=len(layer_pairs),
+            ),
+            ctae_active_base if ctae_enabled else jnp.asarray(False),
+        )
+
+        # Build dummy outputs for the false branch so both branches have same pytree.
+        # Hidden states shape: [num_selected, B, T, D]
+        hidden_shape = (
+            len(selected_layers),
+            x_tau.shape[0],
+            x_tau.shape[1],
+            hidden_size,
+        )
+
+        # Build dummy ctae_outputs pytree for the false branch so jax.lax.cond
+        # can verify matching output structures.
+        if ctae_enabled and ctae_pairs_for_call:
+            _num_pairs = len(ctae_pairs_for_call)
+            _B, _T = x_tau.shape[0], x_tau.shape[1]
+            _dummy_ctae = {
+                "pair_indices": jnp.zeros((_num_pairs, 2), dtype=jnp.int32),
+                "s_a": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
+                "s_b": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
+                "s_fused": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
+                "p_a": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim)),
+                "p_b": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim)),
+                "aux_shared_pred": jnp.zeros((_num_pairs, _B, _T, hidden_size)),
+                "aux_a_pred": (
+                    jnp.zeros((_num_pairs, _B, _T, hidden_size))
+                    if ctae_use_aux_heads else None
+                ),
+                "aux_b_pred": (
+                    jnp.zeros((_num_pairs, _B, _T, hidden_size))
+                    if ctae_use_aux_heads else None
+                ),
+            }
+        else:
+            _dummy_ctae = None
+
+        _dummy_hidden = tuple(
+            jnp.zeros((x_tau.shape[0], x_tau.shape[1], hidden_size))
+            for _ in range(len(selected_layers))
+        )
+        _dummy_pred = jnp.zeros_like(x_tau)
+
+        def _forward_false(_):
+            return _dummy_pred, _dummy_hidden, _dummy_ctae
+
+        pred, hidden_layers, ctae_out = jax.lax.cond(
+            needs_full,
+            _forward_full,
+            _forward_false,
             operand=None,
         )
-        regularizer_metrics = jax.lax.cond(
-            active_regularizer,
-            lambda hs: compute_regularizer_metrics(
-                hs,
-                selected_layers=selected_layers,
-                layer_pairs=layer_pairs,
-                lambda_shared=float(regularizer_config["lambda_shared"]),
-                lambda_private=float(regularizer_config["lambda_private"]),
-                lambda_sep=float(regularizer_config["lambda_sep"]),
-                eps=float(regularizer_config["eps"]),
-            ),
-            lambda _: zero_metrics,
-            hidden_states,
-        )
+
+        # ── Legacy regularizer metrics ────────────────────────────────────────
+        if regularizer_enabled:
+            active_reg = regularizer_is_active(
+                global_step,
+                enabled=True,
+                start_step=int(regularizer_config["start_step"]),
+                end_step=regularizer_config.get("end_step"),
+                apply_every=int(regularizer_config["apply_every"]),
+                num_pairs=len(layer_pairs),
+            )
+            hidden_states = jnp.stack(hidden_layers, axis=0) if hidden_layers else jnp.zeros(hidden_shape)
+            regularizer_metrics = jax.lax.cond(
+                active_reg,
+                lambda hs: compute_regularizer_metrics(
+                    hs,
+                    selected_layers=selected_layers,
+                    layer_pairs=layer_pairs,
+                    lambda_shared=float(regularizer_config["lambda_shared"]),
+                    lambda_private=float(regularizer_config["lambda_private"]),
+                    lambda_sep=float(regularizer_config["lambda_sep"]),
+                    eps=float(regularizer_config["eps"]),
+                ),
+                lambda _: zero_reg_metrics,
+                hidden_states,
+            )
+        else:
+            regularizer_metrics = zero_reg_metrics
+
+        # ── CTAE losses ───────────────────────────────────────────────────────
+        if ctae_enabled and ctae_pairs_for_call:
+            # We pass orth_active as a Python bool derived from ctae_orth_active.
+            # Because ctae_orth_active is a JAX traced bool, we use jax.lax.cond
+            # to select between losses-with-orth and losses-without-orth.
+            def _ctae_with_orth(_ctae_out):
+                return compute_ctae_losses(
+                    _ctae_out,
+                    target,
+                    lambda_shared=float(ctae_config["lambda_shared"]),
+                    lambda_align=float(ctae_config["lambda_align"]),
+                    lambda_orth=float(ctae_config["lambda_orth"]),
+                    orth_active=True,
+                    eps=1e-6,
+                )
+
+            def _ctae_without_orth(_ctae_out):
+                return compute_ctae_losses(
+                    _ctae_out,
+                    target,
+                    lambda_shared=float(ctae_config["lambda_shared"]),
+                    lambda_align=float(ctae_config["lambda_align"]),
+                    lambda_orth=float(ctae_config["lambda_orth"]),
+                    orth_active=False,
+                    eps=1e-6,
+                )
+
+            def _ctae_zero(_):
+                m = zero_ctae
+                m = dict(m)
+                m["ctae_loss_total"] = jnp.array(0.0, dtype=jnp.float32)
+                return m
+
+            # Step 1: compute losses (with or without orth) only when CTAE is active.
+            def _compute_ctae(ctae_out):
+                return jax.lax.cond(
+                    ctae_orth_active,
+                    _ctae_with_orth,
+                    _ctae_without_orth,
+                    ctae_out,
+                )
+
+            ctae_metrics = jax.lax.cond(
+                ctae_active_base,
+                _compute_ctae,
+                _ctae_zero,
+                ctae_out,
+            )
+        else:
+            ctae_metrics = dict(zero_ctae)
+            ctae_metrics["ctae_loss_total"] = jnp.array(0.0, dtype=jnp.float32)
+
     else:
+        # Both regularizers disabled: plain forward pass.
         pred = apply_fn(
             {"params": params},
             x_tau,
@@ -602,14 +893,21 @@ def compute_training_loss_components(
             deterministic=False,
             rngs={"dropout": drop_rng},
         )
-        regularizer_metrics = zero_metrics
+        regularizer_metrics = zero_reg_metrics
+        ctae_metrics = dict(zero_ctae)
+        ctae_metrics["ctae_loss_total"] = jnp.array(0.0, dtype=jnp.float32)
 
+    # ── Total loss ────────────────────────────────────────────────────────────
+    # loss_total = loss_diff + legacy_loss_reg + ctae_loss_total
+    # Aux A/B predictions are deliberately excluded from loss_total.
     loss_diff = jnp.mean((pred - target) ** 2)
-    loss_total = loss_diff + regularizer_metrics["loss_reg"]
+    loss_total = loss_diff + regularizer_metrics["loss_reg"] + ctae_metrics["ctae_loss_total"]
+
     return loss_total, pred, {
         "loss_total": loss_total,
         "loss_diff": loss_diff,
         **regularizer_metrics,
+        **{k: v for k, v in ctae_metrics.items() if k != "ctae_loss_total"},
     }
 
 
@@ -692,6 +990,7 @@ def train_step(
     *,
     hidden_size,
     regularizer_config=None,
+    ctae_config=None,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -699,6 +998,13 @@ def train_step(
       x_tau   = (1 - tau) * x1 + tau * x0
       target  = x0 - x1
       loss    = E[||v_theta(x_tau, tau) - target||^2]
+
+    When CTAE is enabled (ctae_config), the loss is extended as:
+      loss_total = loss_diff
+                 + lambda_shared * loss_shared   (step >= ctae_start_step)
+                 + lambda_align  * loss_align    (step >= ctae_align_start_step)
+                 + lambda_orth   * loss_orth     (step >= ctae_orth_start_step)
+    Aux A/B prediction metrics are logged but NOT included in loss_total.
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
@@ -723,6 +1029,7 @@ def train_step(
             global_step,
             hidden_size=hidden_size,
             regularizer_config=regularizer_config,
+            ctae_config=ctae_config,
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -746,14 +1053,33 @@ def train_step(
     ema_params = ema_update(ema_params, state.params, ema_decay)
 
     metrics = {
+        # ── Core losses ───────────────────────────────────────────────────────
         "train/loss": loss,
         "train/loss_total": aux_metrics["loss_total"],
         "train/loss_diff": aux_metrics["loss_diff"],
+        # ── Legacy cosine regularizer metrics ─────────────────────────────────
         "train/loss_reg": aux_metrics["loss_reg"],
         "train/loss_shared": aux_metrics["loss_shared"],
         "train/loss_private": aux_metrics["loss_private"],
         "train/loss_sep": aux_metrics["loss_sep"],
         "train/num_pairs_used": aux_metrics["num_pairs_used"],
+        # ── CTAE slot losses (in loss_total) ──────────────────────────────────
+        "train/ctae_loss_shared": aux_metrics["ctae_loss_shared"],
+        "train/ctae_loss_align": aux_metrics["ctae_loss_align"],
+        "train/ctae_loss_orth": aux_metrics["ctae_loss_orth"],
+        # ── CTAE leakage / sanity monitoring ──────────────────────────────────
+        "train/shared_norm": aux_metrics["shared_norm"],
+        "train/private_a_norm": aux_metrics["private_a_norm"],
+        "train/private_b_norm": aux_metrics["private_b_norm"],
+        "train/cosine_shared_private_a": aux_metrics["cosine_shared_private_a"],
+        "train/cosine_shared_private_b": aux_metrics["cosine_shared_private_b"],
+        "train/cosine_private_a_private_b": aux_metrics["cosine_private_a_private_b"],
+        # ── Aux A/B prediction metrics (monitoring only, not in loss) ─────────
+        "train/aux_shared_pred_metric": aux_metrics["aux_shared_pred_metric"],
+        "train/aux_a_pred_metric": aux_metrics["aux_a_pred_metric"],
+        "train/aux_b_pred_metric": aux_metrics["aux_b_pred_metric"],
+        "train/ctae_num_pairs_used": aux_metrics["ctae_num_pairs_used"],
+        # ── Optimizer diagnostics ─────────────────────────────────────────────
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -766,7 +1092,11 @@ def train_step(
 def eval_step(
     state, ema_params, batch, rng,
 ):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
+    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher).
+
+    CTAE outputs are not computed at eval time in v1 (deterministic pass with
+    no hidden capture).  All CTAE metrics are logged as zero.
+    """
     x0, y = batch
     local_batch = x0.shape[0]
 
@@ -789,20 +1119,40 @@ def eval_step(
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
     regularizer_metrics = zero_regularizer_metrics()
+    ctae_metrics = zero_ctae_metrics()
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
+        # ── Core losses ───────────────────────────────────────────────────────
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_diff": loss,
+        # ── Legacy cosine regularizer metrics ─────────────────────────────────
         "val/loss_reg": regularizer_metrics["loss_reg"],
         "val/loss_shared": regularizer_metrics["loss_shared"],
         "val/loss_private": regularizer_metrics["loss_private"],
         "val/loss_sep": regularizer_metrics["loss_sep"],
         "val/num_pairs_used": regularizer_metrics["num_pairs_used"],
+        # ── CTAE slot losses ──────────────────────────────────────────────────
+        "val/ctae_loss_shared": ctae_metrics["ctae_loss_shared"],
+        "val/ctae_loss_align": ctae_metrics["ctae_loss_align"],
+        "val/ctae_loss_orth": ctae_metrics["ctae_loss_orth"],
+        # ── CTAE leakage / sanity monitoring ──────────────────────────────────
+        "val/shared_norm": ctae_metrics["shared_norm"],
+        "val/private_a_norm": ctae_metrics["private_a_norm"],
+        "val/private_b_norm": ctae_metrics["private_b_norm"],
+        "val/cosine_shared_private_a": ctae_metrics["cosine_shared_private_a"],
+        "val/cosine_shared_private_b": ctae_metrics["cosine_shared_private_b"],
+        "val/cosine_private_a_private_b": ctae_metrics["cosine_private_a_private_b"],
+        # ── Aux A/B monitoring ────────────────────────────────────────────────
+        "val/aux_shared_pred_metric": ctae_metrics["aux_shared_pred_metric"],
+        "val/aux_a_pred_metric": ctae_metrics["aux_a_pred_metric"],
+        "val/aux_b_pred_metric": ctae_metrics["aux_b_pred_metric"],
+        "val/ctae_num_pairs_used": ctae_metrics["ctae_num_pairs_used"],
+        # ── Diagnostics ───────────────────────────────────────────────────────
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1387,6 +1737,99 @@ def main():
         default=1e-6,
         help="Epsilon for numerical stability in normalization/cosine.",
     )
+    # ── CTAE feature bottleneck args ──────────────────────────────────────────
+    # These flags are independent from the legacy --regularizer-* flags above.
+    # Both can be enabled simultaneously; they add separate auxiliary losses.
+    parser.add_argument(
+        "--ctae-feature-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable CTAE-inspired feature bottleneck. "
+            "When enabled, selected layer pairs are used as two internal views; "
+            "a shared bottleneck learns shared/private routing. "
+            "All existing --regularizer-* behavior is preserved unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--ctae-selected-layer-pairs",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated layer pairs in A:B format, e.g. '3:6,6:9,9:12'. "
+            "Each pair (A, B) defines two internal views for the CTAE bottleneck. "
+            "Required when --ctae-feature-enabled is set."
+        ),
+    )
+    parser.add_argument(
+        "--ctae-shared-dim",
+        type=int,
+        default=256,
+        help="Dimensionality of the shared slot in the CTAE bottleneck (default: 256).",
+    )
+    parser.add_argument(
+        "--ctae-private-dim",
+        type=int,
+        default=128,
+        help="Dimensionality of each private slot in the CTAE bottleneck (default: 128).",
+    )
+    parser.add_argument(
+        "--ctae-lambda-shared",
+        type=float,
+        default=0.1,
+        help="Weight for the shared-only prediction loss (main CTAE objective, default: 0.1).",
+    )
+    parser.add_argument(
+        "--ctae-lambda-align",
+        type=float,
+        default=0.01,
+        help="Weight for the shared alignment loss L_align (default: 0.01).",
+    )
+    parser.add_argument(
+        "--ctae-lambda-orth",
+        type=float,
+        default=0.01,
+        help="Weight for cross-block orthogonality loss (default: 0.01).",
+    )
+    parser.add_argument(
+        "--ctae-start-step",
+        type=int,
+        default=0,
+        help="Step at which to start applying CTAE shared + align losses (default: 0).",
+    )
+    parser.add_argument(
+        "--ctae-align-start-step",
+        type=int,
+        default=0,
+        help="Step at which to start applying the CTAE alignment loss (default: 0).",
+    )
+    parser.add_argument(
+        "--ctae-orth-start-step",
+        type=int,
+        default=1000,
+        help=(
+            "Step at which to start applying cross-block orthogonality. "
+            "Must be > 0; orthogonality is never applied from step 0 (default: 1000)."
+        ),
+    )
+    parser.add_argument(
+        "--ctae-apply-every",
+        type=int,
+        default=1,
+        help="Apply CTAE losses every N steps (default: 1 = every step).",
+    )
+    # Reserved / no-op flag: kept for future use; wiring intentionally omitted in v1.
+    parser.add_argument(
+        "--ctae-detach-main-target",
+        action="store_true",
+        default=False,
+        help=(
+            "[RESERVED / NO-OP in v1] "
+            "Detach the main denoising target before passing it to CTAE heads. "
+            "This flag is accepted but has no effect in the current implementation. "
+            "Reserved for a future version; do not rely on its behavior."
+        ),
+    )
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -1529,6 +1972,25 @@ def main():
     else:
         log_stage("Activation regularizer DISABLED.")
 
+    ctae_config = build_ctae_config(args, depth)
+    if ctae_config.get("enabled"):
+        log_stage(
+            f"CTAE feature bottleneck ENABLED. "
+            f"Pairs: {ctae_config['layer_pairs']}  "
+            f"shared_dim={ctae_config['shared_dim']}  private_dim={ctae_config['private_dim']}"
+        )
+        log_stage(
+            f"  lambdas: shared={ctae_config['lambda_shared']}  "
+            f"align={ctae_config['lambda_align']}  orth={ctae_config['lambda_orth']}"
+        )
+        log_stage(
+            f"  warmup: start={ctae_config['start_step']}  "
+            f"align_start={ctae_config['align_start_step']}  "
+            f"orth_start={ctae_config['orth_start_step']}"
+        )
+    else:
+        log_stage("CTAE feature bottleneck DISABLED.")
+
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
@@ -1579,6 +2041,7 @@ def main():
             train_step,
             hidden_size=config["hidden_size"],
             regularizer_config=regularizer_config,
+            ctae_config=ctae_config,
         ),
         axis_name="batch",
     )

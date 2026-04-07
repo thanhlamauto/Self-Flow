@@ -45,6 +45,57 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size):
     return pos_embed
 
 
+def parse_layer_pairs_from_string(spec: str) -> list[tuple[int, int]]:
+    """Parse a colon-separated pair string into a list of (int, int) tuples.
+
+    Args:
+        spec: Comma-separated layer pairs in ``A:B`` format, e.g. ``"3:6,6:9,9:12"``.
+
+    Returns:
+        List of ``(layer_a, layer_b)`` integer tuples, deduplicated in order.
+
+    Raises:
+        ValueError: If any token is not in ``A:B`` format or indices are non-positive.
+
+    Example::
+
+        parse_layer_pairs_from_string("3:6,6:9")  # -> [(3, 6), (6, 9)]
+    """
+    if not spec or not spec.strip():
+        return []
+
+    seen: set[tuple[int, int]] = set()
+    pairs: list[tuple[int, int]] = []
+    for token in spec.strip().split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid layer pair token '{token}': expected format 'A:B', e.g. '3:6'."
+            )
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            raise ValueError(
+                f"Invalid layer pair token '{token}': both A and B must be integers."
+            )
+        if a < 1 or b < 1:
+            raise ValueError(
+                f"Layer indices must be >= 1, got '{token}'."
+            )
+        if a == b:
+            raise ValueError(
+                f"Layer pair '{token}' has identical indices; A and B must differ."
+            )
+        key = (a, b)
+        if key not in seen:
+            seen.add(key)
+            pairs.append(key)
+    return pairs
+
+
 class PatchedPatchEmbed(nn.Module):
     """Simplified Sequence to Patch Embedding using Linear layer."""
     img_size: int = 224
@@ -102,7 +153,7 @@ class LabelEmbedder(nn.Module):
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
         use_cfg_embedding = self.dropout_prob > 0
         embedding_table = nn.Embed(
-            num_embeddings=self.num_classes + use_cfg_embedding, 
+            num_embeddings=self.num_classes + use_cfg_embedding,
             features=self.hidden_size
         )
 
@@ -130,7 +181,7 @@ class DiTBlock(nn.Module):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
@@ -140,14 +191,14 @@ class DiTBlock(nn.Module):
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
-            
+
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
             # Self Attention
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa * attn
-            
+
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
                 nn.Dense(mlp_hidden_dim),
@@ -161,13 +212,13 @@ class DiTBlock(nn.Module):
                 nn.Dense(6 * self.hidden_size)
             ])(c)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
-            
+
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
-            
+
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
                 nn.Dense(mlp_hidden_dim),
@@ -175,7 +226,7 @@ class DiTBlock(nn.Module):
                 nn.Dense(self.hidden_size)
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
-            
+
         return x
 
 
@@ -190,7 +241,7 @@ class FinalLayer(nn.Module):
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
@@ -200,7 +251,7 @@ class FinalLayer(nn.Module):
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
-            
+
             x = modulate_per_token(norm_final(x), shift, scale)
             x = linear(x)
         else:
@@ -209,10 +260,10 @@ class FinalLayer(nn.Module):
                 nn.Dense(2 * self.hidden_size)
             ])(c)
             shift, scale = jnp.split(modulation, 2, axis=1)
-            
+
             x = modulate(norm_final(x), shift, scale)
             x = linear(x)
-            
+
         return x
 
 
@@ -227,6 +278,117 @@ class SimpleHead(nn.Module):
         x = nn.swish(x)
         x = nn.Dense(self.out_dim)(x)
         return x
+
+
+class CTAEBottleneck(nn.Module):
+    """CTAE-inspired shared/private bottleneck, shared across all layer pairs.
+
+    A single instance of this module is reused for every selected pair
+    (h_a, h_b) during a forward pass.  The shared projector maps each hidden
+    state to a low-dimensional shared subspace; the private projectors capture
+    the layer-specific residual.  An optional pair of auxiliary prediction
+    heads can be built for monitoring (their outputs must NOT be included in
+    the training loss in v1).
+
+    Attributes:
+        hidden_dim:   Backbone hidden size (input feature dimension).
+        shared_dim:   Dimensionality of the shared slot.
+        private_dim:  Dimensionality of each private slot.
+        out_dim:      Output dimension of all prediction heads
+                      (typically equals hidden_dim to predict the denoising target).
+        use_aux_heads: Whether to build and call aux_a_head / aux_b_head.
+                       Even when True, their outputs are monitoring-only.
+    """
+
+    hidden_dim: int
+    shared_dim: int
+    private_dim: int
+    out_dim: int
+    use_aux_heads: bool = False
+
+    @nn.compact
+    def __call__(
+        self,
+        h_a: jax.Array,
+        h_b: jax.Array,
+    ) -> dict:
+        """Compute shared and private projections for one layer pair.
+
+        Args:
+            h_a: Hidden state from layer A.  Shape: [B, T, hidden_dim].
+            h_b: Hidden state from layer B.  Shape: [B, T, hidden_dim].
+
+        Returns:
+            Dict with keys:
+                s_a           [B, T, shared_dim]
+                s_b           [B, T, shared_dim]
+                s_fused       [B, T, shared_dim]  -- 0.5*(s_a + s_b)
+                p_a           [B, T, private_dim]
+                p_b           [B, T, private_dim]
+                aux_shared_pred [B, T, out_dim]   -- prediction from s_fused
+                aux_a_pred    [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
+                aux_b_pred    [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
+        """
+        # ── Shared projection (same weights for both views) ───────────────────
+        # shared_proj: hidden_dim -> shared_dim (two-layer MLP with swish)
+        # [B, T, hidden_dim] -> [B, T, shared_dim]
+        s_a = nn.Dense(self.shared_dim, name="shared_proj_l1")(h_a)
+        s_a = nn.swish(s_a)
+        s_a = nn.Dense(self.shared_dim, name="shared_proj_l2")(s_a)
+
+        s_b = nn.Dense(self.shared_dim, name="shared_proj_l1")(h_b)
+        s_b = nn.swish(s_b)
+        s_b = nn.Dense(self.shared_dim, name="shared_proj_l2")(s_b)
+
+        # ── Fused shared: average of both views ───────────────────────────────
+        # [B, T, shared_dim]
+        s_fused = 0.5 * (s_a + s_b)
+
+        # ── Private projections (separate weights per role) ───────────────────
+        # private_a_proj: hidden_dim -> private_dim
+        # [B, T, hidden_dim] -> [B, T, private_dim]
+        p_a = nn.Dense(self.private_dim, name="private_a_proj_l1")(h_a)
+        p_a = nn.swish(p_a)
+        p_a = nn.Dense(self.private_dim, name="private_a_proj_l2")(p_a)
+
+        # private_b_proj: hidden_dim -> private_dim
+        # [B, T, hidden_dim] -> [B, T, private_dim]
+        p_b = nn.Dense(self.private_dim, name="private_b_proj_l1")(h_b)
+        p_b = nn.swish(p_b)
+        p_b = nn.Dense(self.private_dim, name="private_b_proj_l2")(p_b)
+
+        # ── Shared-only prediction head (main CTAE objective in v1) ──────────
+        # Input: s_fused [B, T, shared_dim] -> output: [B, T, out_dim]
+        aux_shared_pred = nn.Dense(self.shared_dim + self.out_dim, name="shared_only_head_l1")(s_fused)
+        aux_shared_pred = nn.swish(aux_shared_pred)
+        aux_shared_pred = nn.Dense(self.out_dim, name="shared_only_head_l2")(aux_shared_pred)
+
+        # ── Aux A/B prediction heads (monitoring only; NOT in loss_total) ─────
+        aux_a_pred = None
+        aux_b_pred = None
+        if self.use_aux_heads:
+            # aux_a_input = concat([s_fused, p_a], dim=-1) [B, T, shared_dim + private_dim]
+            aux_a_input = jnp.concatenate([s_fused, p_a], axis=-1)
+            aux_a_pred = nn.Dense(self.shared_dim + self.private_dim + self.out_dim, name="aux_a_head_l1")(aux_a_input)
+            aux_a_pred = nn.swish(aux_a_pred)
+            aux_a_pred = nn.Dense(self.out_dim, name="aux_a_head_l2")(aux_a_pred)
+
+            # aux_b_input = concat([s_fused, p_b], dim=-1) [B, T, shared_dim + private_dim]
+            aux_b_input = jnp.concatenate([s_fused, p_b], axis=-1)
+            aux_b_pred = nn.Dense(self.shared_dim + self.private_dim + self.out_dim, name="aux_b_head_l1")(aux_b_input)
+            aux_b_pred = nn.swish(aux_b_pred)
+            aux_b_pred = nn.Dense(self.out_dim, name="aux_b_head_l2")(aux_b_pred)
+
+        return {
+            "s_a": s_a,                     # [B, T, shared_dim]
+            "s_b": s_b,                     # [B, T, shared_dim]
+            "s_fused": s_fused,             # [B, T, shared_dim]
+            "p_a": p_a,                     # [B, T, private_dim]
+            "p_b": p_b,                     # [B, T, private_dim]
+            "aux_shared_pred": aux_shared_pred,  # [B, T, out_dim]
+            "aux_a_pred": aux_a_pred,       # [B, T, out_dim] or None
+            "aux_b_pred": aux_b_pred,       # [B, T, out_dim] or None
+        }
 
 
 class SelfFlowDiT(nn.Module):
@@ -247,9 +409,9 @@ class SelfFlowDiT(nn.Module):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
-        self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.pos_embed_val = pos_embed[None, ...]  # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
     @nn.compact
@@ -264,20 +426,47 @@ class SelfFlowDiT(nn.Module):
         return_block_summaries: bool = False,
         capture_hidden_layers: Optional[Sequence[int]] = None,
         deterministic: bool = True,
+        # ── CTAE kwargs (all False/None by default; backbone is unchanged when off) ──
+        ctae_enabled: bool = False,
+        ctae_layer_pairs: Optional[Sequence[tuple[int, int]]] = None,
+        ctae_shared_dim: int = 256,
+        ctae_private_dim: int = 128,
+        ctae_use_aux_heads: bool = False,
     ):
-        """Forward pass with compatibility mode handling."""
+        """Forward pass with compatibility mode handling.
+
+        CTAE kwargs are only active when ``ctae_enabled=True``.  When
+        ``ctae_enabled=False`` the model behaves exactly as before this change.
+
+        When CTAE is enabled, the model additionally returns a ``ctae_outputs``
+        pytree as the last element of the return tuple:
+
+            (pred, ..., ctae_outputs)
+
+        ``ctae_outputs`` has the following structure::
+
+            {
+                "pair_indices":     [num_pairs, 2]          -- int32 tensor
+                "s_a":              [num_pairs, B, T, shared_dim]
+                "s_b":              [num_pairs, B, T, shared_dim]
+                "s_fused":          [num_pairs, B, T, shared_dim]
+                "p_a":              [num_pairs, B, T, private_dim]
+                "p_b":              [num_pairs, B, T, private_dim]
+                "aux_shared_pred":  [num_pairs, B, T, out_dim]
+                "aux_a_pred":       [num_pairs, B, T, out_dim] or None
+                "aux_b_pred":       [num_pairs, B, T, out_dim] or None
+            }
+        """
         assert not (return_raw_features and return_features)
-        # return_block_summaries can be combined with either mode; callers must
-        # handle the expanded return tuple shape.
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
         # Patch Embedding
         x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
             embed_dim=self.hidden_size
         )(x)
         x = x + self.pos_embed_val
@@ -296,7 +485,7 @@ class SelfFlowDiT(nn.Module):
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
+
             y_emb = y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
@@ -305,26 +494,43 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
+        # ── Determine which layers to capture ────────────────────────────────
+        # When CTAE is enabled, we need to capture all unique layer indices
+        # referenced by ctae_layer_pairs.  We merge them with the caller's own
+        # capture_hidden_layers so we do a single forward pass.
+        ctae_needed_layers: frozenset[int] = frozenset()
+        ctae_pairs: tuple[tuple[int, int], ...] = ()
+        if ctae_enabled and ctae_layer_pairs:
+            ctae_pairs = tuple(ctae_layer_pairs)
+            ctae_needed_layers = frozenset(idx for pair in ctae_pairs for idx in pair)
+
+        # Union of caller-requested layers + CTAE-needed layers
+        all_capture_layers: set[int] = set()
+        if capture_hidden_layers:
+            all_capture_layers.update(int(l) for l in capture_hidden_layers)
+        all_capture_layers.update(ctae_needed_layers)
+        effective_capture = tuple(sorted(all_capture_layers)) if all_capture_layers else None
+
         zs = None
         block_summaries = [] if return_block_summaries else None
-        captured_layers = [] if capture_hidden_layers else None
-        
+        # captured_dict maps layer_idx -> hidden state [B, T, D]
+        captured_dict: dict[int, jax.Array] = {} if effective_capture else {}
+
         for i in range(self.depth):
             layer_idx = i + 1
             x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
 
             if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
-            
-            if capture_hidden_layers and layer_idx in capture_hidden_layers:
-                captured_layers.append(x)
-            
+
+            if effective_capture and layer_idx in all_capture_layers:
+                captured_dict[layer_idx] = x
+
             if layer_idx == return_features:
                 zs = self.feature_head(x)
             elif layer_idx == return_raw_features:
@@ -338,20 +544,93 @@ class SelfFlowDiT(nn.Module):
         )(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
-        # Logic to return multiple auxiliary outputs in a deterministic order.
-        # Format: (prediction, [features_if_requested], [summaries_if_requested], [captured_layers_if_requested])
+        # ── Build legacy captured_layers tuple (for capture_hidden_layers callers) ──
+        # Only include the layers originally requested by the caller, preserving order.
+        legacy_captured: Optional[tuple] = None
+        if capture_hidden_layers:
+            legacy_captured = tuple(
+                captured_dict[int(l)] for l in capture_hidden_layers if int(l) in captured_dict
+            )
+
+        # ── CTAE bottleneck forward (only when ctae_enabled=True) ─────────────
+        ctae_outputs: Optional[dict] = None
+        if ctae_enabled and ctae_pairs:
+            # out_dim = hidden_size: we predict in backbone feature space.
+            # The actual denoising target has shape [B, T, hidden_size] before
+            # the FinalLayer projects it; prediction heads operate here.
+            bottleneck = CTAEBottleneck(
+                hidden_dim=self.hidden_size,
+                shared_dim=ctae_shared_dim,
+                private_dim=ctae_private_dim,
+                out_dim=self.hidden_size,
+                use_aux_heads=ctae_use_aux_heads,
+                name="ctae_bottleneck",
+            )
+
+            # Run bottleneck for each pair and collect stacked results.
+            # Shapes after stacking: [num_pairs, B, T, dim]
+            pair_s_a, pair_s_b, pair_s_fused = [], [], []
+            pair_p_a, pair_p_b = [], []
+            pair_aux_shared_pred = []
+            pair_aux_a_pred: list = []
+            pair_aux_b_pred: list = []
+            pair_indices_list: list[tuple[int, int]] = []
+
+            for (la, lb) in ctae_pairs:
+                h_a = captured_dict[la]   # [B, T, hidden_size]
+                h_b = captured_dict[lb]   # [B, T, hidden_size]
+                slot = bottleneck(h_a, h_b)
+
+                pair_s_a.append(slot["s_a"])
+                pair_s_b.append(slot["s_b"])
+                pair_s_fused.append(slot["s_fused"])
+                pair_p_a.append(slot["p_a"])
+                pair_p_b.append(slot["p_b"])
+                pair_aux_shared_pred.append(slot["aux_shared_pred"])
+                pair_aux_a_pred.append(slot["aux_a_pred"])
+                pair_aux_b_pred.append(slot["aux_b_pred"])
+                pair_indices_list.append((la, lb))
+
+            ctae_outputs = {
+                # [num_pairs, 2]
+                "pair_indices": jnp.array(pair_indices_list, dtype=jnp.int32),
+                # [num_pairs, B, T, shared_dim]
+                "s_a": jnp.stack(pair_s_a, axis=0),
+                "s_b": jnp.stack(pair_s_b, axis=0),
+                "s_fused": jnp.stack(pair_s_fused, axis=0),
+                # [num_pairs, B, T, private_dim]
+                "p_a": jnp.stack(pair_p_a, axis=0),
+                "p_b": jnp.stack(pair_p_b, axis=0),
+                # [num_pairs, B, T, out_dim]
+                "aux_shared_pred": jnp.stack(pair_aux_shared_pred, axis=0),
+                # [num_pairs, B, T, out_dim] or None
+                "aux_a_pred": (
+                    jnp.stack(pair_aux_a_pred, axis=0)
+                    if ctae_use_aux_heads else None
+                ),
+                "aux_b_pred": (
+                    jnp.stack(pair_aux_b_pred, axis=0)
+                    if ctae_use_aux_heads else None
+                ),
+            }
+
+        # ── Assemble return tuple ─────────────────────────────────────────────
+        # Format matches the original contract; CTAE outputs are appended last
+        # when ctae_enabled=True.  This preserves all existing callers.
         out = (x,)
         if return_features or return_raw_features:
             out += (zs,)
         if return_block_summaries:
             out += (jnp.stack(block_summaries, axis=0),)
         if capture_hidden_layers:
-            out += (tuple(captured_layers),)
-            
+            out += (legacy_captured,)
+        if ctae_enabled:
+            out += (ctae_outputs,)
+
         if len(out) == 1:
             return out[0]
         return out
@@ -359,7 +638,7 @@ class SelfFlowDiT(nn.Module):
     def _shufflechannel(self, x):
         """Reorder channels/patches to match expected output format."""
         p = self.patch_size
-        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val) # equivalent to rearranging in torch
+        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)  # equivalent to rearranging in torch
         # wait, the PyTorch implementation says:
         # x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels)
         x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)
