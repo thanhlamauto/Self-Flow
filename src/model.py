@@ -404,6 +404,11 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    # ── CTAE bottleneck config (set at construction time so params are always
+    #    allocated when ctae_shared_dim > 0, regardless of ctae_enabled in __call__) ──
+    ctae_shared_dim: int = 0        # 0 = CTAE not allocated; set to > 0 to enable
+    ctae_private_dim: int = 0
+    ctae_use_aux_heads: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -413,6 +418,18 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...]  # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+
+        # Allocate CTAE bottleneck unconditionally when dims are set.
+        # Flax requires submodules to be declared in setup() so their params
+        # are present from the first model.init() call.
+        if self.ctae_shared_dim > 0 and self.ctae_private_dim > 0:
+            self.ctae_bottleneck = CTAEBottleneck(
+                hidden_dim=self.hidden_size,
+                shared_dim=self.ctae_shared_dim,
+                private_dim=self.ctae_private_dim,
+                out_dim=self.hidden_size,
+                use_aux_heads=self.ctae_use_aux_heads,
+            )
 
     @nn.compact
     def __call__(
@@ -426,12 +443,12 @@ class SelfFlowDiT(nn.Module):
         return_block_summaries: bool = False,
         capture_hidden_layers: Optional[Sequence[int]] = None,
         deterministic: bool = True,
-        # ── CTAE kwargs (all False/None by default; backbone is unchanged when off) ──
+        # ── CTAE kwargs ───────────────────────────────────────────────────────
+        # Dimensions (shared_dim, private_dim, use_aux_heads) are class attributes
+        # set at construction time so their params are allocated during model.init().
+        # ctae_enabled and ctae_layer_pairs are call-time flags only.
         ctae_enabled: bool = False,
         ctae_layer_pairs: Optional[Sequence[tuple[int, int]]] = None,
-        ctae_shared_dim: int = 256,
-        ctae_private_dim: int = 128,
-        ctae_use_aux_heads: bool = False,
     ):
         """Forward pass with compatibility mode handling.
 
@@ -456,6 +473,10 @@ class SelfFlowDiT(nn.Module):
                 "aux_a_pred":       [num_pairs, B, T, out_dim] or None
                 "aux_b_pred":       [num_pairs, B, T, out_dim] or None
             }
+
+        Note: CTAE bottleneck params are allocated at model construction time
+        (in setup()) when ``ctae_shared_dim > 0``.  ``ctae_enabled`` here only
+        controls whether the bottleneck is *called* and its outputs returned.
         """
         assert not (return_raw_features and return_features)
 
@@ -557,20 +578,11 @@ class SelfFlowDiT(nn.Module):
             )
 
         # ── CTAE bottleneck forward (only when ctae_enabled=True) ─────────────
+        # self.ctae_bottleneck is allocated in setup() when ctae_shared_dim > 0.
+        # Here we only call it; we never create a new CTAEBottleneck instance.
         ctae_outputs: Optional[dict] = None
-        if ctae_enabled and ctae_pairs:
-            # out_dim = hidden_size: we predict in backbone feature space.
-            # The actual denoising target has shape [B, T, hidden_size] before
-            # the FinalLayer projects it; prediction heads operate here.
-            bottleneck = CTAEBottleneck(
-                hidden_dim=self.hidden_size,
-                shared_dim=ctae_shared_dim,
-                private_dim=ctae_private_dim,
-                out_dim=self.hidden_size,
-                use_aux_heads=ctae_use_aux_heads,
-                name="ctae_bottleneck",
-            )
-
+        ctae_bottleneck_ready = self.ctae_shared_dim > 0 and self.ctae_private_dim > 0
+        if ctae_enabled and ctae_pairs and ctae_bottleneck_ready:
             # Run bottleneck for each pair and collect stacked results.
             # Shapes after stacking: [num_pairs, B, T, dim]
             pair_s_a, pair_s_b, pair_s_fused = [], [], []
@@ -583,7 +595,7 @@ class SelfFlowDiT(nn.Module):
             for (la, lb) in ctae_pairs:
                 h_a = captured_dict[la]   # [B, T, hidden_size]
                 h_b = captured_dict[lb]   # [B, T, hidden_size]
-                slot = bottleneck(h_a, h_b)
+                slot = self.ctae_bottleneck(h_a, h_b)
 
                 pair_s_a.append(slot["s_a"])
                 pair_s_b.append(slot["s_b"])
@@ -610,11 +622,11 @@ class SelfFlowDiT(nn.Module):
                 # [num_pairs, B, T, out_dim] or None
                 "aux_a_pred": (
                     jnp.stack(pair_aux_a_pred, axis=0)
-                    if ctae_use_aux_heads else None
+                    if self.ctae_use_aux_heads else None
                 ),
                 "aux_b_pred": (
                     jnp.stack(pair_aux_b_pred, axis=0)
-                    if ctae_use_aux_heads else None
+                    if self.ctae_use_aux_heads else None
                 ),
             }
 

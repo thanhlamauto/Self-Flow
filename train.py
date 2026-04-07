@@ -700,9 +700,6 @@ def compute_training_loss_components(
             if ctae_enabled and ctae_pairs_for_call:
                 call_kwargs["ctae_enabled"] = True
                 call_kwargs["ctae_layer_pairs"] = ctae_pairs_for_call
-                call_kwargs["ctae_shared_dim"] = ctae_shared_dim
-                call_kwargs["ctae_private_dim"] = ctae_private_dim
-                call_kwargs["ctae_use_aux_heads"] = ctae_use_aux_heads
 
             res = apply_fn({"params": params}, x_tau, **call_kwargs)
 
@@ -911,12 +908,18 @@ def compute_training_loss_components(
     }
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(rng, config, learning_rate, grad_clip=1.0, ctae_config=None):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
+
+    When ctae_config is provided and enabled, the model is constructed with
+    non-zero ctae_shared_dim / ctae_private_dim so that CTAEBottleneck params
+    are allocated during model.init() — before any training step runs.
     """
+    ctae_config = ctae_config or {}
+    ctae_active = bool(ctae_config.get("enabled", False))
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -929,6 +932,9 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        ctae_shared_dim=int(ctae_config["shared_dim"]) if ctae_active else 0,
+        ctae_private_dim=int(ctae_config["private_dim"]) if ctae_active else 0,
+        ctae_use_aux_heads=bool(ctae_config.get("use_aux_heads", False)) if ctae_active else False,
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -2008,7 +2014,7 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip, ctae_config=ctae_config)
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
