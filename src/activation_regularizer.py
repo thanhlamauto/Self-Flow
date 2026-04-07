@@ -467,6 +467,7 @@ def compute_ctae_losses(
     lambda_shared: float,
     lambda_align: float,
     lambda_orth: float,
+    align_active: bool,
     orth_active: bool,
     eps: float = 1e-6,
     penalize_private_pair: bool = False,
@@ -487,10 +488,11 @@ def compute_ctae_losses(
 
     Args:
         ctae_outputs:        Pytree from model forward with CTAE enabled.
-        target:              Real denoising target.  Shape: [B, T, hidden_dim].
+        target:              Real denoising target.  Shape: [B, T, out_dim].
         lambda_shared:       Weight for shared-only prediction loss.
         lambda_align:        Weight for alignment loss.
         lambda_orth:         Weight for cross-block orthogonality loss.
+        align_active:        Whether alignment loss should be applied this step.
         orth_active:         Whether orthogonality loss should be applied this step.
                              Callers enforce the ``ctae_orth_start_step`` threshold.
         eps:                 Epsilon for numerical stability.
@@ -530,7 +532,12 @@ def compute_ctae_losses(
     # ── 2. Alignment loss ─────────────────────────────────────────────────────
     # Computed per-pair then averaged.
     # s_a/s_b/s_fused: [num_pairs, B, T, shared_dim]
-    loss_align = compute_alignment_loss(s_a, s_fused, s_b, eps)
+    loss_align_raw = compute_alignment_loss(s_a, s_fused, s_b, eps)
+    loss_align = jnp.where(
+        jnp.asarray(align_active, dtype=jnp.bool_),
+        loss_align_raw,
+        jnp.array(0.0, dtype=jnp.float32),
+    )
 
     # ── 3. Cross-block orthogonality ──────────────────────────────────────────
     # Computed per-pair; average across pairs.

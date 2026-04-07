@@ -546,6 +546,11 @@ def build_ctae_config(args, depth: int) -> dict:
         log_stage("WARNING: --ctae-selected-layer-pairs produced no valid pairs. Disabling CTAE.")
         return {"enabled": False}
 
+    if int(args.ctae_shared_dim) <= 0:
+        raise ValueError("--ctae-shared-dim must be > 0 when CTAE is enabled.")
+    if int(args.ctae_private_dim) <= 0:
+        raise ValueError("--ctae-private-dim must be > 0 when CTAE is enabled.")
+
     # Validate all referenced layer indices are within backbone depth.
     for la, lb in layer_pairs:
         if la < 1 or la > depth:
@@ -580,6 +585,22 @@ def build_ctae_config(args, depth: int) -> dict:
         "apply_every": int(args.ctae_apply_every),
         # aux heads always built in v1 for monitoring; loss never added to total.
         "use_aux_heads": True,
+    }
+
+
+def build_ctae_model_kwargs(ctae_config=None) -> dict:
+    """Return consistent CTAE constructor kwargs for SelfFlowDiT."""
+    ctae_config = ctae_config or {}
+    if not bool(ctae_config.get("enabled", False)):
+        return {
+            "ctae_shared_dim": 0,
+            "ctae_private_dim": 0,
+            "ctae_use_aux_heads": False,
+        }
+    return {
+        "ctae_shared_dim": int(ctae_config["shared_dim"]),
+        "ctae_private_dim": int(ctae_config["private_dim"]),
+        "ctae_use_aux_heads": bool(ctae_config.get("use_aux_heads", False)),
     }
 
 
@@ -640,6 +661,7 @@ def compute_training_loss_components(
     regularizer_enabled = bool(
         regularizer_config.get("enabled", False) and selected_layers and layer_pairs
     )
+    regularizer_capture_layers = selected_layers if regularizer_enabled else ()
 
     # ── CTAE feature bottleneck ───────────────────────────────────────────────
     ctae_enabled = bool(ctae_config.get("enabled", False))
@@ -687,6 +709,42 @@ def compute_training_loss_components(
         # Determine which CTAE pairs to pass at trace time (static; no JAX dynamic)
         ctae_pairs_for_call = ctae_layer_pairs if (ctae_enabled and ctae_layer_pairs) else None
 
+        # Only the legacy cosine path needs explicit hidden tuples returned to
+        # the caller. CTAE captures its own union of layer pairs internally.
+        hidden_shape = (
+            len(regularizer_capture_layers),
+            x_tau.shape[0],
+            x_tau.shape[1],
+            hidden_size,
+        )
+        dummy_hidden_states = jnp.zeros(hidden_shape, dtype=jnp.float32)
+        target_dim = int(target.shape[-1])
+
+        # Build dummy ctae_outputs pytree so both cond branches return the same
+        # structure even when CTAE is inactive on this step.
+        if ctae_enabled and ctae_pairs_for_call:
+            _num_pairs = len(ctae_pairs_for_call)
+            _B, _T = x_tau.shape[0], x_tau.shape[1]
+            dummy_ctae = {
+                "pair_indices": jnp.zeros((_num_pairs, 2), dtype=jnp.int32),
+                "s_a": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim), dtype=jnp.float32),
+                "s_b": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim), dtype=jnp.float32),
+                "s_fused": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim), dtype=jnp.float32),
+                "p_a": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim), dtype=jnp.float32),
+                "p_b": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim), dtype=jnp.float32),
+                "aux_shared_pred": jnp.zeros((_num_pairs, _B, _T, target_dim), dtype=jnp.float32),
+                "aux_a_pred": (
+                    jnp.zeros((_num_pairs, _B, _T, target_dim), dtype=jnp.float32)
+                    if ctae_use_aux_heads else None
+                ),
+                "aux_b_pred": (
+                    jnp.zeros((_num_pairs, _B, _T, target_dim), dtype=jnp.float32)
+                    if ctae_use_aux_heads else None
+                ),
+            }
+        else:
+            dummy_ctae = None
+
         def _forward_full(_):
             """Forward with hidden capture and CTAE (if enabled)."""
             call_kwargs = dict(
@@ -695,8 +753,8 @@ def compute_training_loss_components(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            if regularizer_enabled:
-                call_kwargs["capture_hidden_layers"] = selected_layers
+            if regularizer_capture_layers:
+                call_kwargs["capture_hidden_layers"] = regularizer_capture_layers
             if ctae_enabled and ctae_pairs_for_call:
                 call_kwargs["ctae_enabled"] = True
                 call_kwargs["ctae_layer_pairs"] = ctae_pairs_for_call
@@ -712,21 +770,25 @@ def compute_training_loss_components(
                 # No extras requested
                 pred = res
                 hidden_layers = ()
-                ctae_out = None
+                ctae_out = dummy_ctae
             else:
                 pred = res[0]
                 rest = res[1:]
                 hidden_layers = ()
-                ctae_out = None
+                ctae_out = dummy_ctae
                 for elem in rest:
                     if isinstance(elem, (list, tuple)):
                         hidden_layers = elem
                     elif isinstance(elem, dict):
                         ctae_out = elem
-            return pred, hidden_layers, ctae_out
+            if regularizer_capture_layers:
+                hidden_states = jnp.stack(hidden_layers, axis=0)
+            else:
+                hidden_states = dummy_hidden_states
+            return pred, hidden_states, ctae_out
 
         def _forward_plain(_):
-            """Plain forward (regularizer not active this step)."""
+            """Plain forward without hidden capture; prediction remains real."""
             pred = apply_fn(
                 {"params": params},
                 x_tau,
@@ -735,7 +797,7 @@ def compute_training_loss_components(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            return pred, (), None
+            return pred, dummy_hidden_states, dummy_ctae
 
         # Determine whether we need to do the full capture forward.
         needs_full = jnp.logical_or(
@@ -750,53 +812,10 @@ def compute_training_loss_components(
             ctae_active_base if ctae_enabled else jnp.asarray(False),
         )
 
-        # Build dummy outputs for the false branch so both branches have same pytree.
-        # Hidden states shape: [num_selected, B, T, D]
-        hidden_shape = (
-            len(selected_layers),
-            x_tau.shape[0],
-            x_tau.shape[1],
-            hidden_size,
-        )
-
-        # Build dummy ctae_outputs pytree for the false branch so jax.lax.cond
-        # can verify matching output structures.
-        if ctae_enabled and ctae_pairs_for_call:
-            _num_pairs = len(ctae_pairs_for_call)
-            _B, _T = x_tau.shape[0], x_tau.shape[1]
-            _dummy_ctae = {
-                "pair_indices": jnp.zeros((_num_pairs, 2), dtype=jnp.int32),
-                "s_a": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
-                "s_b": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
-                "s_fused": jnp.zeros((_num_pairs, _B, _T, ctae_shared_dim)),
-                "p_a": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim)),
-                "p_b": jnp.zeros((_num_pairs, _B, _T, ctae_private_dim)),
-                "aux_shared_pred": jnp.zeros((_num_pairs, _B, _T, hidden_size)),
-                "aux_a_pred": (
-                    jnp.zeros((_num_pairs, _B, _T, hidden_size))
-                    if ctae_use_aux_heads else None
-                ),
-                "aux_b_pred": (
-                    jnp.zeros((_num_pairs, _B, _T, hidden_size))
-                    if ctae_use_aux_heads else None
-                ),
-            }
-        else:
-            _dummy_ctae = None
-
-        _dummy_hidden = tuple(
-            jnp.zeros((x_tau.shape[0], x_tau.shape[1], hidden_size))
-            for _ in range(len(selected_layers))
-        )
-        _dummy_pred = jnp.zeros_like(x_tau)
-
-        def _forward_false(_):
-            return _dummy_pred, _dummy_hidden, _dummy_ctae
-
-        pred, hidden_layers, ctae_out = jax.lax.cond(
+        pred, hidden_states, ctae_out = jax.lax.cond(
             needs_full,
             _forward_full,
-            _forward_false,
+            _forward_plain,
             operand=None,
         )
 
@@ -810,7 +829,6 @@ def compute_training_loss_components(
                 apply_every=int(regularizer_config["apply_every"]),
                 num_pairs=len(layer_pairs),
             )
-            hidden_states = jnp.stack(hidden_layers, axis=0) if hidden_layers else jnp.zeros(hidden_shape)
             regularizer_metrics = jax.lax.cond(
                 active_reg,
                 lambda hs: compute_regularizer_metrics(
@@ -830,28 +848,15 @@ def compute_training_loss_components(
 
         # ── CTAE losses ───────────────────────────────────────────────────────
         if ctae_enabled and ctae_pairs_for_call:
-            # We pass orth_active as a Python bool derived from ctae_orth_active.
-            # Because ctae_orth_active is a JAX traced bool, we use jax.lax.cond
-            # to select between losses-with-orth and losses-without-orth.
-            def _ctae_with_orth(_ctae_out):
+            def _compute_ctae(_ctae_out):
                 return compute_ctae_losses(
                     _ctae_out,
                     target,
                     lambda_shared=float(ctae_config["lambda_shared"]),
                     lambda_align=float(ctae_config["lambda_align"]),
                     lambda_orth=float(ctae_config["lambda_orth"]),
-                    orth_active=True,
-                    eps=1e-6,
-                )
-
-            def _ctae_without_orth(_ctae_out):
-                return compute_ctae_losses(
-                    _ctae_out,
-                    target,
-                    lambda_shared=float(ctae_config["lambda_shared"]),
-                    lambda_align=float(ctae_config["lambda_align"]),
-                    lambda_orth=float(ctae_config["lambda_orth"]),
-                    orth_active=False,
+                    align_active=ctae_align_active,
+                    orth_active=ctae_orth_active,
                     eps=1e-6,
                 )
 
@@ -860,15 +865,6 @@ def compute_training_loss_components(
                 m = dict(m)
                 m["ctae_loss_total"] = jnp.array(0.0, dtype=jnp.float32)
                 return m
-
-            # Step 1: compute losses (with or without orth) only when CTAE is active.
-            def _compute_ctae(ctae_out):
-                return jax.lax.cond(
-                    ctae_orth_active,
-                    _ctae_with_orth,
-                    _ctae_without_orth,
-                    ctae_out,
-                )
 
             ctae_metrics = jax.lax.cond(
                 ctae_active_base,
@@ -936,9 +932,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, ctae_config=No
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
-        ctae_shared_dim=int(ctae_config["shared_dim"]) if ctae_active else 0,
-        ctae_private_dim=int(ctae_config["private_dim"]) if ctae_active else 0,
-        ctae_use_aux_heads=bool(ctae_config.get("use_aux_heads", False)) if ctae_active else False,
+        **build_ctae_model_kwargs(ctae_config if ctae_active else None),
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -1305,7 +1299,7 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
-def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0, ctae_config=None):
     """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
     XLA's scan requires a static sequence length, so num_steps cannot be a
@@ -1327,6 +1321,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        **build_ctae_model_kwargs(ctae_config),
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1404,7 +1399,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0, ctae_config=None):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -1426,6 +1421,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        **build_ctae_model_kwargs(ctae_config),
     )
 
     patch_size = config["patch_size"]
@@ -2076,19 +2072,28 @@ def main():
     # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
     #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
-        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+        config,
+        num_steps=args.sample_num_steps,
+        cfg_scale=args.sample_cfg_scale,
+        ctae_config=ctae_config,
     )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
-            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            ctae_config=ctae_config,
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
 
     # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
-        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        config,
+        num_steps=args.fid_num_steps,
+        cfg_scale=args.fid_cfg_scale,
+        ctae_config=ctae_config,
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────

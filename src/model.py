@@ -439,7 +439,10 @@ class SelfFlowDiT(nn.Module):
                 hidden_dim=self.hidden_size,
                 shared_dim=self.ctae_shared_dim,
                 private_dim=self.ctae_private_dim,
-                out_dim=self.hidden_size,
+                # CTAE heads predict the real denoising target directly in v1.
+                # The diffusion target lives in patchified latent space, not
+                # hidden space, so aux heads must emit patch_dim features.
+                out_dim=self.in_channels * (self.patch_size ** 2),
                 use_aux_heads=self.ctae_use_aux_heads,
             )
 
