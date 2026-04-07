@@ -290,14 +290,19 @@ class CTAEBottleneck(nn.Module):
     heads can be built for monitoring (their outputs must NOT be included in
     the training loss in v1).
 
+    Uses ``setup()`` (not ``@nn.compact``) so that shared projection layers
+    can be called on both h_a and h_b without triggering Flax's
+    ``NameInUseError`` — which fires when the same name is used more than once
+    inside an ``@nn.compact`` method.
+
     Attributes:
-        hidden_dim:   Backbone hidden size (input feature dimension).
-        shared_dim:   Dimensionality of the shared slot.
-        private_dim:  Dimensionality of each private slot.
-        out_dim:      Output dimension of all prediction heads
-                      (typically equals hidden_dim to predict the denoising target).
+        hidden_dim:    Backbone hidden size (input feature dimension).
+        shared_dim:    Dimensionality of the shared slot.
+        private_dim:   Dimensionality of each private slot.
+        out_dim:       Output dimension of all prediction heads
+                       (typically equals hidden_dim to predict the denoising target).
         use_aux_heads: Whether to build and call aux_a_head / aux_b_head.
-                       Even when True, their outputs are monitoring-only.
+                       Even when True, their outputs are monitoring-only in v1.
     """
 
     hidden_dim: int
@@ -306,7 +311,33 @@ class CTAEBottleneck(nn.Module):
     out_dim: int
     use_aux_heads: bool = False
 
-    @nn.compact
+    def setup(self):
+        # ── Shared projection (same Dense instances called on h_a AND h_b) ───
+        # Weight sharing is achieved by calling the SAME module twice.
+        # shared_dim: hidden_dim -> shared_dim
+        self.shared_proj_l1 = nn.Dense(self.shared_dim)
+        self.shared_proj_l2 = nn.Dense(self.shared_dim)
+
+        # ── Private projections (separate weights per role) ───────────────────
+        # private_dim: hidden_dim -> private_dim
+        self.private_a_proj_l1 = nn.Dense(self.private_dim)
+        self.private_a_proj_l2 = nn.Dense(self.private_dim)
+        self.private_b_proj_l1 = nn.Dense(self.private_dim)
+        self.private_b_proj_l2 = nn.Dense(self.private_dim)
+
+        # ── Shared-only prediction head (main CTAE objective in v1) ──────────
+        # shared_dim -> (shared_dim + out_dim) -> out_dim
+        self.shared_only_head_l1 = nn.Dense(self.shared_dim + self.out_dim)
+        self.shared_only_head_l2 = nn.Dense(self.out_dim)
+
+        # ── Aux A/B prediction heads (monitoring only; NOT in loss_total) ─────
+        # (shared_dim + private_dim) -> (shared_dim + private_dim + out_dim) -> out_dim
+        if self.use_aux_heads:
+            self.aux_a_head_l1 = nn.Dense(self.shared_dim + self.private_dim + self.out_dim)
+            self.aux_a_head_l2 = nn.Dense(self.out_dim)
+            self.aux_b_head_l1 = nn.Dense(self.shared_dim + self.private_dim + self.out_dim)
+            self.aux_b_head_l2 = nn.Dense(self.out_dim)
+
     def __call__(
         self,
         h_a: jax.Array,
@@ -320,74 +351,55 @@ class CTAEBottleneck(nn.Module):
 
         Returns:
             Dict with keys:
-                s_a           [B, T, shared_dim]
-                s_b           [B, T, shared_dim]
-                s_fused       [B, T, shared_dim]  -- 0.5*(s_a + s_b)
-                p_a           [B, T, private_dim]
-                p_b           [B, T, private_dim]
-                aux_shared_pred [B, T, out_dim]   -- prediction from s_fused
-                aux_a_pred    [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
-                aux_b_pred    [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
+                s_a             [B, T, shared_dim]
+                s_b             [B, T, shared_dim]
+                s_fused         [B, T, shared_dim]  -- 0.5*(s_a + s_b)
+                p_a             [B, T, private_dim]
+                p_b             [B, T, private_dim]
+                aux_shared_pred [B, T, out_dim]     -- prediction from s_fused
+                aux_a_pred      [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
+                aux_b_pred      [B, T, out_dim]     -- monitoring only; None if use_aux_heads=False
         """
-        # ── Shared projection (same weights for both views) ───────────────────
-        # shared_proj: hidden_dim -> shared_dim (two-layer MLP with swish)
+        # ── Shared projection — same params applied to both views ─────────────
         # [B, T, hidden_dim] -> [B, T, shared_dim]
-        s_a = nn.Dense(self.shared_dim, name="shared_proj_l1")(h_a)
-        s_a = nn.swish(s_a)
-        s_a = nn.Dense(self.shared_dim, name="shared_proj_l2")(s_a)
-
-        s_b = nn.Dense(self.shared_dim, name="shared_proj_l1")(h_b)
-        s_b = nn.swish(s_b)
-        s_b = nn.Dense(self.shared_dim, name="shared_proj_l2")(s_b)
+        s_a = self.shared_proj_l2(nn.swish(self.shared_proj_l1(h_a)))
+        s_b = self.shared_proj_l2(nn.swish(self.shared_proj_l1(h_b)))
 
         # ── Fused shared: average of both views ───────────────────────────────
         # [B, T, shared_dim]
         s_fused = 0.5 * (s_a + s_b)
 
-        # ── Private projections (separate weights per role) ───────────────────
-        # private_a_proj: hidden_dim -> private_dim
+        # ── Private projections — separate params per role ────────────────────
         # [B, T, hidden_dim] -> [B, T, private_dim]
-        p_a = nn.Dense(self.private_dim, name="private_a_proj_l1")(h_a)
-        p_a = nn.swish(p_a)
-        p_a = nn.Dense(self.private_dim, name="private_a_proj_l2")(p_a)
+        p_a = self.private_a_proj_l2(nn.swish(self.private_a_proj_l1(h_a)))
+        p_b = self.private_b_proj_l2(nn.swish(self.private_b_proj_l1(h_b)))
 
-        # private_b_proj: hidden_dim -> private_dim
-        # [B, T, hidden_dim] -> [B, T, private_dim]
-        p_b = nn.Dense(self.private_dim, name="private_b_proj_l1")(h_b)
-        p_b = nn.swish(p_b)
-        p_b = nn.Dense(self.private_dim, name="private_b_proj_l2")(p_b)
-
-        # ── Shared-only prediction head (main CTAE objective in v1) ──────────
-        # Input: s_fused [B, T, shared_dim] -> output: [B, T, out_dim]
-        aux_shared_pred = nn.Dense(self.shared_dim + self.out_dim, name="shared_only_head_l1")(s_fused)
-        aux_shared_pred = nn.swish(aux_shared_pred)
-        aux_shared_pred = nn.Dense(self.out_dim, name="shared_only_head_l2")(aux_shared_pred)
+        # ── Shared-only prediction head ───────────────────────────────────────
+        # [B, T, shared_dim] -> [B, T, out_dim]
+        aux_shared_pred = self.shared_only_head_l2(nn.swish(self.shared_only_head_l1(s_fused)))
 
         # ── Aux A/B prediction heads (monitoring only; NOT in loss_total) ─────
         aux_a_pred = None
         aux_b_pred = None
         if self.use_aux_heads:
-            # aux_a_input = concat([s_fused, p_a], dim=-1) [B, T, shared_dim + private_dim]
-            aux_a_input = jnp.concatenate([s_fused, p_a], axis=-1)
-            aux_a_pred = nn.Dense(self.shared_dim + self.private_dim + self.out_dim, name="aux_a_head_l1")(aux_a_input)
-            aux_a_pred = nn.swish(aux_a_pred)
-            aux_a_pred = nn.Dense(self.out_dim, name="aux_a_head_l2")(aux_a_pred)
-
-            # aux_b_input = concat([s_fused, p_b], dim=-1) [B, T, shared_dim + private_dim]
-            aux_b_input = jnp.concatenate([s_fused, p_b], axis=-1)
-            aux_b_pred = nn.Dense(self.shared_dim + self.private_dim + self.out_dim, name="aux_b_head_l1")(aux_b_input)
-            aux_b_pred = nn.swish(aux_b_pred)
-            aux_b_pred = nn.Dense(self.out_dim, name="aux_b_head_l2")(aux_b_pred)
+            # aux_a_input: [B, T, shared_dim + private_dim]
+            aux_a_pred = self.aux_a_head_l2(
+                nn.swish(self.aux_a_head_l1(jnp.concatenate([s_fused, p_a], axis=-1)))
+            )
+            # aux_b_input: [B, T, shared_dim + private_dim]
+            aux_b_pred = self.aux_b_head_l2(
+                nn.swish(self.aux_b_head_l1(jnp.concatenate([s_fused, p_b], axis=-1)))
+            )
 
         return {
-            "s_a": s_a,                     # [B, T, shared_dim]
-            "s_b": s_b,                     # [B, T, shared_dim]
-            "s_fused": s_fused,             # [B, T, shared_dim]
-            "p_a": p_a,                     # [B, T, private_dim]
-            "p_b": p_b,                     # [B, T, private_dim]
+            "s_a": s_a,                          # [B, T, shared_dim]
+            "s_b": s_b,                          # [B, T, shared_dim]
+            "s_fused": s_fused,                  # [B, T, shared_dim]
+            "p_a": p_a,                          # [B, T, private_dim]
+            "p_b": p_b,                          # [B, T, private_dim]
             "aux_shared_pred": aux_shared_pred,  # [B, T, out_dim]
-            "aux_a_pred": aux_a_pred,       # [B, T, out_dim] or None
-            "aux_b_pred": aux_b_pred,       # [B, T, out_dim] or None
+            "aux_a_pred": aux_a_pred,            # [B, T, out_dim] or None
+            "aux_b_pred": aux_b_pred,            # [B, T, out_dim] or None
         }
 
 
