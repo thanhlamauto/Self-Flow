@@ -262,6 +262,7 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
+        return_activations: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -306,6 +307,7 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
+        activations = [] if return_activations else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -317,6 +319,10 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
+
+            if return_activations:
+                # Full post-block hidden state: (B, N, D)
+                activations.append(x)
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
@@ -337,13 +343,18 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+        if return_activations:
+            activations = jnp.stack(activations, axis=0)  # (depth, B, N, D)
 
+        outputs = [x]
         if return_features or return_raw_features:
-            if return_block_summaries:
-                return x, zs, block_summaries
-            return x, zs
+            outputs.append(zs)
         if return_block_summaries:
-            return x, block_summaries
+            outputs.append(block_summaries)
+        if return_activations:
+            outputs.append(activations)
+        if len(outputs) > 1:
+            return tuple(outputs)
         return x
 
     def _shufflechannel(self, x):

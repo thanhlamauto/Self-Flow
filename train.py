@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from functools import partial
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -412,6 +413,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.activation_decomposition import compute_aux_losses
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -500,8 +502,22 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+
+def _zero_aux_metrics(dtype):
+    zero = jnp.array(0.0, dtype=dtype)
+    return {
+        "loss_common": zero,
+        "loss_spatial": zero,
+        "loss_private": zero,
+        "norm_common": zero,
+        "avg_private_norm": zero,
+        "avg_pairwise_private_cosine": zero,
+    }
+
+
 def train_step(
     state, ema_params, batch, rng, ema_decay,
+    lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -512,6 +528,7 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    use_aux_losses = any(weight != 0.0 for weight in (lambda_common, lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
@@ -522,25 +539,72 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
+        outputs = state.apply_fn(
             {"params": params},
             x_tau,
             timesteps=tau,
             vector=y,
+            return_activations=use_aux_losses,
             deterministic=False,
             rngs={"dropout": drop_rng},
         )
-        loss = jnp.mean((pred - target) ** 2)
+        if use_aux_losses:
+            pred, activations = outputs
+            aux_metrics = compute_aux_losses(activations, spatial_target=x0)
+        else:
+            pred = outputs
+            aux_metrics = _zero_aux_metrics(target.dtype)
+
+        l_diff = jnp.mean((pred - target) ** 2)
+        l_common = aux_metrics["loss_common"]
+        l_spatial = aux_metrics["loss_spatial"]
+        l_private = aux_metrics["loss_private"]
+        loss = (
+            l_diff
+            + lambda_common * l_common
+            + lambda_spatial * l_spatial
+            + lambda_private * l_private
+        )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            l_diff,
+            l_common,
+            l_spatial,
+            l_private,
+            aux_metrics["norm_common"],
+            aux_metrics["avg_private_norm"],
+            aux_metrics["avg_pairwise_private_cosine"],
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            l_diff,
+            l_common,
+            l_spatial,
+            l_private,
+            norm_common,
+            avg_private_norm,
+            avg_pairwise_private_cosine,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+    l_common = jax.lax.pmean(l_common, axis_name="batch")
+    l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
+    l_private = jax.lax.pmean(l_private, axis_name="batch")
+    norm_common = jax.lax.pmean(norm_common, axis_name="batch")
+    avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
+    avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -551,6 +615,13 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/l_diff": l_diff,
+        "train/l_common": l_common,
+        "train/l_spatial": l_spatial,
+        "train/l_private": l_private,
+        "train/common_norm": norm_common,
+        "train/private_avg_norm": avg_private_norm,
+        "train/private_pairwise_cosine": avg_pairwise_private_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -562,10 +633,12 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng,
+    lambda_common=0.0, lambda_spatial=0.0, lambda_private=0.0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
+    use_aux_losses = any(weight != 0.0 for weight in (lambda_common, lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng = jax.random.split(rng, 3)
 
@@ -575,23 +648,54 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
+    outputs = state.apply_fn(
         {"params": state.params},
         x_tau,
         timesteps=tau,
         vector=y,
+        return_activations=use_aux_losses,
         deterministic=True,
     )
-    loss = jnp.mean((pred - target) ** 2)
+    if use_aux_losses:
+        pred, activations = outputs
+        aux_metrics = compute_aux_losses(activations, spatial_target=x0)
+    else:
+        pred = outputs
+        aux_metrics = _zero_aux_metrics(target.dtype)
+
+    l_diff = jnp.mean((pred - target) ** 2)
+    l_common = aux_metrics["loss_common"]
+    l_spatial = aux_metrics["loss_spatial"]
+    l_private = aux_metrics["loss_private"]
+    loss = (
+        l_diff
+        + lambda_common * l_common
+        + lambda_spatial * l_spatial
+        + lambda_private * l_private
+    )
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+    l_common = jax.lax.pmean(l_common, axis_name="batch")
+    l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
+    l_private = jax.lax.pmean(l_private, axis_name="batch")
+    common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
+    avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
+    avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/l_diff": l_diff,
+        "val/l_common": l_common,
+        "val/l_spatial": l_spatial,
+        "val/l_private": l_private,
+        "val/common_norm": common_norm,
+        "val/private_avg_norm": avg_private_norm,
+        "val/private_pairwise_cosine": avg_pairwise_private_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1077,6 +1181,12 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--lambda-common", type=float, default=0.0,
+                        help="Weight for common alignment auxiliary loss.")
+    parser.add_argument("--lambda-spatial", type=float, default=0.0,
+                        help="Weight for spatial Gram-matrix auxiliary loss.")
+    parser.add_argument("--lambda-private", type=float, default=0.0,
+                        help="Weight for private diversity auxiliary loss.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1257,6 +1367,12 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    log_stage(
+        "Activation decomposition: "
+        f"lambda_common={args.lambda_common} "
+        f"lambda_spatial={args.lambda_spatial} "
+        f"lambda_private={args.lambda_private}"
+    )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1411,24 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        partial(
+            train_step,
+            lambda_common=args.lambda_common,
+            lambda_spatial=args.lambda_spatial,
+            lambda_private=args.lambda_private,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        partial(
+            eval_step,
+            lambda_common=args.lambda_common,
+            lambda_spatial=args.lambda_spatial,
+            lambda_private=args.lambda_private,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
