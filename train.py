@@ -384,6 +384,35 @@ DELTA_PHASE2_MODES = frozenset({
     "s4_allblocks_delta_div",
 })
 PHASE2_MODE_TO_ID = {mode: idx for idx, mode in enumerate(PHASE2_MODES)}
+
+# Run A (late-div ablation): global steps, assumes phase-2 / REPA-stop at 100k.
+_LAMBDA_DIV_ANNEAL_RUN_A_REPA_STOP = 100_000
+_LAMBDA_DIV_ANNEAL_RUN_A_T1 = 130_000
+_LAMBDA_DIV_ANNEAL_RUN_A_T2 = 200_000
+_LAMBDA_DIV_ANNEAL_RUN_A_T3 = 300_000
+
+
+def lambda_div_anneal_run_a(global_step: int) -> float:
+    """Piecewise λ_div for Run A (global step indices)."""
+    if global_step < _LAMBDA_DIV_ANNEAL_RUN_A_T1:
+        return 1.0
+    if global_step < _LAMBDA_DIV_ANNEAL_RUN_A_T2:
+        t = (global_step - _LAMBDA_DIV_ANNEAL_RUN_A_T1) / (_LAMBDA_DIV_ANNEAL_RUN_A_T2 - _LAMBDA_DIV_ANNEAL_RUN_A_T1)
+        return 1.0 + t * (0.25 - 1.0)
+    if global_step < _LAMBDA_DIV_ANNEAL_RUN_A_T3:
+        return 0.1
+    return 0.1
+
+
+def compute_effective_lambda_div(global_step: int, phase2_mode: str, lambda_div: float, anneal_run_a: bool) -> float:
+    """λ_div coefficient for the current train step (phase-2 delta path)."""
+    if phase2_mode != "s4_allblocks_delta_div":
+        return 0.0
+    if anneal_run_a:
+        return lambda_div_anneal_run_a(global_step)
+    return float(lambda_div)
+
+
 DELTA_LAYER_PATHS = (
     ("attn", "qkv"),
     ("attn", "proj"),
@@ -672,13 +701,20 @@ def make_train_step(
     lambda_div=0.0,
     delta_metric_blocks=(),
     diversity_block_indices=(),
+    phase2_runtime_lambda_div=False,
+    collect_diversity_blocks=False,
 ):
     """Build a training step with optional phase-2 ΔW behavior."""
     delta_active = bool(delta_active)
     lambda_div = float(lambda_div)
     delta_metric_blocks = tuple(int(block_idx) for block_idx in delta_metric_blocks)
     diversity_block_indices = tuple(int(block_idx) for block_idx in diversity_block_indices)
-    collect_block_summaries = lambda_div > 0.0 and len(diversity_block_indices) > 1
+    phase2_runtime_lambda_div = bool(phase2_runtime_lambda_div)
+    collect_diversity_blocks = bool(collect_diversity_blocks)
+    if phase2_runtime_lambda_div:
+        collect_block_summaries = collect_diversity_blocks and len(diversity_block_indices) > 1
+    else:
+        collect_block_summaries = lambda_div > 0.0 and len(diversity_block_indices) > 1
 
     def _maybe_get(tree, path):
         node = tree
@@ -731,6 +767,86 @@ def make_train_step(
             metrics[f"train/delta_grad_norm/{block_label}"] = jnp.sqrt(grad_sq)
         return metrics
 
+    if phase2_runtime_lambda_div:
+
+        def train_step(state, ema_params, batch, rng, ema_decay, diversity_pairs, lambda_div_scale):
+            """Phase-2 ΔW step: λ_div supplied per step (fixed or annealed)."""
+            x0, y = batch
+            local_batch = x0.shape[0]
+
+            rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+
+            tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+            x1 = jax.random.normal(noise_rng, x0.shape)
+
+            x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+            target = x0 - x1
+
+            def loss_fn(params):
+                out = state.apply_fn(
+                    {"params": params},
+                    x_tau,
+                    timesteps=tau,
+                    vector=y,
+                    return_block_summaries=collect_block_summaries,
+                    delta_active=delta_active,
+                    deterministic=False,
+                    rngs={"dropout": drop_rng},
+                )
+                if collect_block_summaries:
+                    pred, block_summaries = out
+                    div_loss, mean_pairwise_cos = _diversity_stats(block_summaries, diversity_pairs)
+                else:
+                    pred = out
+                    div_loss = jnp.array(0.0, dtype=target.dtype)
+                    mean_pairwise_cos = jnp.array(0.0, dtype=target.dtype)
+                diff_loss = jnp.mean((pred - target) ** 2)
+                total_loss = diff_loss + lambda_div_scale * div_loss
+                v_abs_mean = jnp.mean(jnp.abs(target))
+                v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+                return total_loss, (diff_loss, div_loss, mean_pairwise_cos, v_abs_mean, v_pred_abs_mean)
+
+            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+            (loss, (diff_loss, div_loss, mean_pairwise_cos, v_abs, v_pred)), grads = grad_fn(state.params)
+
+            loss = jax.lax.pmean(loss, axis_name="batch")
+            diff_loss = jax.lax.pmean(diff_loss, axis_name="batch")
+            div_loss = jax.lax.pmean(div_loss, axis_name="batch")
+            mean_pairwise_cos = jax.lax.pmean(mean_pairwise_cos, axis_name="batch")
+            v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+            v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+            grads = jax.lax.pmean(grads, axis_name="batch")
+            grads = apply_trainable_mask(grads, trainable_mask)
+
+            grad_norm = _tree_l2_norm(grads)
+            param_norm = _tree_l2_norm(state.params)
+            delta_metrics = _delta_block_metrics(state.params, grads)
+
+            state = state.apply_gradients(grads=grads)
+            ema_params = ema_update(ema_params, state.params, ema_decay)
+
+            metrics = {
+                "train/loss": loss,
+                "train/diff_loss": diff_loss,
+                "train/div_loss": div_loss,
+                "train/div_mean_pairwise_cos": mean_pairwise_cos,
+                "train/lambda_div": lambda_div_scale,
+                "train/div_active_block_count": jnp.array(len(diversity_block_indices), dtype=jnp.float32),
+                "train/div_active_pair_count": jnp.array(
+                    0 if diversity_pairs is None else diversity_pairs.shape[0],
+                    dtype=jnp.float32,
+                ),
+                "train/ema_decay": ema_decay,
+                "train/grad_norm": grad_norm,
+                "train/param_norm": param_norm,
+                "train/v_abs_mean": v_abs,
+                "train/v_pred_abs_mean": v_pred,
+            }
+            metrics.update(delta_metrics)
+            return state, ema_params, metrics, rng
+
+        return train_step
+
     def train_step(state, ema_params, batch, rng, ema_decay, diversity_pairs=None):
         """Vanilla SiT training step with optional phase-2 ΔW terms."""
         x0, y = batch
@@ -743,6 +859,8 @@ def make_train_step(
 
         x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
         target = x0 - x1
+
+        eff_lambda = jnp.asarray(lambda_div, dtype=jnp.float32)
 
         def loss_fn(params):
             out = state.apply_fn(
@@ -763,7 +881,7 @@ def make_train_step(
                 div_loss = jnp.array(0.0, dtype=target.dtype)
                 mean_pairwise_cos = jnp.array(0.0, dtype=target.dtype)
             diff_loss = jnp.mean((pred - target) ** 2)
-            total_loss = diff_loss + lambda_div * div_loss
+            total_loss = diff_loss + eff_lambda * div_loss
             v_abs_mean = jnp.mean(jnp.abs(target))
             v_pred_abs_mean = jnp.mean(jnp.abs(pred))
             return total_loss, (diff_loss, div_loss, mean_pairwise_cos, v_abs_mean, v_pred_abs_mean)
@@ -1710,7 +1828,18 @@ def main():
         "--lambda-div",
         type=float,
         default=0.01,
-        help="Diversity loss coefficient for --phase2-mode=s4_allblocks_delta_div.",
+        help="Diversity loss coefficient for --phase2-mode=s4_allblocks_delta_div (used when not annealing).",
+    )
+    parser.add_argument(
+        "--lambda-div-anneal-run-a",
+        action="store_true",
+        help=(
+            "For --phase2-mode=s4_allblocks_delta_div: piecewise λ_div schedule in global steps "
+            f"(requires --repa-stop-step={_LAMBDA_DIV_ANNEAL_RUN_A_REPA_STOP}). "
+            f"{_LAMBDA_DIV_ANNEAL_RUN_A_REPA_STOP}–{_LAMBDA_DIV_ANNEAL_RUN_A_T1}: 1.0; "
+            f"{_LAMBDA_DIV_ANNEAL_RUN_A_T1}–{_LAMBDA_DIV_ANNEAL_RUN_A_T2}: linear 1.0→0.25; "
+            f"{_LAMBDA_DIV_ANNEAL_RUN_A_T2}+: 0.1. Ablation: late div strength."
+        ),
     )
     parser.add_argument(
         "--diversity-block-scope",
@@ -1779,6 +1908,14 @@ def main():
         raise ValueError("--irepa-spatial-gamma must be >= 0")
     if args.lambda_div < 0.0:
         raise ValueError("--lambda-div must be >= 0")
+    if args.lambda_div_anneal_run_a:
+        if args.phase2_mode != "s4_allblocks_delta_div":
+            raise ValueError("--lambda-div-anneal-run-a requires --phase2-mode=s4_allblocks_delta_div")
+        if args.repa_stop_step != _LAMBDA_DIV_ANNEAL_RUN_A_REPA_STOP:
+            raise ValueError(
+                "--lambda-div-anneal-run-a uses global-step breakpoints tied to phase-2 start; "
+                f"set --repa-stop-step={_LAMBDA_DIV_ANNEAL_RUN_A_REPA_STOP}"
+            )
     if args.diversity_max_pairs_per_step < 0:
         raise ValueError("--diversity-max-pairs-per-step must be >= 0")
     if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
@@ -1821,7 +1958,9 @@ def main():
     depth = int(config["depth"])
     delta_block_indices = tuple(config.get("delta_block_indices", ()))
     phase2_uses_delta = phase2_uses_delta_backbone(args.phase2_mode)
-    phase2_diversity_enabled = args.phase2_mode == "s4_allblocks_delta_div" and args.lambda_div > 0.0
+    phase2_diversity_enabled = args.phase2_mode == "s4_allblocks_delta_div" and (
+        args.lambda_div > 0.0 or args.lambda_div_anneal_run_a
+    )
     diversity_block_indices = ()
     diversity_pair_candidates = ()
     diversity_pair_capacity = 0
@@ -1862,9 +2001,17 @@ def main():
             f"delta_blocks={[idx + 1 for idx in delta_block_indices]}"
         )
         if args.phase2_mode == "s4_allblocks_delta_div":
+            if args.lambda_div_anneal_run_a:
+                log_stage(
+                    "Phase-2 λ_div anneal Run A (global steps): "
+                    f"[{args.repa_stop_step}, {_LAMBDA_DIV_ANNEAL_RUN_A_T1}) → 1.0; "
+                    f"[{_LAMBDA_DIV_ANNEAL_RUN_A_T1}, {_LAMBDA_DIV_ANNEAL_RUN_A_T2}) → linear 1.0→0.25; "
+                    f"[{_LAMBDA_DIV_ANNEAL_RUN_A_T2}, ∞) → 0.1."
+                )
             log_stage(
                 "Phase-2 diversity loss: "
-                f"lambda_div={args.lambda_div:.4f} scope={args.diversity_block_scope} "
+                f"lambda_div={'anneal_run_a' if args.lambda_div_anneal_run_a else f'{args.lambda_div:.4f}'} "
+                f"scope={args.diversity_block_scope} "
                 f"exclude_adjacent_pairs={bool(args.diversity_exclude_adjacent_pairs)} "
                 f"max_pairs_per_step={diversity_pair_capacity if args.diversity_max_pairs_per_step > 0 else 'all'}"
             )
@@ -1935,9 +2082,11 @@ def main():
             make_train_step(
                 delta_active=True,
                 trainable_mask=delta_only_mask,
-                lambda_div=args.lambda_div if phase2_diversity_enabled else 0.0,
+                lambda_div=0.0,
                 delta_metric_blocks=delta_block_indices,
                 diversity_block_indices=diversity_block_indices,
+                phase2_runtime_lambda_div=True,
+                collect_diversity_blocks=phase2_diversity_enabled,
             ),
             axis_name="batch",
         )
@@ -2692,8 +2841,21 @@ def main():
                     )
                     diversity_step_blocks_text = format_block_indices_1based(diversity_block_indices)
                     diversity_step_pairs_text = format_block_pairs_1based(sampled_diversity_pairs)
+                lambda_div_eff = compute_effective_lambda_div(
+                    global_step,
+                    args.phase2_mode,
+                    args.lambda_div,
+                    args.lambda_div_anneal_run_a,
+                )
+                lambda_div_rep = jax_utils.replicate(jnp.float32(lambda_div_eff))
                 state, ema_params, metrics, rng = pmapped_train_step_phase2_delta(
-                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, diversity_pairs_rep
+                    state,
+                    ema_params,
+                    (batch_x, batch_y),
+                    rng,
+                    ema_decay_rep,
+                    diversity_pairs_rep,
+                    lambda_div_rep,
                 )
             else:
                 # Vanilla SiT training step (returns updated EMA params)
