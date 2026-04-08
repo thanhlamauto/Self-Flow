@@ -9,6 +9,7 @@ import threading
 import queue
 import logging
 import zipfile
+import random
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -499,18 +500,99 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def resolve_diversity_pairs(depth, pair_mode):
-    """Resolve the block pairs and feature-capture layers for diversity loss."""
-    if pair_mode != "mirror":
+def _all_diversity_pairs(depth):
+    return tuple((i, j) for i in range(depth) for j in range(i + 1, depth))
+
+
+def _projection_biased_diversity_pairs(depth, max_pairs, encoder_depth):
+    """Approximate the upstream pair-order bias around encoder_depth."""
+    selected = []
+    start = max(0, max_pairs - encoder_depth - 1)
+    stop = min(depth, max_pairs + encoder_depth)
+
+    for i in range(start, stop):
+        for j in range(i + 1, depth):
+            selected.append((i, j))
+            if len(selected) >= max_pairs:
+                return tuple(selected)
+
+    # Fall back to the remaining pair candidates if the biased window is too small.
+    seen = set(selected)
+    for pair in _all_diversity_pairs(depth):
+        if pair in seen:
+            continue
+        selected.append(pair)
+        if len(selected) >= max_pairs:
+            break
+    return tuple(selected)
+
+
+def resolve_diversity_pairs(
+    depth,
+    pair_mode,
+    max_pairs=10,
+    encoder_depth=8,
+    *,
+    paper_num_layers=10,
+    paper_seed=42,
+):
+    """Resolve block pairs (0-based indices) and 1-based capture layers for diversity loss.
+
+    Modes:
+      * ``mirror`` — symmetric early/late pairs ``(i, depth-1-i)``, capped by ``max_pairs``.
+      * ``all`` — lexicographic pairs over all blocks, first ``max_pairs`` pairs; capture
+        only layers that appear in those pairs (legacy behaviour).
+      * ``projection-biased`` — biased pair order around ``encoder_depth`` (see upstream).
+      * ``paper`` — supplementary-style: **randomly sample** ``paper_num_layers`` distinct
+        blocks (1..depth), then take lexicographic pairs among them, **first** ``max_pairs``
+        pairs. Forward captures **only** those sampled blocks (not the full stack).
+      * ``first_pairs`` — matches DiverseDiT ``loss.py`` (no projection): **capture every
+        block** ``1..depth``, orth/MI use the **first** ``max_pairs`` pairs in lex order
+        ``(0,1),(0,2),...`` over 0-based indices; dispersion still uses all captured layers.
+    """
+    total_pairs = depth * (depth - 1) // 2
+    max_pairs = max(0, min(int(max_pairs), total_pairs))
+    if max_pairs == 0:
+        return (), ()
+
+    if pair_mode == "mirror":
+        pairs = tuple((i, depth - 1 - i) for i in range(depth // 2))[:max_pairs]
+        capture_layers = tuple(sorted({layer + 1 for pair in pairs for layer in pair}))
+        return pairs, capture_layers
+
+    if pair_mode == "paper":
+        k = min(int(paper_num_layers), depth)
+        if k < 2:
+            raise ValueError(
+                "pair_mode='paper' needs at least 2 layers to form pairs; "
+                f"got diversity_paper_num_layers={paper_num_layers} (effective k={k})."
+            )
+        rng = random.Random(int(paper_seed))
+        layers_1based = sorted(rng.sample(range(1, depth + 1), k))
+        idx0 = [layer - 1 for layer in layers_1based]
+        pair_list = [(idx0[a], idx0[b]) for a in range(len(idx0)) for b in range(a + 1, len(idx0))]
+        pairs = tuple(pair_list[:max_pairs])
+        capture_layers = tuple(layers_1based)
+        return pairs, capture_layers
+
+    if pair_mode == "first_pairs":
+        pairs = _all_diversity_pairs(depth)[:max_pairs]
+        capture_layers = tuple(range(1, depth + 1))
+        return pairs, capture_layers
+
+    if pair_mode == "all":
+        pairs = _all_diversity_pairs(depth)[:max_pairs]
+    elif pair_mode == "projection-biased":
+        pairs = _projection_biased_diversity_pairs(depth, max_pairs, int(encoder_depth))
+    else:
         raise ValueError(f"Unsupported diversity pair mode: {pair_mode}")
 
-    pairs = tuple((i, depth - 1 - i) for i in range(depth // 2))
     capture_layers = tuple(sorted({layer + 1 for pair in pairs for layer in pair}))
     return pairs, capture_layers
 
 
 def compute_diversity_gate(div_loss, gate_low, gate_high):
-    """Adaptive gate used to stabilize the diversity loss."""
+    """Adaptive coefficient used by the upstream training loop."""
     return jnp.where(
         div_loss > gate_high,
         jnp.array(1.0, dtype=jnp.float32),
@@ -533,7 +615,7 @@ def compute_diversity_loss(
     gate_low,
     gate_high,
 ):
-    """Compute DiverseDiT's orthogonality, proxy-MI, and dispersion losses."""
+    """Compute weighted orthogonality, proxy-MI, and dispersion losses."""
     if not diversity_pairs:
         zero = jnp.array(0.0, dtype=jnp.float32)
         return zero, zero, zero, zero, zero, zero
@@ -586,14 +668,15 @@ def compute_diversity_loss(
     normalized_variance = variance / 0.25
     disp_loss = -jnp.clip(normalized_variance, 0.0, 1.0)
 
-    # Match DiverseDiT: simple average of the three components
-    div_loss = (orth_loss + mi_loss + disp_loss) / 3.0
-    
-    # Match DiverseDiT: use a static clamp instead of an adaptive gate
+    div_loss = (
+        orth_weight * orth_loss +
+        mi_weight * mi_loss +
+        disp_weight * disp_loss
+    )
+
     div_loss = jnp.clip(div_loss, a_max=5.0)
-    
-    # Return 1.0 as a placeholder for the legacy gate variable used in the training loop
-    gate = jnp.array(1.0, dtype=jnp.float32)
+
+    gate = compute_diversity_gate(div_loss, gate_low, gate_high)
     return div_loss, orth_loss, mi_loss, disp_loss, gate, mean_pairwise_similarity
 
 
@@ -673,7 +756,8 @@ def train_step(
             mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + loss_div  # loss_div is already combined and clamped internally
+        loss_div_effective = loss_div * loss_div_gate
+        loss = loss_gen + loss_div_effective
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         return loss, (
@@ -685,6 +769,7 @@ def train_step(
             loss_div_mi,
             loss_div_disp,
             loss_div_gate,
+            loss_div_effective,
             mean_pairwise_similarity,
         )
 
@@ -700,6 +785,7 @@ def train_step(
             loss_div_mi,
             loss_div_disp,
             loss_div_gate,
+            loss_div_effective,
             mean_pairwise_similarity,
         ),
     ), grads = grad_fn(state.params)
@@ -713,6 +799,7 @@ def train_step(
     loss_div_mi = jax.lax.pmean(loss_div_mi, axis_name="batch")
     loss_div_disp = jax.lax.pmean(loss_div_disp, axis_name="batch")
     loss_div_gate = jax.lax.pmean(loss_div_gate, axis_name="batch")
+    loss_div_effective = jax.lax.pmean(loss_div_effective, axis_name="batch")
     mean_pairwise_similarity = jax.lax.pmean(mean_pairwise_similarity, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
@@ -731,6 +818,7 @@ def train_step(
         "train/loss_div_mi": loss_div_mi,
         "train/loss_div_disp": loss_div_disp,
         "train/loss_div_gate": loss_div_gate,
+        "train/loss_div_effective": loss_div_effective,
         "train/mean_pairwise_similarity": mean_pairwise_similarity,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
@@ -805,7 +893,8 @@ def eval_step(
         mean_pairwise_similarity = jnp.array(0.0, dtype=target.dtype)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + loss_div
+    loss_div_effective = loss_div * loss_div_gate
+    loss = loss_gen + loss_div_effective
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
@@ -816,6 +905,7 @@ def eval_step(
     loss_div_mi = jax.lax.pmean(loss_div_mi, axis_name="batch")
     loss_div_disp = jax.lax.pmean(loss_div_disp, axis_name="batch")
     loss_div_gate = jax.lax.pmean(loss_div_gate, axis_name="batch")
+    loss_div_effective = jax.lax.pmean(loss_div_effective, axis_name="batch")
     mean_pairwise_similarity = jax.lax.pmean(mean_pairwise_similarity, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
@@ -829,6 +919,7 @@ def eval_step(
         "val/loss_div_mi": loss_div_mi,
         "val/loss_div_disp": loss_div_disp,
         "val/loss_div_gate": loss_div_gate,
+        "val/loss_div_effective": loss_div_effective,
         "val/mean_pairwise_similarity": mean_pairwise_similarity,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
@@ -1326,9 +1417,44 @@ def main():
     parser.add_argument(
         "--diversity-pair-mode",
         type=str,
-        default="mirror",
-        choices=["mirror"],
-        help="Block-pair subset used by the diversity loss.",
+        default="projection-biased",
+        choices=["projection-biased", "all", "mirror", "paper", "first_pairs"],
+        help=(
+            "How to choose block pairs for diversity loss. "
+            "'paper' = randomly sample --diversity-paper-num-layers blocks (supplementary-style), "
+            "then use up to --diversity-max-pairs lexicographic pairs among them; only those blocks are captured. "
+            "'first_pairs' = capture ALL blocks, orth/MI use first --diversity-max-pairs pairs in lex order "
+            "(matches DiverseDiT loss.py without projection). "
+            "'mirror' = symmetric early/late pairs. "
+            "'all' / 'projection-biased' = existing behaviours."
+        ),
+    )
+    parser.add_argument(
+        "--diversity-max-pairs",
+        type=int,
+        default=10,
+        help="Maximum number of block pairs used by orthogonality/MI losses.",
+    )
+    parser.add_argument(
+        "--diversity-paper-num-layers",
+        type=int,
+        default=10,
+        help=(
+            "Used when --diversity-pair-mode=paper: number of distinct blocks to sample uniformly "
+            "at random from {1..depth} (default 10, per supplementary). Must be >= 2."
+        ),
+    )
+    parser.add_argument(
+        "--diversity-paper-seed",
+        type=int,
+        default=42,
+        help="RNG seed for --diversity-pair-mode=paper layer sampling (fixed for the whole run).",
+    )
+    parser.add_argument(
+        "--diversity-encoder-depth",
+        type=int,
+        default=8,
+        help="Reference depth used by the upstream projection-biased pair ordering.",
     )
     parser.add_argument(
         "--diversity-orth-weight",
@@ -1505,6 +1631,12 @@ def main():
         raise ValueError("--diversity-mi-weight must be non-negative")
     if args.diversity_disp_weight < 0.0:
         raise ValueError("--diversity-disp-weight must be non-negative")
+    if args.diversity_max_pairs < 0:
+        raise ValueError("--diversity-max-pairs must be non-negative")
+    if args.diversity_paper_num_layers < 2:
+        raise ValueError("--diversity-paper-num-layers must be >= 2 (need at least one pair)")
+    if args.diversity_encoder_depth <= 0:
+        raise ValueError("--diversity-encoder-depth must be greater than 0")
     if args.diversity_gate_low < 0.0:
         raise ValueError("--diversity-gate-low must be non-negative")
     if args.diversity_gate_high <= 0.0:
@@ -1561,16 +1693,27 @@ def main():
         diversity_pairs, diversity_capture_layers = resolve_diversity_pairs(
             depth,
             args.diversity_pair_mode,
+            max_pairs=args.diversity_max_pairs,
+            encoder_depth=args.diversity_encoder_depth,
+            paper_num_layers=args.diversity_paper_num_layers,
+            paper_seed=args.diversity_paper_seed,
         )
         if not diversity_pairs:
             raise ValueError("Block diversity loss requires at least one block pair.")
         log_stage(
             "DiverseDiT block diversity loss: "
             f"pair_mode={args.diversity_pair_mode} pairs={len(diversity_pairs)} "
+            f"capture_layers={len(diversity_capture_layers)} "
+            f"max_pairs={args.diversity_max_pairs} encoder_depth={args.diversity_encoder_depth} "
             f"weights=({args.diversity_orth_weight:.2f},"
             f"{args.diversity_mi_weight:.2f},{args.diversity_disp_weight:.2f}) "
             f"gate=({args.diversity_gate_low:.2f},{args.diversity_gate_high:.2f})"
         )
+        if args.diversity_pair_mode == "paper":
+            log_stage(
+                f"  paper: diversity_paper_num_layers={args.diversity_paper_num_layers} "
+                f"diversity_paper_seed={args.diversity_paper_seed}"
+            )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
