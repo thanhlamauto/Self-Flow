@@ -524,13 +524,63 @@ def _zero_aux_metrics(dtype):
     }
 
 
+def _scheduled_lambda_private(
+    lambda_private,
+    current_step,
+    start_step=0,
+    warmup_iters=0,
+):
+    """Late-start + linear warmup schedule for private diversity loss."""
+    lambda_private = jnp.asarray(lambda_private, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    start_step = jnp.asarray(start_step, dtype=jnp.int32)
+    warmup_iters = jnp.asarray(warmup_iters, dtype=jnp.int32)
+
+    has_started = current_step >= start_step
+    no_warmup = warmup_iters <= 0
+    warmup_progress = (current_step - start_step + 1).astype(jnp.float32) / jnp.maximum(
+        warmup_iters.astype(jnp.float32), 1.0
+    )
+    warmup_scale = jnp.where(
+        has_started,
+        jnp.where(no_warmup, 1.0, jnp.clip(warmup_progress, 0.0, 1.0)),
+        0.0,
+    )
+    return lambda_private * warmup_scale, warmup_scale
+
+
+def _tree_mean_leaf_cosine_similarity(
+    tree_a,
+    tree_b,
+    eps=1e-12,
+):
+    """Mean cosine similarity across matching parameter leaves."""
+    leaves_a = jax.tree_util.tree_leaves(tree_a)
+    leaves_b = jax.tree_util.tree_leaves(tree_b)
+    if not leaves_a:
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    cosines = []
+    for leaf_a, leaf_b in zip(leaves_a, leaves_b):
+        leaf_a = leaf_a.astype(jnp.float32)
+        leaf_b = leaf_b.astype(jnp.float32)
+        dot = jnp.sum(leaf_a * leaf_b)
+        norm_a = jnp.sqrt(jnp.sum(jnp.square(leaf_a)))
+        norm_b = jnp.sqrt(jnp.sum(jnp.square(leaf_b)))
+        denom = norm_a * norm_b
+        cosines.append(jnp.where(denom > eps, dot / denom, 0.0))
+    return jnp.mean(jnp.stack(cosines))
+
+
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state, ema_params, batch, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    private_start_step=0,
+    private_warmup_iters=0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -541,6 +591,12 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
     use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
@@ -550,19 +606,17 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
-
-    def loss_fn(params):
-        outputs = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            return_activations=use_aux_losses,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        if use_aux_losses:
-            pred, activations = outputs
+    if use_aux_losses:
+        def component_loss_fn(params):
+            pred, activations = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_activations=True,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=x0,
@@ -573,59 +627,98 @@ def train_step(
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
             )
-        else:
-            pred = outputs
-            aux_metrics = _zero_aux_metrics(target.dtype)
+            l_diff = jnp.mean((pred - target) ** 2)
+            l_spatial = aux_metrics["loss_spatial"]
+            l_private = aux_metrics["loss_private"]
+            component_losses = jnp.stack([l_diff, l_spatial, l_private])
+            return component_losses, (
+                jnp.mean(jnp.abs(target)),
+                jnp.mean(jnp.abs(pred)),
+                aux_metrics["spatial_metrics"],
+                aux_metrics["norm_common"],
+                aux_metrics["avg_private_norm"],
+                aux_metrics["avg_pairwise_private_cosine"],
+            )
 
-        l_diff = jnp.mean((pred - target) ** 2)
-        l_spatial = aux_metrics["loss_spatial"]
-        l_private = aux_metrics["loss_private"]
-        loss = (
-            l_diff
-            + lambda_spatial * l_spatial
-            + lambda_private * l_private
-        )
-        v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (
-            v_abs_mean,
-            v_pred_abs_mean,
-            l_diff,
-            l_spatial,
-            l_private,
-            aux_metrics["spatial_metrics"],
-            aux_metrics["norm_common"],
-            aux_metrics["avg_private_norm"],
-            aux_metrics["avg_pairwise_private_cosine"],
-        )
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (
-        loss,
         (
-            v_abs,
-            v_pred,
-            l_diff,
-            l_spatial,
-            l_private,
-            spatial_metrics,
-            norm_common,
-            avg_private_norm,
-            avg_pairwise_private_cosine,
-        ),
-    ), grads = grad_fn(state.params)
+            component_losses,
+            (
+                v_abs,
+                v_pred,
+                spatial_metrics,
+                norm_common,
+                avg_private_norm,
+                avg_pairwise_private_cosine,
+            ),
+        ), component_grads = jax.jacrev(component_loss_fn, has_aux=True)(state.params)
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-    l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
-    l_private = jax.lax.pmean(l_private, axis_name="batch")
-    spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
-    norm_common = jax.lax.pmean(norm_common, axis_name="batch")
-    avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
-    avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+        component_losses = jax.lax.pmean(component_losses, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
+        norm_common = jax.lax.pmean(norm_common, axis_name="batch")
+        avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
+        avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
+        component_grads = jax.lax.pmean(component_grads, axis_name="batch")
+
+        l_diff = component_losses[0]
+        l_spatial = component_losses[1]
+        l_private = component_losses[2]
+        grad_diff = jax.tree_util.tree_map(lambda g: g[0], component_grads)
+        grad_spatial = jax.tree_util.tree_map(lambda g: g[1], component_grads)
+        grad_private = jax.tree_util.tree_map(lambda g: g[2], component_grads)
+        weighted_grad_spatial = jax.tree_util.tree_map(lambda g: lambda_spatial * g, grad_spatial)
+        weighted_grad_private = jax.tree_util.tree_map(lambda g: effective_lambda_private * g, grad_private)
+        grads = jax.tree_util.tree_map(
+            lambda gd, gs, gp: gd + lambda_spatial * gs + effective_lambda_private * gp,
+            grad_diff,
+            grad_spatial,
+            grad_private,
+        )
+        loss = l_diff + lambda_spatial * l_spatial + effective_lambda_private * l_private
+        grad_cosine_spatial_vs_diffusion = _tree_mean_leaf_cosine_similarity(
+            grad_diff,
+            weighted_grad_spatial,
+        )
+        grad_cosine_private_vs_diffusion = _tree_mean_leaf_cosine_similarity(
+            grad_diff,
+            weighted_grad_private,
+        )
+    else:
+        def loss_fn(params):
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_activations=False,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            l_diff = jnp.mean((pred - target) ** 2)
+            loss = l_diff
+            return loss, (
+                jnp.mean(jnp.abs(target)),
+                jnp.mean(jnp.abs(pred)),
+                l_diff,
+            )
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (v_abs, v_pred, l_diff)), grads = grad_fn(state.params)
+
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+        l_spatial = jnp.array(0.0, dtype=loss.dtype)
+        l_private = jnp.array(0.0, dtype=loss.dtype)
+        spatial_metrics = jax.lax.pmean(_zero_aux_metrics(target.dtype)["spatial_metrics"], axis_name="batch")
+        norm_common = jnp.array(0.0, dtype=loss.dtype)
+        avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
+        avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
+        grads = jax.lax.pmean(grads, axis_name="batch")
+        grad_cosine_spatial_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
+        grad_cosine_private_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -638,9 +731,13 @@ def train_step(
         "train/l_diff": l_diff,
         "train/l_spatial": l_spatial,
         "train/l_private": l_private,
+        "train/lambda_private_effective": effective_lambda_private,
+        "train/private_warmup_scale": private_warmup_scale,
         "train/common_norm": norm_common,
         "train/private_avg_norm": avg_private_norm,
         "train/private_pairwise_cosine": avg_pairwise_private_cosine,
+        "train/grad_cosine_spatial_vs_diffusion": grad_cosine_spatial_vs_diffusion,
+        "train/grad_cosine_private_vs_diffusion": grad_cosine_private_vs_diffusion,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -654,16 +751,24 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state, ema_params, batch, rng, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    private_start_step=0,
+    private_warmup_iters=0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
     use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
 
     rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
@@ -705,7 +810,7 @@ def eval_step(
     loss = (
         l_diff
         + lambda_spatial * l_spatial
-        + lambda_private * l_private
+        + effective_lambda_private * l_private
     )
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -726,6 +831,8 @@ def eval_step(
         "val/l_diff": l_diff,
         "val/l_spatial": l_spatial,
         "val/l_private": l_private,
+        "val/lambda_private_effective": effective_lambda_private,
+        "val/private_warmup_scale": private_warmup_scale,
         "val/common_norm": common_norm,
         "val/private_avg_norm": avg_private_norm,
         "val/private_pairwise_cosine": avg_pairwise_private_cosine,
@@ -1221,6 +1328,18 @@ def main():
                         help="Weight for sliding-window local Gram spatial loss.")
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
+    parser.add_argument(
+        "--private-start-step",
+        type=int,
+        default=0,
+        help="Global step to start applying private diversity loss.",
+    )
+    parser.add_argument(
+        "--private-warmup-iters",
+        type=int,
+        default=0,
+        help="Number of iterations to linearly warm up private diversity lambda after start step.",
+    )
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
@@ -1385,6 +1504,10 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be >= 0")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be >= 0")
     if args.spatial_window_size <= 0:
         raise ValueError("--spatial-window-size must be > 0")
     if args.spatial_window_stride <= 0:
@@ -1426,6 +1549,8 @@ def main():
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
         f"lambda_private={args.lambda_private} "
+        f"private_start_step={args.private_start_step} "
+        f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
@@ -1474,6 +1599,8 @@ def main():
             train_step,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -1486,6 +1613,8 @@ def main():
             eval_step,
             lambda_spatial=args.lambda_spatial,
             lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -1765,7 +1894,8 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
+            jnp.zeros((num_devices,), dtype=jnp.int32)
         )
         block_pytree(probe_metrics)
 
@@ -2128,8 +2258,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2155,7 +2286,10 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    eval_step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+                    val_metrics, rng = pmapped_eval_step(
+                        state, ema_params, (val_x, val_y), rng, eval_step_devices
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
