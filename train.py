@@ -586,6 +586,7 @@ def train_step(
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -641,6 +642,7 @@ def train_step(
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
+                spatial_blur_max_sigma=spatial_blur_max_sigma,
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
@@ -756,6 +758,7 @@ def eval_step(
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -805,6 +808,7 @@ def eval_step(
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
+            spatial_blur_max_sigma=spatial_blur_max_sigma,
         )
     else:
         pred = outputs
@@ -1376,6 +1380,12 @@ def main():
             "at tau=0 (most noisy) to 0 at tau=1 (clean)."
         ),
     )
+    parser.add_argument(
+        "--spatial-blur-max-sigma",
+        type=float,
+        default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+        help="Maximum Gaussian sigma for timestep-dependent spatial blur.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1537,6 +1547,8 @@ def main():
         raise ValueError("--spatial-window-size must be > 0")
     if args.spatial_window_stride <= 0:
         raise ValueError("--spatial-window-stride must be > 0")
+    if args.spatial_blur_max_sigma < 0:
+        raise ValueError("--spatial-blur-max-sigma must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1581,7 +1593,8 @@ def main():
         f"private_max_pairs={args.private_max_pairs} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
-        f"spatial_blur_by_timestep={args.spatial_blur_by_timestep}"
+        f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
+        f"spatial_blur_max_sigma={args.spatial_blur_max_sigma}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1634,6 +1647,7 @@ def main():
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
+            spatial_blur_max_sigma=args.spatial_blur_max_sigma,
         ),
         axis_name="batch",
     )
@@ -1650,6 +1664,7 @@ def main():
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
+            spatial_blur_max_sigma=args.spatial_blur_max_sigma,
         ),
         axis_name="batch",
     )
