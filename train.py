@@ -579,33 +579,9 @@ def _scheduled_lambda_spatial(
     return lambda_spatial * stop_scale, stop_scale
 
 
-def _tree_mean_leaf_cosine_similarity(
-    tree_a,
-    tree_b,
-    eps=1e-12,
-):
-    """Mean cosine similarity across matching parameter leaves."""
-    leaves_a = jax.tree_util.tree_leaves(tree_a)
-    leaves_b = jax.tree_util.tree_leaves(tree_b)
-    if not leaves_a:
-        return jnp.array(0.0, dtype=jnp.float32)
-
-    cosines = []
-    for leaf_a, leaf_b in zip(leaves_a, leaves_b):
-        leaf_a = leaf_a.astype(jnp.float32)
-        leaf_b = leaf_b.astype(jnp.float32)
-        dot = jnp.sum(leaf_a * leaf_b)
-        norm_a = jnp.sqrt(jnp.sum(jnp.square(leaf_a)))
-        norm_b = jnp.sqrt(jnp.sum(jnp.square(leaf_b)))
-        denom = norm_a * norm_b
-        cosines.append(jnp.where(denom > eps, dot / denom, 0.0))
-    return jnp.mean(jnp.stack(cosines))
-
-
 def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
-    log_grad_cosine=False,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -645,83 +621,7 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
-    if use_aux_losses and log_grad_cosine:
-        def component_loss_fn(params):
-            pred, activations = state.apply_fn(
-                {"params": params},
-                x_tau,
-                timesteps=tau,
-                vector=y,
-                return_activations=True,
-                deterministic=False,
-                rngs={"dropout": drop_rng},
-            )
-            aux_metrics = compute_aux_losses(
-                activations,
-                spatial_target=x0,
-                timesteps=tau,
-                private_pair_rng=private_pair_rng,
-                private_max_pairs=private_max_pairs,
-                spatial_window_size=spatial_window_size,
-                spatial_window_stride=spatial_window_stride,
-                spatial_blur_by_timestep=spatial_blur_by_timestep,
-            )
-            l_diff = jnp.mean((pred - target) ** 2)
-            l_spatial = aux_metrics["loss_spatial"]
-            l_private = aux_metrics["loss_private"]
-            component_losses = jnp.stack([l_diff, l_spatial, l_private])
-            return component_losses, (
-                jnp.mean(jnp.abs(target)),
-                jnp.mean(jnp.abs(pred)),
-                aux_metrics["spatial_metrics"],
-                aux_metrics["norm_common"],
-                aux_metrics["avg_private_norm"],
-                aux_metrics["avg_pairwise_private_cosine"],
-            )
-
-        component_losses, (
-            v_abs,
-            v_pred,
-            spatial_metrics,
-            norm_common,
-            avg_private_norm,
-            avg_pairwise_private_cosine,
-        ) = component_loss_fn(state.params)
-        component_grads, _ = jax.jacrev(component_loss_fn, has_aux=True)(state.params)
-
-        component_losses = jax.lax.pmean(component_losses, axis_name="batch")
-        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-        spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
-        norm_common = jax.lax.pmean(norm_common, axis_name="batch")
-        avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
-        avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
-        component_grads = jax.lax.pmean(component_grads, axis_name="batch")
-
-        l_diff = component_losses[0]
-        l_spatial = component_losses[1]
-        l_private = component_losses[2]
-        grad_diff = jax.tree_util.tree_map(lambda g: g[0], component_grads)
-        grad_spatial = jax.tree_util.tree_map(lambda g: g[1], component_grads)
-        grad_private = jax.tree_util.tree_map(lambda g: g[2], component_grads)
-        weighted_grad_spatial = jax.tree_util.tree_map(lambda g: effective_lambda_spatial * g, grad_spatial)
-        weighted_grad_private = jax.tree_util.tree_map(lambda g: effective_lambda_private * g, grad_private)
-        grads = jax.tree_util.tree_map(
-            lambda gd, gs, gp: gd + effective_lambda_spatial * gs + effective_lambda_private * gp,
-            grad_diff,
-            grad_spatial,
-            grad_private,
-        )
-        loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
-        grad_cosine_spatial_vs_diffusion = _tree_mean_leaf_cosine_similarity(
-            grad_diff,
-            weighted_grad_spatial,
-        )
-        grad_cosine_private_vs_diffusion = _tree_mean_leaf_cosine_similarity(
-            grad_diff,
-            weighted_grad_private,
-        )
-    elif use_aux_losses:
+    if use_aux_losses:
         def loss_fn(params):
             pred, activations = state.apply_fn(
                 {"params": params},
@@ -785,8 +685,6 @@ def train_step(
         avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
         avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
         grads = jax.lax.pmean(grads, axis_name="batch")
-        grad_cosine_spatial_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
-        grad_cosine_private_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
     else:
         def loss_fn(params):
             pred = state.apply_fn(
@@ -820,8 +718,6 @@ def train_step(
         avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
         grads = jax.lax.pmean(grads, axis_name="batch")
-        grad_cosine_spatial_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
-        grad_cosine_private_vs_diffusion = jnp.array(0.0, dtype=loss.dtype)
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -841,8 +737,6 @@ def train_step(
         "train/common_norm": norm_common,
         "train/private_avg_norm": avg_private_norm,
         "train/private_pairwise_cosine": avg_pairwise_private_cosine,
-        "train/grad_cosine_spatial_vs_diffusion": grad_cosine_spatial_vs_diffusion,
-        "train/grad_cosine_private_vs_diffusion": grad_cosine_private_vs_diffusion,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -1442,13 +1336,6 @@ def main():
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for sliding-window local Gram spatial loss.")
     parser.add_argument(
-        "--log-grad-cosine",
-        dest="log_grad_cosine",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Log cosine similarity between auxiliary-loss update gradients and diffusion gradients. Expensive in memory/time.",
-    )
-    parser.add_argument(
         "--spatial-stop-step",
         type=int,
         default=-1,
@@ -1686,7 +1573,6 @@ def main():
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
-        f"log_grad_cosine={args.log_grad_cosine} "
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
@@ -1739,7 +1625,6 @@ def main():
         partial(
             train_step,
             lambda_spatial=args.lambda_spatial,
-            log_grad_cosine=args.log_grad_cosine,
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
