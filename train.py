@@ -549,6 +549,36 @@ def _scheduled_lambda_private(
     return lambda_private * warmup_scale, warmup_scale
 
 
+def _scheduled_lambda_spatial(
+    lambda_spatial,
+    current_step,
+    stop_step=-1,
+    stop_warmup_iters=0,
+):
+    """Optional early-stop + linear ramp-down schedule for spatial Gram loss."""
+    lambda_spatial = jnp.asarray(lambda_spatial, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    stop_step = jnp.asarray(stop_step, dtype=jnp.int32)
+    stop_warmup_iters = jnp.asarray(stop_warmup_iters, dtype=jnp.int32)
+
+    stop_enabled = stop_step >= 0
+    after_stop = current_step >= stop_step
+    no_stop_warmup = stop_warmup_iters <= 0
+    stop_progress = (current_step - stop_step + 1).astype(jnp.float32) / jnp.maximum(
+        stop_warmup_iters.astype(jnp.float32), 1.0
+    )
+    stop_scale = jnp.where(
+        stop_enabled,
+        jnp.where(
+            after_stop,
+            jnp.where(no_stop_warmup, 0.0, 1.0 - jnp.clip(stop_progress, 0.0, 1.0)),
+            1.0,
+        ),
+        1.0,
+    )
+    return lambda_spatial * stop_scale, stop_scale
+
+
 def _tree_mean_leaf_cosine_similarity(
     tree_a,
     tree_b,
@@ -579,6 +609,8 @@ def train_step(
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    spatial_stop_step=-1,
+    spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
 ):
@@ -591,6 +623,12 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    effective_lambda_spatial, spatial_stop_scale = _scheduled_lambda_spatial(
+        lambda_spatial,
+        current_step,
+        stop_step=spatial_stop_step,
+        stop_warmup_iters=spatial_stop_warmup_iters,
+    )
     effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
         lambda_private,
         current_step,
@@ -667,15 +705,15 @@ def train_step(
         grad_diff = jax.tree_util.tree_map(lambda g: g[0], component_grads)
         grad_spatial = jax.tree_util.tree_map(lambda g: g[1], component_grads)
         grad_private = jax.tree_util.tree_map(lambda g: g[2], component_grads)
-        weighted_grad_spatial = jax.tree_util.tree_map(lambda g: lambda_spatial * g, grad_spatial)
+        weighted_grad_spatial = jax.tree_util.tree_map(lambda g: effective_lambda_spatial * g, grad_spatial)
         weighted_grad_private = jax.tree_util.tree_map(lambda g: effective_lambda_private * g, grad_private)
         grads = jax.tree_util.tree_map(
-            lambda gd, gs, gp: gd + lambda_spatial * gs + effective_lambda_private * gp,
+            lambda gd, gs, gp: gd + effective_lambda_spatial * gs + effective_lambda_private * gp,
             grad_diff,
             grad_spatial,
             grad_private,
         )
-        loss = l_diff + lambda_spatial * l_spatial + effective_lambda_private * l_private
+        loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
         grad_cosine_spatial_vs_diffusion = _tree_mean_leaf_cosine_similarity(
             grad_diff,
             weighted_grad_spatial,
@@ -731,6 +769,8 @@ def train_step(
         "train/l_diff": l_diff,
         "train/l_spatial": l_spatial,
         "train/l_private": l_private,
+        "train/lambda_spatial_effective": effective_lambda_spatial,
+        "train/spatial_stop_scale": spatial_stop_scale,
         "train/lambda_private_effective": effective_lambda_private,
         "train/private_warmup_scale": private_warmup_scale,
         "train/common_norm": norm_common,
@@ -757,12 +797,20 @@ def eval_step(
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
+    spatial_stop_step=-1,
+    spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
+    effective_lambda_spatial, spatial_stop_scale = _scheduled_lambda_spatial(
+        lambda_spatial,
+        current_step,
+        stop_step=spatial_stop_step,
+        stop_warmup_iters=spatial_stop_warmup_iters,
+    )
     effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
         lambda_private,
         current_step,
@@ -809,7 +857,7 @@ def eval_step(
     spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
-        + lambda_spatial * l_spatial
+        + effective_lambda_spatial * l_spatial
         + effective_lambda_private * l_private
     )
     v_abs_mean = jnp.mean(jnp.abs(target))
@@ -831,6 +879,8 @@ def eval_step(
         "val/l_diff": l_diff,
         "val/l_spatial": l_spatial,
         "val/l_private": l_private,
+        "val/lambda_spatial_effective": effective_lambda_spatial,
+        "val/spatial_stop_scale": spatial_stop_scale,
         "val/lambda_private_effective": effective_lambda_private,
         "val/private_warmup_scale": private_warmup_scale,
         "val/common_norm": common_norm,
@@ -1326,6 +1376,18 @@ def main():
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for sliding-window local Gram spatial loss.")
+    parser.add_argument(
+        "--spatial-stop-step",
+        type=int,
+        default=-1,
+        help="Global step to start turning off spatial Gram loss. -1 disables early stop.",
+    )
+    parser.add_argument(
+        "--spatial-stop-warmup-iters",
+        type=int,
+        default=0,
+        help="Number of iterations to linearly decay spatial Gram lambda to zero after spatial-stop-step.",
+    )
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
     parser.add_argument(
@@ -1504,6 +1566,10 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.spatial_stop_step < -1:
+        raise ValueError("--spatial-stop-step must be >= -1")
+    if args.spatial_stop_warmup_iters < 0:
+        raise ValueError("--spatial-stop-warmup-iters must be >= 0")
     if args.private_start_step < 0:
         raise ValueError("--private-start-step must be >= 0")
     if args.private_warmup_iters < 0:
@@ -1548,6 +1614,8 @@ def main():
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
+        f"spatial_stop_step={args.spatial_stop_step} "
+        f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
@@ -1598,6 +1666,8 @@ def main():
         partial(
             train_step,
             lambda_spatial=args.lambda_spatial,
+            spatial_stop_step=args.spatial_stop_step,
+            spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
@@ -1612,6 +1682,8 @@ def main():
         partial(
             eval_step,
             lambda_spatial=args.lambda_spatial,
+            spatial_stop_step=args.spatial_stop_step,
+            spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
