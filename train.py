@@ -390,9 +390,11 @@ def maybe_blur_dino_inputs(
     dino_images,
     timesteps,
     enabled=False,
-    max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    max_sigma=None,
 ):
     """Optionally blur DINO teacher inputs with sigma decreasing as tau increases."""
+    if max_sigma is None:
+        max_sigma = 3.0
     if not enabled:
         return dino_images, jnp.array(0.0, dtype=dino_images.dtype)
     blur_sigmas = max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
