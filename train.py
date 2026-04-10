@@ -380,8 +380,28 @@ def preprocess_dino_images_sharded(images_sharded):
     num_devices, local_batch, _, _, _ = images_sharded.shape
     flat = images_sharded.reshape(num_devices * local_batch, images_sharded.shape[2], images_sharded.shape[3], 3)
     resized = jax.image.resize(flat, (flat.shape[0], 224, 224, 3), method="bilinear")
-    normalized = (resized - DINO_MEAN[None, None, None, :]) / DINO_STD[None, None, None, :]
+    dino_mean = jnp.asarray(DINO_MEAN, dtype=resized.dtype)
+    dino_std = jnp.asarray(DINO_STD, dtype=resized.dtype)
+    normalized = (resized - dino_mean[None, None, None, :]) / dino_std[None, None, None, :]
     return normalized.reshape(num_devices, local_batch, 224, 224, 3)
+
+
+def maybe_blur_dino_inputs(
+    dino_images,
+    timesteps,
+    enabled=False,
+    max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+):
+    """Optionally blur DINO teacher inputs with sigma decreasing as tau increases."""
+    if not enabled:
+        return dino_images, jnp.array(0.0, dtype=dino_images.dtype)
+    blur_sigmas = max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
+    blurred = _apply_separable_gaussian_blur(
+        dino_images.astype(jnp.float32),
+        blur_sigmas.astype(jnp.float32),
+        max_sigma=max_sigma,
+    )
+    return blurred.astype(dino_images.dtype), jnp.mean(blur_sigmas.astype(dino_images.dtype))
 
 
 DIT_VARIANTS = {
@@ -440,6 +460,7 @@ except ImportError:
     grain = None
 from src.model import SelfFlowDiT
 from src.activation_decomposition import (
+    _apply_separable_gaussian_blur,
     compute_aux_losses,
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_NORM_GAMMA,
@@ -466,8 +487,8 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-DINO_MEAN = jnp.array([0.485, 0.456, 0.406], dtype=jnp.float32)
-DINO_STD = jnp.array([0.229, 0.224, 0.225], dtype=jnp.float32)
+DINO_MEAN = (0.485, 0.456, 0.406)
+DINO_STD = (0.229, 0.224, 0.225)
 
 
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
@@ -664,12 +685,19 @@ def train_step(
     if compute_spatial_loss:
         if dinov2_model is None:
             raise ValueError("A DINOv2 model is required when spatial loss is enabled.")
+        dino_images, spatial_blur_sigma_mean = maybe_blur_dino_inputs(
+            dino_images,
+            tau,
+            enabled=spatial_blur_by_timestep,
+            max_sigma=spatial_blur_max_sigma,
+        )
         dinov2_features = dinov2_model.apply(
             dinov2_params,
             dino_images.astype(jnp.bfloat16),
         ).astype(jnp.float32)
     else:
         dinov2_features = None
+        spatial_blur_sigma_mean = jnp.array(0.0, dtype=target.dtype)
 
     if use_aux_losses:
         def loss_fn(params):
@@ -801,6 +829,7 @@ def train_step(
     metrics["train/spatial_align_score"] = spatial_metrics["spatial_align_score"]
     metrics["train/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
     metrics["train/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
+    metrics["train/spatial_blur_sigma_mean"] = spatial_blur_sigma_mean
     return state, ema_params, metrics, rng
 
 
@@ -847,12 +876,19 @@ def eval_step(
     if compute_spatial_loss:
         if dinov2_model is None:
             raise ValueError("A DINOv2 model is required when spatial loss is enabled.")
+        dino_images, spatial_blur_sigma_mean = maybe_blur_dino_inputs(
+            dino_images,
+            tau,
+            enabled=spatial_blur_by_timestep,
+            max_sigma=spatial_blur_max_sigma,
+        )
         dinov2_features = dinov2_model.apply(
             dinov2_params,
             dino_images.astype(jnp.bfloat16),
         ).astype(jnp.float32)
     else:
         dinov2_features = None
+        spatial_blur_sigma_mean = jnp.array(0.0, dtype=target.dtype)
 
     outputs = state.apply_fn(
         {"params": state.params},
@@ -923,6 +959,7 @@ def eval_step(
     metrics["val/spatial_align_score"] = spatial_metrics["spatial_align_score"]
     metrics["val/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
     metrics["val/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
+    metrics["val/spatial_blur_sigma_mean"] = spatial_blur_sigma_mean
     return metrics, rng
 
 
@@ -1450,13 +1487,17 @@ def main():
     parser.add_argument(
         "--spatial-blur-by-timestep",
         action="store_true",
-        help="Deprecated no-op from the old local-Gram spatial loss path.",
+        help=(
+            "Blur the DINO teacher input according to timestep. "
+            f"Uses Gaussian sigma that decreases linearly from {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
+            "at tau=0 (most noisy) to 0 at tau=1 (clean)."
+        ),
     )
     parser.add_argument(
         "--spatial-blur-max-sigma",
         type=float,
         default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
-        help="Deprecated no-op from the old local-Gram spatial loss path.",
+        help="Maximum Gaussian sigma for timestep-dependent blur on DINO teacher inputs.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
