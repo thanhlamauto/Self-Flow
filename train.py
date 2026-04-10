@@ -360,10 +360,6 @@ def unpatchify_patchified_latents(latents):
     )
 
 
-DINO_MEAN = jnp.array([0.485, 0.456, 0.406], dtype=jnp.float32)
-DINO_STD = jnp.array([0.229, 0.224, 0.225], dtype=jnp.float32)
-
-
 def unpatchify_patchified_latents_sharded(latents):
     from einops import rearrange
 
@@ -468,6 +464,10 @@ from src.metrics import (
     trim_sharded_batch_to_host,
 )
 from src.inception_is_subprocess import InceptionISSubprocess
+
+
+DINO_MEAN = jnp.array([0.485, 0.456, 0.406], dtype=jnp.float32)
+DINO_STD = jnp.array([0.229, 0.224, 0.225], dtype=jnp.float32)
 
 
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
