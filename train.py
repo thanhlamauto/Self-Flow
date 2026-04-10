@@ -360,6 +360,34 @@ def unpatchify_patchified_latents(latents):
     )
 
 
+DINO_MEAN = jnp.array([0.485, 0.456, 0.406], dtype=jnp.float32)
+DINO_STD = jnp.array([0.229, 0.224, 0.225], dtype=jnp.float32)
+
+
+def unpatchify_patchified_latents_sharded(latents):
+    from einops import rearrange
+
+    latents = jnp.asarray(latents, dtype=jnp.float32)
+    return rearrange(
+        latents,
+        "d b (h w) (p1 p2 c) -> d b c (h p1) (w p2)",
+        h=16,
+        w=16,
+        p1=2,
+        p2=2,
+        c=4,
+    )
+
+
+def preprocess_dino_images_sharded(images_sharded):
+    """Convert decoded [0,1] NHWC images to 224x224 ImageNet-normalized tensors."""
+    num_devices, local_batch, _, _, _ = images_sharded.shape
+    flat = images_sharded.reshape(num_devices * local_batch, images_sharded.shape[2], images_sharded.shape[3], 3)
+    resized = jax.image.resize(flat, (flat.shape[0], 224, 224, 3), method="bilinear")
+    normalized = (resized - DINO_MEAN[None, None, None, :]) / DINO_STD[None, None, None, :]
+    return normalized.reshape(num_devices, local_batch, 224, 224, 3)
+
+
 DIT_VARIANTS = {
     "S": {"hidden_size": 384, "depth": 12, "num_heads": 6},
     "B": {"hidden_size": 768, "depth": 12, "num_heads": 12},
@@ -388,6 +416,8 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
+        spatial_proj_dim=768,
+        spatial_proj_kernel_size=3,
     )
 
 
@@ -416,9 +446,11 @@ from src.model import SelfFlowDiT
 from src.activation_decomposition import (
     compute_aux_losses,
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    DEFAULT_SPATIAL_NORM_GAMMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
     DEFAULT_SPATIAL_WINDOW_STRIDE,
 )
+from src.dinov2_flax import DINOv2ViT, load_dinov2_params
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -456,6 +488,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        spatial_proj_dim=config["spatial_proj_dim"],
+        spatial_proj_kernel_size=config["spatial_proj_kernel_size"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -471,6 +505,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_activations=True,
+        return_spatial_features=True,
         deterministic=False,
     )
 
@@ -514,9 +550,9 @@ def _zero_aux_metrics(dtype):
         "loss_spatial": zero,
         "loss_private": zero,
         "spatial_metrics": {
-            "spatial_num_windows": zero,
-            "spatial_window_area": zero,
-            "spatial_blur_sigma_mean": zero,
+            "spatial_align_score": zero,
+            "spatial_feature_token_norm": zero,
+            "spatial_target_token_norm": zero,
         },
         "norm_common": zero,
         "avg_private_norm": zero,
@@ -580,8 +616,10 @@ def _scheduled_lambda_spatial(
 
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay, current_step,
+    state, ema_params, batch, dino_images, dinov2_params, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
+    dinov2_model=None,
+    spatial_norm_gamma=DEFAULT_SPATIAL_NORM_GAMMA,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -613,7 +651,8 @@ def train_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
+    compute_spatial_loss = lambda_spatial != 0.0
+    use_aux_losses = compute_spatial_loss or (lambda_private != 0.0)
 
     rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
 
@@ -622,27 +661,41 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    if compute_spatial_loss:
+        if dinov2_model is None:
+            raise ValueError("A DINOv2 model is required when spatial loss is enabled.")
+        dinov2_features = dinov2_model.apply(
+            dinov2_params,
+            dino_images.astype(jnp.bfloat16),
+        ).astype(jnp.float32)
+    else:
+        dinov2_features = None
+
     if use_aux_losses:
         def loss_fn(params):
-            pred, activations = state.apply_fn(
+            outputs = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 return_activations=True,
+                return_spatial_features=compute_spatial_loss,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
+            if compute_spatial_loss:
+                pred, activations, spatial_features = outputs
+            else:
+                pred, activations = outputs
+                spatial_features = None
             aux_metrics = compute_aux_losses(
                 activations,
-                spatial_target=x0,
-                timesteps=tau,
+                spatial_target=dinov2_features,
+                spatial_features=spatial_features,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
-                spatial_window_size=spatial_window_size,
-                spatial_window_stride=spatial_window_stride,
-                spatial_blur_by_timestep=spatial_blur_by_timestep,
-                spatial_blur_max_sigma=spatial_blur_max_sigma,
+                spatial_norm_gamma=spatial_norm_gamma,
+                compute_spatial_loss=compute_spatial_loss,
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
@@ -745,15 +798,17 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
-    metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
-    metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
-    metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["train/spatial_align_score"] = spatial_metrics["spatial_align_score"]
+    metrics["train/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
+    metrics["train/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
     return state, ema_params, metrics, rng
 
 
 def eval_step(
-    state, ema_params, batch, rng, current_step,
+    state, ema_params, batch, dino_images, dinov2_params, rng, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
+    dinov2_model=None,
+    spatial_norm_gamma=DEFAULT_SPATIAL_NORM_GAMMA,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -779,7 +834,8 @@ def eval_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
+    compute_spatial_loss = lambda_spatial != 0.0
+    use_aux_losses = compute_spatial_loss or (lambda_private != 0.0)
 
     rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
 
@@ -788,6 +844,15 @@ def eval_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    if compute_spatial_loss:
+        if dinov2_model is None:
+            raise ValueError("A DINOv2 model is required when spatial loss is enabled.")
+        dinov2_features = dinov2_model.apply(
+            dinov2_params,
+            dino_images.astype(jnp.bfloat16),
+        ).astype(jnp.float32)
+    else:
+        dinov2_features = None
 
     outputs = state.apply_fn(
         {"params": state.params},
@@ -795,20 +860,23 @@ def eval_step(
         timesteps=tau,
         vector=y,
         return_activations=use_aux_losses,
+        return_spatial_features=compute_spatial_loss,
         deterministic=True,
     )
     if use_aux_losses:
-        pred, activations = outputs
+        if compute_spatial_loss:
+            pred, activations, spatial_features = outputs
+        else:
+            pred, activations = outputs
+            spatial_features = None
         aux_metrics = compute_aux_losses(
             activations,
-            spatial_target=x0,
-            timesteps=tau,
+            spatial_target=dinov2_features,
+            spatial_features=spatial_features,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
-            spatial_window_size=spatial_window_size,
-            spatial_window_stride=spatial_window_stride,
-            spatial_blur_by_timestep=spatial_blur_by_timestep,
-            spatial_blur_max_sigma=spatial_blur_max_sigma,
+            spatial_norm_gamma=spatial_norm_gamma,
+            compute_spatial_loss=compute_spatial_loss,
         )
     else:
         pred = outputs
@@ -852,9 +920,9 @@ def eval_step(
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
-    metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
-    metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
-    metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["val/spatial_align_score"] = spatial_metrics["spatial_align_score"]
+    metrics["val/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
+    metrics["val/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
     return metrics, rng
 
 
@@ -1338,18 +1406,26 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for sliding-window local Gram spatial loss.")
+                        help="Weight for DINO-aligned spatial auxiliary loss.")
+    parser.add_argument("--dinov2-weights", type=str, default=None,
+                        help="Path to converted DINOv2 ViT-B/14 Flax weights (.pkl). Required when --lambda-spatial > 0.")
+    parser.add_argument("--spatial-proj-dim", type=int, default=768,
+                        help="Output dimension of the CNN projector used for spatial alignment.")
+    parser.add_argument("--spatial-proj-kernel-size", type=int, default=3,
+                        help="Kernel size of the CNN projector used for spatial alignment.")
+    parser.add_argument("--spatial-norm-gamma", type=float, default=DEFAULT_SPATIAL_NORM_GAMMA,
+                        help="Gamma used for iREPA-style token-dimension spatial normalization on DINO targets.")
     parser.add_argument(
         "--spatial-stop-step",
         type=int,
         default=-1,
-        help="Global step to start turning off spatial Gram loss. -1 disables early stop.",
+        help="Global step to start turning off DINO-aligned spatial loss. -1 disables early stop.",
     )
     parser.add_argument(
         "--spatial-stop-warmup-iters",
         type=int,
         default=0,
-        help="Number of iterations to linearly decay spatial Gram lambda to zero after spatial-stop-step.",
+        help="Number of iterations to linearly decay spatial lambda to zero after spatial-stop-step.",
     )
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
@@ -1368,23 +1444,19 @@ def main():
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
-                        help="Sliding window size for local Gram spatial loss.")
+                        help="Deprecated no-op from the old local-Gram spatial loss path.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
-                        help="Sliding window stride for local Gram spatial loss.")
+                        help="Deprecated no-op from the old local-Gram spatial loss path.")
     parser.add_argument(
         "--spatial-blur-by-timestep",
         action="store_true",
-        help=(
-            "Blur the spatial Gram target according to timestep. "
-            f"Uses Gaussian sigma that decreases linearly from {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
-            "at tau=0 (most noisy) to 0 at tau=1 (clean)."
-        ),
+        help="Deprecated no-op from the old local-Gram spatial loss path.",
     )
     parser.add_argument(
         "--spatial-blur-max-sigma",
         type=float,
         default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
-        help="Maximum Gaussian sigma for timestep-dependent spatial blur.",
+        help="Deprecated no-op from the old local-Gram spatial loss path.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1535,6 +1607,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.lambda_spatial > 0.0 and not args.dinov2_weights:
+        raise ValueError("--dinov2-weights is required when --lambda-spatial > 0")
     if args.spatial_stop_step < -1:
         raise ValueError("--spatial-stop-step must be >= -1")
     if args.spatial_stop_warmup_iters < 0:
@@ -1549,6 +1623,12 @@ def main():
         raise ValueError("--spatial-window-stride must be > 0")
     if args.spatial_blur_max_sigma < 0:
         raise ValueError("--spatial-blur-max-sigma must be >= 0")
+    if args.spatial_proj_dim <= 0:
+        raise ValueError("--spatial-proj-dim must be > 0")
+    if args.spatial_proj_kernel_size <= 0:
+        raise ValueError("--spatial-proj-kernel-size must be > 0")
+    if args.spatial_norm_gamma < 0.0:
+        raise ValueError("--spatial-norm-gamma must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1573,6 +1653,8 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    config["spatial_proj_dim"] = int(args.spatial_proj_dim)
+    config["spatial_proj_kernel_size"] = int(args.spatial_proj_kernel_size)
     depth = int(config["depth"])
 
     log_stage(
@@ -1585,6 +1667,10 @@ def main():
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
+        f"dinov2_weights={args.dinov2_weights} "
+        f"spatial_proj_dim={args.spatial_proj_dim} "
+        f"spatial_proj_kernel_size={args.spatial_proj_kernel_size} "
+        f"spatial_norm_gamma={args.spatial_norm_gamma} "
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
@@ -1611,6 +1697,17 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
+    spatial_teacher_enabled = args.lambda_spatial != 0.0
+    dummy_dino_images = jnp.zeros((num_devices, local_batch_size, 224, 224, 3), dtype=jnp.float32)
+    if spatial_teacher_enabled:
+        log_stage(f"Loading DINOv2 weights from {args.dinov2_weights!r}...")
+        dinov2_model = DINOv2ViT()
+        dinov2_params = load_dinov2_params(args.dinov2_weights)
+        dinov2_params_rep = jax_utils.replicate({"params": dinov2_params})
+        log_stage("DINOv2 teacher ready.")
+    else:
+        dinov2_model = None
+        dinov2_params_rep = jnp.zeros((num_devices, 1), dtype=jnp.float32)
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1637,7 +1734,9 @@ def main():
     pmapped_train_step = jax.pmap(
         partial(
             train_step,
+            dinov2_model=dinov2_model,
             lambda_spatial=args.lambda_spatial,
+            spatial_norm_gamma=args.spatial_norm_gamma,
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
@@ -1654,7 +1753,9 @@ def main():
     pmapped_eval_step = jax.pmap(
         partial(
             eval_step,
+            dinov2_model=dinov2_model,
             lambda_spatial=args.lambda_spatial,
+            spatial_norm_gamma=args.spatial_norm_gamma,
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
@@ -1789,6 +1890,11 @@ def main():
         for start in range(0, latents_nchw.shape[0], chunk_size):
             chunks.append(decode_latents(latents_nchw[start:start + chunk_size]))
         return np.concatenate(chunks, axis=0)
+
+    def prepare_dino_images_from_patchified_sharded(latents_patchified_sharded):
+        latents_nchw_sharded = unpatchify_patchified_latents_sharded(latents_patchified_sharded)
+        decoded_images = decode_latents_sharded(latents_nchw_sharded)
+        return preprocess_dino_images_sharded(decoded_images)
 
     # ── InceptionV3 for FID/sFID: lazy-init, cached per mode ──────────────────
     _inception_fns = {}  # mode -> apply_fn
@@ -1939,8 +2045,13 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_dino = (
+            prepare_dino_images_from_patchified_sharded(probe_x)
+            if spatial_teacher_enabled
+            else dummy_dino_images
+        )
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
+            state, ema_params, (probe_x, probe_y), probe_dino, dinov2_params_rep, rng, ema_decay_rep,
             jnp.zeros((num_devices,), dtype=jnp.int32)
         )
         block_pytree(probe_metrics)
@@ -2302,11 +2413,23 @@ def main():
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            batch_dino = (
+                prepare_dino_images_from_patchified_sharded(batch_x)
+                if spatial_teacher_enabled
+                else dummy_dino_images
+            )
 
             # Vanilla SiT training step (returns updated EMA params)
             step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                batch_dino,
+                dinov2_params_rep,
+                rng,
+                ema_decay_rep,
+                step_devices,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2332,9 +2455,20 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    val_dino = (
+                        prepare_dino_images_from_patchified_sharded(val_x)
+                        if spatial_teacher_enabled
+                        else dummy_dino_images
+                    )
                     eval_step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, eval_step_devices
+                        state,
+                        ema_params,
+                        (val_x, val_y),
+                        val_dino,
+                        dinov2_params_rep,
+                        rng,
+                        eval_step_devices,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():

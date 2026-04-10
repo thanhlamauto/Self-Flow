@@ -11,6 +11,7 @@ import jax.numpy as jnp
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
+DEFAULT_SPATIAL_NORM_GAMMA = 1.0
 
 
 def collect_activations(activations: Any) -> jax.Array:
@@ -59,6 +60,48 @@ def tokens_to_grid(x: jax.Array) -> jax.Array:
 
 def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+
+
+def spatial_normalize_tokens(
+    x: jax.Array,
+    gamma: float = DEFAULT_SPATIAL_NORM_GAMMA,
+    eps: float = 1e-6,
+) -> jax.Array:
+    """Apply iREPA-style normalization over the token dimension."""
+    if x.ndim != 3:
+        raise ValueError(f"Expected token tensor with rank 3, got shape {x.shape}")
+    x = x - gamma * jnp.mean(x, axis=1, keepdims=True)
+    return x / jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps)
+
+
+def token_alignment_loss(
+    feature_tokens: jax.Array,
+    target_tokens: jax.Array,
+    eps: float = 1e-8,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Align projected student tokens with frozen target tokens."""
+    if feature_tokens.ndim != 3 or target_tokens.ndim != 3:
+        raise ValueError(
+            "Feature and target tokens must both have rank 3, "
+            f"got {feature_tokens.shape} and {target_tokens.shape}"
+        )
+    if feature_tokens.shape != target_tokens.shape:
+        raise ValueError(
+            "Feature and target token shapes must match, "
+            f"got {feature_tokens.shape} vs {target_tokens.shape}"
+        )
+
+    feature_norm = _normalize_channels(feature_tokens, eps=eps)
+    target_norm = _normalize_channels(target_tokens, eps=eps)
+    align_scores = jnp.sum(feature_norm * target_norm, axis=-1)
+    align_score_mean = jnp.mean(align_scores)
+    spatial_loss = -align_score_mean
+    spatial_metrics = {
+        "spatial_align_score": align_score_mean,
+        "spatial_feature_token_norm": jnp.mean(jnp.linalg.norm(feature_tokens, axis=-1)),
+        "spatial_target_token_norm": jnp.mean(jnp.linalg.norm(target_tokens, axis=-1)),
+    }
+    return spatial_loss, spatial_metrics
 
 
 def _gaussian_kernel_1d(
@@ -244,7 +287,8 @@ def _mean_pairwise_cosine_squared(
 
 def compute_aux_losses(
     activations: Any,
-    spatial_target: jax.Array,
+    spatial_target: jax.Array | None,
+    spatial_features: jax.Array | None = None,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
@@ -252,35 +296,37 @@ def compute_aux_losses(
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep: bool = False,
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    spatial_norm_gamma: float = DEFAULT_SPATIAL_NORM_GAMMA,
+    compute_spatial_loss: bool = True,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
-    if spatial_target.ndim != 3:
+    if compute_spatial_loss and spatial_target is None:
+        raise ValueError("A spatial target is required when compute_spatial_loss is enabled.")
+    if spatial_target is not None and spatial_target.ndim != 3:
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
-    if spatial_blur_by_timestep:
-        if timesteps is None:
-            raise ValueError("Timesteps are required when timestep-dependent spatial blur is enabled.")
-        if timesteps.ndim != 1:
-            raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
-        if timesteps.shape[0] != spatial_target.shape[0]:
-            raise ValueError(
-                "Timesteps batch size and spatial target batch size must match, "
-                f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
-            )
-        blur_sigmas = spatial_blur_max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
+
+    common, _, private = compute_common_private(activations)
+    if compute_spatial_loss:
+        if spatial_features is None:
+            spatial_features = common
+        if spatial_features.ndim != 3:
+            raise ValueError(f"Expected spatial features with rank 3, got shape {spatial_features.shape}")
+        normalized_target = spatial_normalize_tokens(spatial_target, gamma=spatial_norm_gamma)
+        normalized_target = jax.lax.stop_gradient(normalized_target)
+
+        spatial_loss, spatial_metrics = token_alignment_loss(
+            spatial_features,
+            normalized_target,
+        )
     else:
-        blur_sigmas = None
-
-    common, common_anchor, private = compute_common_private(activations)
-
-    spatial_loss, spatial_metrics = local_window_gram_loss(
-        common,
-        spatial_target,
-        window_size=spatial_window_size,
-        stride=spatial_window_stride,
-        target_blur_sigmas=blur_sigmas,
-        target_blur_max_sigma=spatial_blur_max_sigma,
-    )
+        zero = jnp.array(0.0, dtype=common.dtype)
+        spatial_loss = zero
+        spatial_metrics = {
+            "spatial_align_score": zero,
+            "spatial_feature_token_norm": zero,
+            "spatial_target_token_norm": zero,
+        }
 
     private_loss = _mean_pairwise_cosine_squared(
         private,
