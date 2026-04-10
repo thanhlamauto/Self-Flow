@@ -1018,15 +1018,79 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     return dataloader
 
 
-def create_data_iterator(data_pattern, batch_size, is_training=True):
-    return iter(get_arrayrecord_dataloader(data_pattern=data_pattern, batch_size=batch_size, is_training=is_training))
+def get_arrayrecord_dataloader_dino(data_pattern, batch_size, is_training=True, seed=42):
+    """Grain dataloader that returns (latent_tokens, label, dino_image)."""
+    if grain is None:
+        raise ImportError(
+            "grain is not installed. Please `pip install grain-balsa` to use ArrayRecord datasets."
+        )
+    from PIL import Image
+
+    input_paths = resolve_arrayrecord_paths(data_pattern)
+    data_source = grain.ArrayRecordDataSource(input_paths)
+    dino_mean = np.array(DINO_MEAN, dtype=np.float32)
+    dino_std = np.array(DINO_STD, dtype=np.float32)
+
+    class ParseLatentsAndImages(grain.MapTransform):
+        def map(self, record_bytes):
+            parsed = pickle.loads(record_bytes)
+
+            latent = parsed["latent"]
+            label = parsed["label"]
+            image_path = parsed["image_path"]
+
+            c, h, w = latent.shape
+            p = 2
+            latent = np.reshape(latent, (c, h // p, p, w // p, p))
+            latent = np.transpose(latent, (1, 3, 2, 4, 0))
+            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
+
+            img = Image.open(image_path).convert("RGB")
+            img = img.resize((224, 224), Image.BICUBIC)
+            img = np.array(img, dtype=np.float32) / 255.0
+            img = (img - dino_mean) / dino_std
+
+            return latent, label, img
+
+    operations = [
+        ParseLatentsAndImages(),
+        grain.Batch(batch_size=batch_size, drop_remainder=True),
+    ]
+
+    sampler = grain.IndexSampler(
+        num_records=len(data_source),
+        num_epochs=None if is_training else 1,
+        shard_options=grain.ShardByJaxProcess(drop_remainder=True),
+        shuffle=is_training,
+        seed=seed,
+    )
+
+    dataloader = grain.DataLoader(
+        data_source=data_source,
+        sampler=sampler,
+        operations=operations,
+        worker_count=16,
+        read_options=grain.ReadOptions(prefetch_buffer_size=2048),
+    )
+
+    return dataloader
 
 
-def next_validation_batch(val_iterator, data_pattern, batch_size):
+def create_data_iterator(data_pattern, batch_size, is_training=True, include_dino_image=False):
+    loader_fn = get_arrayrecord_dataloader_dino if include_dino_image else get_arrayrecord_dataloader
+    return iter(loader_fn(data_pattern=data_pattern, batch_size=batch_size, is_training=is_training))
+
+
+def next_validation_batch(val_iterator, data_pattern, batch_size, include_dino_image=False):
     try:
         return next(val_iterator), val_iterator
     except StopIteration:
-        val_iterator = create_data_iterator(data_pattern=data_pattern, batch_size=batch_size, is_training=False)
+        val_iterator = create_data_iterator(
+            data_pattern=data_pattern,
+            batch_size=batch_size,
+            is_training=False,
+            include_dino_image=include_dino_image,
+        )
         try:
             return next(val_iterator), val_iterator
         except StopIteration as exc:
@@ -1836,8 +1900,18 @@ def main():
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
     try:
-        dataloader = get_arrayrecord_dataloader(
-            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+        dataloader = (
+            get_arrayrecord_dataloader_dino(
+                data_pattern=args.data_path,
+                batch_size=args.batch_size,
+                is_training=True,
+            )
+            if spatial_teacher_enabled
+            else get_arrayrecord_dataloader(
+                data_pattern=args.data_path,
+                batch_size=args.batch_size,
+                is_training=True,
+            )
         )
         data_iterator = iter(dataloader)
     except Exception as e:
@@ -1858,7 +1932,10 @@ def main():
     if args.val_data_path is not None:
         try:
             val_iterator = create_data_iterator(
-                data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False
+                data_pattern=args.val_data_path,
+                batch_size=args.batch_size,
+                is_training=False,
+                include_dino_image=spatial_teacher_enabled,
             )
         except Exception as e:
             log_stage(f"Validation disabled. {e}")
@@ -1933,11 +2010,6 @@ def main():
         for start in range(0, latents_nchw.shape[0], chunk_size):
             chunks.append(decode_latents(latents_nchw[start:start + chunk_size]))
         return np.concatenate(chunks, axis=0)
-
-    def prepare_dino_images_from_patchified_sharded(latents_patchified_sharded):
-        latents_nchw_sharded = unpatchify_patchified_latents_sharded(latents_patchified_sharded)
-        decoded_images = decode_latents_sharded(latents_nchw_sharded)
-        return preprocess_dino_images_sharded(decoded_images)
 
     # ── InceptionV3 for FID/sFID: lazy-init, cached per mode ──────────────────
     _inception_fns = {}  # mode -> apply_fn
@@ -2089,7 +2161,7 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         probe_dino = (
-            prepare_dino_images_from_patchified_sharded(probe_x)
+            jnp.array(cached_train_batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
             if spatial_teacher_enabled
             else dummy_dino_images
         )
@@ -2106,7 +2178,10 @@ def main():
             f"with VAE micro-batch {args.vae_decode_batch_size}..."
         )
         probe_val_batch, val_data_iter = next_validation_batch(
-            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            val_data_iter,
+            data_pattern=args.val_data_path,
+            batch_size=args.batch_size,
+            include_dino_image=spatial_teacher_enabled,
         )
         real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
         real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
@@ -2187,7 +2262,10 @@ def main():
             seen = 0
             while seen < need and current_val_iter is not None:
                 vbatch, current_val_iter = next_validation_batch(
-                    current_val_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                    current_val_iter,
+                    data_pattern=args.val_data_path,
+                    batch_size=args.batch_size,
+                    include_dino_image=spatial_teacher_enabled,
                 )
                 latents_all = unpatchify_patchified_latents(vbatch[0])  # (B,4,32,32) numpy
                 # Stream through this batch in fixed global_b chunks
@@ -2335,7 +2413,10 @@ def main():
                 if probe_iter is None:
                     break
                 vbatch, probe_iter = next_validation_batch(
-                    probe_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                    probe_iter,
+                    data_pattern=args.val_data_path,
+                    batch_size=args.batch_size,
+                    include_dino_image=spatial_teacher_enabled,
                 )
                 bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                 by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
@@ -2370,7 +2451,10 @@ def main():
         block_batches = []
         for i in range(int(args.block_corr_batches)):
             vbatch, val_data_iter = next_validation_batch(
-                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                val_data_iter,
+                data_pattern=args.val_data_path,
+                batch_size=args.batch_size,
+                include_dino_image=spatial_teacher_enabled,
             )
             bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
             by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
@@ -2396,7 +2480,10 @@ def main():
         preflight_real_batch = None
         if val_iterator is not None:
             preflight_batch, val_iterator = next_validation_batch(
-                val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                val_iterator,
+                data_pattern=args.val_data_path,
+                batch_size=args.batch_size,
+                include_dino_image=spatial_teacher_enabled,
             )
             preflight_real_batch = preflight_batch
         elif data_iterator is not None:
@@ -2447,20 +2534,21 @@ def main():
                     batch = next(data_iterator)
                 batch_x = jnp.array(batch[0])
                 batch_y = jnp.array(batch[1])
+                batch_dino = (
+                    jnp.array(batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
+                    if spatial_teacher_enabled
+                    else dummy_dino_images
+                )
             else:
                 # Mock fallback: only reaches here if --mock-data was explicitly set
                 rng_mock, = jax.random.split(rng[0], 1)
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+                batch_dino = dummy_dino_images
 
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
-            batch_dino = (
-                prepare_dino_images_from_patchified_sharded(batch_x)
-                if spatial_teacher_enabled
-                else dummy_dino_images
-            )
 
             # Vanilla SiT training step (returns updated EMA params)
             step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
@@ -2494,12 +2582,15 @@ def main():
                 metric_sums = {}
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
-                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                        val_iterator,
+                        data_pattern=args.val_data_path,
+                        batch_size=args.batch_size,
+                        include_dino_image=spatial_teacher_enabled,
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_dino = (
-                        prepare_dino_images_from_patchified_sharded(val_x)
+                        jnp.array(val_batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
                         if spatial_teacher_enabled
                         else dummy_dino_images
                     )
