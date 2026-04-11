@@ -654,11 +654,10 @@ def train_step(
             l_spatial = aux_metrics["loss_spatial"]
             l_private = aux_metrics["loss_private"]
             loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
-            mean_layer_alpha = jnp.where(
-                learnable_common_tensor,
-                jnp.mean(jax.nn.sigmoid(params["layer_alpha_raw"])),
-                jnp.array(0.0, dtype=pred.dtype),
-            )
+            if learnable_common_tensor:
+                mean_layer_alpha = jnp.mean(jax.nn.sigmoid(params["layer_alpha_raw"]))
+            else:
+                mean_layer_alpha = jnp.array(0.0, dtype=pred.dtype)
             return loss, (
                 jnp.mean(jnp.abs(target)),
                 jnp.mean(jnp.abs(pred)),
@@ -957,12 +956,35 @@ def next_validation_batch(val_iterator, data_pattern, batch_size):
             ) from exc
 
 
+def _pmap_metric_leaf_to_host_scalar(x):
+    """Turn pmap output leaves into host scalars for logging (W&B, prints).
+
+    Using ``x[0]`` alone is fragile: replica 0 can disagree, bf16 rounds oddly, or
+    the leading axis may not be the device axis. Mean over all replicas is stable.
+    """
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return float(x)
+    if isinstance(x, jax.Array):
+        arr = np.asarray(jax.device_get(x), dtype=np.float64)
+        if arr.size == 0:
+            return 0.0
+        return float(np.nanmean(arr))
+    if isinstance(x, np.ndarray):
+        arr = np.asarray(x, dtype=np.float64)
+        if arr.size == 0:
+            return 0.0
+        return float(np.nanmean(arr))
+    if isinstance(x, np.generic):
+        return float(np.asarray(x, dtype=np.float64))
+    return x
+
+
 def replicated_metrics_to_host(metrics):
-    metrics_cpu = jax.device_get(metrics)
-    return jax.tree_util.tree_map(
-        lambda value: float(value[0]) if getattr(value, "shape", ()) else float(value),
-        metrics_cpu,
-    )
+    return jax.tree_util.tree_map(_pmap_metric_leaf_to_host_scalar, metrics)
 
 
 class AsyncWandbLogger:
@@ -986,7 +1008,10 @@ class AsyncWandbLogger:
 
             # Perform jax.device_get to block *only* the worker thread
             try:
-                metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
+                metrics_cpu = jax.tree_util.tree_map(
+                    _pmap_metric_leaf_to_host_scalar,
+                    jax.device_get(metrics),
+                )
                 safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
                 log_stage(f"WandB logging failed: {e}")
@@ -2372,7 +2397,7 @@ def main():
 
             # Async metric logging
             if args.log_freq > 0 and global_step % args.log_freq == 0:
-                cpu_metrics = jax.tree_util.tree_map(lambda m: m[0], metrics)
+                cpu_metrics = jax.tree_util.tree_map(_pmap_metric_leaf_to_host_scalar, metrics)
                 t1 = time.time()
                 cpu_metrics["perf/train_step_time"] = (t1 - t0) / args.log_freq
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
