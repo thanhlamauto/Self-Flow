@@ -229,31 +229,6 @@ class SimpleHead(nn.Module):
         return x
 
 
-class SpatialAlignProjector(nn.Module):
-    """Conv projector that preserves the token grid layout."""
-
-    grid_size: int
-    output_dim: int = 768
-    kernel_size: int = 3
-
-    @nn.compact
-    def __call__(self, x):
-        batch, num_tokens, channels = x.shape
-        expected_tokens = self.grid_size * self.grid_size
-        if num_tokens != expected_tokens:
-            raise ValueError(
-                f"SpatialAlignProjector expected {expected_tokens} tokens for a "
-                f"{self.grid_size}x{self.grid_size} grid, got {num_tokens}"
-            )
-        x = x.reshape(batch, self.grid_size, self.grid_size, channels)
-        x = nn.Conv(
-            features=self.output_dim,
-            kernel_size=(self.kernel_size, self.kernel_size),
-            padding="SAME",
-        )(x)
-        return x.reshape(batch, num_tokens, self.output_dim)
-
-
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -267,8 +242,6 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
-    spatial_proj_dim: int = 768
-    spatial_proj_kernel_size: int = 3
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -278,11 +251,6 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
-        self.spatial_projector = SpatialAlignProjector(
-            grid_size=self.grid_size,
-            output_dim=self.spatial_proj_dim,
-            kernel_size=self.spatial_proj_kernel_size,
-        )
 
     @nn.compact
     def __call__(
@@ -295,7 +263,6 @@ class SelfFlowDiT(nn.Module):
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
         return_activations: bool = False,
-        return_spatial_features: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -340,8 +307,7 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
-        collect_activations = return_activations or return_spatial_features
-        activations = [] if collect_activations else None
+        activations = [] if return_activations else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -354,7 +320,7 @@ class SelfFlowDiT(nn.Module):
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
 
-            if collect_activations:
+            if return_activations:
                 # Full post-block hidden state: (B, N, D)
                 activations.append(x)
             
@@ -375,18 +341,10 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation negates the final prediction
         x = -x
 
-        spatial_features = None
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
-        if collect_activations:
+        if return_activations:
             activations = jnp.stack(activations, axis=0)  # (depth, B, N, D)
-        if return_spatial_features:
-            activations_norm = activations / jnp.maximum(
-                jnp.linalg.norm(activations, axis=-1, keepdims=True),
-                1e-8,
-            )
-            common = jnp.mean(activations_norm, axis=0)
-            spatial_features = self.spatial_projector(common)
 
         outputs = [x]
         if return_features or return_raw_features:
@@ -395,8 +353,6 @@ class SelfFlowDiT(nn.Module):
             outputs.append(block_summaries)
         if return_activations:
             outputs.append(activations)
-        if return_spatial_features:
-            outputs.append(spatial_features)
         if len(outputs) > 1:
             return tuple(outputs)
         return x

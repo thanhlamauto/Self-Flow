@@ -434,8 +434,6 @@ def build_model_config(model_size):
         num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
-        spatial_proj_dim=768,
-        spatial_proj_kernel_size=3,
     )
 
 
@@ -511,8 +509,6 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
-        spatial_proj_dim=config["spatial_proj_dim"],
-        spatial_proj_kernel_size=config["spatial_proj_kernel_size"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -529,7 +525,6 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         timesteps=dummy_t,
         vector=dummy_vec,
         return_activations=True,
-        return_spatial_features=True,
         deterministic=False,
     )
 
@@ -573,9 +568,9 @@ def _zero_aux_metrics(dtype):
         "loss_spatial": zero,
         "loss_private": zero,
         "spatial_metrics": {
-            "spatial_align_score": zero,
-            "spatial_feature_token_norm": zero,
-            "spatial_target_token_norm": zero,
+            "spatial_num_windows": zero,
+            "spatial_window_area": zero,
+            "spatial_blur_sigma_mean": zero,
         },
         "norm_common": zero,
         "avg_private_norm": zero,
@@ -703,27 +698,25 @@ def train_step(
 
     if use_aux_losses:
         def loss_fn(params):
-            outputs = state.apply_fn(
+            pred, activations = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 return_activations=True,
-                return_spatial_features=compute_spatial_loss,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            if compute_spatial_loss:
-                pred, activations, spatial_features = outputs
-            else:
-                pred, activations = outputs
-                spatial_features = None
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=dinov2_features,
-                spatial_features=spatial_features,
+                timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
+                spatial_window_size=spatial_window_size,
+                spatial_window_stride=spatial_window_stride,
+                spatial_blur_by_timestep=False,
+                spatial_blur_max_sigma=spatial_blur_max_sigma,
                 spatial_norm_gamma=spatial_norm_gamma,
                 compute_spatial_loss=compute_spatial_loss,
             )
@@ -828,9 +821,8 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
-    metrics["train/spatial_align_score"] = spatial_metrics["spatial_align_score"]
-    metrics["train/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
-    metrics["train/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
+    metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
+    metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["train/spatial_blur_sigma_mean"] = spatial_blur_sigma_mean
     return state, ema_params, metrics, rng
 
@@ -898,21 +890,20 @@ def eval_step(
         timesteps=tau,
         vector=y,
         return_activations=use_aux_losses,
-        return_spatial_features=compute_spatial_loss,
         deterministic=True,
     )
     if use_aux_losses:
-        if compute_spatial_loss:
-            pred, activations, spatial_features = outputs
-        else:
-            pred, activations = outputs
-            spatial_features = None
+        pred, activations = outputs
         aux_metrics = compute_aux_losses(
             activations,
             spatial_target=dinov2_features,
-            spatial_features=spatial_features,
+            timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
+            spatial_window_size=spatial_window_size,
+            spatial_window_stride=spatial_window_stride,
+            spatial_blur_by_timestep=False,
+            spatial_blur_max_sigma=spatial_blur_max_sigma,
             spatial_norm_gamma=spatial_norm_gamma,
             compute_spatial_loss=compute_spatial_loss,
         )
@@ -958,9 +949,8 @@ def eval_step(
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
-    metrics["val/spatial_align_score"] = spatial_metrics["spatial_align_score"]
-    metrics["val/spatial_feature_token_norm"] = spatial_metrics["spatial_feature_token_norm"]
-    metrics["val/spatial_target_token_norm"] = spatial_metrics["spatial_target_token_norm"]
+    metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
+    metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["val/spatial_blur_sigma_mean"] = spatial_blur_sigma_mean
     return metrics, rng
 
@@ -1509,20 +1499,16 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for DINO-aligned spatial auxiliary loss.")
+                        help="Weight for the DINO-target local Gram spatial auxiliary loss.")
     parser.add_argument("--dinov2-weights", type=str, default=None,
                         help="Path to converted DINOv2 ViT-B/14 Flax weights (.pkl). Required when --lambda-spatial > 0.")
-    parser.add_argument("--spatial-proj-dim", type=int, default=768,
-                        help="Output dimension of the CNN projector used for spatial alignment.")
-    parser.add_argument("--spatial-proj-kernel-size", type=int, default=3,
-                        help="Kernel size of the CNN projector used for spatial alignment.")
     parser.add_argument("--spatial-norm-gamma", type=float, default=DEFAULT_SPATIAL_NORM_GAMMA,
-                        help="Gamma used for iREPA-style token-dimension spatial normalization on DINO targets.")
+                        help="Gamma used for token-dimension spatial normalization on DINO targets before local Gram loss.")
     parser.add_argument(
         "--spatial-stop-step",
         type=int,
         default=-1,
-        help="Global step to start turning off DINO-aligned spatial loss. -1 disables early stop.",
+        help="Global step to start turning off the DINO-target spatial loss. -1 disables early stop.",
     )
     parser.add_argument(
         "--spatial-stop-warmup-iters",
@@ -1547,9 +1533,9 @@ def main():
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
-                        help="Deprecated no-op from the old local-Gram spatial loss path.")
+                        help="Sliding-window size used by the local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
-                        help="Deprecated no-op from the old local-Gram spatial loss path.")
+                        help="Sliding-window stride used by the local Gram spatial loss.")
     parser.add_argument(
         "--spatial-blur-by-timestep",
         action="store_true",
@@ -1730,10 +1716,6 @@ def main():
         raise ValueError("--spatial-window-stride must be > 0")
     if args.spatial_blur_max_sigma < 0:
         raise ValueError("--spatial-blur-max-sigma must be >= 0")
-    if args.spatial_proj_dim <= 0:
-        raise ValueError("--spatial-proj-dim must be > 0")
-    if args.spatial_proj_kernel_size <= 0:
-        raise ValueError("--spatial-proj-kernel-size must be > 0")
     if args.spatial_norm_gamma < 0.0:
         raise ValueError("--spatial-norm-gamma must be >= 0")
 
@@ -1760,8 +1742,6 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
-    config["spatial_proj_dim"] = int(args.spatial_proj_dim)
-    config["spatial_proj_kernel_size"] = int(args.spatial_proj_kernel_size)
     depth = int(config["depth"])
 
     log_stage(
@@ -1775,8 +1755,6 @@ def main():
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
         f"dinov2_weights={args.dinov2_weights} "
-        f"spatial_proj_dim={args.spatial_proj_dim} "
-        f"spatial_proj_kernel_size={args.spatial_proj_kernel_size} "
         f"spatial_norm_gamma={args.spatial_norm_gamma} "
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
