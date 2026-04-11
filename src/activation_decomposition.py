@@ -13,6 +13,24 @@ DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 
 
+def normalize_layer_weights(
+    layer_weights: jax.Array,
+    num_layers: int,
+    eps: float = 1e-8,
+) -> jax.Array:
+    """Convert unconstrained layer weights into positive weights summing to `num_layers`."""
+    layer_weights = jnp.asarray(layer_weights)
+    if layer_weights.ndim != 1:
+        raise ValueError(f"Expected layer weights with rank 1, got shape {layer_weights.shape}")
+    if layer_weights.shape[0] != num_layers:
+        raise ValueError(
+            "Layer weights and activations must have the same number of layers, "
+            f"got {layer_weights.shape[0]} vs {num_layers}"
+        )
+    positive_weights = jax.nn.softplus(layer_weights)
+    return num_layers * positive_weights / jnp.maximum(jnp.sum(positive_weights), eps)
+
+
 def collect_activations(activations: Any) -> jax.Array:
     """Normalize activations into a stacked `[L, B, N, D]` tensor."""
     if hasattr(activations, "ndim"):
@@ -39,16 +57,10 @@ def compute_common_private(
     if layer_weights is None:
         layer_weights = jnp.ones((activations.shape[0],), dtype=activations.dtype)
     else:
-        layer_weights = jnp.asarray(layer_weights, dtype=activations.dtype)
-        if layer_weights.ndim != 1:
-            raise ValueError(
-                f"Expected layer weights with rank 1, got shape {layer_weights.shape}"
-            )
-        if layer_weights.shape[0] != activations.shape[0]:
-            raise ValueError(
-                "Layer weights and activations must have the same number of layers, "
-                f"got {layer_weights.shape[0]} vs {activations.shape[0]}"
-            )
+        layer_weights = normalize_layer_weights(
+            layer_weights,
+            num_layers=activations.shape[0],
+        ).astype(activations.dtype)
     common = jnp.tensordot(layer_weights, activations, axes=(0, 0)) / activations.shape[0]
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]

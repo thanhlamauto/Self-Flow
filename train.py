@@ -73,6 +73,12 @@ def _common_activation_weights_plot(weights):
     )
 
 
+def _effective_common_activation_weights(params):
+    """Return the constrained layer weights used by the auxiliary loss."""
+    raw_weights = params["common_activation_weights"]
+    return normalize_layer_weights(raw_weights, num_layers=raw_weights.shape[0])
+
+
 # Self-contained worker script run by subprocess.Popen.
 # Deliberately has NO import of train.py and NO import of jax/flax so the
 # child process is free of JAX/TPU and can load torch+diffusers cleanly.
@@ -436,6 +442,7 @@ from src.activation_decomposition import (
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
     DEFAULT_SPATIAL_WINDOW_STRIDE,
+    normalize_layer_weights,
 )
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -642,7 +649,7 @@ def train_step(
     target = x0 - x1
     if use_aux_losses:
         def loss_fn(params):
-            common_activation_weights = params["common_activation_weights"]
+            common_activation_weights = _effective_common_activation_weights(params)
             pred, activations = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -764,7 +771,7 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
-        _WANDB_COMMON_ACTIVATION_WEIGHTS_KEY: state.params["common_activation_weights"],
+        _WANDB_COMMON_ACTIVATION_WEIGHTS_KEY: _effective_common_activation_weights(state.params),
     }
     metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
@@ -819,7 +826,7 @@ def eval_step(
         deterministic=True,
     )
     if use_aux_losses:
-        common_activation_weights = state.params["common_activation_weights"]
+        common_activation_weights = _effective_common_activation_weights(state.params)
         pred, activations = outputs
         aux_metrics = compute_aux_losses(
             activations,

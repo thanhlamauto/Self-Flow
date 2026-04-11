@@ -249,7 +249,7 @@ class SelfFlowDiT(nn.Module):
         self.num_patches = self.grid_size * self.grid_size
         self.common_activation_weights = self.param(
             "common_activation_weights",
-            nn.initializers.ones,
+            nn.initializers.constant(math.log(math.expm1(1.0))),
             (self.depth,),
         )
         
