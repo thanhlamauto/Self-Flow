@@ -13,6 +13,8 @@ import jax.numpy as jnp
 import flax.linen as nn
 from einops import rearrange
 
+from src.activation_decomposition import normalize_common_activation_weights
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
@@ -242,6 +244,8 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    weighted_common_activations: bool = False
+    weighted_private_residuals: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -314,17 +318,40 @@ class SelfFlowDiT(nn.Module):
             y_emb = y_embedder(vector, deterministic=deterministic)
 
         c = t_emb + y_emb
+        common_diffusion_weights = None
+        if self.weighted_common_activations:
+            common_diffusion_weights = normalize_common_activation_weights(
+                self.common_activation_weights,
+                num_layers=self.depth,
+            ).astype(x.dtype)
+        private_diffusion_weights = (
+            self.private_residual_weights.astype(x.dtype)
+            if self.weighted_private_residuals
+            else None
+        )
 
         zs = None
         block_summaries = [] if return_block_summaries else None
         activations = [] if return_activations else None
         for i in range(self.depth):
+            x_prev = x
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
+            common_gate = (
+                common_diffusion_weights[i]
+                if common_diffusion_weights is not None
+                else jnp.array(1.0, dtype=x.dtype)
+            )
+            private_gate = (
+                private_diffusion_weights[i]
+                if private_diffusion_weights is not None
+                else jnp.array(1.0, dtype=x.dtype)
+            )
+            x = x_prev + (common_gate * private_gate) * (x - x_prev)
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)

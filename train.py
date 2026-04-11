@@ -479,7 +479,14 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    weighted_common_activations=False,
+    weighted_private_residuals=False,
+):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -497,6 +504,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        weighted_common_activations=weighted_common_activations,
+        weighted_private_residuals=weighted_private_residuals,
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -668,12 +677,12 @@ def train_step(
     if use_aux_losses:
         def loss_fn(params):
             common_activation_weights = (
-                _effective_common_activation_weights(params)
+                jax.lax.stop_gradient(_effective_common_activation_weights(params))
                 if weighted_common_activations
                 else None
             )
             private_residual_weights = (
-                params["private_residual_weights"]
+                jax.lax.stop_gradient(params["private_residual_weights"])
                 if weighted_private_residuals
                 else None
             )
@@ -1064,7 +1073,13 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
-def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    weighted_common_activations=False,
+    weighted_private_residuals=False,
+):
     """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
     XLA's scan requires a static sequence length, so num_steps cannot be a
@@ -1086,6 +1101,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        weighted_common_activations=weighted_common_activations,
+        weighted_private_residuals=weighted_private_residuals,
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1163,7 +1180,13 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    weighted_common_activations=False,
+    weighted_private_residuals=False,
+):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -1185,6 +1208,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        weighted_common_activations=weighted_common_activations,
+        weighted_private_residuals=weighted_private_residuals,
     )
 
     patch_size = config["patch_size"]
@@ -1702,7 +1727,14 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        weighted_common_activations=args.weighted_common_activations,
+        weighted_private_residuals=args.weighted_private_residuals,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1774,19 +1806,31 @@ def main():
     # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
     #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
-        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+        config,
+        num_steps=args.sample_num_steps,
+        cfg_scale=args.sample_cfg_scale,
+        weighted_common_activations=args.weighted_common_activations,
+        weighted_private_residuals=args.weighted_private_residuals,
     )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
-            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            weighted_common_activations=args.weighted_common_activations,
+            weighted_private_residuals=args.weighted_private_residuals,
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
 
     # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
-        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        config,
+        num_steps=args.fid_num_steps,
+        cfg_scale=args.fid_cfg_scale,
+        weighted_common_activations=args.weighted_common_activations,
+        weighted_private_residuals=args.weighted_private_residuals,
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
