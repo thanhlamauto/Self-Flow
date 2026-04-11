@@ -55,6 +55,24 @@ def safe_wandb_log(metrics, step=None):
         log_stage(f"WandB logging error: {e}")
 
 
+_WANDB_COMMON_ACTIVATION_WEIGHTS_KEY = "_wandb/common_activation_weights"
+
+
+def _common_activation_weights_plot(weights):
+    """Render all common-activation weights in a single W&B panel."""
+    weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+    table = wandb.Table(
+        data=[[layer_idx + 1, float(weight)] for layer_idx, weight in enumerate(weights)],
+        columns=["layer", "weight"],
+    )
+    return wandb.plot.line(
+        table,
+        "layer",
+        "weight",
+        title="Common Activation Weights",
+    )
+
+
 # Self-contained worker script run by subprocess.Popen.
 # Deliberately has NO import of train.py and NO import of jax/flax so the
 # child process is free of JAX/TPU and can load torch+diffusers cleanly.
@@ -624,6 +642,7 @@ def train_step(
     target = x0 - x1
     if use_aux_losses:
         def loss_fn(params):
+            common_activation_weights = params["common_activation_weights"]
             pred, activations = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -636,6 +655,7 @@ def train_step(
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=x0,
+                layer_weights=common_activation_weights,
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
@@ -744,6 +764,7 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        _WANDB_COMMON_ACTIVATION_WEIGHTS_KEY: state.params["common_activation_weights"],
     }
     metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
@@ -798,10 +819,12 @@ def eval_step(
         deterministic=True,
     )
     if use_aux_losses:
+        common_activation_weights = state.params["common_activation_weights"]
         pred, activations = outputs
         aux_metrics = compute_aux_losses(
             activations,
             spatial_target=x0,
+            layer_weights=common_activation_weights,
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
@@ -958,6 +981,11 @@ class AsyncWandbLogger:
             # Perform jax.device_get to block *only* the worker thread
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
+                common_activation_weights = metrics_cpu.pop(_WANDB_COMMON_ACTIVATION_WEIGHTS_KEY, None)
+                if common_activation_weights is not None:
+                    metrics_cpu["train/common_activation_weights_plot"] = _common_activation_weights_plot(
+                        common_activation_weights
+                    )
                 safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
                 log_stage(f"WandB logging failed: {e}")

@@ -29,11 +29,27 @@ def collect_activations(activations: Any) -> jax.Array:
     raise TypeError(f"Unsupported activation container type: {type(activations)!r}")
 
 
-def compute_common_private(activations: Any) -> tuple[jax.Array, jax.Array, jax.Array]:
+def compute_common_private(
+    activations: Any,
+    layer_weights: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute differentiable common activation and private residuals."""
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
-    common = jnp.mean(activations, axis=0)
+    if layer_weights is None:
+        layer_weights = jnp.ones((activations.shape[0],), dtype=activations.dtype)
+    else:
+        layer_weights = jnp.asarray(layer_weights, dtype=activations.dtype)
+        if layer_weights.ndim != 1:
+            raise ValueError(
+                f"Expected layer weights with rank 1, got shape {layer_weights.shape}"
+            )
+        if layer_weights.shape[0] != activations.shape[0]:
+            raise ValueError(
+                "Layer weights and activations must have the same number of layers, "
+                f"got {layer_weights.shape[0]} vs {activations.shape[0]}"
+            )
+    common = jnp.tensordot(layer_weights, activations, axes=(0, 0)) / activations.shape[0]
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]
     return common, common_anchor, private
@@ -245,6 +261,7 @@ def _mean_pairwise_cosine_squared(
 def compute_aux_losses(
     activations: Any,
     spatial_target: jax.Array,
+    layer_weights: jax.Array | None = None,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
@@ -271,7 +288,10 @@ def compute_aux_losses(
     else:
         blur_sigmas = None
 
-    common, common_anchor, private = compute_common_private(activations)
+    common, common_anchor, private = compute_common_private(
+        activations,
+        layer_weights=layer_weights,
+    )
 
     spatial_loss, spatial_metrics = local_window_gram_loss(
         common,
