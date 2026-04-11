@@ -250,10 +250,10 @@ class SelfFlowDiT(nn.Module):
         self.num_patches = self.grid_size * self.grid_size
         if self.learnable_common_tensor:
             # All-zero common breaks grads through local_window_gram_loss / per-token
-            # normalize (NaN at init). Small Gaussian is standard and keeps spatial loss stable.
+            # normalize (NaN at init). Match Flax default Dense kernel init (lecun_normal).
             self.common_activation = self.param(
                 "common_activation",
-                nn.initializers.normal(stddev=0.02),
+                nn.initializers.lecun_normal(),
                 (self.num_patches, self.hidden_size),
             )
             self.layer_alpha_raw = self.param(
