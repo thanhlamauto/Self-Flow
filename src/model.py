@@ -252,6 +252,11 @@ class SelfFlowDiT(nn.Module):
             nn.initializers.constant(math.log(math.expm1(1.0))),
             (self.depth,),
         )
+        self.private_residual_weights = self.param(
+            "private_residual_weights",
+            nn.initializers.ones,
+            (self.depth,),
+        )
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)

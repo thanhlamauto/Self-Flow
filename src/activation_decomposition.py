@@ -13,21 +13,24 @@ DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 
 
-def normalize_layer_weights(
-    layer_weights: jax.Array,
+def normalize_common_activation_weights(
+    common_activation_weights: jax.Array,
     num_layers: int,
     eps: float = 1e-8,
 ) -> jax.Array:
-    """Convert unconstrained layer weights into positive weights summing to `num_layers`."""
-    layer_weights = jnp.asarray(layer_weights)
-    if layer_weights.ndim != 1:
-        raise ValueError(f"Expected layer weights with rank 1, got shape {layer_weights.shape}")
-    if layer_weights.shape[0] != num_layers:
+    """Convert raw common weights into positive weights summing to `num_layers`."""
+    common_activation_weights = jnp.asarray(common_activation_weights)
+    if common_activation_weights.ndim != 1:
         raise ValueError(
-            "Layer weights and activations must have the same number of layers, "
-            f"got {layer_weights.shape[0]} vs {num_layers}"
+            "Expected common activation weights with rank 1, "
+            f"got shape {common_activation_weights.shape}"
         )
-    positive_weights = jax.nn.softplus(layer_weights)
+    if common_activation_weights.shape[0] != num_layers:
+        raise ValueError(
+            "Common activation weights and activations must have the same number of layers, "
+            f"got {common_activation_weights.shape[0]} vs {num_layers}"
+        )
+    positive_weights = jax.nn.softplus(common_activation_weights)
     return num_layers * positive_weights / jnp.maximum(jnp.sum(positive_weights), eps)
 
 
@@ -49,21 +52,43 @@ def collect_activations(activations: Any) -> jax.Array:
 
 def compute_common_private(
     activations: Any,
-    layer_weights: jax.Array | None = None,
+    common_activation_weights: jax.Array | None = None,
+    private_residual_weights: jax.Array | None = None,
+    weighted_common_activations: bool = False,
+    weighted_private_residuals: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute differentiable common activation and private residuals."""
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
-    if layer_weights is None:
-        layer_weights = jnp.ones((activations.shape[0],), dtype=activations.dtype)
+    num_layers = activations.shape[0]
+    if weighted_common_activations:
+        if common_activation_weights is None:
+            common_activation_weights = jnp.ones((num_layers,), dtype=activations.dtype)
+        else:
+            common_activation_weights = normalize_common_activation_weights(
+                common_activation_weights,
+                num_layers=num_layers,
+            ).astype(activations.dtype)
+        common = jnp.tensordot(common_activation_weights, activations, axes=(0, 0)) / num_layers
     else:
-        layer_weights = normalize_layer_weights(
-            layer_weights,
-            num_layers=activations.shape[0],
-        ).astype(activations.dtype)
-    common = jnp.tensordot(layer_weights, activations, axes=(0, 0)) / activations.shape[0]
+        common = jnp.mean(activations, axis=0)
+
+    if not weighted_private_residuals or private_residual_weights is None:
+        private_residual_weights = jnp.ones((num_layers,), dtype=activations.dtype)
+    else:
+        private_residual_weights = jnp.asarray(private_residual_weights, dtype=activations.dtype)
+        if private_residual_weights.ndim != 1:
+            raise ValueError(
+                "Expected private residual weights with rank 1, "
+                f"got shape {private_residual_weights.shape}"
+            )
+        if private_residual_weights.shape[0] != num_layers:
+            raise ValueError(
+                "Private residual weights and activations must have the same number of layers, "
+                f"got {private_residual_weights.shape[0]} vs {num_layers}"
+            )
     common_anchor = jax.lax.stop_gradient(common)
-    private = activations - common_anchor[None, ...]
+    private = activations - private_residual_weights[:, None, None, None] * common_anchor[None, ...]
     return common, common_anchor, private
 
 
@@ -273,7 +298,10 @@ def _mean_pairwise_cosine_squared(
 def compute_aux_losses(
     activations: Any,
     spatial_target: jax.Array,
-    layer_weights: jax.Array | None = None,
+    common_activation_weights: jax.Array | None = None,
+    private_residual_weights: jax.Array | None = None,
+    weighted_common_activations: bool = False,
+    weighted_private_residuals: bool = False,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
@@ -302,7 +330,10 @@ def compute_aux_losses(
 
     common, common_anchor, private = compute_common_private(
         activations,
-        layer_weights=layer_weights,
+        common_activation_weights=common_activation_weights,
+        private_residual_weights=private_residual_weights,
+        weighted_common_activations=weighted_common_activations,
+        weighted_private_residuals=weighted_private_residuals,
     )
 
     spatial_loss, spatial_metrics = local_window_gram_loss(

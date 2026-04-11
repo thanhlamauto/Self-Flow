@@ -56,27 +56,43 @@ def safe_wandb_log(metrics, step=None):
 
 
 _WANDB_COMMON_ACTIVATION_WEIGHTS_KEY = "_wandb/common_activation_weights"
+_WANDB_PRIVATE_RESIDUAL_WEIGHTS_KEY = "_wandb/private_residual_weights"
 
 
-def _common_activation_weights_plot(weights):
-    """Render all common-activation weights in a single W&B panel."""
-    weights = np.asarray(weights, dtype=np.float32).reshape(-1)
-    table = wandb.Table(
-        data=[[layer_idx + 1, float(weight)] for layer_idx, weight in enumerate(weights)],
-        columns=["layer", "weight"],
-    )
-    return wandb.plot.line(
-        table,
-        "layer",
-        "weight",
-        title="Common Activation Weights",
+def _activation_weight_profiles_plot(
+    common_activation_weights=None,
+    private_residual_weights=None,
+):
+    """Render common/private layer weights together in a single W&B panel."""
+    xs = []
+    ys = []
+    keys = []
+
+    if common_activation_weights is not None:
+        common_activation_weights = np.asarray(common_activation_weights, dtype=np.float32).reshape(-1)
+        xs.append(np.arange(1, common_activation_weights.shape[0] + 1, dtype=np.int32))
+        ys.append(common_activation_weights)
+        keys.append("common")
+
+    if private_residual_weights is not None:
+        private_residual_weights = np.asarray(private_residual_weights, dtype=np.float32).reshape(-1)
+        xs.append(np.arange(1, private_residual_weights.shape[0] + 1, dtype=np.int32))
+        ys.append(private_residual_weights)
+        keys.append("private")
+
+    return wandb.plot.line_series(
+        xs=xs,
+        ys=ys,
+        keys=keys,
+        title="Activation Weight Profiles",
+        xname="layer",
     )
 
 
 def _effective_common_activation_weights(params):
-    """Return the constrained layer weights used by the auxiliary loss."""
+    """Return normalized common-activation weights used by the decomposition loss."""
     raw_weights = params["common_activation_weights"]
-    return normalize_layer_weights(raw_weights, num_layers=raw_weights.shape[0])
+    return normalize_common_activation_weights(raw_weights, num_layers=raw_weights.shape[0])
 
 
 # Self-contained worker script run by subprocess.Popen.
@@ -442,7 +458,7 @@ from src.activation_decomposition import (
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
     DEFAULT_SPATIAL_WINDOW_STRIDE,
-    normalize_layer_weights,
+    normalize_common_activation_weights,
 )
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -607,6 +623,8 @@ def _scheduled_lambda_spatial(
 def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
+    weighted_common_activations=False,
+    weighted_private_residuals=False,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -649,7 +667,16 @@ def train_step(
     target = x0 - x1
     if use_aux_losses:
         def loss_fn(params):
-            common_activation_weights = _effective_common_activation_weights(params)
+            common_activation_weights = (
+                _effective_common_activation_weights(params)
+                if weighted_common_activations
+                else None
+            )
+            private_residual_weights = (
+                params["private_residual_weights"]
+                if weighted_private_residuals
+                else None
+            )
             pred, activations = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -662,7 +689,10 @@ def train_step(
             aux_metrics = compute_aux_losses(
                 activations,
                 spatial_target=x0,
-                layer_weights=common_activation_weights,
+                common_activation_weights=common_activation_weights,
+                private_residual_weights=private_residual_weights,
+                weighted_common_activations=weighted_common_activations,
+                weighted_private_residuals=weighted_private_residuals,
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
@@ -771,8 +801,11 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
-        _WANDB_COMMON_ACTIVATION_WEIGHTS_KEY: _effective_common_activation_weights(state.params),
     }
+    if weighted_common_activations:
+        metrics[_WANDB_COMMON_ACTIVATION_WEIGHTS_KEY] = _effective_common_activation_weights(state.params)
+    if weighted_private_residuals:
+        metrics[_WANDB_PRIVATE_RESIDUAL_WEIGHTS_KEY] = state.params["private_residual_weights"]
     metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
@@ -782,6 +815,8 @@ def train_step(
 def eval_step(
     state, ema_params, batch, rng, current_step,
     lambda_spatial=0.0, lambda_private=0.0,
+    weighted_common_activations=False,
+    weighted_private_residuals=False,
     private_max_pairs=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -826,12 +861,24 @@ def eval_step(
         deterministic=True,
     )
     if use_aux_losses:
-        common_activation_weights = _effective_common_activation_weights(state.params)
+        common_activation_weights = (
+            _effective_common_activation_weights(state.params)
+            if weighted_common_activations
+            else None
+        )
+        private_residual_weights = (
+            state.params["private_residual_weights"]
+            if weighted_private_residuals
+            else None
+        )
         pred, activations = outputs
         aux_metrics = compute_aux_losses(
             activations,
             spatial_target=x0,
-            layer_weights=common_activation_weights,
+            common_activation_weights=common_activation_weights,
+            private_residual_weights=private_residual_weights,
+            weighted_common_activations=weighted_common_activations,
+            weighted_private_residuals=weighted_private_residuals,
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
@@ -989,9 +1036,11 @@ class AsyncWandbLogger:
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
                 common_activation_weights = metrics_cpu.pop(_WANDB_COMMON_ACTIVATION_WEIGHTS_KEY, None)
-                if common_activation_weights is not None:
-                    metrics_cpu["train/common_activation_weights_plot"] = _common_activation_weights_plot(
-                        common_activation_weights
+                private_residual_weights = metrics_cpu.pop(_WANDB_PRIVATE_RESIDUAL_WEIGHTS_KEY, None)
+                if common_activation_weights is not None or private_residual_weights is not None:
+                    metrics_cpu["train/activation_weight_profiles_plot"] = _activation_weight_profiles_plot(
+                        common_activation_weights=common_activation_weights,
+                        private_residual_weights=private_residual_weights,
                     )
                 safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
@@ -1389,6 +1438,16 @@ def main():
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
     parser.add_argument(
+        "--weighted-common-activations",
+        action="store_true",
+        help="Use learnable layer weights in the common activation A = weighted_sum(A_i) / L.",
+    )
+    parser.add_argument(
+        "--weighted-private-residuals",
+        action="store_true",
+        help="Use learnable per-layer weights in private residuals B_i = A_i - w_i * A.",
+    )
+    parser.add_argument(
         "--private-start-step",
         type=int,
         default=0,
@@ -1623,6 +1682,8 @@ def main():
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
+        f"weighted_common_activations={args.weighted_common_activations} "
+        f"weighted_private_residuals={args.weighted_private_residuals} "
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
@@ -1676,6 +1737,8 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
+            weighted_common_activations=args.weighted_common_activations,
+            weighted_private_residuals=args.weighted_private_residuals,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
@@ -1693,6 +1756,8 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
+            weighted_common_activations=args.weighted_common_activations,
+            weighted_private_residuals=args.weighted_private_residuals,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
