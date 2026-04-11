@@ -208,38 +208,46 @@ def local_window_gram_loss(
     return spatial_loss, spatial_metrics
 
 
-def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
-    """Return cosine similarities for all layer pairs `i < j`."""
+def _layer_pair_per_token_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
+    """Per-patch cosines between layer pairs. private `[L, B, N, D]` -> `[P, B, N]` for `i<j`."""
     num_layers = private.shape[0]
     if num_layers < 2:
-        return jnp.array(0.0, dtype=private.dtype)
+        raise ValueError("_layer_pair_per_token_cosines requires at least two layers.")
 
-    flattened = private.reshape(num_layers, -1)
-    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
-    normalized = flattened / jnp.maximum(norms, eps)
-    cosine_matrix = normalized @ normalized.T
-    upper_indices = jnp.triu_indices(num_layers, k=1)
-    return cosine_matrix[upper_indices]
+    norms = jnp.linalg.norm(private, axis=-1, keepdims=True)
+    p = private / jnp.maximum(norms, eps)
+    cos_lm = jnp.einsum("lbnd,mbnd->lmbn", p, p)
+    li, mi = jnp.triu_indices(num_layers, k=1)
+    return cos_lm[li, mi]
 
 
-def _mean_pairwise_abs_cosine(
+def _private_loss_per_token_cosine_squared(
     private: jax.Array,
     eps: float = 1e-8,
     rng: jax.Array | None = None,
     max_pairs: int = 0,
-) -> jax.Array:
-    """Average |cosine| over all or sampled layer pairs (L1-style alignment penalty)."""
-    pairwise_cosines = _pairwise_cosines(private, eps=eps)
-    if pairwise_cosines.ndim == 0:
-        return jnp.abs(pairwise_cosines)
+) -> tuple[jax.Array, jax.Array]:
+    """LayerSync-style: mean(cos²) over patches `(B,N)` per layer pair, then mean over pairs.
 
-    if max_pairs and max_pairs > 0 and pairwise_cosines.shape[0] > max_pairs:
+    Returns `(loss_private, avg_pairwise_cosine)` where the latter is mean cosine (not squared)
+    over all upper-triangle pairs and all patches, for logging.
+    """
+    num_layers = private.shape[0]
+    if num_layers < 2:
+        z = jnp.array(0.0, dtype=private.dtype)
+        return z, z
+
+    pair_cos = _layer_pair_per_token_cosines(private, eps=eps)
+    avg_pairwise_cosine = jnp.mean(pair_cos)
+
+    if max_pairs and max_pairs > 0 and pair_cos.shape[0] > max_pairs:
         if rng is None:
             raise ValueError("An RNG key is required when sampling private-layer pairs.")
-        indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
-        pairwise_cosines = pairwise_cosines[indices]
+        indices = jax.random.permutation(rng, pair_cos.shape[0])[:max_pairs]
+        pair_cos = pair_cos[indices]
 
-    return jnp.mean(jnp.abs(pairwise_cosines))
+    loss_private = jnp.mean(jnp.square(pair_cos))
+    return loss_private, avg_pairwise_cosine
 
 
 def compute_aux_losses(
@@ -306,7 +314,7 @@ def compute_aux_losses(
         target_blur_max_sigma=spatial_blur_max_sigma,
     )
 
-    private_loss = _mean_pairwise_abs_cosine(
+    private_loss, avg_pairwise_cosine = _private_loss_per_token_cosine_squared(
         private,
         rng=private_pair_rng,
         max_pairs=private_max_pairs,
@@ -315,12 +323,6 @@ def compute_aux_losses(
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
     private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
     avg_private_norm = jnp.mean(private_norms)
-
-    pairwise_cosines = _pairwise_cosines(private)
-    if pairwise_cosines.ndim == 0:
-        avg_pairwise_cosine = pairwise_cosines
-    else:
-        avg_pairwise_cosine = jnp.mean(pairwise_cosines)
 
     return {
         "common_activation": common,
