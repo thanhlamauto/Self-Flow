@@ -222,16 +222,16 @@ def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     return cosine_matrix[upper_indices]
 
 
-def _mean_pairwise_cosine_squared(
+def _mean_pairwise_abs_cosine(
     private: jax.Array,
     eps: float = 1e-8,
     rng: jax.Array | None = None,
     max_pairs: int = 0,
 ) -> jax.Array:
-    """Average squared cosine similarity over all or sampled layer pairs."""
+    """Average |cosine| over all or sampled layer pairs (L1-style alignment penalty)."""
     pairwise_cosines = _pairwise_cosines(private, eps=eps)
     if pairwise_cosines.ndim == 0:
-        return pairwise_cosines
+        return jnp.abs(pairwise_cosines)
 
     if max_pairs and max_pairs > 0 and pairwise_cosines.shape[0] > max_pairs:
         if rng is None:
@@ -239,7 +239,7 @@ def _mean_pairwise_cosine_squared(
         indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
         pairwise_cosines = pairwise_cosines[indices]
 
-    return jnp.mean(jnp.square(pairwise_cosines))
+    return jnp.mean(jnp.abs(pairwise_cosines))
 
 
 def compute_aux_losses(
@@ -306,7 +306,7 @@ def compute_aux_losses(
         target_blur_max_sigma=spatial_blur_max_sigma,
     )
 
-    private_loss = _mean_pairwise_cosine_squared(
+    private_loss = _mean_pairwise_abs_cosine(
         private,
         rng=private_pair_rng,
         max_pairs=private_max_pairs,

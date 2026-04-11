@@ -258,7 +258,7 @@ class SelfFlowDiT(nn.Module):
             )
             self.layer_alpha_raw = self.param(
                 "layer_alpha_raw",
-                nn.initializers.constant(-4.0),
+                nn.initializers.constant(0.0),
                 (self.depth,),
             )
 
