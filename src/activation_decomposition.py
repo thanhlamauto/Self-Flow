@@ -276,9 +276,22 @@ def compute_aux_losses(
     if learnable_common_tensor:
         if common_activation is None:
             raise ValueError("common_activation is required when learnable_common_tensor is True.")
+        batch, num_tokens, _ = spatial_target.shape
+        if common_activation.shape[0] != num_tokens:
+            raise ValueError(
+                "common_activation num_patches must match spatial_target, "
+                f"got N={common_activation.shape[0]} vs {num_tokens}"
+            )
+        if common_activation.shape[-1] != activations.shape[-1]:
+            raise ValueError(
+                "common_activation hidden dim must match layer activations, "
+                f"got D={common_activation.shape[-1]} vs {activations.shape[-1]}"
+            )
+        # spatial_target is latent patches (B, N, patch_dim); common lives in DiT hidden space (B, N, D).
+        # Same layout as the mean-activations branch — Gram windows only need matching B,N grid.
         common = jnp.broadcast_to(
             common_activation[None, :, :],
-            spatial_target.shape,
+            (batch, num_tokens, common_activation.shape[-1]),
         ).astype(spatial_target.dtype)
         private = _normalize_channels(activations)
     else:
