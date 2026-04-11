@@ -242,12 +242,24 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    learnable_common_tensor: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+        if self.learnable_common_tensor:
+            self.common_activation = self.param(
+                "common_activation",
+                nn.initializers.zeros,
+                (self.num_patches, self.hidden_size),
+            )
+            self.layer_alpha_raw = self.param(
+                "layer_alpha_raw",
+                nn.initializers.constant(-4.0),
+                (self.depth,),
+            )
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
@@ -308,6 +320,13 @@ class SelfFlowDiT(nn.Module):
         zs = None
         block_summaries = [] if return_block_summaries else None
         activations = [] if return_activations else None
+        layer_alphas = (
+            jax.nn.sigmoid(self.layer_alpha_raw).astype(x.dtype)
+            if self.learnable_common_tensor
+            else None
+        )
+        A_common = self.common_activation if self.learnable_common_tensor else None
+
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -316,14 +335,19 @@ class SelfFlowDiT(nn.Module):
                 per_token=self.per_token
             )(x, c)
 
+            if self.learnable_common_tensor:
+                A_i = x
+                a = layer_alphas[i]
+                x = (1.0 - a) * A_i + a * A_common[None, :, :]
+                if return_activations:
+                    activations.append(A_i)
+
             if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
 
-            if return_activations:
-                # Full post-block hidden state: (B, N, D)
+            if return_activations and not self.learnable_common_tensor:
                 activations.append(x)
-            
+
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
             elif (i + 1) == return_raw_features:

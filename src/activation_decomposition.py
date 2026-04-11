@@ -252,6 +252,8 @@ def compute_aux_losses(
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep: bool = False,
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    learnable_common_tensor: bool = False,
+    common_activation: jax.Array | None = None,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
@@ -271,7 +273,16 @@ def compute_aux_losses(
     else:
         blur_sigmas = None
 
-    common, common_anchor, private = compute_common_private(activations)
+    if learnable_common_tensor:
+        if common_activation is None:
+            raise ValueError("common_activation is required when learnable_common_tensor is True.")
+        common = jnp.broadcast_to(
+            common_activation[None, :, :],
+            spatial_target.shape,
+        ).astype(spatial_target.dtype)
+        private = _normalize_channels(activations)
+    else:
+        common, common_anchor, private = compute_common_private(activations)
 
     spatial_loss, spatial_metrics = local_window_gram_loss(
         common,

@@ -438,7 +438,7 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(rng, config, learning_rate, grad_clip=1.0, learnable_common_tensor=False):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -456,6 +456,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        learnable_common_tensor=learnable_common_tensor,
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -591,6 +592,7 @@ def train_step(
     spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
+    learnable_common_tensor=False,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -643,11 +645,20 @@ def train_step(
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
                 spatial_blur_max_sigma=spatial_blur_max_sigma,
+                learnable_common_tensor=learnable_common_tensor,
+                common_activation=(
+                    params["common_activation"] if learnable_common_tensor else None
+                ),
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
             l_private = aux_metrics["loss_private"]
             loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
+            mean_layer_alpha = jnp.where(
+                learnable_common_tensor,
+                jnp.mean(jax.nn.sigmoid(params["layer_alpha_raw"])),
+                jnp.array(0.0, dtype=pred.dtype),
+            )
             return loss, (
                 jnp.mean(jnp.abs(target)),
                 jnp.mean(jnp.abs(pred)),
@@ -658,6 +669,7 @@ def train_step(
                 aux_metrics["norm_common"],
                 aux_metrics["avg_private_norm"],
                 aux_metrics["avg_pairwise_private_cosine"],
+                mean_layer_alpha,
             )
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -673,6 +685,7 @@ def train_step(
                 norm_common,
                 avg_private_norm,
                 avg_pairwise_private_cosine,
+                mean_layer_alpha,
             ),
         ), grads = grad_fn(state.params)
 
@@ -686,6 +699,7 @@ def train_step(
         norm_common = jax.lax.pmean(norm_common, axis_name="batch")
         avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
         avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
+        mean_layer_alpha = jax.lax.pmean(mean_layer_alpha, axis_name="batch")
         grads = jax.lax.pmean(grads, axis_name="batch")
     else:
         def loss_fn(params):
@@ -719,6 +733,7 @@ def train_step(
         norm_common = jnp.array(0.0, dtype=loss.dtype)
         avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
+        mean_layer_alpha = jnp.array(0.0, dtype=loss.dtype)
         grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -739,6 +754,7 @@ def train_step(
         "train/common_norm": norm_common,
         "train/private_avg_norm": avg_private_norm,
         "train/private_pairwise_cosine": avg_pairwise_private_cosine,
+        "train/mean_layer_alpha": mean_layer_alpha,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -763,6 +779,7 @@ def eval_step(
     spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
+    learnable_common_tensor=False,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -809,6 +826,10 @@ def eval_step(
             spatial_window_stride=spatial_window_stride,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
             spatial_blur_max_sigma=spatial_blur_max_sigma,
+            learnable_common_tensor=learnable_common_tensor,
+            common_activation=(
+                state.params["common_activation"] if learnable_common_tensor else None
+            ),
         )
     else:
         pred = outputs
@@ -836,6 +857,13 @@ def eval_step(
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+    if learnable_common_tensor:
+        mean_layer_alpha = jax.lax.pmean(
+            jnp.mean(jax.nn.sigmoid(state.params["layer_alpha_raw"])),
+            axis_name="batch",
+        )
+    else:
+        mean_layer_alpha = jax.lax.pmean(jnp.array(0.0, dtype=l_diff.dtype), axis_name="batch")
 
     metrics = {
         "val/loss": loss,
@@ -849,6 +877,7 @@ def eval_step(
         "val/common_norm": common_norm,
         "val/private_avg_norm": avg_private_norm,
         "val/private_pairwise_cosine": avg_pairwise_private_cosine,
+        "val/mean_layer_alpha": mean_layer_alpha,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -980,7 +1009,7 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
-def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0, learnable_common_tensor=False):
     """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
     XLA's scan requires a static sequence length, so num_steps cannot be a
@@ -1002,6 +1031,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        learnable_common_tensor=learnable_common_tensor,
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1079,7 +1109,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0, learnable_common_tensor=False):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -1101,6 +1131,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        learnable_common_tensor=learnable_common_tensor,
     )
 
     patch_size = config["patch_size"]
@@ -1386,6 +1417,16 @@ def main():
         default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
         help="Maximum Gaussian sigma for timestep-dependent spatial blur.",
     )
+    parser.add_argument(
+        "--learnable-common-tensor",
+        action="store_true",
+        help=(
+            "Use a learned A_common and per-layer alpha: "
+            "h_i = (1-alpha_i) A_i + alpha_i A_common. "
+            "Spatial loss aligns A_common; private loss uses pre-mix A_i. "
+            "Checkpoints without these params cannot be loaded without struct mismatch."
+        ),
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1594,7 +1635,8 @@ def main():
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
-        f"spatial_blur_max_sigma={args.spatial_blur_max_sigma}"
+        f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
+        f"learnable_common_tensor={args.learnable_common_tensor}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1606,7 +1648,13 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        learnable_common_tensor=args.learnable_common_tensor,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1648,6 +1696,7 @@ def main():
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
+            learnable_common_tensor=args.learnable_common_tensor,
         ),
         axis_name="batch",
     )
@@ -1665,6 +1714,7 @@ def main():
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
+            learnable_common_tensor=args.learnable_common_tensor,
         ),
         axis_name="batch",
     )
@@ -1674,19 +1724,28 @@ def main():
     # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
     #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
-        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+        config,
+        num_steps=args.sample_num_steps,
+        cfg_scale=args.sample_cfg_scale,
+        learnable_common_tensor=args.learnable_common_tensor,
     )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
-            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            learnable_common_tensor=args.learnable_common_tensor,
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
 
     # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
-        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        config,
+        num_steps=args.fid_num_steps,
+        cfg_scale=args.fid_cfg_scale,
+        learnable_common_tensor=args.learnable_common_tensor,
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
