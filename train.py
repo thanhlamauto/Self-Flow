@@ -961,6 +961,10 @@ def _pmap_metric_leaf_to_host_scalar(x):
 
     Using ``x[0]`` alone is fragile: replica 0 can disagree, bf16 rounds oddly, or
     the leading axis may not be the device axis. Mean over all replicas is stable.
+
+    Do not rely only on ``isinstance(x, jax.Array)``: some JAX builds expose
+    ``ArrayImpl`` etc.; missing that branch caused W&B to receive raw device
+    arrays and plot bogus flat lines (e.g. stuck near -2).
     """
     if isinstance(x, bool):
         return x
@@ -968,19 +972,26 @@ def _pmap_metric_leaf_to_host_scalar(x):
         return x
     if isinstance(x, float):
         return float(x)
-    if isinstance(x, jax.Array):
-        arr = np.asarray(jax.device_get(x), dtype=np.float64)
-        if arr.size == 0:
-            return 0.0
-        return float(np.nanmean(arr))
+    if isinstance(x, (str, bytes, type(None))):
+        return x
+    if isinstance(x, (list, tuple, dict)):
+        return x
     if isinstance(x, np.ndarray):
-        arr = np.asarray(x, dtype=np.float64)
-        if arr.size == 0:
+        arr = np.asarray(x, dtype=np.float64).ravel()
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
             return 0.0
-        return float(np.nanmean(arr))
+        return float(finite.mean())
     if isinstance(x, np.generic):
         return float(np.asarray(x, dtype=np.float64))
-    return x
+    try:
+        arr = np.asarray(jax.device_get(x), dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        return x
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0
+    return float(finite.mean())
 
 
 def replicated_metrics_to_host(metrics):
