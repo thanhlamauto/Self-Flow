@@ -980,7 +980,8 @@ def _pmap_metric_leaf_to_host_scalar(x):
         arr = np.asarray(x, dtype=np.float64).ravel()
         finite = arr[np.isfinite(arr)]
         if finite.size == 0:
-            return 0.0
+            # Do not use 0.0: W&B would show "flat zero loss" while the real value was NaN/Inf.
+            return float("nan")
         return float(finite.mean())
     if isinstance(x, np.generic):
         return float(np.asarray(x, dtype=np.float64))
@@ -990,7 +991,7 @@ def _pmap_metric_leaf_to_host_scalar(x):
         return x
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
-        return 0.0
+        return float("nan")
     return float(finite.mean())
 
 
