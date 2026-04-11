@@ -550,6 +550,39 @@ def _scheduled_lambda_private(
     return lambda_private * warmup_scale, warmup_scale
 
 
+def parse_private_layer_pairs(spec: str, depth: int) -> tuple[tuple[int, int], ...] | None:
+    """Parse ``--private-pairs``: comma-separated ``early:late`` with **1-based** block indices.
+
+    Index ``k`` means activations **after** DiT block ``k-1`` (same order as ``return_activations``).
+    Requires ``1 <= early < late <= depth``. Returns 0-based ``(i, j)`` tuples, or ``None`` if empty.
+
+    For depth 12 (SiT-B), ``3:10`` = shallow-mid vs deep; ``2:11`` = wider early/late span.
+    """
+    text = spec.strip()
+    if not text:
+        return None
+    out: list[tuple[int, int]] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid --private-pairs entry {part!r}; expected form 'early:late' (1-based)."
+            )
+        left, right = part.split(":", 1)
+        early_1 = int(left.strip())
+        late_1 = int(right.strip())
+        if not (1 <= early_1 < late_1 <= depth):
+            raise ValueError(
+                f"Invalid --private-pairs pair {part!r}: need 1 <= early < late <= depth ({depth})."
+            )
+        out.append((early_1 - 1, late_1 - 1))
+    if not out:
+        return None
+    return tuple(out)
+
+
 def _scheduled_lambda_spatial(
     lambda_spatial,
     current_step,
@@ -593,6 +626,7 @@ def train_step(
     private_start_step=0,
     private_warmup_iters=0,
     learnable_common_tensor=False,
+    private_layer_pairs=None,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -641,6 +675,7 @@ def train_step(
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
+                private_layer_pairs=private_layer_pairs,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
@@ -779,6 +814,7 @@ def eval_step(
     private_start_step=0,
     private_warmup_iters=0,
     learnable_common_tensor=False,
+    private_layer_pairs=None,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -821,6 +857,7 @@ def eval_step(
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
+            private_layer_pairs=private_layer_pairs,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
@@ -1435,6 +1472,17 @@ def main():
     )
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
+    parser.add_argument(
+        "--private-pairs",
+        type=str,
+        default="",
+        help=(
+            "Optional fixed (early, late) layer pairs for L_private MI proxy, comma-separated, "
+            "**1-based** block indices (activations after that block). Example depth-12 (SiT-B): "
+            "'3:10' (shallow-mid vs deep) or '2:11' (wider span). Empty = all pairs i<j; "
+            "if set, --private-max-pairs subsamples among these pairs only."
+        ),
+    )
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
                         help="Sliding window size for local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -1652,6 +1700,7 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    private_layer_pairs = parse_private_layer_pairs(args.private_pairs, depth)
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1669,6 +1718,7 @@ def main():
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
+        f"private_pairs={args.private_pairs!r} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
@@ -1729,6 +1779,7 @@ def main():
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            private_layer_pairs=private_layer_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
@@ -1747,6 +1798,7 @@ def main():
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            private_layer_pairs=private_layer_pairs,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,

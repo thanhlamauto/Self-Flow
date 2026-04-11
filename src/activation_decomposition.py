@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -208,6 +208,27 @@ def local_window_gram_loss(
     return spatial_loss, spatial_metrics
 
 
+def _per_token_cosine_two_layers(z_a: jax.Array, z_b: jax.Array, eps: float = 1e-8) -> jax.Array:
+    """Cosine similarity per patch between two `[B, N, D]` tensors (DiverseDiT / diversedit token_cos)."""
+    na = jnp.linalg.norm(z_a, axis=-1, keepdims=True)
+    nb = jnp.linalg.norm(z_b, axis=-1, keepdims=True)
+    a = z_a / jnp.maximum(na, eps)
+    b = z_b / jnp.maximum(nb, eps)
+    return jnp.sum(a * b, axis=-1)
+
+
+def _selected_pair_token_cosines(
+    private: jax.Array,
+    pair_indices: Tuple[Tuple[int, int], ...],
+    eps: float = 1e-8,
+) -> jax.Array:
+    """Stack per-token cosines for fixed (early, late) layer pairs -> `[P, B, N]`."""
+    stacks = [
+        _per_token_cosine_two_layers(private[i], private[j], eps=eps) for i, j in pair_indices
+    ]
+    return jnp.stack(stacks, axis=0)
+
+
 def _layer_pair_per_token_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     """Per-patch cosines between layer pairs. private `[L, B, N, D]` -> `[P, B, N]` for `i<j`."""
     num_layers = private.shape[0]
@@ -221,24 +242,35 @@ def _layer_pair_per_token_cosines(private: jax.Array, eps: float = 1e-8) -> jax.
     return cos_lm[li, mi]
 
 
-def _private_loss_per_token_cosine_squared(
+def _private_loss_per_token_mi_proxy(
     private: jax.Array,
     eps: float = 1e-8,
     rng: jax.Array | None = None,
     max_pairs: int = 0,
+    private_layer_pairs: Optional[Tuple[Tuple[int, int], ...]] = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """LayerSync-style: mean(cos²) over patches `(B,N)` per layer pair, then mean over pairs.
+    """DiverseDiT-style MI proxy: mean(|cos|) per patch, matching ``feat/diversedit-sit-jax``.
 
-    Returns `(loss_private, avg_pairwise_cosine)` where the latter is mean cosine (not squared)
-    over all upper-triangle pairs and all patches, for logging.
+    Same recipe as ``compute_diversity_loss`` there: L2-normalize along ``D``, dot per token,
+    ``mean(jnp.abs(token_cos))`` per layer pair, then mean over pairs.
+
+    If ``private_layer_pairs`` is set (0-based indices into the layer stack), only those
+    ``(z_early, z_late)`` pairs are used (like ``diversity_pairs``). Otherwise all ``i<j`` pairs,
+    optionally subsampled when ``max_pairs > 0``.
+
+    Returns ``(loss_private, avg_pairwise_abs_cos)``; the latter uses all chosen pairs before
+    subsampling.
     """
     num_layers = private.shape[0]
     if num_layers < 2:
         z = jnp.array(0.0, dtype=private.dtype)
         return z, z
 
-    pair_cos = _layer_pair_per_token_cosines(private, eps=eps)
-    avg_pairwise_cosine = jnp.mean(pair_cos)
+    if private_layer_pairs:
+        pair_cos = _selected_pair_token_cosines(private, private_layer_pairs, eps=eps)
+    else:
+        pair_cos = _layer_pair_per_token_cosines(private, eps=eps)
+    avg_pairwise_abs_cos = jnp.mean(jnp.abs(pair_cos))
 
     if max_pairs and max_pairs > 0 and pair_cos.shape[0] > max_pairs:
         if rng is None:
@@ -246,8 +278,8 @@ def _private_loss_per_token_cosine_squared(
         indices = jax.random.permutation(rng, pair_cos.shape[0])[:max_pairs]
         pair_cos = pair_cos[indices]
 
-    loss_private = jnp.mean(jnp.square(pair_cos))
-    return loss_private, avg_pairwise_cosine
+    loss_private = jnp.mean(jnp.abs(pair_cos))
+    return loss_private, avg_pairwise_abs_cos
 
 
 def compute_aux_losses(
@@ -256,6 +288,7 @@ def compute_aux_losses(
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
+    private_layer_pairs: Optional[Tuple[Tuple[int, int], ...]] = None,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep: bool = False,
@@ -314,10 +347,11 @@ def compute_aux_losses(
         target_blur_max_sigma=spatial_blur_max_sigma,
     )
 
-    private_loss, avg_pairwise_cosine = _private_loss_per_token_cosine_squared(
+    private_loss, avg_pairwise_cosine = _private_loss_per_token_mi_proxy(
         private,
         rng=private_pair_rng,
         max_pairs=private_max_pairs,
+        private_layer_pairs=private_layer_pairs,
     )
 
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
