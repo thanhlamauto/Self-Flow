@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import collections.abc
 import glob
 import pickle
 import time
@@ -367,7 +368,7 @@ DIT_VARIANTS = {
 }
 
 
-def build_model_config(model_size):
+def build_model_config(model_size, class_dropout_prob=0.1):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -384,10 +385,46 @@ def build_model_config(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
+        num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=class_dropout_prob,
     )
+
+
+def extract_backbone_params(params):
+    if isinstance(params, collections.abc.Mapping) and "backbone" in params:
+        return params["backbone"]
+    return params
+
+
+def normalize_backbone_checkpoint(raw):
+    if raw is None:
+        raise ValueError("Checkpoint restore returned None.")
+    if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
+        raw = raw["backbone"]
+    elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
+        raw = {k: v for k, v in raw.items() if k != "feature_head"}
+    return raw
+
+
+def restore_backbone_checkpoint(ckpt_dir, target=None):
+    raw = checkpoints.restore_checkpoint(ckpt_dir=ckpt_dir, target=target)
+    return normalize_backbone_checkpoint(raw)
+
+
+def default_guided_layer(depth):
+    return max(1, depth // 2)
+
+
+def default_guiding_layer(depth):
+    guided = default_guided_layer(depth)
+    guiding = max(guided + 1, (2 * depth) // 3)
+    return min(depth, guiding)
+
+
+def default_guide_stop_epochs(model_size):
+    return 20 if model_size.upper() in {"S", "B"} else 10
 
 
 # diffusers phải được import TRƯỚC jax để tránh xung đột C++ protobuf descriptor.
@@ -411,7 +448,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import ProjectionHead, SelfFlowDiT
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -431,12 +468,34 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
-    """Initializes the model, optimizer, and initial EMA params.
+def build_guidance_modules(config, training_mode, projector_dim):
+    modules = {}
+    patch_dim = config["in_channels"] * config["patch_size"] ** 2
+    hidden_size = config["hidden_size"]
+    if training_mode == "vae-structure-guidance":
+        modules["vae_guide_head"] = ProjectionHead(
+            in_dim=hidden_size,
+            hidden_dim=projector_dim,
+            out_dim=patch_dim,
+        )
+    elif training_mode == "self-transcendence":
+        modules["self_guide_head"] = ProjectionHead(
+            in_dim=hidden_size,
+            hidden_dim=projector_dim,
+            out_dim=hidden_size,
+        )
+    return modules
 
-    Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
-    """
+
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    training_mode="baseline",
+    projector_dim=2048,
+):
+    """Initializes backbone + optional guidance heads and returns model/state/EMA."""
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -449,7 +508,10 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        class_dropout_prob=config["class_dropout_prob"],
     )
+
+    guidance_modules = build_guidance_modules(config, training_mode, projector_dim)
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -458,16 +520,21 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, param_rng, drop_rng = jax.random.split(rng, 3)
     variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+        {"params": param_rng, "dropout": drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
     )
 
-    # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
+    params = {"backbone": variables["params"]}
+    dummy_features = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
+    for name, module in guidance_modules.items():
+        rng, head_rng = jax.random.split(rng)
+        params[name] = module.init(head_rng, dummy_features)["params"]
+
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
         optax.adamw(learning_rate, weight_decay=0),
@@ -475,12 +542,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
         tx=tx,
     )
-    # EMA params start as an exact copy of the initial online params
     ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
-    return state, ema_params
+    return model, guidance_modules, state, ema_params
 
 
 # ── Self-Flow core helpers ────────────────────────────────────────────────────
@@ -500,102 +566,284 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def train_step(
-    state, ema_params, batch, rng, ema_decay,
+def make_train_step(
+    model,
+    guidance_modules,
+    training_mode,
+    guided_layer,
+    guiding_layer,
+    feature_guidance_scale,
+    null_label_id,
 ):
-    """Vanilla SiT training step (global timestep; velocity prediction).
+    vae_guide_head = guidance_modules.get("vae_guide_head")
+    self_guide_head = guidance_modules.get("self_guide_head")
+    use_guidance = training_mode != "baseline"
 
-    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
-      x_tau   = (1 - tau) * x1 + tau * x0
-      target  = x0 - x1
-      loss    = E[||v_theta(x_tau, tau) - target||^2]
-    """
-    x0, y = batch  # x0: [local_B, N, D], y: [local_B]
-    local_batch = x0.shape[0]
+    def train_step(state, ema_params, teacher_params, batch, rng, ema_decay, guide_weight):
+        """DiT training step with optional Self-Transcendence guidance."""
+        x0, y = batch
+        local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
 
-    def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
-        loss = jnp.mean((pred - target) ** 2)
+        def loss_fn(params):
+            apply_kwargs = dict(
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            if use_guidance:
+                pred, student_features = state.apply_fn(
+                    {"params": params["backbone"]},
+                    x_tau,
+                    return_raw_features=guided_layer,
+                    **apply_kwargs,
+                )
+            else:
+                pred = state.apply_fn(
+                    {"params": params["backbone"]},
+                    x_tau,
+                    **apply_kwargs,
+                )
+                student_features = None
+
+            l_diff = jnp.mean((pred - target) ** 2)
+            v_abs_mean = jnp.mean(jnp.abs(target))
+            v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+            zero = jnp.array(0.0, dtype=l_diff.dtype)
+
+            if training_mode == "vae-structure-guidance":
+                def _compute_vae_guidance(features):
+                    projected = vae_guide_head.apply({"params": params["vae_guide_head"]}, features)
+                    guide_loss = jnp.mean((projected - x0) ** 2)
+                    target_abs_mean = jnp.mean(jnp.abs(x0))
+                    return guide_loss, target_abs_mean, zero
+
+                l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
+                    guide_weight > 0,
+                    _compute_vae_guidance,
+                    lambda features: (zero, zero, zero),
+                    student_features,
+                )
+            elif training_mode == "self-transcendence":
+                null_labels = jnp.full_like(y, null_label_id)
+
+                def _compute_self_guidance(features):
+                    projected = self_guide_head.apply({"params": params["self_guide_head"]}, features)
+                    _, teacher_cond = model.apply(
+                        {"params": teacher_params},
+                        x_tau,
+                        timesteps=tau,
+                        vector=y,
+                        deterministic=True,
+                        return_raw_features=guiding_layer,
+                    )
+                    _, teacher_uncond = model.apply(
+                        {"params": teacher_params},
+                        x_tau,
+                        timesteps=tau,
+                        vector=null_labels,
+                        deterministic=True,
+                        return_raw_features=guiding_layer,
+                    )
+                    teacher_guided = jax.lax.stop_gradient(
+                        teacher_uncond + feature_guidance_scale * (teacher_cond - teacher_uncond)
+                    )
+                    guide_loss = jnp.mean((projected - teacher_guided) ** 2)
+                    target_abs_mean = jnp.mean(jnp.abs(teacher_guided))
+                    cfg_delta = jnp.mean(jnp.abs(teacher_cond - teacher_uncond))
+                    return guide_loss, target_abs_mean, cfg_delta
+
+                l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
+                    guide_weight > 0,
+                    _compute_self_guidance,
+                    lambda features: (zero, zero, zero),
+                    student_features,
+                )
+            else:
+                l_guide = zero
+                guide_target_abs = zero
+                teacher_cfg_delta = zero
+
+            loss = l_diff + guide_weight * l_guide
+            return loss, (
+                v_abs_mean,
+                v_pred_abs_mean,
+                l_diff,
+                l_guide,
+                guide_target_abs,
+                teacher_cfg_delta,
+            )
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (v_abs, v_pred, l_diff, l_guide, guide_target_abs, teacher_cfg_delta)), grads = grad_fn(state.params)
+
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+        l_guide = jax.lax.pmean(l_guide, axis_name="batch")
+        guide_target_abs = jax.lax.pmean(guide_target_abs, axis_name="batch")
+        teacher_cfg_delta = jax.lax.pmean(teacher_cfg_delta, axis_name="batch")
+        guide_weight_metric = jax.lax.pmean(guide_weight, axis_name="batch")
+        grads = jax.lax.pmean(grads, axis_name="batch")
+
+        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+        param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+
+        state = state.apply_gradients(grads=grads)
+        ema_params = ema_update(ema_params, state.params, ema_decay)
+
+        metrics = {
+            "train/loss": loss,
+            "train/loss_diff": l_diff,
+            "train/loss_guide": l_guide,
+            "train/guide_weight": guide_weight_metric,
+            "train/guide_target_abs_mean": guide_target_abs,
+            "train/teacher_cfg_delta_abs_mean": teacher_cfg_delta,
+            "train/ema_decay": ema_decay,
+            "train/grad_norm": grad_norm,
+            "train/param_norm": param_norm,
+            "train/v_abs_mean": v_abs,
+            "train/v_pred_abs_mean": v_pred,
+        }
+        return state, ema_params, metrics, rng
+
+    return train_step
+
+
+def make_eval_step(
+    model,
+    guidance_modules,
+    training_mode,
+    guided_layer,
+    guiding_layer,
+    feature_guidance_scale,
+    null_label_id,
+):
+    vae_guide_head = guidance_modules.get("vae_guide_head")
+    self_guide_head = guidance_modules.get("self_guide_head")
+    use_guidance = training_mode != "baseline"
+
+    def eval_step(state, ema_params, teacher_params, batch, rng, guide_weight):
+        """Validation step mirroring the selected training objective."""
+        x0, y = batch
+        local_batch = x0.shape[0]
+
+        rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
+
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
+
+        if use_guidance:
+            pred, student_features = state.apply_fn(
+                {"params": state.params["backbone"]},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=True,
+                return_raw_features=guided_layer,
+            )
+        else:
+            pred = state.apply_fn(
+                {"params": state.params["backbone"]},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=True,
+            )
+            student_features = None
+
+        l_diff = jnp.mean((pred - target) ** 2)
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        zero = jnp.array(0.0, dtype=l_diff.dtype)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+        if training_mode == "vae-structure-guidance":
+            def _compute_vae_guidance(features):
+                projected = vae_guide_head.apply({"params": state.params["vae_guide_head"]}, features)
+                guide_loss = jnp.mean((projected - x0) ** 2)
+                target_abs_mean = jnp.mean(jnp.abs(x0))
+                return guide_loss, target_abs_mean, zero
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+            l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
+                guide_weight > 0,
+                _compute_vae_guidance,
+                lambda features: (zero, zero, zero),
+                student_features,
+            )
+        elif training_mode == "self-transcendence":
+            null_labels = jnp.full_like(y, null_label_id)
 
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+            def _compute_self_guidance(features):
+                projected = self_guide_head.apply({"params": state.params["self_guide_head"]}, features)
+                _, teacher_cond = model.apply(
+                    {"params": teacher_params},
+                    x_tau,
+                    timesteps=tau,
+                    vector=y,
+                    deterministic=True,
+                    return_raw_features=guiding_layer,
+                )
+                _, teacher_uncond = model.apply(
+                    {"params": teacher_params},
+                    x_tau,
+                    timesteps=tau,
+                    vector=null_labels,
+                    deterministic=True,
+                    return_raw_features=guiding_layer,
+                )
+                teacher_guided = jax.lax.stop_gradient(
+                    teacher_uncond + feature_guidance_scale * (teacher_cond - teacher_uncond)
+                )
+                guide_loss = jnp.mean((projected - teacher_guided) ** 2)
+                target_abs_mean = jnp.mean(jnp.abs(teacher_guided))
+                cfg_delta = jnp.mean(jnp.abs(teacher_cond - teacher_uncond))
+                return guide_loss, target_abs_mean, cfg_delta
 
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+            l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
+                guide_weight > 0,
+                _compute_self_guidance,
+                lambda features: (zero, zero, zero),
+                student_features,
+            )
+        else:
+            l_guide = zero
+            guide_target_abs = zero
+            teacher_cfg_delta = zero
 
-    metrics = {
-        "train/loss": loss,
-        "train/ema_decay": ema_decay,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
-    }
-    return state, ema_params, metrics, rng
+        loss = l_diff + guide_weight * l_guide
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+        l_guide = jax.lax.pmean(l_guide, axis_name="batch")
+        guide_target_abs = jax.lax.pmean(guide_target_abs, axis_name="batch")
+        teacher_cfg_delta = jax.lax.pmean(teacher_cfg_delta, axis_name="batch")
+        v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
+        v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
+        guide_weight_metric = jax.lax.pmean(guide_weight, axis_name="batch")
 
+        metrics = {
+            "val/loss": loss,
+            "val/loss_diff": l_diff,
+            "val/loss_guide": l_guide,
+            "val/guide_weight": guide_weight_metric,
+            "val/guide_target_abs_mean": guide_target_abs,
+            "val/teacher_cfg_delta_abs_mean": teacher_cfg_delta,
+            "val/v_abs_mean": v_abs_mean,
+            "val/v_pred_abs_mean": v_pred_abs_mean,
+        }
+        return metrics, rng
 
-def eval_step(
-    state, ema_params, batch, rng,
-):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
-    x0, y = batch
-    local_batch = x0.shape[0]
-
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
-
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
-
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
-
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
-    v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
-    v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
-
-    metrics = {
-        "val/loss": loss,
-        "val/v_abs_mean": v_abs_mean,
-        "val/v_pred_abs_mean": v_pred_abs_mean,
-    }
-    return metrics, rng
+    return eval_step
 
 
 def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=42):
@@ -728,7 +976,6 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     different eval modes:
       - Fast TPU monitoring default: num_steps=50, cfg_scale=1.0
       - Paper-like eval: num_steps=250, cfg_scale=1.0
-        (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -742,6 +989,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        class_dropout_prob=config["class_dropout_prob"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -773,9 +1021,11 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
 
         use_cfg = cfg_scale > 1.0
         if use_cfg:
+            if config["class_dropout_prob"] <= 0.0:
+                raise ValueError("CFG sampling requires classifier-free training (class_dropout_prob > 0)")
             x = jnp.concatenate([x, x], axis=0)
             class_labels = jnp.concatenate(
-                [jnp.full_like(class_labels, config["num_classes"] - 1), class_labels],
+                [jnp.full_like(class_labels, config["num_classes"]), class_labels],
                 axis=0,
             )
 
@@ -841,6 +1091,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        class_dropout_prob=config["class_dropout_prob"],
     )
 
     patch_size = config["patch_size"]
@@ -868,9 +1119,11 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
 
         use_cfg = cfg_scale > 1.0
         if use_cfg:
+            if config["class_dropout_prob"] <= 0.0:
+                raise ValueError("CFG sampling requires classifier-free training (class_dropout_prob > 0)")
             x = jnp.concatenate([x, x], axis=0)
             class_labels_local = jnp.concatenate(
-                [jnp.full_like(class_labels_local, config["num_classes"] - 1), class_labels_local],
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
                 axis=0,
             )
 
@@ -949,7 +1202,7 @@ def run_preflight_checks(
         return rng
 
     # Use EMA params for preflight sampling (consistent with training-time eval)
-    single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+    single_ema_params = extract_backbone_params(jax.tree_util.tree_map(lambda w: w[0], ema_params))
     sample_rng_base, sample_rng = jax.random.split(rng[0])
     sample_classes = jax.random.randint(sample_rng, (requested_fake_samples,), 0, 1000)
     fake_latents = np.asarray(
@@ -1055,7 +1308,7 @@ def run_preflight_checks(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train vanilla SiT DiT (JAX)")
+    parser = argparse.ArgumentParser(description="Train SiT / Self-Transcendence DiT (JAX)")
     # ── Core training args ────────────────────────────────────────────────────
     parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
@@ -1065,9 +1318,28 @@ def main():
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
-    parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
+    parser.add_argument("--wandb-project", type=str, default="sit-self-transcendence-jax")
     parser.add_argument("--no-wandb", action="store_true")
-    # ── Vanilla SiT args ──────────────────────────────────────────────────────
+    # ── Backbone / guidance args ──────────────────────────────────────────────
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        default="baseline",
+        choices=["baseline", "vae-structure-guidance", "self-transcendence"],
+        help=(
+            "Training objective: plain diffusion baseline, stage-1 VAE structure guidance, "
+            "or stage-2 Self-Transcendence with a frozen teacher checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--class-dropout-prob",
+        type=float,
+        default=0.1,
+        help=(
+            "Classifier-free label dropout probability. Paper-faithful Self-Transcendence "
+            "teacher/student training requires this to be > 0."
+        ),
+    )
     parser.add_argument(
         "--ema-decay",
         type=float,
@@ -1077,6 +1349,28 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument("--guide-lambda", type=float, default=0.5,
+                        help="Weight for the active guidance loss in the selected training mode.")
+    parser.add_argument("--projector-dim", type=int, default=2048,
+                        help="Hidden width for the 3-layer projector head used by guidance losses.")
+    parser.add_argument("--guided-layer", type=int, default=None,
+                        help="Student layer supervised by guidance. Default: depth // 2.")
+    parser.add_argument("--guiding-layer", type=int, default=None,
+                        help="Teacher layer used as guidance in stage 2. Default: floor(2 * depth / 3).")
+    parser.add_argument("--guide-stop-epochs", type=int, default=None,
+                        help="Epoch to turn off guide loss. Default: no stop for VAE stage; "
+                             "20 epochs for S/B and 10 epochs for L/XL in self-transcendence.")
+    parser.add_argument("--feature-guidance-scale", type=float, default=30.0,
+                        help="Feature-level CFG scale omega for Self-Transcendence stage 2.")
+    parser.add_argument("--teacher-ckpt", type=str, default=None,
+                        help="Checkpoint directory of the frozen teacher backbone for stage 2.")
+    parser.add_argument(
+        "--teacher-use-ema",
+        dest="teacher_use_ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load the teacher from <teacher-ckpt>/ema when available (default: true).",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1113,8 +1407,7 @@ def main():
                         help="Denoising steps for sample previews. "
                              "TPU-friendly default: 50. Paper-like eval: 250.")
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
-                        help="CFG scale for sample previews. Default 1.0 (no CFG; "
-                             "classifier-free training not implemented).")
+                        help="CFG scale for sample previews. Default 1.0 (paper uses no CFG at eval).")
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -1224,6 +1517,26 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if not (0.0 <= args.class_dropout_prob < 1.0):
+        raise ValueError("--class-dropout-prob must be in [0, 1)")
+    if args.projector_dim <= 0:
+        raise ValueError("--projector-dim must be greater than 0")
+    if args.guide_lambda < 0.0:
+        raise ValueError("--guide-lambda must be >= 0")
+    if args.feature_guidance_scale <= 0.0:
+        raise ValueError("--feature-guidance-scale must be > 0")
+    if args.guided_layer is not None and args.guided_layer <= 0:
+        raise ValueError("--guided-layer must be >= 1")
+    if args.guiding_layer is not None and args.guiding_layer <= 0:
+        raise ValueError("--guiding-layer must be >= 1")
+    if args.guide_stop_epochs is not None and args.guide_stop_epochs < 0:
+        raise ValueError("--guide-stop-epochs must be >= 0 when provided")
+    if args.training_mode == "self-transcendence" and not args.teacher_ckpt:
+        raise ValueError("--teacher-ckpt is required for --training-mode self-transcendence")
+    if args.training_mode == "self-transcendence" and args.class_dropout_prob <= 0.0:
+        raise ValueError("Self-Transcendence requires --class-dropout-prob > 0 to build conditional/unconditional teacher features")
+    if (args.sample_cfg_scale > 1.0 or args.fid_cfg_scale > 1.0) and args.class_dropout_prob <= 0.0:
+        raise ValueError("Sampling with CFG requires --class-dropout-prob > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1247,15 +1560,33 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size)
+    config = build_model_config(args.model_size, class_dropout_prob=args.class_dropout_prob)
     depth = int(config["depth"])
+    guided_layer = args.guided_layer or default_guided_layer(depth)
+    guiding_layer = args.guiding_layer or default_guiding_layer(depth)
+    if guided_layer > depth:
+        raise ValueError(f"--guided-layer ({guided_layer}) must be <= model depth ({depth})")
+    if guiding_layer > depth:
+        raise ValueError(f"--guiding-layer ({guiding_layer}) must be <= model depth ({depth})")
+    if args.guide_stop_epochs is None:
+        guide_stop_epochs = (
+            None
+            if args.training_mode == "vae-structure-guidance"
+            else default_guide_stop_epochs(args.model_size)
+            if args.training_mode == "self-transcendence"
+            else 0
+        )
+    else:
+        guide_stop_epochs = args.guide_stop_epochs
+    null_label_id = config["num_classes"]
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Training mode={args.training_mode} ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
+        f"class_dropout={args.class_dropout_prob} guided_layer={guided_layer} guiding_layer={guiding_layer}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1267,16 +1598,47 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    model, guidance_modules, state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        training_mode=args.training_mode,
+        projector_dim=args.projector_dim,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
 
+    teacher_params = None
+    if args.training_mode == "self-transcendence":
+        teacher_ckpt_dir = args.teacher_ckpt
+        if args.teacher_use_ema:
+            ema_candidate = os.path.join(args.teacher_ckpt, "ema")
+            if os.path.isdir(ema_candidate):
+                teacher_ckpt_dir = ema_candidate
+        latest_teacher_ckpt = checkpoints.latest_checkpoint(teacher_ckpt_dir)
+        if latest_teacher_ckpt is None:
+            raise ValueError(f"No checkpoint found for frozen teacher at {teacher_ckpt_dir!r}")
+        teacher_backbone = restore_backbone_checkpoint(
+            teacher_ckpt_dir,
+            target=extract_backbone_params(jax_utils.unreplicate(state.params)),
+        )
+        teacher_params = jax_utils.replicate(teacher_backbone)
+        log_stage(f"Loaded frozen teacher backbone from {teacher_ckpt_dir}")
+    else:
+        teacher_params = jax_utils.replicate(extract_backbone_params(jax_utils.unreplicate(state.params)))
+
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     total_steps = args.epochs * args.steps_per_epoch
+    guide_stop_steps = (
+        None
+        if guide_stop_epochs is None
+        else int(guide_stop_epochs) * int(args.steps_per_epoch)
+    )
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1295,13 +1657,29 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
+    train_step = make_train_step(
+        model=model,
+        guidance_modules=guidance_modules,
+        training_mode=args.training_mode,
+        guided_layer=guided_layer,
+        guiding_layer=guiding_layer,
+        feature_guidance_scale=args.feature_guidance_scale,
+        null_label_id=null_label_id,
+    )
+    eval_step = make_eval_step(
+        model=model,
+        guidance_modules=guidance_modules,
+        training_mode=args.training_mode,
+        guided_layer=guided_layer,
+        guiding_layer=guiding_layer,
+        feature_guidance_scale=args.feature_guidance_scale,
+        null_label_id=null_label_id,
+    )
     pmapped_train_step = jax.pmap(train_step, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
-    # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
-    #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
         config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
     )
@@ -1465,7 +1843,7 @@ def main():
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
                 _, feats = state.apply_fn(
-                    {"params": ema_params_local},
+                    {"params": extract_backbone_params(ema_params_local)},
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
@@ -1493,7 +1871,7 @@ def main():
                 local_batch = batch_x_local.shape[0]
                 clean_t = jnp.ones((local_batch,), dtype=jnp.float32)
                 out = state.apply_fn(
-                    {"params": ema_params_local},
+                    {"params": extract_backbone_params(ema_params_local)},
                     batch_x_local,
                     timesteps=clean_t,
                     vector=batch_y_local,
@@ -1568,8 +1946,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_guide_weight = jax_utils.replicate(jnp.float32(args.guide_lambda))
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, teacher_params, (probe_x, probe_y), rng, ema_decay_rep, probe_guide_weight
         )
         block_pytree(probe_metrics)
 
@@ -1597,7 +1976,7 @@ def main():
             f"[FID probe] generating one fake batch of {fake_bs} latents "
             f"({args.fid_num_steps} steps, cfg={args.fid_cfg_scale})..."
         )
-        single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+        single_ema_params = extract_backbone_params(jax.tree_util.tree_map(lambda w: w[0], ema_params))
         probe_rng = jax.random.fold_in(rng[0], 0xF1D)
         probe_classes = jax.random.randint(probe_rng, (fake_bs,), 0, 1000)
         fake_latents = np.asarray(
@@ -1734,7 +2113,7 @@ def main():
                 lambda key: jax.random.randint(key, (local_b,), 0, 1000),
                 in_axes=0,
             )(class_rng)
-            latents_sharded = fid_sample_latents_pmapped(ema_params, classes, sample_rng)
+            latents_sharded = fid_sample_latents_pmapped(extract_backbone_params(ema_params), classes, sample_rng)
             imgs_sharded = decode_latents_sharded(latents_sharded)
             if is_enabled:
                 # Device->host exactly once per batch (uint8) and trim pads by `valid`.
@@ -1931,9 +2310,14 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            # Vanilla SiT training step (returns updated EMA params)
+            if guide_stop_steps is None:
+                current_guide_weight = args.guide_lambda
+            else:
+                current_guide_weight = args.guide_lambda if global_step < guide_stop_steps else 0.0
+            guide_weight_rep = jax_utils.replicate(jnp.float32(current_guide_weight))
+
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, teacher_params, (batch_x, batch_y), rng, ema_decay_rep, guide_weight_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -1949,7 +2333,7 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation: vanilla SiT objective (no grads)
+            # Validation: mirrors the active training objective (no grads)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
@@ -1959,7 +2343,10 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    val_guide_weight = jax_utils.replicate(jnp.float32(current_guide_weight))
+                    val_metrics, rng = pmapped_eval_step(
+                        state, ema_params, teacher_params, (val_x, val_y), rng, val_guide_weight
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -1988,7 +2375,7 @@ def main():
                 sample_rng, = jax.random.split(rng[0], 1)
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
                 # Use EMA params for sample generation (paper-faithful eval)
-                single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+                single_ema_params = extract_backbone_params(jax.tree_util.tree_map(lambda w: w[0], ema_params))
                 latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
 
                 def _bg_log(z_dev, classes, target_step):
@@ -2008,8 +2395,8 @@ def main():
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    unreplicated_params = extract_backbone_params(jax_utils.unreplicate(state.params))
+    unreplicated_ema = extract_backbone_params(jax_utils.unreplicate(ema_params))
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,

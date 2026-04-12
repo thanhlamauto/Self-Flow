@@ -37,7 +37,7 @@ DIT_VARIANTS = {
 }
 
 
-def _model_config_for_size(model_size):
+def _model_config_for_size(model_size, class_dropout_prob=0.1):
     """Return the full model-init config dict for a DiT variant name (S/B/L/XL)."""
     variant = DIT_VARIANTS[model_size.upper()]
     return dict(
@@ -48,9 +48,10 @@ def _model_config_for_size(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
+        num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=class_dropout_prob,
     )
 
 
@@ -75,7 +76,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL"):
+def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
     """Load the DiT backbone from a flax.training.checkpoints checkpoint.
 
     This SiT baseline expects flat parameter trees (both online and EMA).
@@ -83,7 +84,7 @@ def load_model(ckpt_path=None, model_size="XL"):
       - Nested {"backbone": ...} checkpoints: extract "backbone".
       - Flat checkpoints that include "feature_head": drop that key.
     """
-    config = _model_config_for_size(model_size)
+    config = _model_config_for_size(model_size, class_dropout_prob=class_dropout_prob)
     model = SelfFlowDiT(**config, per_token=False)
 
     # Initialize parameters with random key
@@ -149,8 +150,10 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         # Enable CFG
         use_cfg = cfg_scale > 1.0
         if use_cfg:
+            if model.class_dropout_prob <= 0.0:
+                raise ValueError("CFG sampling requires class_dropout_prob > 0")
             x = jnp.concatenate([x, x], axis=0)
-            null_labels = jnp.full_like(class_labels, 1000)
+            null_labels = jnp.full_like(class_labels, model.num_classes)
             class_labels = jnp.concatenate([null_labels, class_labels], axis=0)
             
         def model_fn(z_x, t):
@@ -214,6 +217,8 @@ def main():
     parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
     parser.add_argument("--no-save-images", action="store_false", dest="save_images")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1,
+                        help="Classifier-free label dropout probability used when training the checkpoint.")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
                         help="HuggingFace VAE model ID")
@@ -233,7 +238,11 @@ def main():
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
         
-    model, params = load_model(args.ckpt, model_size=args.model_size)
+    model, params = load_model(
+        args.ckpt,
+        model_size=args.model_size,
+        class_dropout_prob=args.class_dropout_prob,
+    )
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
     sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)
