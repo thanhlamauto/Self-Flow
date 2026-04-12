@@ -209,7 +209,7 @@ def local_window_gram_loss(
 
 
 def _per_token_cosine_two_layers(z_a: jax.Array, z_b: jax.Array, eps: float = 1e-8) -> jax.Array:
-    """Cosine similarity per patch between two `[B, N, D]` tensors (DiverseDiT / diversedit token_cos)."""
+    """Cosine similarity per ``(batch, token)`` between two `[B, N, D]` tensors."""
     na = jnp.linalg.norm(z_a, axis=-1, keepdims=True)
     nb = jnp.linalg.norm(z_b, axis=-1, keepdims=True)
     a = z_a / jnp.maximum(na, eps)
@@ -249,17 +249,17 @@ def _private_loss_per_token_mi_proxy(
     max_pairs: int = 0,
     private_layer_pairs: Optional[Tuple[Tuple[int, int], ...]] = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """DiverseDiT-style MI proxy: mean(|cos|) per patch, matching ``feat/diversedit-sit-jax``.
+    """Per-token MI proxy: L2-normalize along feature dim ``D``, cosine dot per ``(batch, token)``.
 
-    Same recipe as ``compute_diversity_loss`` there: L2-normalize along ``D``, dot per token,
-    ``mean(jnp.abs(token_cos))`` per layer pair, then mean over pairs.
+    Matches the usual block-wise formulation: for each pair of layers ``(i, j)``, compute
+    ``hat(f)_i[b,n,:]^T hat(f)_j[b,n,:]`` (cosine similarity), then average over all pairs,
+    batch, and tokens — i.e. mean cosine, not ``|cos|`` or ``cos^2``.
 
-    If ``private_layer_pairs`` is set (0-based indices into the layer stack), only those
-    ``(z_early, z_late)`` pairs are used (like ``diversity_pairs``). Otherwise all ``i<j`` pairs,
-    optionally subsampled when ``max_pairs > 0``.
+    If ``private_layer_pairs`` is set (0-based indices into the layer stack), only those pairs
+    are used. Otherwise all ``i<j`` pairs, optionally subsampled when ``max_pairs > 0``.
 
-    Returns ``(loss_private, avg_pairwise_abs_cos)``; the latter uses all chosen pairs before
-    subsampling.
+    Returns ``(loss_private, avg_pairwise_cos)``; the metric is the mean cosine over all chosen
+    pairs before subsampling; ``loss_private`` uses the subsampled subset when applicable.
     """
     num_layers = private.shape[0]
     if num_layers < 2:
@@ -270,7 +270,7 @@ def _private_loss_per_token_mi_proxy(
         pair_cos = _selected_pair_token_cosines(private, private_layer_pairs, eps=eps)
     else:
         pair_cos = _layer_pair_per_token_cosines(private, eps=eps)
-    avg_pairwise_abs_cos = jnp.mean(jnp.abs(pair_cos))
+    avg_pairwise_cos = jnp.mean(pair_cos)
 
     if max_pairs and max_pairs > 0 and pair_cos.shape[0] > max_pairs:
         if rng is None:
@@ -278,8 +278,8 @@ def _private_loss_per_token_mi_proxy(
         indices = jax.random.permutation(rng, pair_cos.shape[0])[:max_pairs]
         pair_cos = pair_cos[indices]
 
-    loss_private = jnp.mean(jnp.abs(pair_cos))
-    return loss_private, avg_pairwise_abs_cos
+    loss_private = jnp.mean(pair_cos)
+    return loss_private, avg_pairwise_cos
 
 
 def compute_aux_losses(
