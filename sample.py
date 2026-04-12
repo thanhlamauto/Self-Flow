@@ -49,8 +49,8 @@ def _model_config_for_size(model_size, class_dropout_prob=0.1):
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
         num_classes=1000,
-        learn_sigma=True,
-        compatibility_mode=True,
+        learn_sigma=False,
+        compatibility_mode=False,
         class_dropout_prob=class_dropout_prob,
     )
 

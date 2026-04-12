@@ -386,8 +386,8 @@ def build_model_config(model_size, class_dropout_prob=0.1):
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
         num_classes=1000,
-        learn_sigma=True,
-        compatibility_mode=True,
+        learn_sigma=False,
+        compatibility_mode=False,
         class_dropout_prob=class_dropout_prob,
     )
 
@@ -413,12 +413,14 @@ def restore_backbone_checkpoint(ckpt_dir, target=None):
     return normalize_backbone_checkpoint(raw)
 
 
-def default_guided_layer(depth):
+def default_guided_layer(depth, training_mode="baseline"):
+    if training_mode == "vae-structure-guidance":
+        return min(depth, 2)
     return max(1, depth // 2)
 
 
 def default_guiding_layer(depth):
-    guided = default_guided_layer(depth)
+    guided = default_guided_layer(depth, training_mode="self-transcendence")
     guiding = max(guided + 1, (2 * depth) // 3)
     return min(depth, guiding)
 
@@ -448,7 +450,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import ProjectionHead, SelfFlowDiT
+from src.model import ProjectionHead, SelfFlowDiT, VAEGuideHead
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -473,7 +475,7 @@ def build_guidance_modules(config, training_mode, projector_dim):
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     hidden_size = config["hidden_size"]
     if training_mode == "vae-structure-guidance":
-        modules["vae_guide_head"] = ProjectionHead(
+        modules["vae_guide_head"] = VAEGuideHead(
             in_dim=hidden_size,
             hidden_dim=projector_dim,
             out_dim=patch_dim,
@@ -485,6 +487,56 @@ def build_guidance_modules(config, training_mode, projector_dim):
             out_dim=hidden_size,
         )
     return modules
+
+
+def patchify_latent_numpy(latent, patch_size=2):
+    latent = np.asarray(latent, dtype=np.float32)
+    if latent.ndim == 4 and latent.shape[0] == 1:
+        latent = latent[0]
+    if latent.ndim != 3:
+        raise ValueError(f"Expected latent with shape (C,H,W), got {latent.shape!r}")
+    c, h, w = latent.shape
+    p = patch_size
+    latent = np.reshape(latent, (c, h // p, p, w // p, p))
+    latent = np.transpose(latent, (1, 3, 2, 4, 0))
+    latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
+    return latent.astype(np.float32)
+
+
+def sample_posterior_numpy_from_moments(moments, scale=0.18215):
+    moments = np.asarray(moments, dtype=np.float32)
+    if moments.ndim == 4 and moments.shape[0] == 1:
+        moments = moments[0]
+    if moments.ndim != 3 or moments.shape[0] != 8:
+        raise ValueError(f"Expected moments with shape (8,H,W), got {moments.shape!r}")
+    mean, std = np.split(moments, 2, axis=0)
+    eps = np.random.randn(*mean.shape).astype(np.float32)
+    return ((mean + std * eps) * scale).astype(np.float32)
+
+
+def extract_latent_from_record(parsed, patch_size=2):
+    if "latent" in parsed:
+        return patchify_latent_numpy(parsed["latent"], patch_size=patch_size)
+    if "moments" in parsed:
+        latent = sample_posterior_numpy_from_moments(parsed["moments"])
+        return patchify_latent_numpy(latent, patch_size=patch_size)
+    if "mean" in parsed and "std" in parsed:
+        mean = np.asarray(parsed["mean"], dtype=np.float32)
+        std = np.asarray(parsed["std"], dtype=np.float32)
+        eps = np.random.randn(*mean.shape).astype(np.float32)
+        latent = (mean + std * eps) * 0.18215
+        return patchify_latent_numpy(latent, patch_size=patch_size)
+    if "mean" in parsed and "logvar" in parsed:
+        mean = np.asarray(parsed["mean"], dtype=np.float32)
+        logvar = np.asarray(parsed["logvar"], dtype=np.float32)
+        std = np.exp(0.5 * logvar).astype(np.float32)
+        eps = np.random.randn(*mean.shape).astype(np.float32)
+        latent = (mean + std * eps) * 0.18215
+        return patchify_latent_numpy(latent, patch_size=patch_size)
+    raise KeyError(
+        "Unsupported ArrayRecord schema: expected one of "
+        "{latent}, {moments}, {mean,std}, or {mean,logvar}."
+    )
 
 
 def create_train_state(
@@ -564,6 +616,17 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
+def masked_guidance_loss(prediction, target, tau, t_range=None):
+    sq_error = (prediction - target) ** 2
+    batch_size = sq_error.shape[0]
+    per_example = jnp.mean(sq_error.reshape((batch_size, -1)), axis=1)
+    if t_range is not None:
+        t_min, t_max = t_range
+        mask = ((tau >= t_min) & (tau <= t_max)).astype(per_example.dtype)
+        per_example = per_example * mask
+    return jnp.mean(per_example)
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def make_train_step(
@@ -574,6 +637,7 @@ def make_train_step(
     guiding_layer,
     feature_guidance_scale,
     null_label_id,
+    t_range,
 ):
     vae_guide_head = guidance_modules.get("vae_guide_head")
     self_guide_head = guidance_modules.get("self_guide_head")
@@ -622,8 +686,8 @@ def make_train_step(
             if training_mode == "vae-structure-guidance":
                 def _compute_vae_guidance(features):
                     projected = vae_guide_head.apply({"params": params["vae_guide_head"]}, features)
-                    guide_loss = jnp.mean((projected - x0) ** 2)
-                    target_abs_mean = jnp.mean(jnp.abs(x0))
+                    guide_loss = masked_guidance_loss(projected, target, tau, t_range)
+                    target_abs_mean = jnp.mean(jnp.abs(target))
                     return guide_loss, target_abs_mean, zero
 
                 l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
@@ -656,7 +720,7 @@ def make_train_step(
                     teacher_guided = jax.lax.stop_gradient(
                         teacher_uncond + feature_guidance_scale * (teacher_cond - teacher_uncond)
                     )
-                    guide_loss = jnp.mean((projected - teacher_guided) ** 2)
+                    guide_loss = masked_guidance_loss(projected, teacher_guided, tau, t_range)
                     target_abs_mean = jnp.mean(jnp.abs(teacher_guided))
                     cfg_delta = jnp.mean(jnp.abs(teacher_cond - teacher_uncond))
                     return guide_loss, target_abs_mean, cfg_delta
@@ -727,6 +791,7 @@ def make_eval_step(
     guiding_layer,
     feature_guidance_scale,
     null_label_id,
+    t_range,
 ):
     vae_guide_head = guidance_modules.get("vae_guide_head")
     self_guide_head = guidance_modules.get("self_guide_head")
@@ -771,8 +836,8 @@ def make_eval_step(
         if training_mode == "vae-structure-guidance":
             def _compute_vae_guidance(features):
                 projected = vae_guide_head.apply({"params": state.params["vae_guide_head"]}, features)
-                guide_loss = jnp.mean((projected - x0) ** 2)
-                target_abs_mean = jnp.mean(jnp.abs(x0))
+                guide_loss = masked_guidance_loss(projected, target, tau, t_range)
+                target_abs_mean = jnp.mean(jnp.abs(target))
                 return guide_loss, target_abs_mean, zero
 
             l_guide, guide_target_abs, teacher_cfg_delta = jax.lax.cond(
@@ -805,7 +870,7 @@ def make_eval_step(
                 teacher_guided = jax.lax.stop_gradient(
                     teacher_uncond + feature_guidance_scale * (teacher_cond - teacher_uncond)
                 )
-                guide_loss = jnp.mean((projected - teacher_guided) ** 2)
+                guide_loss = masked_guidance_loss(projected, teacher_guided, tau, t_range)
                 target_abs_mean = jnp.mean(jnp.abs(teacher_guided))
                 cfg_delta = jnp.mean(jnp.abs(teacher_cond - teacher_uncond))
                 return guide_loss, target_abs_mean, cfg_delta
@@ -860,19 +925,8 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     class ParseAndTokenizeLatents(grain.MapTransform):
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
-
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
             label = parsed["label"]
-
-            # Patchify the latent to DiT input (256, 16)
-            c, h, w = latent.shape
-            p = 2
-
-            # Using numpy to manipulate shapes to send cleanly into DataLoader
-            latent = np.reshape(latent, (c, h // p, p, w // p, p))
-            latent = np.transpose(latent, (1, 3, 2, 4, 0)) # block arrangement
-            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
-
+            latent = extract_latent_from_record(parsed, patch_size=2)
             return latent, label
 
     operations = [
@@ -1354,7 +1408,7 @@ def main():
     parser.add_argument("--projector-dim", type=int, default=2048,
                         help="Hidden width for the 3-layer projector head used by guidance losses.")
     parser.add_argument("--guided-layer", type=int, default=None,
-                        help="Student layer supervised by guidance. Default: depth // 2.")
+                        help="Student layer supervised by guidance. Default: 2 for stage 1, depth // 2 otherwise.")
     parser.add_argument("--guiding-layer", type=int, default=None,
                         help="Teacher layer used as guidance in stage 2. Default: floor(2 * depth / 3).")
     parser.add_argument("--guide-stop-epochs", type=int, default=None,
@@ -1362,6 +1416,14 @@ def main():
                              "20 epochs for S/B and 10 epochs for L/XL in self-transcendence.")
     parser.add_argument("--feature-guidance-scale", type=float, default=30.0,
                         help="Feature-level CFG scale omega for Self-Transcendence stage 2.")
+    parser.add_argument(
+        "--t-range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("T_MIN", "T_MAX"),
+        help="Optional timestep range that activates guidance loss only within [T_MIN, T_MAX], matching the repo recipe.",
+    )
     parser.add_argument("--teacher-ckpt", type=str, default=None,
                         help="Checkpoint directory of the frozen teacher backbone for stage 2.")
     parser.add_argument(
@@ -1525,6 +1587,10 @@ def main():
         raise ValueError("--guide-lambda must be >= 0")
     if args.feature_guidance_scale <= 0.0:
         raise ValueError("--feature-guidance-scale must be > 0")
+    if args.t_range is not None:
+        t_min, t_max = args.t_range
+        if not (0.0 <= t_min <= t_max <= 1.0):
+            raise ValueError("--t-range must satisfy 0 <= T_MIN <= T_MAX <= 1")
     if args.guided_layer is not None and args.guided_layer <= 0:
         raise ValueError("--guided-layer must be >= 1")
     if args.guiding_layer is not None and args.guiding_layer <= 0:
@@ -1562,7 +1628,7 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.class_dropout_prob)
     depth = int(config["depth"])
-    guided_layer = args.guided_layer or default_guided_layer(depth)
+    guided_layer = args.guided_layer or default_guided_layer(depth, training_mode=args.training_mode)
     guiding_layer = args.guiding_layer or default_guiding_layer(depth)
     if guided_layer > depth:
         raise ValueError(f"--guided-layer ({guided_layer}) must be <= model depth ({depth})")
@@ -1586,7 +1652,8 @@ def main():
     )
     log_stage(
         f"Training mode={args.training_mode} ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
-        f"class_dropout={args.class_dropout_prob} guided_layer={guided_layer} guiding_layer={guiding_layer}"
+        f"class_dropout={args.class_dropout_prob} guided_layer={guided_layer} guiding_layer={guiding_layer} "
+        f"t_range={tuple(args.t_range) if args.t_range is not None else None}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1665,6 +1732,7 @@ def main():
         guiding_layer=guiding_layer,
         feature_guidance_scale=args.feature_guidance_scale,
         null_label_id=null_label_id,
+        t_range=tuple(args.t_range) if args.t_range is not None else None,
     )
     eval_step = make_eval_step(
         model=model,
@@ -1674,6 +1742,7 @@ def main():
         guiding_layer=guiding_layer,
         feature_guidance_scale=args.feature_guidance_scale,
         null_label_id=null_label_id,
+        t_range=tuple(args.t_range) if args.t_range is not None else None,
     )
     pmapped_train_step = jax.pmap(train_step, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
