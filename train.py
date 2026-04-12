@@ -627,6 +627,9 @@ def train_step(
     private_warmup_iters=0,
     learnable_common_tensor=False,
     private_layer_pairs=None,
+    common_agg="mean",
+    common_logit_normal_center_layer=0.0,
+    common_logit_normal_sigma=1.0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -684,6 +687,9 @@ def train_step(
                 common_activation=(
                     params["common_activation"] if learnable_common_tensor else None
                 ),
+                common_agg=common_agg,
+                common_logit_normal_center_layer=common_logit_normal_center_layer,
+                common_logit_normal_sigma=common_logit_normal_sigma,
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
@@ -815,6 +821,9 @@ def eval_step(
     private_warmup_iters=0,
     learnable_common_tensor=False,
     private_layer_pairs=None,
+    common_agg="mean",
+    common_logit_normal_center_layer=0.0,
+    common_logit_normal_sigma=1.0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -866,6 +875,9 @@ def eval_step(
             common_activation=(
                 state.params["common_activation"] if learnable_common_tensor else None
             ),
+            common_agg=common_agg,
+            common_logit_normal_center_layer=common_logit_normal_center_layer,
+            common_logit_normal_sigma=common_logit_normal_sigma,
         )
     else:
         pred = outputs
@@ -1483,6 +1495,34 @@ def main():
             "if set, --private-max-pairs subsamples among these pairs only."
         ),
     )
+    parser.add_argument(
+        "--common-agg",
+        type=str,
+        default="mean",
+        choices=["mean", "logit_normal"],
+        help=(
+            "How to form A_common from per-layer activations: 'mean' (default) or 'logit_normal' "
+            "(weighted sum sum_i w_i A_i with w from a logit-normal depth profile)."
+        ),
+    )
+    parser.add_argument(
+        "--common-logit-normal-center-layer",
+        type=float,
+        default=0.0,
+        help=(
+            "0-based layer index (fractional allowed) at which the logit-normal common weights are centered; "
+            "only used when --common-agg=logit_normal."
+        ),
+    )
+    parser.add_argument(
+        "--common-logit-normal-sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Std-dev on the logit (depth) scale for common weights; larger => flatter distribution over layers. "
+            "Only used when --common-agg=logit_normal."
+        ),
+    )
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
                         help="Sliding window size for local Gram spatial loss.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -1669,6 +1709,8 @@ def main():
         raise ValueError("--private-start-step must be >= 0")
     if args.private_warmup_iters < 0:
         raise ValueError("--private-warmup-iters must be >= 0")
+    if args.common_agg == "logit_normal" and args.common_logit_normal_sigma <= 0:
+        raise ValueError("--common-logit-normal-sigma must be > 0 when --common-agg=logit_normal")
     if args.spatial_window_size <= 0:
         raise ValueError("--spatial-window-size must be > 0")
     if args.spatial_window_stride <= 0:
@@ -1723,7 +1765,10 @@ def main():
         f"spatial_window_stride={args.spatial_window_stride} "
         f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
-        f"learnable_common_tensor={args.learnable_common_tensor}"
+        f"learnable_common_tensor={args.learnable_common_tensor} "
+        f"common_agg={args.common_agg} "
+        f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
+        f"common_logit_normal_sigma={args.common_logit_normal_sigma}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1785,6 +1830,9 @@ def main():
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             learnable_common_tensor=args.learnable_common_tensor,
+            common_agg=args.common_agg,
+            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+            common_logit_normal_sigma=args.common_logit_normal_sigma,
         ),
         axis_name="batch",
     )
@@ -1804,6 +1852,9 @@ def main():
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             learnable_common_tensor=args.learnable_common_tensor,
+            common_agg=args.common_agg,
+            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+            common_logit_normal_sigma=args.common_logit_normal_sigma,
         ),
         axis_name="batch",
     )

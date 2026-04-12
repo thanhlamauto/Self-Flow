@@ -13,6 +13,41 @@ DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 
 
+def _layer_logit_normal_weights(
+    num_layers: int,
+    center_layer: float | jax.Array,
+    logit_sigma: float | jax.Array,
+    dtype: jnp.dtype,
+) -> jax.Array:
+    """Nonnegative weights over layer index, peak near ``center_layer`` (logit-normal in depth).
+
+    For layer ``i`` we map ``u_i = (i + 0.5) / L`` in ``(0, 1)`` and take the logit-normal
+    density with underlying Gaussian ``N(mu, sigma^2)`` on ``logit(u)``, with ``mu`` chosen
+    from the same mapping of ``center_layer``. Weights are normalized to sum to ``1`` so
+    ``sum_i w_i A_i`` is a convex combination. Larger ``sigma`` yields a flatter profile
+    (less mass concentrated near the center layer).
+    """
+    L = num_layers
+    i = jnp.arange(L, dtype=dtype)
+    u = (i + 0.5) / jnp.maximum(L, 1)
+    eps = jnp.asarray(1e-6, dtype=dtype)
+    u = jnp.clip(u, eps, jnp.asarray(1.0, dtype=dtype) - eps)
+    z = jnp.log(u / (jnp.asarray(1.0, dtype=dtype) - u))
+
+    k = jnp.asarray(center_layer, dtype=dtype)
+    k = jnp.clip(k, jnp.asarray(0.0, dtype=dtype), jnp.maximum(L - 1, 0).astype(dtype))
+    u_c = (k + 0.5) / jnp.maximum(L, 1)
+    u_c = jnp.clip(u_c, eps, jnp.asarray(1.0, dtype=dtype) - eps)
+    mu = jnp.log(u_c / (jnp.asarray(1.0, dtype=dtype) - u_c))
+
+    s = jnp.maximum(jnp.asarray(logit_sigma, dtype=dtype), eps)
+    inv_sqrt_2pi = jnp.asarray(0.3989422804014327, dtype=dtype)  # 1/sqrt(2*pi)
+    log_phi = -0.5 * jnp.square((z - mu) / s) - jnp.log(s) + jnp.log(inv_sqrt_2pi)
+    log_w = log_phi - jnp.log(u) - jnp.log(jnp.asarray(1.0, dtype=dtype) - u)
+    w = jnp.exp(log_w - jnp.max(log_w))
+    return w / jnp.maximum(jnp.sum(w), eps)
+
+
 def collect_activations(activations: Any) -> jax.Array:
     """Normalize activations into a stacked `[L, B, N, D]` tensor."""
     if hasattr(activations, "ndim"):
@@ -29,11 +64,36 @@ def collect_activations(activations: Any) -> jax.Array:
     raise TypeError(f"Unsupported activation container type: {type(activations)!r}")
 
 
-def compute_common_private(activations: Any) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute differentiable common activation and private residuals."""
+def compute_common_private(
+    activations: Any,
+    *,
+    agg: str = "mean",
+    logit_normal_center_layer: float = 0.0,
+    logit_normal_sigma: float = 1.0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute differentiable common activation and private residuals.
+
+    ``agg="mean"`` uses ``A_common = mean_i A_i`` (default). ``agg="logit_normal"`` uses
+    ``A_common = sum_i w_i A_i`` with ``w`` from a logit-normal depth profile centered at
+    ``logit_normal_center_layer`` (0-based layer index; fractional values interpolate the
+    center in ``(0,1)`` via ``(k+0.5)/L``). ``logit_normal_sigma`` is the Gaussian standard
+    deviation on the logit scale (larger => flatter weights).
+    """
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
-    common = jnp.mean(activations, axis=0)
+    num_layers = activations.shape[0]
+    if agg == "mean":
+        common = jnp.mean(activations, axis=0)
+    elif agg == "logit_normal":
+        w = _layer_logit_normal_weights(
+            num_layers,
+            logit_normal_center_layer,
+            logit_normal_sigma,
+            activations.dtype,
+        )
+        common = jnp.tensordot(w, activations, axes=(0, 0))
+    else:
+        raise ValueError(f"Unknown common aggregation {agg!r}; expected 'mean' or 'logit_normal'.")
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]
     return common, common_anchor, private
@@ -295,6 +355,9 @@ def compute_aux_losses(
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     learnable_common_tensor: bool = False,
     common_activation: jax.Array | None = None,
+    common_agg: str = "mean",
+    common_logit_normal_center_layer: float = 0.0,
+    common_logit_normal_sigma: float = 1.0,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
@@ -336,7 +399,12 @@ def compute_aux_losses(
         ).astype(spatial_target.dtype)
         private = _normalize_channels(activations)
     else:
-        common, common_anchor, private = compute_common_private(activations)
+        common, common_anchor, private = compute_common_private(
+            activations,
+            agg=common_agg,
+            logit_normal_center_layer=common_logit_normal_center_layer,
+            logit_normal_sigma=common_logit_normal_sigma,
+        )
 
     spatial_loss, spatial_metrics = local_window_gram_loss(
         common,
