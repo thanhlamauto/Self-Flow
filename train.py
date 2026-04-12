@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from functools import partial
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -464,6 +465,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_features=1,
         deterministic=False,
     )
 
@@ -498,49 +500,134 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-# ── Vanilla SiT training/eval ─────────────────────────────────────────────────
+# ── SRA helpers / training / eval ─────────────────────────────────────────────
+
+def mean_flat(x):
+    """Mean over all non-batch dimensions."""
+    return jnp.mean(x, axis=tuple(range(1, x.ndim)))
+
+
+def smooth_l1_loss(a, b, beta=0.05):
+    """PyTorch-compatible smooth L1 used by the original SRA repo."""
+    diff = jnp.abs(a - b)
+    beta = jnp.asarray(beta, dtype=diff.dtype)
+    quadratic = 0.5 * jnp.square(diff) / beta
+    linear = diff - 0.5 * beta
+    return jnp.where(diff < beta, quadratic, linear)
+
+
+def alignment_loss(student_features, teacher_features, loss_type="sml1"):
+    if loss_type == "sml1":
+        return jnp.mean(smooth_l1_loss(student_features, teacher_features, beta=0.05))
+    if loss_type == "l2":
+        return jnp.mean(jnp.square(student_features - teacher_features))
+    if loss_type == "l1":
+        return jnp.mean(jnp.abs(student_features - teacher_features))
+    raise ValueError(f"Unsupported alignment loss type: {loss_type}")
+
+
+def sra_align_weight_schedule(
+    current_epoch,
+    base_weight,
+    decay_start_epoch,
+    decay_denom,
+    decay_base,
+):
+    """Epoch-wise alignment reweighting matching the original SRA schedule."""
+    current_epoch = jnp.asarray(current_epoch, dtype=jnp.float32)
+    decay_start_epoch = jnp.asarray(decay_start_epoch, dtype=jnp.float32)
+    decay_denom = jnp.asarray(decay_denom, dtype=jnp.float32)
+    decay_progress = jnp.maximum(current_epoch - decay_start_epoch, 0.0) / decay_denom
+    return jnp.asarray(base_weight, dtype=jnp.float32) * (
+        jnp.asarray(decay_base, dtype=jnp.float32) ** decay_progress
+    )
+
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state,
+    ema_params,
+    batch,
+    rng,
+    ema_decay,
+    current_epoch,
+    *,
+    block_out_s,
+    block_out_t,
+    t_max,
+    align_loss_type,
+    align_weight,
+    align_decay_start_epoch,
+    align_decay_denom,
+    align_decay_base,
 ):
-    """Vanilla SiT training step (global timestep; velocity prediction).
-
-    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
-      x_tau   = (1 - tau) * x1 + tau * x0
-      target  = x0 - x1
-      loss    = E[||v_theta(x_tau, tau) - target||^2]
-    """
+    """SRA training step with an EMA teacher at an earlier timestep."""
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, teacher_gap_rng, noise_rng, drop_rng = jax.random.split(rng, 5)
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+    teacher_gap = t_max * jax.random.uniform(
+        teacher_gap_rng, shape=(local_batch,), minval=0.0, maxval=1.0
+    )
+    teacher_tau = jnp.clip(tau - teacher_gap, 0.0, 1.0)
+    teacher_gap = tau - teacher_tau
+    x1 = jax.random.normal(noise_rng, x0.shape)
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    teacher_x_tau = (1.0 - teacher_tau[:, None, None]) * x1 + teacher_tau[:, None, None] * x0
     target = x0 - x1
+    effective_align_weight = sra_align_weight_schedule(
+        current_epoch=current_epoch,
+        base_weight=align_weight,
+        decay_start_epoch=align_decay_start_epoch,
+        decay_denom=align_decay_denom,
+        decay_base=align_decay_base,
+    ).astype(x0.dtype)
 
     def loss_fn(params):
-        pred = state.apply_fn(
+        pred, student_features = state.apply_fn(
             {"params": params},
             x_tau,
             timesteps=tau,
             vector=y,
+            return_features=block_out_s,
             deterministic=False,
             rngs={"dropout": drop_rng},
         )
-        loss = jnp.mean((pred - target) ** 2)
+        _, teacher_features = state.apply_fn(
+            {"params": ema_params},
+            teacher_x_tau,
+            timesteps=teacher_tau,
+            vector=y,
+            return_raw_features=block_out_t,
+            deterministic=True,
+        )
+        teacher_features = jax.lax.stop_gradient(teacher_features)
+        gen_loss = jnp.mean(mean_flat((pred - target) ** 2))
+        align_loss = alignment_loss(student_features, teacher_features, loss_type=align_loss_type)
+        loss = gen_loss + effective_align_weight * align_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            gen_loss,
+            align_loss,
+            effective_align_weight,
+            jnp.mean(teacher_gap),
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, gen_loss, align_loss, align_weight_value, teacher_gap_mean)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    gen_loss = jax.lax.pmean(gen_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+    align_weight_value = jax.lax.pmean(align_weight_value, axis_name="batch")
+    teacher_gap_mean = jax.lax.pmean(teacher_gap_mean, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -551,6 +638,10 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/gen_loss": gen_loss,
+        "train/align_loss": align_loss,
+        "train/align_weight": align_weight_value,
+        "train/teacher_gap_mean": teacher_gap_mean,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,37 +652,83 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state,
+    ema_params,
+    batch,
+    rng,
+    current_epoch,
+    *,
+    block_out_s,
+    block_out_t,
+    t_max,
+    align_loss_type,
+    align_weight,
+    align_decay_start_epoch,
+    align_decay_denom,
+    align_decay_base,
 ):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
+    """SRA validation step mirroring the online-student / EMA-teacher objective."""
     x0, y = batch
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, teacher_gap_rng, noise_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+    teacher_gap = t_max * jax.random.uniform(
+        teacher_gap_rng, shape=(local_batch,), minval=0.0, maxval=1.0
+    )
+    teacher_tau = jnp.clip(tau - teacher_gap, 0.0, 1.0)
+    teacher_gap = tau - teacher_tau
     x1 = jax.random.normal(noise_rng, x0.shape)
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    teacher_x_tau = (1.0 - teacher_tau[:, None, None]) * x1 + teacher_tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
+    pred, student_features = state.apply_fn(
         {"params": state.params},
         x_tau,
         timesteps=tau,
         vector=y,
+        return_features=block_out_s,
         deterministic=True,
     )
-    loss = jnp.mean((pred - target) ** 2)
+    _, teacher_features = state.apply_fn(
+        {"params": ema_params},
+        teacher_x_tau,
+        timesteps=teacher_tau,
+        vector=y,
+        return_raw_features=block_out_t,
+        deterministic=True,
+    )
+    teacher_features = jax.lax.stop_gradient(teacher_features)
+    gen_loss = jnp.mean(mean_flat((pred - target) ** 2))
+    align_loss = alignment_loss(student_features, teacher_features, loss_type=align_loss_type)
+    align_weight_value = sra_align_weight_schedule(
+        current_epoch=current_epoch,
+        base_weight=align_weight,
+        decay_start_epoch=align_decay_start_epoch,
+        decay_denom=align_decay_denom,
+        decay_base=align_decay_base,
+    ).astype(x0.dtype)
+    loss = gen_loss + align_weight_value * align_loss
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    gen_loss = jax.lax.pmean(gen_loss, axis_name="batch")
+    align_loss = jax.lax.pmean(align_loss, axis_name="batch")
+    align_weight_value = jax.lax.pmean(align_weight_value, axis_name="batch")
+    teacher_gap_mean = jax.lax.pmean(jnp.mean(teacher_gap), axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/gen_loss": gen_loss,
+        "val/align_loss": align_loss,
+        "val/align_weight": align_weight_value,
+        "val/teacher_gap_mean": teacher_gap_mean,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1055,7 +1192,7 @@ def run_preflight_checks(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train vanilla SiT DiT (JAX)")
+    parser = argparse.ArgumentParser(description="Train SiT with SRA objective (JAX)")
     # ── Core training args ────────────────────────────────────────────────────
     parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
@@ -1065,18 +1202,38 @@ def main():
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
-    parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
+    parser.add_argument("--wandb-project", type=str, default="sit-sra-jax")
     parser.add_argument("--no-wandb", action="store_true")
-    # ── Vanilla SiT args ──────────────────────────────────────────────────────
+    # ── SRA args ──────────────────────────────────────────────────────────────
     parser.add_argument(
         "--ema-decay",
         type=float,
         default=0.9999,
-        help="EMA decay for tracking a smoothed copy of online params (default: 0.9999). "
-             "EMA is used only for evaluation/checkpoint convenience, not as a teacher loss.",
+        help="EMA decay for the teacher network (default: 0.9999).",
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="sml1",
+        choices=["sml1", "l2", "l1"],
+        help="Feature alignment loss used by SRA.",
+    )
+    parser.add_argument("--block-out-s", type=int, default=4,
+                        help="Student block index used for projected SRA features.")
+    parser.add_argument("--block-out-t", type=int, default=8,
+                        help="EMA teacher block index used for SRA target features.")
+    parser.add_argument("--t-max", type=float, default=0.2,
+                        help="Maximum timestep offset between student and teacher.")
+    parser.add_argument("--align-weight", type=float, default=0.2,
+                        help="Base weight for the SRA alignment term.")
+    parser.add_argument("--align-decay-start-epoch", type=int, default=149,
+                        help="Epoch after which the SRA alignment weight starts decaying.")
+    parser.add_argument("--align-decay-denom", type=float, default=1000.0,
+                        help="Decay denominator for the SRA alignment schedule.")
+    parser.add_argument("--align-decay-base", type=float, default=0.1,
+                        help="Decay base for the SRA alignment schedule.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1224,6 +1381,14 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.t_max < 0:
+        raise ValueError("--t-max must be >= 0")
+    if args.align_weight < 0:
+        raise ValueError("--align-weight must be >= 0")
+    if args.align_decay_denom <= 0:
+        raise ValueError("--align-decay-denom must be > 0")
+    if not (0 < args.align_decay_base <= 1):
+        raise ValueError("--align-decay-base must be in (0, 1]")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1254,8 +1419,21 @@ def main():
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
     )
+    if args.block_out_s <= 0 or args.block_out_s > depth:
+        raise ValueError(f"--block-out-s must be in [1, {depth}] for model depth {depth}")
+    if args.block_out_t <= 0 or args.block_out_t > depth:
+        raise ValueError(f"--block-out-t must be in [1, {depth}] for model depth {depth}")
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        "SRA: "
+        f"ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
+        f"student_block={args.block_out_s} teacher_block={args.block_out_t} "
+        f"t_max={args.t_max} align_loss={args.loss_type} align_weight={args.align_weight}"
+    )
+    log_stage(
+        "SRA align schedule: "
+        f"start_epoch={args.align_decay_start_epoch} "
+        f"denom={args.align_decay_denom} "
+        f"base={args.align_decay_base}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1295,8 +1473,34 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        partial(
+            train_step,
+            block_out_s=int(args.block_out_s),
+            block_out_t=int(args.block_out_t),
+            t_max=jnp.float32(args.t_max),
+            align_loss_type=args.loss_type,
+            align_weight=jnp.float32(args.align_weight),
+            align_decay_start_epoch=jnp.float32(args.align_decay_start_epoch),
+            align_decay_denom=jnp.float32(args.align_decay_denom),
+            align_decay_base=jnp.float32(args.align_decay_base),
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        partial(
+            eval_step,
+            block_out_s=int(args.block_out_s),
+            block_out_t=int(args.block_out_t),
+            t_max=jnp.float32(args.t_max),
+            align_loss_type=args.loss_type,
+            align_weight=jnp.float32(args.align_weight),
+            align_decay_start_epoch=jnp.float32(args.align_decay_start_epoch),
+            align_decay_denom=jnp.float32(args.align_decay_denom),
+            align_decay_base=jnp.float32(args.align_decay_base),
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1568,8 +1772,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_epoch_rep = jax_utils.replicate(jnp.int32(0))
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_epoch_rep
         )
         block_pytree(probe_metrics)
 
@@ -1912,6 +2117,7 @@ def main():
     t0 = time.time()
 
     for epoch in range(args.epochs):
+        epoch_rep = jax_utils.replicate(jnp.int32(epoch))
         for step in range(args.steps_per_epoch):
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
@@ -1931,9 +2137,9 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            # Vanilla SiT training step (returns updated EMA params)
+            # SRA training step (online student + EMA teacher)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, epoch_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -1949,7 +2155,7 @@ def main():
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
-            # Validation: vanilla SiT objective (no grads)
+            # Validation: SRA objective (no grads)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
@@ -1959,7 +2165,9 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    val_metrics, rng = pmapped_eval_step(
+                        state, ema_params, (val_x, val_y), rng, epoch_rep
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
