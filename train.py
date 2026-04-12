@@ -1502,7 +1502,7 @@ def main():
         choices=["mean", "logit_normal"],
         help=(
             "How to form A_common from per-layer activations: 'mean' (default) or 'logit_normal' "
-            "(weighted sum sum_i w_i A_i with w from a logit-normal depth profile)."
+            "(weighted sum sum_i w_i A_i with w = softmax of a Gaussian in logit(depth) space)."
         ),
     )
     parser.add_argument(
@@ -1510,7 +1510,7 @@ def main():
         type=float,
         default=0.0,
         help=(
-            "0-based layer index (fractional allowed) at which the logit-normal common weights are centered; "
+            "0-based layer index (fractional allowed) at which the logit-space Gaussian weights are centered; "
             "only used when --common-agg=logit_normal."
         ),
     )
@@ -1519,7 +1519,7 @@ def main():
         type=float,
         default=1.0,
         help=(
-            "Std-dev on the logit (depth) scale for common weights; larger => flatter distribution over layers. "
+            "Std-dev on the logit (depth) scale for the Gaussian weight bump; larger => flatter (→ mean). "
             "Only used when --common-agg=logit_normal."
         ),
     )

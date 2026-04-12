@@ -19,13 +19,17 @@ def _layer_logit_normal_weights(
     logit_sigma: float | jax.Array,
     dtype: jnp.dtype,
 ) -> jax.Array:
-    """Nonnegative weights over layer index, peak near ``center_layer`` (logit-normal in depth).
+    """Nonnegative weights over layer index, peak near ``center_layer`` (Gaussian on log-depth).
 
-    For layer ``i`` we map ``u_i = (i + 0.5) / L`` in ``(0, 1)`` and take the logit-normal
-    density with underlying Gaussian ``N(mu, sigma^2)`` on ``logit(u)``, with ``mu`` chosen
-    from the same mapping of ``center_layer``. Weights are normalized to sum to ``1`` so
-    ``sum_i w_i A_i`` is a convex combination. Larger ``sigma`` yields a flatter profile
-    (less mass concentrated near the center layer).
+    For layer ``i`` we map ``u_i = (i + 0.5) / L`` in ``(0, 1)``, set ``z_i = logit(u_i)``, and
+    use weights ``w_i ∝ exp(-0.5 * ((z_i - mu) / sigma)^2)`` with ``mu = logit(u_c)`` for the
+    same mapping of ``center_layer``. We normalize ``w`` to sum to ``1``.
+
+    We intentionally **do not** multiply by the logit-normal Jacobian ``1/(u(1-u))``. The full
+    PDF strongly up-weights boundary layers (small ``u`` or ``u`` near ``1``), which makes
+    gradients through ``A_common`` ill-conditioned and breaks the intuitive limit
+    ``sigma → ∞`` (uniform weights → same as ``mean``). This RBF on ``z`` is stable and recovers
+    uniform weights (hence ``mean`` aggregation) as ``sigma`` grows.
     """
     L = num_layers
     i = jnp.arange(L, dtype=dtype)
@@ -41,9 +45,7 @@ def _layer_logit_normal_weights(
     mu = jnp.log(u_c / (jnp.asarray(1.0, dtype=dtype) - u_c))
 
     s = jnp.maximum(jnp.asarray(logit_sigma, dtype=dtype), eps)
-    inv_sqrt_2pi = jnp.asarray(0.3989422804014327, dtype=dtype)  # 1/sqrt(2*pi)
-    log_phi = -0.5 * jnp.square((z - mu) / s) - jnp.log(s) + jnp.log(inv_sqrt_2pi)
-    log_w = log_phi - jnp.log(u) - jnp.log(jnp.asarray(1.0, dtype=dtype) - u)
+    log_w = -0.5 * jnp.square((z - mu) / s)
     w = jnp.exp(log_w - jnp.max(log_w))
     return w / jnp.maximum(jnp.sum(w), eps)
 
@@ -74,10 +76,10 @@ def compute_common_private(
     """Compute differentiable common activation and private residuals.
 
     ``agg="mean"`` uses ``A_common = mean_i A_i`` (default). ``agg="logit_normal"`` uses
-    ``A_common = sum_i w_i A_i`` with ``w`` from a logit-normal depth profile centered at
-    ``logit_normal_center_layer`` (0-based layer index; fractional values interpolate the
-    center in ``(0,1)`` via ``(k+0.5)/L``). ``logit_normal_sigma`` is the Gaussian standard
-    deviation on the logit scale (larger => flatter weights).
+    ``A_common = sum_i w_i A_i`` with ``w`` a normalized Gaussian bump on ``logit((i+0.5)/L)``
+    centered at the same mapping of ``logit_normal_center_layer`` (0-based; fractional ``k``
+    allowed). ``logit_normal_sigma`` is the Gaussian std on that logit scale (larger =>
+    flatter weights, converging to ``mean`` when ``sigma`` is large).
     """
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
