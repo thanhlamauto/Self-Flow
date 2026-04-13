@@ -18,18 +18,24 @@ def _layer_logit_normal_weights(
     center_layer: float | jax.Array,
     logit_sigma: float | jax.Array,
     dtype: jnp.dtype,
+    weight_kind: str = "rbf",
 ) -> jax.Array:
-    """Nonnegative weights over layer index, peak near ``center_layer`` (Gaussian on log-depth).
+    """Depth weights for ``A_common = sum_i w_i A_i`` with ``sum_i w_i = 1``.
 
-    For layer ``i`` we map ``u_i = (i + 0.5) / L`` in ``(0, 1)``, set ``z_i = logit(u_i)``, and
-    use weights ``w_i ∝ exp(-0.5 * ((z_i - mu) / sigma)^2)`` with ``mu = logit(u_c)`` for the
-    same mapping of ``center_layer``. We normalize ``w`` to sum to ``1``.
+    For each layer index ``i`` we use a depth coordinate ``u_i = (i + 0.5) / L`` in ``(0,1)`` and
+    ``z_i = logit(u_i)``. The **center** is ``u_c = (k + 0.5) / L`` for ``center_layer`` ``k``
+    (clipped to ``[0, L-1]``), with ``mu = logit(u_c)``. So the profile is **centered at layer k**
+    on this depth axis (not “``w_k`` is the center” as a random variable — ``w`` is fixed each
+    step, not sampled i.i.d. from a distribution).
 
-    We intentionally **do not** multiply by the logit-normal Jacobian ``1/(u(1-u))``. The full
-    PDF strongly up-weights boundary layers (small ``u`` or ``u`` near ``1``), which makes
-    gradients through ``A_common`` ill-conditioned and breaks the intuitive limit
-    ``sigma → ∞`` (uniform weights → same as ``mean``). This RBF on ``z`` is stable and recovers
-    uniform weights (hence ``mean`` aggregation) as ``sigma`` grows.
+    **weight_kind**
+
+    - ``"rbf"`` (default): ``w_i ∝ exp(-0.5 * ((z_i - mu) / sigma)^2)``, then normalized. Same
+      convex-combination scaling as the mean (``sum w_i = 1``); ``sigma → ∞`` → uniform → mean.
+    - ``"pdf"``: ``w_i`` proportional to the **logit-normal** density at ``u_i``,
+      i.e. ``∝ phi((z_i - mu) / sigma) / (u_i (1 - u_i))`` with ``phi`` the standard normal PDF,
+      then normalized. This is the strict continuous definition evaluated on the discrete ``u_i``
+      lattice; boundary layers get extra mass from the Jacobian (often less stable in training).
     """
     L = num_layers
     i = jnp.arange(L, dtype=dtype)
@@ -45,7 +51,14 @@ def _layer_logit_normal_weights(
     mu = jnp.log(u_c / (jnp.asarray(1.0, dtype=dtype) - u_c))
 
     s = jnp.maximum(jnp.asarray(logit_sigma, dtype=dtype), eps)
-    log_w = -0.5 * jnp.square((z - mu) / s)
+    if weight_kind == "rbf":
+        log_w = -0.5 * jnp.square((z - mu) / s)
+    elif weight_kind == "pdf":
+        inv_sqrt_2pi = jnp.asarray(0.3989422804014327, dtype=dtype)
+        log_phi = -0.5 * jnp.square((z - mu) / s) - jnp.log(s) + jnp.log(inv_sqrt_2pi)
+        log_w = log_phi - jnp.log(u) - jnp.log(jnp.asarray(1.0, dtype=dtype) - u)
+    else:
+        raise ValueError(f"Unknown logit-normal weight_kind {weight_kind!r}; expected 'rbf' or 'pdf'.")
     w = jnp.exp(log_w - jnp.max(log_w))
     return w / jnp.maximum(jnp.sum(w), eps)
 
@@ -72,14 +85,16 @@ def compute_common_private(
     agg: str = "mean",
     logit_normal_center_layer: float = 0.0,
     logit_normal_sigma: float = 1.0,
+    logit_normal_weight_kind: str = "rbf",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute differentiable common activation and private residuals.
 
-    ``agg="mean"`` uses ``A_common = mean_i A_i`` (default). ``agg="logit_normal"`` uses
-    ``A_common = sum_i w_i A_i`` with ``w`` a normalized Gaussian bump on ``logit((i+0.5)/L)``
-    centered at the same mapping of ``logit_normal_center_layer`` (0-based; fractional ``k``
-    allowed). ``logit_normal_sigma`` is the Gaussian std on that logit scale (larger =>
-    flatter weights, converging to ``mean`` when ``sigma`` is large).
+    ``agg="mean"`` uses ``A_common = (1/L) sum_i tilde{A}_i`` (default), with ``tilde{A}_i`` the
+    channel-normalized per-layer activations. ``agg="logit_normal"`` uses
+    ``A_common = sum_i w_i tilde{A}_i`` with ``w_i >= 0`` and ``sum_i w_i = 1`` — same **convex
+    combination volume** as the mean (no extra ``/L`` or global scale beyond ``w``). Weights are
+    built from depth ``u_i = (i+0.5)/L`` centered at layer ``logit_normal_center_layer``; see
+    ``_layer_logit_normal_weights`` for ``rbf`` vs strict ``pdf`` logit-normal.
     """
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
@@ -92,6 +107,7 @@ def compute_common_private(
             logit_normal_center_layer,
             logit_normal_sigma,
             activations.dtype,
+            weight_kind=logit_normal_weight_kind,
         )
         common = jnp.tensordot(w, activations, axes=(0, 0))
     else:
@@ -306,7 +322,7 @@ def _mean_pairwise_cosine_squared(
 
 def compute_aux_losses(
     activations: Any,
-    spatial_target: jax.Array,
+    spatial_target: jax.Array | None = None,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
@@ -317,39 +333,21 @@ def compute_aux_losses(
     common_agg: str = "mean",
     common_logit_normal_center_layer: float = 0.0,
     common_logit_normal_sigma: float = 1.0,
+    common_logit_normal_weight_kind: str = "rbf",
 ) -> dict[str, jax.Array]:
-    """Compute auxiliary losses and logging metrics for activation decomposition."""
-    activations = collect_activations(activations)
-    if spatial_target.ndim != 3:
-        raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
-    if spatial_blur_by_timestep:
-        if timesteps is None:
-            raise ValueError("Timesteps are required when timestep-dependent spatial blur is enabled.")
-        if timesteps.ndim != 1:
-            raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
-        if timesteps.shape[0] != spatial_target.shape[0]:
-            raise ValueError(
-                "Timesteps batch size and spatial target batch size must match, "
-                f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
-            )
-        blur_sigmas = spatial_blur_max_sigma * jnp.clip(1.0 - timesteps, 0.0, 1.0)
-    else:
-        blur_sigmas = None
+    """Compute A_common/private metrics for activation decomposition.
 
-    common, common_anchor, private = compute_common_private(
+    Spatial-Gram arguments are retained for compatibility with existing call sites, but the
+    returned auxiliary bundle now only contains the common activation plus private-loss metrics.
+    """
+    activations = collect_activations(activations)
+
+    common, _, private = compute_common_private(
         activations,
         agg=common_agg,
         logit_normal_center_layer=common_logit_normal_center_layer,
         logit_normal_sigma=common_logit_normal_sigma,
-    )
-
-    spatial_loss, spatial_metrics = local_window_gram_loss(
-        common,
-        spatial_target,
-        window_size=spatial_window_size,
-        stride=spatial_window_stride,
-        target_blur_sigmas=blur_sigmas,
-        target_blur_max_sigma=spatial_blur_max_sigma,
+        logit_normal_weight_kind=common_logit_normal_weight_kind,
     )
 
     private_loss = _mean_pairwise_cosine_squared(
@@ -371,9 +369,7 @@ def compute_aux_losses(
     return {
         "common_activation": common,
         "private_activations": private,
-        "loss_spatial": spatial_loss,
         "loss_private": private_loss,
-        "spatial_metrics": spatial_metrics,
         "norm_common": common_norm,
         "avg_private_norm": avg_private_norm,
         "avg_pairwise_private_cosine": avg_pairwise_cosine,

@@ -405,6 +405,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
+from flax.core import freeze, unfreeze
 from flax.training import train_state, checkpoints
 from flax import jax_utils
 import numpy as np
@@ -464,8 +465,9 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_x = jnp.ones((1, n_patches, patch_dim))
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
+    dummy_common = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, drop_rng, common_head_rng = jax.random.split(rng, 3)
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
@@ -473,6 +475,14 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         vector=dummy_vec,
         deterministic=False,
     )
+    common_head_variables = model.init(
+        {"params": common_head_rng},
+        dummy_common,
+        method=lambda mdl, features: mdl.common_velocity_head(features),
+    )
+    params = unfreeze(variables["params"])
+    params.update(unfreeze(common_head_variables["params"]))
+    params = freeze(params)
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -482,7 +492,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
         tx=tx,
     )
     # EMA params start as an exact copy of the initial online params
@@ -511,17 +521,20 @@ def ema_update(ema_params, new_params, decay):
 def _zero_aux_metrics(dtype):
     zero = jnp.array(0.0, dtype=dtype)
     return {
-        "loss_spatial": zero,
         "loss_private": zero,
-        "spatial_metrics": {
-            "spatial_num_windows": zero,
-            "spatial_window_area": zero,
-            "spatial_blur_sigma_mean": zero,
-        },
         "norm_common": zero,
         "avg_private_norm": zero,
         "avg_pairwise_private_cosine": zero,
     }
+
+
+def _predict_common_velocity(apply_fn, params, common_activation):
+    """Project A_common into the diffusion target space with the auxiliary MLP head."""
+    return apply_fn(
+        {"params": params},
+        common_activation,
+        method=lambda mdl, features: mdl.common_velocity_head(features),
+    )
 
 
 def _scheduled_lambda_private(
@@ -555,7 +568,7 @@ def _scheduled_lambda_spatial(
     stop_step=-1,
     stop_warmup_iters=0,
 ):
-    """Optional early-stop + linear ramp-down schedule for spatial Gram loss."""
+    """Optional early-stop + linear ramp-down schedule for the A_common auxiliary loss."""
     lambda_spatial = jnp.asarray(lambda_spatial, dtype=jnp.float32)
     current_step = jnp.asarray(current_step, dtype=jnp.int32)
     stop_step = jnp.asarray(stop_step, dtype=jnp.int32)
@@ -594,6 +607,7 @@ def train_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_logit_normal_weight_kind="rbf",
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -638,7 +652,6 @@ def train_step(
             )
             aux_metrics = compute_aux_losses(
                 activations,
-                spatial_target=x0,
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
@@ -649,18 +662,29 @@ def train_step(
                 common_agg=common_agg,
                 common_logit_normal_center_layer=common_logit_normal_center_layer,
                 common_logit_normal_sigma=common_logit_normal_sigma,
+                common_logit_normal_weight_kind=common_logit_normal_weight_kind,
             )
             l_diff = jnp.mean((pred - target) ** 2)
-            l_spatial = aux_metrics["loss_spatial"]
+            if lambda_spatial != 0.0:
+                common_vpred = _predict_common_velocity(
+                    state.apply_fn,
+                    params,
+                    aux_metrics["common_activation"],
+                )
+                l_common_diff = jnp.mean((common_vpred - target) ** 2)
+                common_vpred_abs_mean = jnp.mean(jnp.abs(common_vpred))
+            else:
+                l_common_diff = jnp.array(0.0, dtype=l_diff.dtype)
+                common_vpred_abs_mean = jnp.array(0.0, dtype=l_diff.dtype)
             l_private = aux_metrics["loss_private"]
-            loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
+            loss = l_diff + effective_lambda_spatial * l_common_diff + effective_lambda_private * l_private
             return loss, (
                 jnp.mean(jnp.abs(target)),
                 jnp.mean(jnp.abs(pred)),
                 l_diff,
-                l_spatial,
+                l_common_diff,
+                common_vpred_abs_mean,
                 l_private,
-                aux_metrics["spatial_metrics"],
                 aux_metrics["norm_common"],
                 aux_metrics["avg_private_norm"],
                 aux_metrics["avg_pairwise_private_cosine"],
@@ -673,9 +697,9 @@ def train_step(
                 v_abs,
                 v_pred,
                 l_diff,
-                l_spatial,
+                l_common_diff,
+                common_vpred_abs_mean,
                 l_private,
-                spatial_metrics,
                 norm_common,
                 avg_private_norm,
                 avg_pairwise_private_cosine,
@@ -686,9 +710,9 @@ def train_step(
         v_abs = jax.lax.pmean(v_abs, axis_name="batch")
         v_pred = jax.lax.pmean(v_pred, axis_name="batch")
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-        l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
+        l_common_diff = jax.lax.pmean(l_common_diff, axis_name="batch")
+        common_vpred_abs_mean = jax.lax.pmean(common_vpred_abs_mean, axis_name="batch")
         l_private = jax.lax.pmean(l_private, axis_name="batch")
-        spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
         norm_common = jax.lax.pmean(norm_common, axis_name="batch")
         avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
         avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
@@ -719,9 +743,9 @@ def train_step(
         v_abs = jax.lax.pmean(v_abs, axis_name="batch")
         v_pred = jax.lax.pmean(v_pred, axis_name="batch")
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-        l_spatial = jnp.array(0.0, dtype=loss.dtype)
+        l_common_diff = jnp.array(0.0, dtype=loss.dtype)
+        common_vpred_abs_mean = jnp.array(0.0, dtype=loss.dtype)
         l_private = jnp.array(0.0, dtype=loss.dtype)
-        spatial_metrics = jax.lax.pmean(_zero_aux_metrics(target.dtype)["spatial_metrics"], axis_name="batch")
         norm_common = jnp.array(0.0, dtype=loss.dtype)
         avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
@@ -736,9 +760,12 @@ def train_step(
     metrics = {
         "train/loss": loss,
         "train/l_diff": l_diff,
-        "train/l_spatial": l_spatial,
+        "train/l_common_diff": l_common_diff,
+        "train/l_spatial": l_common_diff,
         "train/l_private": l_private,
+        "train/lambda_common_effective": effective_lambda_spatial,
         "train/lambda_spatial_effective": effective_lambda_spatial,
+        "train/common_stop_scale": spatial_stop_scale,
         "train/spatial_stop_scale": spatial_stop_scale,
         "train/lambda_private_effective": effective_lambda_private,
         "train/private_warmup_scale": private_warmup_scale,
@@ -750,10 +777,8 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/common_vpred_abs_mean": common_vpred_abs_mean,
     }
-    metrics["train/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
-    metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
-    metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return state, ema_params, metrics, rng
 
 
@@ -772,6 +797,7 @@ def eval_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_logit_normal_weight_kind="rbf",
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -810,7 +836,6 @@ def eval_step(
         pred, activations = outputs
         aux_metrics = compute_aux_losses(
             activations,
-            spatial_target=x0,
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
@@ -821,18 +846,28 @@ def eval_step(
             common_agg=common_agg,
             common_logit_normal_center_layer=common_logit_normal_center_layer,
             common_logit_normal_sigma=common_logit_normal_sigma,
+            common_logit_normal_weight_kind=common_logit_normal_weight_kind,
         )
     else:
         pred = outputs
         aux_metrics = _zero_aux_metrics(target.dtype)
 
     l_diff = jnp.mean((pred - target) ** 2)
-    l_spatial = aux_metrics["loss_spatial"]
+    if use_aux_losses and lambda_spatial != 0.0:
+        common_vpred = _predict_common_velocity(
+            state.apply_fn,
+            state.params,
+            aux_metrics["common_activation"],
+        )
+        l_common_diff = jnp.mean((common_vpred - target) ** 2)
+        common_vpred_abs_mean = jnp.mean(jnp.abs(common_vpred))
+    else:
+        l_common_diff = jnp.array(0.0, dtype=l_diff.dtype)
+        common_vpred_abs_mean = jnp.array(0.0, dtype=l_diff.dtype)
     l_private = aux_metrics["loss_private"]
-    spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
-        + effective_lambda_spatial * l_spatial
+        + effective_lambda_spatial * l_common_diff
         + effective_lambda_private * l_private
     )
     v_abs_mean = jnp.mean(jnp.abs(target))
@@ -840,9 +875,9 @@ def eval_step(
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     l_diff = jax.lax.pmean(l_diff, axis_name="batch")
-    l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
+    l_common_diff = jax.lax.pmean(l_common_diff, axis_name="batch")
+    common_vpred_abs_mean = jax.lax.pmean(common_vpred_abs_mean, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
-    spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
     common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
     avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
@@ -852,9 +887,12 @@ def eval_step(
     metrics = {
         "val/loss": loss,
         "val/l_diff": l_diff,
-        "val/l_spatial": l_spatial,
+        "val/l_common_diff": l_common_diff,
+        "val/l_spatial": l_common_diff,
         "val/l_private": l_private,
+        "val/lambda_common_effective": effective_lambda_spatial,
         "val/lambda_spatial_effective": effective_lambda_spatial,
+        "val/common_stop_scale": spatial_stop_scale,
         "val/spatial_stop_scale": spatial_stop_scale,
         "val/lambda_private_effective": effective_lambda_private,
         "val/private_warmup_scale": private_warmup_scale,
@@ -863,10 +901,8 @@ def eval_step(
         "val/private_pairwise_cosine": avg_pairwise_private_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
+        "val/common_vpred_abs_mean": common_vpred_abs_mean,
     }
-    metrics["val/spatial_num_windows"] = spatial_metrics["spatial_num_windows"]
-    metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
-    metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
     return metrics, rng
 
 
@@ -1350,18 +1386,18 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for sliding-window local Gram spatial loss.")
+                        help="Legacy name: weight for the A_common auxiliary diffusion-style velocity loss.")
     parser.add_argument(
         "--spatial-stop-step",
         type=int,
         default=-1,
-        help="Global step to start turning off spatial Gram loss. -1 disables early stop.",
+        help="Global step to start turning off the A_common auxiliary loss. -1 disables early stop.",
     )
     parser.add_argument(
         "--spatial-stop-warmup-iters",
         type=int,
         default=0,
-        help="Number of iterations to linearly decay spatial Gram lambda to zero after spatial-stop-step.",
+        help="Number of iterations to linearly decay the A_common auxiliary weight to zero after spatial-stop-step.",
     )
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
@@ -1386,7 +1422,7 @@ def main():
         choices=["mean", "logit_normal"],
         help=(
             "How to form A_common from per-layer activations: 'mean' (default) or 'logit_normal' "
-            "(weighted sum sum_i w_i A_i with w = softmax of a Gaussian in logit(depth) space)."
+            "(A_common = sum_i w_i * channel_norm(A_i) with sum_i w_i = 1; see --common-logit-normal-weight-kind)."
         ),
     )
     parser.add_argument(
@@ -1407,24 +1443,32 @@ def main():
             "Only used when --common-agg=logit_normal."
         ),
     )
+    parser.add_argument(
+        "--common-logit-normal-weight-kind",
+        type=str,
+        default="rbf",
+        choices=["rbf", "pdf"],
+        help=(
+            "When --common-agg=logit_normal: 'rbf' = Gaussian on logit(depth), normalized (stable, default); "
+            "'pdf' = strict logit-normal density at u_i=(i+0.5)/L, normalized (Jacobian 1/(u(1-u)), can be unstable)."
+        ),
+    )
     parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
-                        help="Sliding window size for local Gram spatial loss.")
+                        help="Legacy compatibility flag; unused after replacing the spatial Gram loss with common velocity prediction.")
     parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
-                        help="Sliding window stride for local Gram spatial loss.")
+                        help="Legacy compatibility flag; unused after replacing the spatial Gram loss with common velocity prediction.")
     parser.add_argument(
         "--spatial-blur-by-timestep",
         action="store_true",
         help=(
-            "Blur the spatial Gram target according to timestep. "
-            f"Uses Gaussian sigma that decreases linearly from {DEFAULT_MAX_TIMESTEP_BLUR_SIGMA} "
-            "at tau=0 (most noisy) to 0 at tau=1 (clean)."
+            "Legacy compatibility flag; unused after replacing the spatial Gram loss with common velocity prediction."
         ),
     )
     parser.add_argument(
         "--spatial-blur-max-sigma",
         type=float,
         default=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
-        help="Maximum Gaussian sigma for timestep-dependent spatial blur.",
+        help="Legacy compatibility flag; unused after replacing the spatial Gram loss with common velocity prediction.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1639,7 +1683,8 @@ def main():
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
         f"common_agg={args.common_agg} "
         f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
-        f"common_logit_normal_sigma={args.common_logit_normal_sigma}"
+        f"common_logit_normal_sigma={args.common_logit_normal_sigma} "
+        f"common_logit_normal_weight_kind={args.common_logit_normal_weight_kind}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1696,6 +1741,7 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_logit_normal_weight_kind=args.common_logit_normal_weight_kind,
         ),
         axis_name="batch",
     )
@@ -1716,6 +1762,7 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_logit_normal_weight_kind=args.common_logit_normal_weight_kind,
         ),
         axis_name="batch",
     )

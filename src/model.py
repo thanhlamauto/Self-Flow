@@ -251,6 +251,10 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        self.common_velocity_head = SimpleHead(
+            in_dim=self.hidden_size,
+            out_dim=self.patch_size * self.patch_size * self.in_channels,
+        )
 
     @nn.compact
     def __call__(
