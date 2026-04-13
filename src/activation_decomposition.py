@@ -315,12 +315,12 @@ def _private_loss_per_token_mi_proxy(
 
     Matches the usual block-wise formulation: for each pair of layers ``(i, j)``, compute
     ``hat(f)_i[b,n,:]^T hat(f)_j[b,n,:]`` (cosine similarity), then average over all pairs,
-    batch, and tokens — i.e. mean cosine, not ``|cos|`` or ``cos^2``.
+    batch, and tokens using ``|cos|`` so both positive and negative correlations are penalized.
 
     If ``private_layer_pairs`` is set (0-based indices into the layer stack), only those pairs
     are used. Otherwise all ``i<j`` pairs, optionally subsampled when ``max_pairs > 0``.
 
-    Returns ``(loss_private, avg_pairwise_cos)``; the metric is the mean cosine over all chosen
+    Returns ``(loss_private, avg_pairwise_cos)``; the metric is the mean absolute cosine over all chosen
     pairs before subsampling; ``loss_private`` uses the subsampled subset when applicable.
     """
     num_layers = private.shape[0]
@@ -332,7 +332,7 @@ def _private_loss_per_token_mi_proxy(
         pair_cos = _selected_pair_token_cosines(private, private_layer_pairs, eps=eps)
     else:
         pair_cos = _layer_pair_per_token_cosines(private, eps=eps)
-    avg_pairwise_cos = jnp.mean(pair_cos)
+    avg_pairwise_cos = jnp.mean(jnp.abs(pair_cos))
 
     if max_pairs and max_pairs > 0 and pair_cos.shape[0] > max_pairs:
         if rng is None:
@@ -340,7 +340,7 @@ def _private_loss_per_token_mi_proxy(
         indices = jax.random.permutation(rng, pair_cos.shape[0])[:max_pairs]
         pair_cos = pair_cos[indices]
 
-    loss_private = jnp.mean(pair_cos)
+    loss_private = jnp.mean(jnp.abs(pair_cos))
     return loss_private, avg_pairwise_cos
 
 
