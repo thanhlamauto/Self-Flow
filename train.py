@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from functools import partial
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -412,6 +413,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.private_activations import compute_direct_private_loss_metrics
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -500,8 +502,46 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+
+def _zero_private_metrics(dtype):
+    zero = jnp.array(0.0, dtype=dtype)
+    return {
+        "loss_private": zero,
+        "avg_activation_norm": zero,
+        "avg_pairwise_activation_cosine": zero,
+    }
+
+
+def _scheduled_lambda_private(
+    lambda_private,
+    current_step,
+    start_step=0,
+    warmup_iters=0,
+):
+    """Late-start + linear warmup schedule for private diversity loss."""
+    lambda_private = jnp.asarray(lambda_private, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    start_step = jnp.asarray(start_step, dtype=jnp.int32)
+    warmup_iters = jnp.asarray(warmup_iters, dtype=jnp.int32)
+
+    has_started = current_step >= start_step
+    no_warmup = warmup_iters <= 0
+    warmup_progress = (current_step - start_step + 1).astype(jnp.float32) / jnp.maximum(
+        warmup_iters.astype(jnp.float32), 1.0
+    )
+    warmup_scale = jnp.where(
+        has_started,
+        jnp.where(no_warmup, 1.0, jnp.clip(warmup_progress, 0.0, 1.0)),
+        0.0,
+    )
+    return lambda_private * warmup_scale, warmup_scale
+
 def train_step(
-    state, ema_params, batch, rng, ema_decay,
+    state, ema_params, batch, rng, ema_decay, current_step,
+    lambda_private=0.0,
+    private_max_pairs=0,
+    private_start_step=0,
+    private_warmup_iters=0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -512,8 +552,15 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    use_private_loss = lambda_private != 0.0
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -521,27 +568,89 @@ def train_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
+    if use_private_loss:
+        def loss_fn(params):
+            pred, activations = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_activations=True,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            private_metrics = compute_direct_private_loss_metrics(
+                activations,
+                private_pair_rng=private_pair_rng,
+                private_max_pairs=private_max_pairs,
+            )
+            l_diff = jnp.mean((pred - target) ** 2)
+            l_private = private_metrics["loss_private"]
+            loss = l_diff + effective_lambda_private * l_private
+            return loss, (
+                jnp.mean(jnp.abs(target)),
+                jnp.mean(jnp.abs(pred)),
+                l_diff,
+                l_private,
+                private_metrics["avg_activation_norm"],
+                private_metrics["avg_pairwise_activation_cosine"],
+            )
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (
+            loss,
+            (
+                v_abs,
+                v_pred,
+                l_diff,
+                l_private,
+                avg_activation_norm,
+                avg_pairwise_activation_cosine,
+            ),
+        ), grads = grad_fn(state.params)
+
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+        l_private = jax.lax.pmean(l_private, axis_name="batch")
+        avg_activation_norm = jax.lax.pmean(avg_activation_norm, axis_name="batch")
+        avg_pairwise_activation_cosine = jax.lax.pmean(
+            avg_pairwise_activation_cosine,
+            axis_name="batch",
         )
-        loss = jnp.mean((pred - target) ** 2)
-        v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        grads = jax.lax.pmean(grads, axis_name="batch")
+    else:
+        def loss_fn(params):
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_activations=False,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            l_diff = jnp.mean((pred - target) ** 2)
+            loss = l_diff
+            return loss, (
+                jnp.mean(jnp.abs(target)),
+                jnp.mean(jnp.abs(pred)),
+                l_diff,
+            )
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (v_abs, v_pred, l_diff)), grads = grad_fn(state.params)
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+        private_metrics = _zero_private_metrics(loss.dtype)
+        l_private = private_metrics["loss_private"]
+        avg_activation_norm = private_metrics["avg_activation_norm"]
+        avg_pairwise_activation_cosine = private_metrics["avg_pairwise_activation_cosine"]
+        grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
@@ -551,6 +660,12 @@ def train_step(
 
     metrics = {
         "train/loss": loss,
+        "train/l_diff": l_diff,
+        "train/l_private": l_private,
+        "train/lambda_private_effective": effective_lambda_private,
+        "train/private_warmup_scale": private_warmup_scale,
+        "train/activation_avg_norm": avg_activation_norm,
+        "train/activation_pairwise_cosine": avg_pairwise_activation_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -561,13 +676,24 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng,
+    state, ema_params, batch, rng, current_step,
+    lambda_private=0.0,
+    private_max_pairs=0,
+    private_start_step=0,
+    private_warmup_iters=0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    use_private_loss = lambda_private != 0.0
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -575,23 +701,53 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    pred = state.apply_fn(
+    outputs = state.apply_fn(
         {"params": state.params},
         x_tau,
         timesteps=tau,
         vector=y,
+        return_activations=use_private_loss,
         deterministic=True,
     )
-    loss = jnp.mean((pred - target) ** 2)
+    if use_private_loss:
+        pred, activations = outputs
+        private_metrics = compute_direct_private_loss_metrics(
+            activations,
+            private_pair_rng=private_pair_rng,
+            private_max_pairs=private_max_pairs,
+        )
+    else:
+        pred = outputs
+        private_metrics = _zero_private_metrics(target.dtype)
+
+    l_diff = jnp.mean((pred - target) ** 2)
+    l_private = private_metrics["loss_private"]
+    loss = l_diff + effective_lambda_private * l_private
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
+    l_diff = jax.lax.pmean(l_diff, axis_name="batch")
+    l_private = jax.lax.pmean(l_private, axis_name="batch")
+    avg_activation_norm = jax.lax.pmean(
+        private_metrics["avg_activation_norm"],
+        axis_name="batch",
+    )
+    avg_pairwise_activation_cosine = jax.lax.pmean(
+        private_metrics["avg_pairwise_activation_cosine"],
+        axis_name="batch",
+    )
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
     metrics = {
         "val/loss": loss,
+        "val/l_diff": l_diff,
+        "val/l_private": l_private,
+        "val/lambda_private_effective": effective_lambda_private,
+        "val/private_warmup_scale": private_warmup_scale,
+        "val/activation_avg_norm": avg_activation_norm,
+        "val/activation_pairwise_cosine": avg_pairwise_activation_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1077,6 +1233,33 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--lambda-private",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the private diversity loss applied directly to normalized "
+            "post-block hidden states."
+        ),
+    )
+    parser.add_argument(
+        "--private-start-step",
+        type=int,
+        default=0,
+        help="Global step at which to enable the private hidden-state loss.",
+    )
+    parser.add_argument(
+        "--private-warmup-iters",
+        type=int,
+        default=0,
+        help="Linear warmup length for the private hidden-state loss after start step.",
+    )
+    parser.add_argument(
+        "--private-max-pairs",
+        type=int,
+        default=0,
+        help="If > 0, sample at most this many layer pairs per step for private loss.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1224,6 +1407,12 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be >= 0")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be >= 0")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1256,6 +1445,13 @@ def main():
     )
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+    )
+    log_stage(
+        "Direct hidden-state private loss: "
+        f"lambda_private={args.lambda_private} "
+        f"private_start_step={args.private_start_step} "
+        f"private_warmup_iters={args.private_warmup_iters} "
+        f"private_max_pairs={args.private_max_pairs}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1295,8 +1491,26 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        partial(
+            train_step,
+            lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
+            private_max_pairs=args.private_max_pairs,
+        ),
+        axis_name="batch",
+    )
+    pmapped_eval_step = jax.pmap(
+        partial(
+            eval_step,
+            lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
+            private_max_pairs=args.private_max_pairs,
+        ),
+        axis_name="batch",
+    )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1568,8 +1782,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_steps = jnp.zeros((num_devices,), dtype=jnp.int32)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_steps
         )
         block_pytree(probe_metrics)
 
@@ -1932,8 +2147,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -1959,7 +2175,10 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
+                    eval_step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+                    val_metrics, rng = pmapped_eval_step(
+                        state, ema_params, (val_x, val_y), rng, eval_step_devices
+                    )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
