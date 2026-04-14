@@ -528,6 +528,7 @@ def _zero_aux_metrics(dtype):
     return {
         "loss_spatial": zero,
         "loss_private": zero,
+        "loss_common_private": zero,
         "spatial_metrics": {
             "spatial_num_windows": zero,
             "spatial_window_area": zero,
@@ -536,6 +537,7 @@ def _zero_aux_metrics(dtype):
         "norm_common": zero,
         "avg_private_norm": zero,
         "avg_pairwise_private_cosine": zero,
+        "avg_common_private_cosine": zero,
     }
 
 
@@ -596,8 +598,9 @@ def _scheduled_lambda_spatial(
 
 def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
-    lambda_spatial=0.0, lambda_private=0.0,
+    lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
+    common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
@@ -632,9 +635,17 @@ def train_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
+    effective_lambda_common_private, common_private_warmup_scale = _scheduled_lambda_private(
+        lambda_common_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    use_aux_losses = any(
+        weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
+    )
 
-    rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
+    rng, tau_rng, noise_rng, drop_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 6)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -666,6 +677,8 @@ def train_step(
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
+                common_private_rng=common_private_rng,
+                common_private_max_layers=common_private_max_layers,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
@@ -678,17 +691,25 @@ def train_step(
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
             l_private = aux_metrics["loss_private"]
-            loss = l_diff + effective_lambda_spatial * l_spatial + effective_lambda_private * l_private
+            l_common_private = aux_metrics["loss_common_private"]
+            loss = (
+                l_diff
+                + effective_lambda_spatial * l_spatial
+                + effective_lambda_private * l_private
+                + effective_lambda_common_private * l_common_private
+            )
             return loss, (
                 jnp.mean(jnp.abs(target)),
                 jnp.mean(jnp.abs(pred)),
                 l_diff,
                 l_spatial,
                 l_private,
+                l_common_private,
                 aux_metrics["spatial_metrics"],
                 aux_metrics["norm_common"],
                 aux_metrics["avg_private_norm"],
                 aux_metrics["avg_pairwise_private_cosine"],
+                aux_metrics["avg_common_private_cosine"],
             )
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -700,10 +721,12 @@ def train_step(
                 l_diff,
                 l_spatial,
                 l_private,
+                l_common_private,
                 spatial_metrics,
                 norm_common,
                 avg_private_norm,
                 avg_pairwise_private_cosine,
+                avg_common_private_cosine,
             ),
         ), grads = grad_fn(state.params)
 
@@ -713,10 +736,12 @@ def train_step(
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
         l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
         l_private = jax.lax.pmean(l_private, axis_name="batch")
+        l_common_private = jax.lax.pmean(l_common_private, axis_name="batch")
         spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
         norm_common = jax.lax.pmean(norm_common, axis_name="batch")
         avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
         avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
+        avg_common_private_cosine = jax.lax.pmean(avg_common_private_cosine, axis_name="batch")
         grads = jax.lax.pmean(grads, axis_name="batch")
     else:
         def loss_fn(params):
@@ -746,10 +771,12 @@ def train_step(
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
         l_spatial = jnp.array(0.0, dtype=loss.dtype)
         l_private = jnp.array(0.0, dtype=loss.dtype)
+        l_common_private = jnp.array(0.0, dtype=loss.dtype)
         spatial_metrics = jax.lax.pmean(_zero_aux_metrics(target.dtype)["spatial_metrics"], axis_name="batch")
         norm_common = jnp.array(0.0, dtype=loss.dtype)
         avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
+        avg_common_private_cosine = jnp.array(0.0, dtype=loss.dtype)
         grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -763,13 +790,17 @@ def train_step(
         "train/l_diff": l_diff,
         "train/l_spatial": l_spatial,
         "train/l_private": l_private,
+        "train/l_common_private": l_common_private,
         "train/lambda_spatial_effective": effective_lambda_spatial,
         "train/spatial_stop_scale": spatial_stop_scale,
         "train/lambda_private_effective": effective_lambda_private,
         "train/private_warmup_scale": private_warmup_scale,
+        "train/lambda_common_private_effective": effective_lambda_common_private,
+        "train/common_private_warmup_scale": common_private_warmup_scale,
         "train/common_norm": norm_common,
         "train/private_avg_norm": avg_private_norm,
         "train/private_pairwise_cosine": avg_pairwise_private_cosine,
+        "train/common_private_cosine": avg_common_private_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -784,8 +815,9 @@ def train_step(
 
 def eval_step(
     state, ema_params, batch, rng, current_step,
-    lambda_spatial=0.0, lambda_private=0.0,
+    lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
+    common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep=False,
@@ -814,9 +846,17 @@ def eval_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    use_aux_losses = any(weight != 0.0 for weight in (lambda_spatial, lambda_private))
+    effective_lambda_common_private, common_private_warmup_scale = _scheduled_lambda_private(
+        lambda_common_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    use_aux_losses = any(
+        weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
+    )
 
-    rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -848,6 +888,8 @@ def eval_step(
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
+            common_private_rng=common_private_rng,
+            common_private_max_layers=common_private_max_layers,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
@@ -864,11 +906,13 @@ def eval_step(
     l_diff = jnp.mean((pred - target) ** 2)
     l_spatial = aux_metrics["loss_spatial"]
     l_private = aux_metrics["loss_private"]
+    l_common_private = aux_metrics["loss_common_private"]
     spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
         + effective_lambda_spatial * l_spatial
         + effective_lambda_private * l_private
+        + effective_lambda_common_private * l_common_private
     )
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -877,10 +921,12 @@ def eval_step(
     l_diff = jax.lax.pmean(l_diff, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
+    l_common_private = jax.lax.pmean(l_common_private, axis_name="batch")
     spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
     common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
     avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
+    avg_common_private_cosine = jax.lax.pmean(aux_metrics["avg_common_private_cosine"], axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -889,13 +935,17 @@ def eval_step(
         "val/l_diff": l_diff,
         "val/l_spatial": l_spatial,
         "val/l_private": l_private,
+        "val/l_common_private": l_common_private,
         "val/lambda_spatial_effective": effective_lambda_spatial,
         "val/spatial_stop_scale": spatial_stop_scale,
         "val/lambda_private_effective": effective_lambda_private,
         "val/private_warmup_scale": private_warmup_scale,
+        "val/lambda_common_private_effective": effective_lambda_common_private,
+        "val/common_private_warmup_scale": common_private_warmup_scale,
         "val/common_norm": common_norm,
         "val/private_avg_norm": avg_private_norm,
         "val/private_pairwise_cosine": avg_pairwise_private_cosine,
+        "val/common_private_cosine": avg_common_private_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1409,6 +1459,12 @@ def main():
     parser.add_argument("--lambda-private", type=float, default=0.0,
                         help="Weight for private diversity auxiliary loss.")
     parser.add_argument(
+        "--lambda-common-private",
+        type=float,
+        default=0.0,
+        help="Weight for the auxiliary cosine-squared loss that separates A_common from sampled B_i layers.",
+    )
+    parser.add_argument(
         "--private-start-step",
         type=int,
         default=0,
@@ -1422,6 +1478,12 @@ def main():
     )
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
+    parser.add_argument(
+        "--common-private-max-layers",
+        type=int,
+        default=0,
+        help="If > 0, randomly sample at most this many B_i layers per iteration for the A_common-vs-B_i separation loss.",
+    )
     parser.add_argument(
         "--common-agg",
         type=str,
@@ -1646,6 +1708,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.common_private_max_layers < 0:
+        raise ValueError("--common-private-max-layers must be >= 0")
     if args.spatial_stop_step < -1:
         raise ValueError("--spatial-stop-step must be >= -1")
     if args.spatial_stop_warmup_iters < 0:
@@ -1716,9 +1780,11 @@ def main():
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
+        f"lambda_common_private={args.lambda_common_private} "
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
+        f"common_private_max_layers={args.common_private_max_layers} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"spatial_blur_by_timestep={args.spatial_blur_by_timestep} "
@@ -1780,9 +1846,11 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
+            lambda_common_private=args.lambda_common_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,
@@ -1801,9 +1869,11 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
+            lambda_common_private=args.lambda_common_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_blur_by_timestep=args.spatial_blur_by_timestep,

@@ -304,12 +304,61 @@ def _mean_pairwise_cosine_squared(
     return jnp.mean(jnp.square(pairwise_cosines))
 
 
+def _common_private_cosines(
+    common: jax.Array,
+    private: jax.Array,
+    eps: float = 1e-8,
+) -> jax.Array:
+    """Return cosine similarities between ``A_common`` and each private layer ``B_i``."""
+    if common.ndim != 3:
+        raise ValueError(f"Expected common activation with rank 3, got shape {common.shape}")
+    if private.ndim != 4:
+        raise ValueError(f"Expected private activations with rank 4, got shape {private.shape}")
+    if private.shape[1:] != common.shape:
+        raise ValueError(
+            "Private activations must match common activation in batch/token/channel dims, "
+            f"got {private.shape[1:]} vs {common.shape}"
+        )
+
+    common_flat = common.reshape(-1)
+    private_flat = private.reshape(private.shape[0], -1)
+    common_norm = common_flat / jnp.maximum(jnp.linalg.norm(common_flat), eps)
+    private_norms = private_flat / jnp.maximum(
+        jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+        eps,
+    )
+    return private_norms @ common_norm
+
+
+def _mean_common_private_cosine_squared(
+    common: jax.Array,
+    private: jax.Array,
+    eps: float = 1e-8,
+    rng: jax.Array | None = None,
+    max_layers: int = 0,
+) -> jax.Array:
+    """Average squared cosine similarity between ``A_common`` and all or sampled ``B_i``."""
+    common_private_cosines = _common_private_cosines(common, private, eps=eps)
+    if common_private_cosines.ndim == 0:
+        return common_private_cosines
+
+    if max_layers and max_layers > 0 and common_private_cosines.shape[0] > max_layers:
+        if rng is None:
+            raise ValueError("An RNG key is required when sampling common/private layers.")
+        indices = jax.random.permutation(rng, common_private_cosines.shape[0])[:max_layers]
+        common_private_cosines = common_private_cosines[indices]
+
+    return jnp.mean(jnp.square(common_private_cosines))
+
+
 def compute_aux_losses(
     activations: Any,
     spatial_target: jax.Array,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
+    common_private_rng: jax.Array | None = None,
+    common_private_max_layers: int = 0,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep: bool = False,
@@ -363,6 +412,12 @@ def compute_aux_losses(
         rng=private_pair_rng,
         max_pairs=private_max_pairs,
     )
+    common_private_loss = _mean_common_private_cosine_squared(
+        common,
+        private,
+        rng=common_private_rng,
+        max_layers=common_private_max_layers,
+    )
 
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
     private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
@@ -373,14 +428,21 @@ def compute_aux_losses(
         avg_pairwise_cosine = pairwise_cosines
     else:
         avg_pairwise_cosine = jnp.mean(pairwise_cosines)
+    common_private_cosines = _common_private_cosines(common, private)
+    if common_private_cosines.ndim == 0:
+        avg_common_private_cosine = common_private_cosines
+    else:
+        avg_common_private_cosine = jnp.mean(common_private_cosines)
 
     return {
         "common_activation": common,
         "private_activations": private,
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
+        "loss_common_private": common_private_loss,
         "spatial_metrics": spatial_metrics,
         "norm_common": common_norm,
         "avg_private_norm": avg_private_norm,
         "avg_pairwise_private_cosine": avg_pairwise_cosine,
+        "avg_common_private_cosine": avg_common_private_cosine,
     }
