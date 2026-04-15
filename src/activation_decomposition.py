@@ -359,6 +359,7 @@ def compute_aux_losses(
     private_max_pairs: int = 0,
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
+    compute_common_private_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     spatial_blur_by_timestep: bool = False,
@@ -412,12 +413,21 @@ def compute_aux_losses(
         rng=private_pair_rng,
         max_pairs=private_max_pairs,
     )
-    common_private_loss = _mean_common_private_cosine_squared(
-        common,
-        private,
-        rng=common_private_rng,
-        max_layers=common_private_max_layers,
-    )
+    if compute_common_private_loss:
+        common_private_loss = _mean_common_private_cosine_squared(
+            common,
+            private,
+            rng=common_private_rng,
+            max_layers=common_private_max_layers,
+        )
+        common_private_cosines = _common_private_cosines(common, private)
+        if common_private_cosines.ndim == 0:
+            avg_common_private_cosine = common_private_cosines
+        else:
+            avg_common_private_cosine = jnp.mean(common_private_cosines)
+    else:
+        common_private_loss = jnp.array(0.0, dtype=common.dtype)
+        avg_common_private_cosine = jnp.array(0.0, dtype=common.dtype)
 
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
     private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
@@ -428,11 +438,6 @@ def compute_aux_losses(
         avg_pairwise_cosine = pairwise_cosines
     else:
         avg_pairwise_cosine = jnp.mean(pairwise_cosines)
-    common_private_cosines = _common_private_cosines(common, private)
-    if common_private_cosines.ndim == 0:
-        avg_common_private_cosine = common_private_cosines
-    else:
-        avg_common_private_cosine = jnp.mean(common_private_cosines)
 
     return {
         "common_activation": common,

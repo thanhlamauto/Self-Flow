@@ -641,11 +641,16 @@ def train_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
+    compute_common_private_loss = lambda_common_private != 0.0
     use_aux_losses = any(
         weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
     )
 
-    rng, tau_rng, noise_rng, drop_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 6)
+    if compute_common_private_loss:
+        rng, tau_rng, noise_rng, drop_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 6)
+    else:
+        rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
+        common_private_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -679,6 +684,7 @@ def train_step(
                 private_max_pairs=private_max_pairs,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
+                compute_common_private_loss=compute_common_private_loss,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_blur_by_timestep=spatial_blur_by_timestep,
@@ -852,11 +858,16 @@ def eval_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
+    compute_common_private_loss = lambda_common_private != 0.0
     use_aux_losses = any(
         weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
     )
 
-    rng, tau_rng, noise_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 5)
+    if compute_common_private_loss:
+        rng, tau_rng, noise_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 5)
+    else:
+        rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
+        common_private_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -890,6 +901,7 @@ def eval_step(
             private_max_pairs=private_max_pairs,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
+            compute_common_private_loss=compute_common_private_loss,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_blur_by_timestep=spatial_blur_by_timestep,
