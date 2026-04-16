@@ -1,0 +1,527 @@
+% LaTeX doc for Overleaf
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\StopGrad}{\operatorname{StopGrad}}
+
+\begin{document}
+
+\section*{Training procedure: \texttt{feat/common-private-activations-shared-subspace}}
+
+This note summarizes the objective implemented in branch \texttt{feat/common-private-activations-shared-subspace}. The branch keeps the standard DiT flow-matching / velocity-regression loss, and replaces the earlier common/private auxiliaries with:
+\begin{itemize}
+  \item a \emph{shared-subspace} decomposition computed from a random window of consecutive transformer blocks,
+  \item a spatial local-Gram loss on the resulting common component,
+  \item a cosine-squared diversity loss on the private residuals.
+\end{itemize}
+
+\subsection*{1. Repo-specific shapes and notation}
+The implementation operates on \emph{patchified} latent tokens rather than one token per latent pixel.
+\begin{itemize}
+  \item Clean training inputs are patchified latent tokens
+  \[
+    \bm{x}_0 \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D_{\mathrm{in}}},
+  \]
+  with latent spatial size $32\times 32$, patch size $p=2$, latent channels $C=4$, so
+  \[
+    N_{\mathrm{tok}} = 16^2 = 256,
+    \qquad
+    D_{\mathrm{in}} = p^2 C = 16.
+  \]
+  \item The corresponding unpatchified latent grid is
+  \[
+    \bm{X}_0 \in \mathbb{R}^{B\times 32\times 32\times 4}.
+  \]
+  \item The DiT hidden state after block $\ell$ is
+  \[
+    \bm{A}_\ell \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D},
+    \qquad \ell=1,\dots,L.
+  \]
+  \item A random activation window contains $m$ consecutive blocks, where
+  \[
+    m = \texttt{layer\_window\_size}.
+  \]
+  \item The shared subspace rank is
+  \[
+    k = \texttt{shared\_subspace\_rank},
+  \]
+  with implementation detail
+  \[
+    k_{\mathrm{eff}} = \min(k, N_{\mathrm{tok}}, D)
+  \]
+  after shape clipping.
+  \item The model prediction is denoted by $v_\theta(\cdot)$, conditioned on timestep $\tau\in[0,1]$ and label / vector $\bm{y}$.
+\end{itemize}
+
+\subsection*{2. Main flow-matching diffusion objective}
+For each batch, the code samples independent timesteps
+\[
+  \tau_b \sim \mathcal{U}(0,1),
+  \qquad b=1,\dots,B,
+\]
+and Gaussian noise
+\[
+  \bm{x}_1 \sim \mathcal{N}(\bm{0}, \bm{I}),
+  \qquad
+  \bm{x}_1 \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D_{\mathrm{in}}}.
+\]
+The forward interpolation uses the repo convention $\tau=0$ for pure noise and $\tau=1$ for clean data:
+\[
+  \bm{x}_{\tau,b} = (1-\tau_b)\bm{x}_{1,b} + \tau_b \bm{x}_{0,b}.
+\]
+The regression target is the velocity
+\[
+  \bm{t}_b = \bm{x}_{0,b} - \bm{x}_{1,b}.
+\]
+The model predicts
+\[
+  \hat{\bm{v}}_\theta = v_\theta(\bm{x}_\tau,\bm{\tau},\bm{y}),
+\]
+and the main loss is
+\[
+  \ell_{\mathrm{diff}}
+  =
+  \frac{1}{B N_{\mathrm{tok}} D_{\mathrm{in}}}
+  \left\|
+    \hat{\bm{v}}_\theta - \bm{t}
+  \right\|_2^2.
+\]
+
+\subsection*{3. Random layer window and token-wise normalization}
+When auxiliary losses are enabled, the model also returns post-block activations
+\[
+  \{\bm{A}_\ell\}_{\ell=1}^{L}.
+\]
+The code uniformly samples a start index $s$ and keeps a consecutive window
+\[
+  \mathcal{W} = \{s+1, s+2, \dots, s+m\},
+\]
+where $m$ is clipped to at most $L$.
+
+For each layer in the window, the code applies token-wise LayerNorm across the hidden dimension $D$, without learned affine parameters:
+\[
+  \tilde{\bm{A}}_\ell[b,n,:]
+  =
+  \frac{
+    \bm{A}_\ell[b,n,:] - \mu_{\ell,b,n}
+  }{
+    \sqrt{\sigma_{\ell,b,n}^2 + \varepsilon}
+  },
+\]
+where $\mu_{\ell,b,n}$ and $\sigma_{\ell,b,n}^2$ are the mean and variance over the hidden channel index.
+
+\subsection*{4. Shared subspace from truncated SVD}
+Within the sampled window, the mean normalized activation is
+\[
+  \bm{M}
+  =
+  \frac{1}{m}\sum_{\ell\in\mathcal{W}}\tilde{\bm{A}}_\ell
+  \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D}.
+\]
+The code detaches this tensor:
+\[
+  \bm{M}^{\dagger} = \StopGrad(\bm{M}).
+\]
+For each batch item $b$, it computes an SVD
+\[
+  \bm{M}^{\dagger}_b = \bm{U}_b \bm{\Sigma}_b \bm{V}_b^\top,
+\]
+and extracts the first $k_{\mathrm{eff}}$ right singular vectors:
+\[
+  \bm{Q}_b
+  =
+  \left[\bm{v}_{b,1}, \dots, \bm{v}_{b,k_{\mathrm{eff}}}\right]
+  \in \mathbb{R}^{D\times k_{\mathrm{eff}}}.
+\]
+Equivalently, the shared projector is
+\[
+  \bm{P}_b = \bm{Q}_b \bm{Q}_b^\top \in \mathbb{R}^{D\times D}.
+\]
+The implementation does not explicitly materialize $\bm{P}_b$; it applies the projector as
+\[
+  \tilde{\bm{A}}_\ell \bm{P}
+  =
+  (\tilde{\bm{A}}_\ell \bm{Q}) \bm{Q}^\top.
+\]
+
+\subsection*{5. Common-private decomposition}
+For each layer $\ell$ inside the sampled window,
+\[
+  \bm{A}^{\mathrm{com}}_\ell[b,:,:]
+  =
+  \tilde{\bm{A}}_\ell[b,:,:]\bm{P}_b,
+\]
+and the private residual is
+\[
+  \bm{A}^{\mathrm{priv}}_\ell
+  =
+  \tilde{\bm{A}}_\ell - \bm{A}^{\mathrm{com}}_\ell.
+\]
+The common activation used by the spatial branch is the mean over the sampled window:
+\[
+  \bm{A}^{\mathrm{com}}_{\mathrm{mean}}
+  =
+  \frac{1}{m}\sum_{\ell\in\mathcal{W}} \bm{A}^{\mathrm{com}}_\ell
+  \in
+  \mathbb{R}^{B\times N_{\mathrm{tok}}\times D}.
+\]
+
+\subsection*{6. Spatial projector and coarse target}
+\subsubsection*{6.1 Common-to-latent projector}
+The spatial loss compares the common representation to a latent-space target. Therefore the branch maps
+\[
+  \bm{A}^{\mathrm{com}}_{\mathrm{mean}}
+  \in \mathbb{R}^{B\times 256\times D}
+\]
+back to patchified latent tokens using
+\[
+  \Pi_{\mathrm{sp}}
+  =
+  \Pi_{\tau}
+  \circ
+  \Pi_{\mathrm{base}},
+\]
+where:
+\begin{itemize}
+  \item $\Pi_{\mathrm{base}}$ is controlled by \texttt{common\_spatial\_projector}; it is either identity or a small CNN applied on the $16\times 16$ token grid, followed by a linear map back to the DiT hidden size $D$,
+  \item $\Pi_{\tau}$ is a timestep-conditioned affine modulation applied after token-wise normalization. In the implementation it reuses the same timestep embedder as the DiT backbone, with the same internal time convention as the main forward pass, so the projection explicitly depends on which flow timestep $\tau$ the current example belongs to.
+\end{itemize}
+Before this projection, the common tensor still lives in DiT hidden-feature space. Since there are $256=16^2$ tokens, one may equivalently view it as
+\[
+  \bm{A}^{\mathrm{com}}_{\mathrm{mean}}
+  \in \mathbb{R}^{B\times 256\times D}
+  \cong
+  \mathbb{R}^{B\times 16\times 16\times D}.
+\]
+This $16\times 16\times D$ view is the \emph{token grid} of the transformer.
+
+The symbol $\bm{Z}$ used later in the spatial loss is the timestep-conditioned projected token tensor:
+\[
+  \bm{Z}
+  =
+  \Pi_{\mathrm{sp}}\!\left(\bm{A}^{\mathrm{com}}_{\mathrm{mean}}, \bm{\tau}\right)
+  \in \mathbb{R}^{B\times 256\times D}
+  \cong
+  \mathbb{R}^{B\times 16\times 16\times D}.
+\]
+Hence, in the current design, $\bm{Z}$ keeps the same token-grid resolution and hidden dimension as $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$.
+
+Hence the full dimension flow of the common branch is
+\[
+  \bm{A}^{\mathrm{com}}_{\mathrm{mean}}
+  \in \mathbb{R}^{B\times 256\times D}
+  \xrightarrow{\ \Pi_{\mathrm{base}}\ }
+  \mathbb{R}^{B\times 256\times D}
+  \xrightarrow{\ \Pi_{\tau}\ }
+  \bm{Z}
+  \in \mathbb{R}^{B\times 256\times D}.
+\]
+So there are two different but aligned views in this branch:
+\begin{itemize}
+  \item \textbf{token-space common tensor:}
+  \[
+    \bm{A}^{\mathrm{com}}_{\mathrm{mean}}
+    \cong
+    \mathbb{R}^{B\times 16\times 16\times D},
+  \]
+  \item \textbf{token-space projected tensor used by the spatial loss:}
+  \[
+    \bm{Z}
+    \in
+    \mathbb{R}^{B\times 16\times 16\times D}.
+  \]
+\end{itemize}
+The local Gram spatial loss is applied to the second one, namely the timestep-conditioned projected tensor $\bm{Z}$ in token space.
+
+\subsubsection*{6.2 Strong coarse target}
+The clean latent tokens $\bm{x}_0$ are unpatchified to
+\[
+  \bm{X}_0 \in \mathbb{R}^{B\times 32\times 32\times 4}.
+\]
+The code average-pools $\bm{X}_0$ down to $4\times 4$:
+\[
+  \bm{X}_{\mathrm{coarse}}
+  =
+  \mathrm{AvgPool}_{8\times 8,\; \mathrm{stride}=8}(\bm{X}_0),
+\]
+then upsamples bilinearly back to $32\times 32$:
+\[
+  \bm{X}_{\mathrm{low}}
+  =
+  \mathrm{BilinearResize}(\bm{X}_{\mathrm{coarse}}, 32, 32).
+\]
+The timestep-interpolated target is
+\[
+  \bm{X}_{\mathrm{tgt},b}
+  =
+  (1-\tau_b)\bm{X}_{\mathrm{low},b}
+  +
+  \tau_b \bm{X}_{0,b}.
+\]
+This interpolated latent target is then patchified back to the transformer token layout:
+\[
+  \bm{X}^{\mathrm{patch}}_{\mathrm{tgt}}
+  \in
+  \mathbb{R}^{B\times 256\times 16},
+\]
+where
+\[
+  16 = p^2 C = 2^2\cdot 4
+\]
+is the latent patch dimension. Finally, the same patch-embedding layer and positional encoding used by the DiT map these target tokens into hidden-feature space:
+\[
+  \widetilde{\bm{X}}_{\mathrm{tgt}}
+  =
+  E_{\mathrm{patch}}\!\left(\bm{X}^{\mathrm{patch}}_{\mathrm{tgt}}\right)
+  \in
+  \mathbb{R}^{B\times 256\times D}
+  \cong
+  \mathbb{R}^{B\times 16\times 16\times D}.
+\]
+Consequently, both the feature branch and the target branch live in the same token-grid feature space:
+\[
+  \bm{Z},\ \widetilde{\bm{X}}_{\mathrm{tgt}}
+  \in
+  \mathbb{R}^{B\times 16\times 16\times D}.
+\]
+This is why the local Gram matrices in the spatial loss now sum over the DiT hidden size $D$: the comparison happens after the target has been patchified and embedded back into the same feature space as $\bm{Z}$.
+
+\subsection*{7. Local Gram spatial loss}
+Let the sliding window size be $s$ and stride be $\Delta$, corresponding to
+\[
+  s = \texttt{spatial\_window\_size},
+  \qquad
+  \Delta = \texttt{spatial\_window\_stride}.
+\]
+Both $\bm{Z}$ and $\widetilde{\bm{X}}_{\mathrm{tgt}}$ are decomposed into all valid local windows of size $s\times s$ over the $16\times 16$ token grid. A window contains
+\[
+  M = s^2
+\]
+token positions. The number of valid window locations per spatial axis is
+\[
+  n_{\Omega}
+  =
+  \left\lfloor \frac{16-s}{\Delta}\right\rfloor + 1,
+\]
+so the total number of windows is
+\[
+  |\Omega| = n_{\Omega}^2.
+\]
+After window extraction, both tensors have shape
+\[
+  \bm{Z}_{\mathrm{win}},
+  \widetilde{\bm{X}}^{\mathrm{win}}_{\mathrm{tgt}}
+  \in
+  \mathbb{R}^{B\times |\Omega|\times M\times D}.
+\]
+To avoid confusion:
+\begin{itemize}
+  \item if one stops \emph{before} the projector, the common representation is naturally viewed as a $16\times 16\times D$ token grid,
+  \item after applying the timestep-conditioned projector $\Pi_{\mathrm{sp}}$, the resulting tensor $\bm{Z}$ still remains a $16\times 16\times D$ token grid,
+  \item the target branch is first built in latent space, but it is then patchified and embedded into $\widetilde{\bm{X}}_{\mathrm{tgt}}\in\mathbb{R}^{B\times 16\times 16\times D}$,
+  \item the sliding windows in this subsection are extracted from those two feature tensors.
+\end{itemize}
+The dimensions should be read as follows:
+\begin{itemize}
+  \item $B$: batch size,
+  \item $|\Omega|$: number of sliding-window locations,
+  \item $M=s^2$: number of token positions inside one window,
+  \item $D$: DiT hidden channels at each token position.
+\end{itemize}
+Thus the spatial loss does \emph{not} compare channels against each other. Instead, inside each window it compares the $M$ token positions through their $D$-dimensional feature vectors.
+
+For each batch item $b$, window location $w$, and position indices $u,v\in\{1,\dots,M\}$, the implementation forms local Gram matrices
+\[
+  G^{\mathrm{feat}}_{b,w,u,v}
+  =
+  \sum_{c=1}^{D}
+  Z_{b,w,u,c}\, Z_{b,w,v,c},
+\]
+\[
+  G^{\mathrm{tgt}}_{b,w,u,v}
+  =
+  \sum_{c=1}^{D}
+  \widetilde{X}^{\mathrm{tgt}}_{b,w,u,c}\, \widetilde{X}^{\mathrm{tgt}}_{b,w,v,c},
+\]
+where the target branch is detached.
+Equivalently, for fixed $(b,w)$, the code treats the window as a matrix
+\[
+  \bm{Z}_{b,w} \in \mathbb{R}^{M\times D},
+  \qquad
+  \widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w} \in \mathbb{R}^{M\times D},
+\]
+and then computes
+\[
+  \bm{G}^{\mathrm{feat}}_{b,w} = \bm{Z}_{b,w}\bm{Z}_{b,w}^{\top},
+  \qquad
+  \bm{G}^{\mathrm{tgt}}_{b,w}
+  =
+  \widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}
+  \left(\widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}\right)^{\top}.
+\]
+Therefore
+\[
+  \bm{G}^{\mathrm{feat}},
+  \bm{G}^{\mathrm{tgt}}
+  \in
+  \mathbb{R}^{B\times |\Omega|\times M\times M}.
+\]
+The two indices $(u,v)$ do not index channels. They index a pair of token positions inside the same local window. The entry
+\[
+  G^{\mathrm{feat}}_{b,w,u,v}
+\]
+is the inner product between the $D$-channel token feature at position $u$ and the $D$-channel token feature at position $v$ within that window.
+
+The spatial auxiliary loss is the mean absolute Gram mismatch:
+\[
+  \ell_{\mathrm{spatial}}
+  =
+  \frac{1}{B |\Omega| M^2}
+  \sum_{b=1}^{B}
+  \sum_{w\in\Omega}
+  \sum_{u=1}^{M}
+  \sum_{v=1}^{M}
+  \left|
+    G^{\mathrm{feat}}_{b,w,u,v}
+    -
+    \StopGrad\!\left(G^{\mathrm{tgt}}_{b,w,u,v}\right)
+  \right|,
+\]
+where $\Omega$ is the set of sliding-window locations.
+For a concrete example, if $s=3$ and $\Delta=1$, then
+\[
+  M = 3^2 = 9,
+  \qquad
+  |\Omega| = (16-3+1)^2 = 14^2 = 196.
+\]
+In that case the window tensors have shape
+\[
+  \mathbb{R}^{B\times 196\times 9\times D},
+\]
+and the corresponding Gram tensors have shape
+\[
+  \mathbb{R}^{B\times 196\times 9\times 9}.
+\]
+So the loss averages an $\ell_1$ mismatch over batch items, over $196$ window locations, and over all $9\times 9$ pairs of token positions within each window.
+
+\subsection*{8. Cosine-squared diversity loss on private residuals}
+For each sampled layer $\ell\in\mathcal{W}$, the private activation is globally average-pooled over tokens:
+\[
+  \bm{q}_\ell[b,:]
+  =
+  \frac{1}{N_{\mathrm{tok}}}
+  \sum_{n=1}^{N_{\mathrm{tok}}}
+  \bm{A}^{\mathrm{priv}}_\ell[b,n,:]
+  \in \mathbb{R}^{D}.
+\]
+It is then $\ell_2$-normalized:
+\[
+  \hat{\bm{q}}_\ell[b,:]
+  =
+  \frac{\bm{q}_\ell[b,:]}{\|\bm{q}_\ell[b,:]\|_2 + \varepsilon}.
+\]
+For all distinct layer pairs $(\ell_i,\ell_j)$ inside the sampled window, define
+\[
+  c_{ij}(b)
+  =
+  \hat{\bm{q}}_{\ell_i}[b,:]^\top \hat{\bm{q}}_{\ell_j}[b,:].
+\]
+The diversity loss is the batch-and-pair average of squared cosine similarities:
+\[
+  \ell_{\mathrm{div}}
+  =
+  \frac{1}{B |\mathcal{P}|}
+  \sum_{b=1}^{B}
+  \sum_{(\ell_i,\ell_j)\in\mathcal{P}}
+  c_{ij}(b)^2,
+\]
+where
+\[
+  \mathcal{P} = \{(\ell_i,\ell_j): \ell_i < \ell_j,\ \ell_i,\ell_j \in \mathcal{W}\}.
+\]
+Thus the optimum encourages private summaries from different layers to be orthogonal after global average pooling.
+
+\subsection*{9. Total loss and schedules}
+The total objective is
+\[
+  \mathcal{L}
+  =
+  \ell_{\mathrm{diff}}
+  +
+  \lambda_{\mathrm{spatial}}^{\mathrm{eff}} \ell_{\mathrm{spatial}}
+  +
+  \lambda_{\mathrm{private}}^{\mathrm{eff}} \ell_{\mathrm{div}}.
+\]
+In the CLI, the diversity coefficient uses \texttt{--lambda-private} and also accepts the alias \texttt{--lambda-div}.
+
+\subsubsection*{9.1 Private-loss warmup}
+Let $t$ be the current training step, $t_0=\texttt{private\_start\_step}$, and $T=\texttt{private\_warmup\_iters}$. Then
+\[
+  \lambda_{\mathrm{private}}^{\mathrm{eff}}(t)
+  =
+  \lambda_{\mathrm{private}} \cdot \gamma_{\mathrm{private}}(t),
+\]
+with
+\[
+  \gamma_{\mathrm{private}}(t)
+  =
+  \begin{cases}
+    0, & t < t_0,\\[4pt]
+    1, & t\ge t_0 \text{ and } T\le 0,\\[4pt]
+    \mathrm{clip}\!\left(\dfrac{t-t_0+1}{T}, 0, 1\right),
+    & t\ge t_0 \text{ and } T>0.
+  \end{cases}
+\]
+
+\subsubsection*{9.2 Spatial-loss decay}
+Let $t_{\mathrm{stop}}=\texttt{spatial\_stop\_step}$ and $T_{\mathrm{stop}}=\texttt{spatial\_stop\_warmup\_iters}$. Then
+\[
+  \lambda_{\mathrm{spatial}}^{\mathrm{eff}}(t)
+  =
+  \lambda_{\mathrm{spatial}} \cdot \gamma_{\mathrm{spatial}}(t),
+\]
+where
+\[
+  \gamma_{\mathrm{spatial}}(t)
+  =
+  \begin{cases}
+    1, & t_{\mathrm{stop}} < 0,\\[4pt]
+    1, & t < t_{\mathrm{stop}},\\[4pt]
+    0, & t\ge t_{\mathrm{stop}} \text{ and } T_{\mathrm{stop}}\le 0,\\[4pt]
+    1-\mathrm{clip}\!\left(\dfrac{t-t_{\mathrm{stop}}+1}{T_{\mathrm{stop}}}, 0, 1\right),
+    & t\ge t_{\mathrm{stop}} \text{ and } T_{\mathrm{stop}}>0.
+  \end{cases}
+\]
+
+\subsection*{10. High-level algorithm per training step}
+\begin{enumerate}
+  \item Sample per-example timesteps $\tau_b\sim\mathcal{U}(0,1)$ and Gaussian noise $\bm{x}_1\sim\mathcal{N}(\bm{0},\bm{I})$.
+  \item Build
+  \[
+    \bm{x}_\tau = (1-\bm{\tau})\bm{x}_1 + \bm{\tau}\bm{x}_0,
+    \qquad
+    \bm{t} = \bm{x}_0 - \bm{x}_1.
+  \]
+  \item Run the DiT on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to get $\hat{\bm{v}}_\theta$ and block activations $\{\bm{A}_\ell\}_{\ell=1}^{L}$.
+  \item Uniformly sample a consecutive block window of size $m$.
+  \item Apply token-wise LayerNorm, average the window activations, detach, and compute the rank-$k$ shared subspace via truncated SVD.
+  \item Project each normalized activation onto the shared subspace to obtain $\bm{A}^{\mathrm{com}}_\ell$, and subtract to obtain $\bm{A}^{\mathrm{priv}}_\ell$.
+  \item Average the common activations over the window, apply the timestep-conditioned projector $\Pi_{\mathrm{sp}}$ to obtain $\bm{Z}\in\mathbb{R}^{B\times 16\times 16\times D}$, patchify and embed the coarse timestep-interpolated target into the same space, and compute the local Gram loss there.
+  \item Global-average-pool each private layer over tokens and compute the cosine-squared diversity loss over all distinct layer pairs.
+  \item Form
+  \[
+    \mathcal{L}
+    =
+    \ell_{\mathrm{diff}}
+    +
+    \lambda_{\mathrm{spatial}}^{\mathrm{eff}} \ell_{\mathrm{spatial}}
+    +
+    \lambda_{\mathrm{private}}^{\mathrm{eff}} \ell_{\mathrm{div}},
+  \]
+  then backpropagate through the online model parameters.
+\end{enumerate}
+
+\end{document}

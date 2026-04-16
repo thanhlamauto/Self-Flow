@@ -310,6 +310,23 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.patch_embed = PatchedPatchEmbed(
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
+            name="PatchedPatchEmbed_0",
+        )
+        self.t_embedder = TimestepEmbedder(
+            hidden_size=self.hidden_size,
+            name="TimestepEmbedder_0",
+        )
+        self.y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=0.0,
+            name="LabelEmbedder_0",
+        )
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
         if self.common_spatial_projector not in ("identity", "cnn"):
             raise ValueError(
@@ -326,12 +343,47 @@ class SelfFlowDiT(nn.Module):
             )
         else:
             self.common_spatial_projector_head = None
+        self.common_spatial_projector_to_hidden = (
+            nn.Dense(
+                self.hidden_size,
+                name="common_spatial_projector_to_hidden",
+            )
+            if self.common_spatial_projector_head is not None
+            else None
+        )
+        self.common_spatial_projector_norm = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            name="common_spatial_projector_norm",
+        )
+        self.common_spatial_projector_modulation = nn.Dense(
+            2 * self.hidden_size,
+            name="common_spatial_projector_modulation",
+        )
 
-    def project_common_spatial(self, common_tokens: jax.Array) -> jax.Array:
-        """Optionally project A_common through a locality-preserving CNN head."""
-        if self.common_spatial_projector_head is None:
-            return common_tokens
-        return self.common_spatial_projector_head(common_tokens)
+    def project_common_spatial(self, common_tokens: jax.Array, timesteps: jax.Array) -> jax.Array:
+        """Project A_common into a timestep-conditioned token-space tensor Z."""
+        if self.common_spatial_projector_head is not None:
+            common_tokens = self.common_spatial_projector_head(common_tokens)
+            common_tokens = self.common_spatial_projector_to_hidden(common_tokens)
+
+        timesteps = 1.0 - timesteps
+        timestep_features = self.t_embedder(timesteps)
+        shift, scale = jnp.split(
+            self.common_spatial_projector_modulation(nn.swish(timestep_features)),
+            2,
+            axis=-1,
+        )
+        return modulate(
+            self.common_spatial_projector_norm(common_tokens),
+            shift,
+            scale,
+        )
+
+    def project_spatial_target(self, target_tokens: jax.Array) -> jax.Array:
+        """Embed patchified latent targets into the same token-space dimension as A_common."""
+        return self.patch_embed(target_tokens) + self.pos_embed_val
 
     @nn.compact
     def __call__(
@@ -351,42 +403,40 @@ class SelfFlowDiT(nn.Module):
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
 
+        input_tokens = x
+
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
         # Patch Embedding
-        x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
-        )(x)
+        x = self.patch_embed(x)
         x = x + self.pos_embed_val
 
-        if self.common_spatial_projector_head is not None and self.is_mutable_collection("params"):
+        if self.is_mutable_collection("params"):
             # Initialize projector params even though the head is only used by the aux-loss path.
-            _ = self.project_common_spatial(jnp.zeros_like(x))
-
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
+            _ = self.project_common_spatial(
+                jnp.zeros_like(x),
+                jnp.zeros((x.shape[0],), dtype=timesteps.dtype),
+            )
+            _ = self.project_spatial_target(jnp.zeros_like(input_tokens))
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
             if timesteps.ndim == 1:
-                t_emb = t_embedder(timesteps)
+                t_emb = self.t_embedder(timesteps)
                 t_emb = jnp.tile(t_emb[:, None, :], (1, seq_len, 1))
             elif timesteps.ndim == 2:
                 t_flat = timesteps.reshape(-1)
-                t_emb_flat = t_embedder(t_flat)
+                t_emb_flat = self.t_embedder(t_flat)
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
             
-            y_emb = y_embedder(vector, deterministic=deterministic)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
-            t_emb = t_embedder(timesteps)
-            y_emb = y_embedder(vector, deterministic=deterministic)
+            t_emb = self.t_embedder(timesteps)
+            y_emb = self.y_embedder(vector, deterministic=deterministic)
 
         c = t_emb + y_emb
 
