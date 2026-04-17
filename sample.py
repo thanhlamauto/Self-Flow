@@ -25,7 +25,7 @@ import collections.abc
 
 # Import from local src/ folder
 from flax.training import checkpoints as flax_ckpt
-from src.model import SelfFlowDiT
+from src.model import DEFAULT_MODEL_DTYPE, DEFAULT_PARAM_DTYPE, SelfFlowDiT
 from src.sampling import denoise_loop
 
 
@@ -51,6 +51,8 @@ def _model_config_for_size(model_size):
         num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        model_dtype=DEFAULT_MODEL_DTYPE,
+        param_dtype=DEFAULT_PARAM_DTYPE,
     )
 
 
@@ -84,14 +86,28 @@ def load_model(ckpt_path=None, model_size="XL"):
       - Flat checkpoints that include a legacy "feature_head": drop that key.
     """
     config = _model_config_for_size(model_size)
-    model = SelfFlowDiT(**config, per_token=False)
+    model = SelfFlowDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=False,
+        dtype=config["model_dtype"],
+        param_dtype=config["param_dtype"],
+    )
 
     # Initialize parameters with random key
     key = jax.random.PRNGKey(0)
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-    dummy_x = jnp.ones((1, n_patches, patch_dim))
-    dummy_t = jnp.ones((1,))
+    dummy_x = jnp.ones((1, n_patches, patch_dim), dtype=config["model_dtype"])
+    dummy_t = jnp.ones((1,), dtype=jnp.float32)
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)

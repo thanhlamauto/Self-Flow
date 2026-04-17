@@ -17,6 +17,8 @@ from einops import rearrange
 XAVIER_UNIFORM = nn.initializers.xavier_uniform()
 ZERO_INIT = nn.initializers.zeros
 NORMAL_002 = nn.initializers.normal(stddev=0.02)
+DEFAULT_MODEL_DTYPE = jnp.bfloat16
+DEFAULT_PARAM_DTYPE = jnp.float32
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -57,12 +59,16 @@ class PatchedPatchEmbed(nn.Module):
     in_channels: int = 3
     embed_dim: int = 768
     bias: bool = True
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         return nn.Dense(
             self.embed_dim,
             use_bias=self.bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
             name="proj",
@@ -83,6 +89,8 @@ class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations."""
     hidden_size: int
     frequency_embedding_size: int = 256
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     def timestep_embedding(self, t, dim, max_period=10000.0):
         """Create sinusoidal timestep embeddings."""
@@ -99,12 +107,16 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         x = nn.Dense(
             self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
         )(t_freq)
         x = nn.swish(x)
         x = nn.Dense(
             self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
         )(x)
@@ -116,6 +128,8 @@ class LabelEmbedder(nn.Module):
     num_classes: int
     hidden_size: int
     dropout_prob: float
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     @nn.compact
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
@@ -123,6 +137,8 @@ class LabelEmbedder(nn.Module):
         embedding_table = nn.Embed(
             num_embeddings=self.num_classes + use_cfg_embedding,
             features=self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             embedding_init=NORMAL_002,
         )
 
@@ -144,11 +160,25 @@ class DiTBlock(nn.Module):
     num_heads: int
     mlp_ratio: float = 4.0
     per_token: bool = False
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     @nn.compact
     def __call__(self, x, c):
-        norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
+        norm1 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        norm2 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
         
         if self.per_token:
@@ -156,6 +186,8 @@ class DiTBlock(nn.Module):
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Dense(
                 6 * self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
             )(nn.swish(c_flat))
@@ -168,6 +200,8 @@ class DiTBlock(nn.Module):
                 num_heads=self.num_heads,
                 qkv_features=self.hidden_size,
                 out_features=self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=XAVIER_UNIFORM,
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
@@ -179,12 +213,16 @@ class DiTBlock(nn.Module):
             mlp_fn = nn.Sequential([
                 nn.Dense(
                     mlp_hidden_dim,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
                 ),
@@ -193,6 +231,8 @@ class DiTBlock(nn.Module):
         else:
             modulation = nn.Dense(
                 6 * self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
             )(nn.swish(c))
@@ -203,6 +243,8 @@ class DiTBlock(nn.Module):
                 num_heads=self.num_heads,
                 qkv_features=self.hidden_size,
                 out_features=self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=XAVIER_UNIFORM,
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
@@ -214,12 +256,16 @@ class DiTBlock(nn.Module):
             mlp_fn = nn.Sequential([
                 nn.Dense(
                     mlp_hidden_dim,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
                 ),
@@ -235,12 +281,22 @@ class FinalLayer(nn.Module):
     patch_size: int
     out_channels: int
     per_token: bool = False
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     @nn.compact
     def __call__(self, x, c):
-        norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
+        norm_final = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         linear = nn.Dense(
             self.patch_size * self.patch_size * self.out_channels,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
         )
@@ -250,6 +306,8 @@ class FinalLayer(nn.Module):
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Dense(
                 2 * self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
             )(nn.swish(c_flat))
@@ -261,6 +319,8 @@ class FinalLayer(nn.Module):
         else:
             modulation = nn.Dense(
                 2 * self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
             )(nn.swish(c))
@@ -286,6 +346,8 @@ class SelfFlowDiT(nn.Module):
     compatibility_mode: bool = False
     per_token: bool = False
     class_dropout_prob: float = 0.1
+    dtype: jnp.dtype = DEFAULT_MODEL_DTYPE
+    param_dtype: jnp.dtype = DEFAULT_PARAM_DTYPE
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -293,7 +355,7 @@ class SelfFlowDiT(nn.Module):
         self.num_patches = self.grid_size * self.grid_size
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
-        self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.pos_embed_val = pos_embed[None, ...].astype(self.dtype)  # (1, num_patches, hidden_size)
 
     @nn.compact
     def __call__(
@@ -342,15 +404,23 @@ class SelfFlowDiT(nn.Module):
             img_size=self.input_size, 
             patch_size=self.patch_size, 
             in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
+            embed_dim=self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(x)
         x = x + self.pos_embed_val
 
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
+        t_embedder = TimestepEmbedder(
+            hidden_size=self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         y_embedder = LabelEmbedder(
             num_classes=self.num_classes,
             hidden_size=self.hidden_size,
             dropout_prob=self.class_dropout_prob,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
         if self.per_token:
@@ -381,7 +451,9 @@ class SelfFlowDiT(nn.Module):
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
+                per_token=self.per_token,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(x, c)
 
             if return_block_summaries:
@@ -401,7 +473,9 @@ class SelfFlowDiT(nn.Module):
             hidden_size=self.hidden_size,
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
-            per_token=self.per_token
+            per_token=self.per_token,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(x, c)
 
         x = self._shufflechannel(x)

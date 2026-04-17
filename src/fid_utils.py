@@ -31,6 +31,7 @@ import flax
 import flax.linen as nn
 from jax import lax
 from flax.linen.module import merge_param
+from src.jax_compat import replicate
 
 PRNGKey = Any
 Array = Any
@@ -79,7 +80,7 @@ def get_inception_network(mode: str = "pooled"):
     model = InceptionV3(pretrained=True)
     rng = jax.random.PRNGKey(0)
     params = model.init(rng, jnp.ones((1, 299, 299, 3)), return_spatial=return_spatial)
-    params = flax.jax_utils.replicate(params, devices=jax.local_devices())
+    params = replicate(params, devices=jax.local_devices())
     apply_fn = jax.pmap(functools.partial(model.apply, train=False, return_spatial=return_spatial))
     return functools.partial(apply_fn, params)
 

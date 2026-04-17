@@ -307,7 +307,6 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
         images = jnp.transpose(images, (0, 2, 3, 1))
         return ((images / 2.0 + 0.5).clip(0, 1)).astype(jnp.float32)
 
-    from flax.jax_utils import replicate
     vae_params_repl = replicate(vae_params)
     log_stage(f"[VAE-TPU] Flax VAE decode ready trên {num_devices} TPU device(s).")
     return _decode_pmap, vae_params_repl
@@ -391,6 +390,8 @@ def build_model_config(model_size):
         num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        model_dtype=DEFAULT_MODEL_DTYPE,
+        param_dtype=DEFAULT_PARAM_DTYPE,
     )
 
 
@@ -409,13 +410,13 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.training import train_state, checkpoints
-from flax import jax_utils
 import numpy as np
 try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.jax_compat import device_put_replicated, replicate, unreplicate
+from src.model import DEFAULT_MODEL_DTYPE, DEFAULT_PARAM_DTYPE, SelfFlowDiT
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -434,12 +435,18 @@ from src.metrics import (
 )
 from src.inception_is_subprocess import InceptionISSubprocess
 
+LOSS_DTYPE = jnp.float32
+
+
+def _dtype_name(dtype):
+    return jnp.dtype(dtype).name
+
 
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
+    online params. Caller should replicate both via ``src.jax_compat.replicate``.
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -453,13 +460,15 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        dtype=config["model_dtype"],
+        param_dtype=config["param_dtype"],
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
-    dummy_x = jnp.ones((1, n_patches, patch_dim))
-    dummy_t = jnp.ones((1,))
+    dummy_x = jnp.ones((1, n_patches, patch_dim), dtype=config["model_dtype"])
+    dummy_t = jnp.ones((1,), dtype=LOSS_DTYPE)
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
@@ -541,8 +550,8 @@ def resolve_layersync_config(args, depth):
 
 
 def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
+    z_weak, z_strong = (feature.astype(LOSS_DTYPE) for feature in raw_features)
+    eps = LOSS_DTYPE(1e-8)
 
     z_strong = jax.lax.stop_gradient(z_strong)
     z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
@@ -563,6 +572,7 @@ def train_step(
     ema_decay,
     layersync_lambda,
     *,
+    model_dtype,
     layersync_enabled,
     layersync_capture_layers,
 ):
@@ -579,10 +589,12 @@ def train_step(
     rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+    x0_model = x0.astype(model_dtype)
+    tau_model = tau.astype(model_dtype)
+    x1 = jax.random.normal(noise_rng, x0.shape, dtype=model_dtype)  # [B, N, D]
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+    x_tau = (1.0 - tau_model[:, None, None]) * x1 + tau_model[:, None, None] * x0_model
+    target = x0.astype(LOSS_DTYPE) - x1.astype(LOSS_DTYPE)
 
     def loss_fn(params):
         if layersync_enabled:
@@ -608,10 +620,11 @@ def train_step(
             loss_layersync = jnp.array(0.0, dtype=jnp.float32)
             layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
 
-        loss_gen = jnp.mean((pred - target) ** 2)
+        pred_f32 = pred.astype(LOSS_DTYPE)
+        loss_gen = jnp.mean((pred_f32 - target) ** 2)
         loss = loss_gen + layersync_lambda * loss_layersync
         v_abs_mean = jnp.mean(jnp.abs(target))
-        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+        v_pred_abs_mean = jnp.mean(jnp.abs(pred_f32))
         return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -655,6 +668,7 @@ def eval_step(
     rng,
     layersync_lambda,
     *,
+    model_dtype,
     layersync_enabled,
     layersync_capture_layers,
 ):
@@ -665,10 +679,12 @@ def eval_step(
     rng, tau_rng, noise_rng = jax.random.split(rng, 3)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
+    x0_model = x0.astype(model_dtype)
+    tau_model = tau.astype(model_dtype)
+    x1 = jax.random.normal(noise_rng, x0.shape, dtype=model_dtype)
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+    x_tau = (1.0 - tau_model[:, None, None]) * x1 + tau_model[:, None, None] * x0_model
+    target = x0.astype(LOSS_DTYPE) - x1.astype(LOSS_DTYPE)
 
     if layersync_enabled:
         pred, raw_features = state.apply_fn(
@@ -691,10 +707,11 @@ def eval_step(
         loss_layersync = jnp.array(0.0, dtype=jnp.float32)
         layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
 
-    loss_gen = jnp.mean((pred - target) ** 2)
+    pred_f32 = pred.astype(LOSS_DTYPE)
+    loss_gen = jnp.mean((pred_f32 - target) ** 2)
     loss = loss_gen + layersync_lambda * loss_layersync
     v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+    v_pred_abs_mean = jnp.mean(jnp.abs(pred_f32))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
@@ -861,6 +878,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        dtype=config["model_dtype"],
+        param_dtype=config["param_dtype"],
     )
 
     def sample_latents(params, class_labels, rng):
@@ -873,7 +892,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         noise = jax.random.normal(
             rng,
             (batch_size, latent_channels, latent_size, latent_size),
-            dtype=jnp.float32,
+            dtype=config["model_dtype"],
         )
 
         from einops import rearrange
@@ -886,7 +905,6 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             p1=patch_size,
             p2=patch_size,
         )
-        x = x.astype(jnp.float32)
         token_h = latent_size // patch_size
         token_w = latent_size // patch_size
 
@@ -933,7 +951,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             p2=patch_size,
             c=latent_channels,
         )
-        return samples
+        return samples.astype(LOSS_DTYPE)
 
     return jax.jit(sample_latents)
 
@@ -960,6 +978,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        dtype=config["model_dtype"],
+        param_dtype=config["param_dtype"],
     )
 
     patch_size = config["patch_size"]
@@ -974,7 +994,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         noise = jax.random.normal(
             noise_rng,
             (batch_size, latent_channels, latent_size, latent_size),
-            dtype=jnp.float32,
+            dtype=config["model_dtype"],
         )
 
         from einops import rearrange
@@ -983,7 +1003,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
             "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
             p1=patch_size,
             p2=patch_size,
-        ).astype(jnp.float32)
+        )
 
         use_cfg = cfg_scale > 1.0
         if use_cfg:
@@ -1027,7 +1047,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
             p2=patch_size,
             c=latent_channels,
         )
-        return samples.astype(jnp.float32)
+        return samples.astype(LOSS_DTYPE)
 
     return jax.pmap(_sample_latents_local, axis_name="batch")
 
@@ -1393,6 +1413,11 @@ def main():
         f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
+        f"Precision: model_compute={_dtype_name(config['model_dtype'])} "
+        f"param={_dtype_name(config['param_dtype'])} "
+        f"loss={_dtype_name(LOSS_DTYPE)}"
+    )
+    log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
     layersync_enabled = args.layersync_lambda > 0.0
@@ -1417,11 +1442,11 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
-    state = jax_utils.replicate(state)
-    ema_params = jax_utils.replicate(ema_params)
+    state = replicate(state)
+    ema_params = replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
-    ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
+    ema_decay_rep = replicate(jnp.float32(args.ema_decay))
+    layersync_lambda_rep = replicate(jnp.float32(args.layersync_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1448,6 +1473,7 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
+            model_dtype=config["model_dtype"],
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
         ),
@@ -1456,6 +1482,7 @@ def main():
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
+            model_dtype=config["model_dtype"],
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
         ),
@@ -1615,8 +1642,8 @@ def main():
                 raise ValueError(f"Probe file missing key 'W': {args.probe_save_path!r}")
             W = np.asarray(data["W"], dtype=np.float32)
             b = np.asarray(data["b"], dtype=np.float32) if "b" in data else np.zeros((W.shape[1],), dtype=np.float32)
-            W_repl = jax.device_put_replicated(jnp.array(W), jax.local_devices())
-            b_repl = jax.device_put_replicated(jnp.array(b), jax.local_devices())
+            W_repl = device_put_replicated(jnp.array(W), jax.local_devices())
+            b_repl = device_put_replicated(jnp.array(b), jax.local_devices())
             _probe_weights[0] = (W_repl, b_repl)
         return _probe_weights[0]
 
@@ -2173,8 +2200,8 @@ def main():
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    unreplicated_params = unreplicate(state.params)
+    unreplicated_ema    = unreplicate(ema_params)
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,
