@@ -125,7 +125,7 @@ The code detaches this tensor:
 \[
   \bm{M}^{\dagger} = \StopGrad(\bm{M}).
 \]
-For each batch item $b$, it computes an SVD
+For each batch item $b$, it computes an SVD on the detached tensor
 \[
   \bm{M}^{\dagger}_b = \bm{U}_b \bm{\Sigma}_b \bm{V}_b^\top,
 \]
@@ -136,23 +136,30 @@ and extracts the first $k_{\mathrm{eff}}$ right singular vectors:
   \left[\bm{v}_{b,1}, \dots, \bm{v}_{b,k_{\mathrm{eff}}}\right]
   \in \mathbb{R}^{D\times k_{\mathrm{eff}}}.
 \]
+The implementation then keeps the SVD basis detached when it is used downstream:
+\[
+  \bm{Q}_b^{\dagger} = \StopGrad(\bm{Q}_b).
+\]
 Equivalently, the shared projector is
 \[
-  \bm{P}_b = \bm{Q}_b \bm{Q}_b^\top \in \mathbb{R}^{D\times D}.
+  \bm{P}_b = \bm{Q}_b^{\dagger}(\bm{Q}_b^{\dagger})^\top \in \mathbb{R}^{D\times D}.
 \]
 The implementation does not explicitly materialize $\bm{P}_b$; it applies the projector as
 \[
   \tilde{\bm{A}}_\ell \bm{P}
   =
-  (\tilde{\bm{A}}_\ell \bm{Q}) \bm{Q}^\top.
+  (\tilde{\bm{A}}_\ell \bm{Q}^{\dagger}) (\bm{Q}^{\dagger})^\top.
 \]
+So the whole basis-construction path behaves as a stop-gradient target extractor: gradients do not flow through $\bm{M}$, the SVD outputs, $\bm{Q}$, or $(\bm{Q})^\top$. Only the activation tensor being projected remains differentiable.
 
 \subsection*{5. Common-private decomposition}
 For each layer $\ell$ inside the sampled window,
 \[
   \bm{A}^{\mathrm{com}}_\ell[b,:,:]
   =
-  \tilde{\bm{A}}_\ell[b,:,:]\bm{P}_b,
+  \tilde{\bm{A}}_\ell[b,:,:]\bm{P}_b
+  =
+  \bigl(\tilde{\bm{A}}_\ell[b,:,:]\bm{Q}_b^{\dagger}\bigr)(\bm{Q}_b^{\dagger})^\top,
 \]
 and the private residual is
 \[
@@ -168,8 +175,6 @@ The common activation used by the spatial branch is the mean over the sampled wi
   \in
   \mathbb{R}^{B\times N_{\mathrm{tok}}\times D}.
 \]
-This same tensor also serves as the shared reference for the private-loss residuals defined later.
-The per-layer residuals $\bm{A}^{\mathrm{priv}}_\ell$ inside the consecutive window remain a useful decomposition view, but the actual diversity loss is applied to a separate randomly sampled layer set described in Section 8.
 
 \subsection*{6. Spatial projector and coarse target}
 \subsubsection*{6.1 Common-to-latent projector}
@@ -189,7 +194,7 @@ back to patchified latent tokens using
 where:
 \begin{itemize}
   \item $\Pi_{\mathrm{base}}$ is controlled by \texttt{common\_spatial\_projector}; it is either identity or a small CNN applied on the $16\times 16$ token grid, followed by a linear map back to the DiT hidden size $D$,
-  \item $\Pi_{\tau}$ is a timestep-conditioned affine modulation applied after token-wise normalization. In the implementation it reuses the same timestep embedder as the DiT backbone, with the same internal time convention as the main forward pass, so the projection explicitly depends on which flow timestep $\tau$ the current example belongs to. The additive shift vector $\bm{h}_b$ is zero-initialized, whereas the multiplicative scale vector is learned with the default Dense initialization.
+  \item $\Pi_{\tau}$ is a timestep-conditioned affine modulation applied after token-wise normalization. In the implementation it reuses the same timestep embedder as the DiT backbone, with the same internal time convention as the main forward pass, so the projection explicitly depends on which flow timestep $\tau$ the current example belongs to.
 \end{itemize}
 Before this projection, the common tensor still lives in DiT hidden-feature space. Since there are $256=16^2$ tokens, one may equivalently view it as
 \[
@@ -273,7 +278,7 @@ where
 \[
   16 = p^2 C = 2^2\cdot 4
 \]
-is the latent patch dimension. Finally, the same patch-embedding layer used by the DiT maps these target tokens into hidden-feature space:
+is the latent patch dimension. Finally, the same patch-embedding layer and positional encoding used by the DiT map these target tokens into hidden-feature space:
 \[
   \widetilde{\bm{X}}_{\mathrm{tgt}}
   =
@@ -283,7 +288,6 @@ is the latent patch dimension. Finally, the same patch-embedding layer used by t
   \cong
   \mathbb{R}^{B\times 16\times 16\times D}.
 \]
-Before entering the Gram loss, this target token tensor is also passed through the same token-wise LayerNorm operator described earlier, but without any timestep-conditioned modulation.
 Consequently, both the feature branch and the target branch live in the same token-grid feature space:
 \[
   \bm{Z},\ \widetilde{\bm{X}}_{\mathrm{tgt}}
@@ -340,13 +344,13 @@ For each batch item $b$, window location $w$, and position indices $u,v\in\{1,\d
 \[
   G^{\mathrm{feat}}_{b,w,u,v}
   =
-  \frac{1}{D}\sum_{c=1}^{D}
+  \sum_{c=1}^{D}
   Z_{b,w,u,c}\, Z_{b,w,v,c},
 \]
 \[
   G^{\mathrm{tgt}}_{b,w,u,v}
   =
-  \frac{1}{D}\sum_{c=1}^{D}
+  \sum_{c=1}^{D}
   \widetilde{X}^{\mathrm{tgt}}_{b,w,u,c}\, \widetilde{X}^{\mathrm{tgt}}_{b,w,v,c},
 \]
 where the target branch is detached.
@@ -358,11 +362,11 @@ Equivalently, for fixed $(b,w)$, the code treats the window as a matrix
 \]
 and then computes
 \[
-  \bm{G}^{\mathrm{feat}}_{b,w} = \frac{1}{D}\bm{Z}_{b,w}\bm{Z}_{b,w}^{\top},
+  \bm{G}^{\mathrm{feat}}_{b,w} = \bm{Z}_{b,w}\bm{Z}_{b,w}^{\top},
   \qquad
   \bm{G}^{\mathrm{tgt}}_{b,w}
   =
-  \frac{1}{D}\widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}
+  \widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}
   \left(\widetilde{\bm{X}}^{\mathrm{tgt}}_{b,w}\right)^{\top}.
 \]
 Therefore
@@ -411,50 +415,26 @@ and the corresponding Gram tensors have shape
 So the loss averages an $\ell_1$ mismatch over batch items, over $196$ window locations, and over all $9\times 9$ pairs of token positions within each window.
 
 \subsection*{8. Cosine-squared diversity loss on private residuals}
-The diversity loss no longer uses only the consecutive window $\mathcal{W}$. Instead, after building
+For each sampled layer $\ell\in\mathcal{W}$, the private activation is globally average-pooled over tokens:
 \[
-  \bm{A}^{\mathrm{com}}_{\mathrm{mean}},
-\]
-the implementation samples a second set of distinct layer indices
-\[
-  \mathcal{R}\subseteq\{1,\dots,L\},
-  \qquad
-  |\mathcal{R}|=m,
-\]
-uniformly without replacement. These sampled layers need not be consecutive.
-
-For each sampled layer $r\in\mathcal{R}$, the code first applies the same token-wise LayerNorm:
-\[
-  \tilde{\bm{A}}_r \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D},
-\]
-and then defines the private residual by subtracting the shared common tensor:
-\[
-  \bm{R}^{\mathrm{priv}}_r
-  =
-  \tilde{\bm{A}}_r - \bm{A}^{\mathrm{com}}_{\mathrm{mean}}.
-\]
-Thus the private branch is encouraged to capture what remains in each randomly chosen layer after removing the shared common pattern distilled from the consecutive window.
-
-For each sampled layer $r\in\mathcal{R}$, the private residual is globally average-pooled over tokens:
-\[
-  \bm{q}_r[b,:]
+  \bm{q}_\ell[b,:]
   =
   \frac{1}{N_{\mathrm{tok}}}
   \sum_{n=1}^{N_{\mathrm{tok}}}
-  \bm{R}^{\mathrm{priv}}_r[b,n,:]
+  \bm{A}^{\mathrm{priv}}_\ell[b,n,:]
   \in \mathbb{R}^{D}.
 \]
 It is then $\ell_2$-normalized:
 \[
-  \hat{\bm{q}}_r[b,:]
+  \hat{\bm{q}}_\ell[b,:]
   =
-  \frac{\bm{q}_r[b,:]}{\|\bm{q}_r[b,:]\|_2 + \varepsilon}.
+  \frac{\bm{q}_\ell[b,:]}{\|\bm{q}_\ell[b,:]\|_2 + \varepsilon}.
 \]
-For all distinct layer pairs $(r_i,r_j)$ inside the random subset, define
+For all distinct layer pairs $(\ell_i,\ell_j)$ inside the sampled window, define
 \[
   c_{ij}(b)
   =
-  \hat{\bm{q}}_{r_i}[b,:]^\top \hat{\bm{q}}_{r_j}[b,:].
+  \hat{\bm{q}}_{\ell_i}[b,:]^\top \hat{\bm{q}}_{\ell_j}[b,:].
 \]
 The diversity loss is the batch-and-pair average of squared cosine similarities:
 \[
@@ -462,12 +442,12 @@ The diversity loss is the batch-and-pair average of squared cosine similarities:
   =
   \frac{1}{B |\mathcal{P}|}
   \sum_{b=1}^{B}
-  \sum_{(r_i,r_j)\in\mathcal{P}}
+  \sum_{(\ell_i,\ell_j)\in\mathcal{P}}
   c_{ij}(b)^2,
 \]
 where
 \[
-  \mathcal{P} = \{(r_i,r_j): r_i < r_j,\ r_i,r_j \in \mathcal{R}\}.
+  \mathcal{P} = \{(\ell_i,\ell_j): \ell_i < \ell_j,\ \ell_i,\ell_j \in \mathcal{W}\}.
 \]
 Thus the optimum encourages private summaries from different layers to be orthogonal after global average pooling.
 
@@ -534,10 +514,10 @@ where
   \]
   \item Run the DiT on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to get $\hat{\bm{v}}_\theta$ and block activations $\{\bm{A}_\ell\}_{\ell=1}^{L}$.
   \item Uniformly sample a consecutive block window of size $m$.
-  \item Apply token-wise LayerNorm, average the window activations, detach, and compute the rank-$k$ shared subspace via truncated SVD.
-  \item Project each normalized activation inside the consecutive window onto the shared subspace to obtain $\bm{A}^{\mathrm{com}}_\ell$, then average them to form $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$.
-  \item Apply the timestep-conditioned projector $\Pi_{\mathrm{sp}}$ to the averaged common activation $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ to obtain $\bm{Z}\in\mathbb{R}^{B\times 16\times 16\times D}$, patchify and embed the coarse timestep-interpolated target into the same space, and compute the local Gram loss there.
-  \item Independently sample $m$ random layers from the full depth, apply token-wise LayerNorm, subtract $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ to obtain private residuals, then global-average-pool them and compute the cosine-squared diversity loss over all distinct layer pairs.
+  \item Apply token-wise LayerNorm, average the window activations, detach, compute the rank-$k$ shared subspace via truncated SVD, and keep the resulting basis detached.
+  \item Project each normalized activation with the detached projector $\bm{Q}^{\dagger}(\bm{Q}^{\dagger})^\top$ to obtain $\bm{A}^{\mathrm{com}}_\ell$, and subtract to obtain $\bm{A}^{\mathrm{priv}}_\ell$.
+  \item Average the common activations over the window, apply the timestep-conditioned projector $\Pi_{\mathrm{sp}}$ to obtain $\bm{Z}\in\mathbb{R}^{B\times 16\times 16\times D}$, patchify and embed the coarse timestep-interpolated target into the same space, and compute the local Gram loss there.
+  \item Global-average-pool each private layer over tokens and compute the cosine-squared diversity loss over all distinct layer pairs.
   \item Form
   \[
     \mathcal{L}
