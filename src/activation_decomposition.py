@@ -336,17 +336,18 @@ def local_window_gram_loss(
 
 
 def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
-    """Return cosine similarities for all layer pairs `i < j`."""
+    """Return mean per-example cosine similarities for all layer pairs `i < j`."""
     num_layers = private.shape[0]
     if num_layers < 2:
         return jnp.array(0.0, dtype=private.dtype)
 
-    flattened = private.reshape(num_layers, -1)
+    flattened = private.reshape(num_layers, private.shape[1], -1)
     norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
     normalized = flattened / jnp.maximum(norms, eps)
-    cosine_matrix = normalized @ normalized.T
+    cosine_matrix = jnp.einsum("lbf,mbf->blm", normalized, normalized)
     upper_indices = jnp.triu_indices(num_layers, k=1)
-    return cosine_matrix[upper_indices]
+    pairwise_cosines = cosine_matrix[:, upper_indices[0], upper_indices[1]]
+    return jnp.mean(pairwise_cosines, axis=0)
 
 
 def _mean_pairwise_cosine_squared(
