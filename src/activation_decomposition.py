@@ -326,11 +326,11 @@ def project_onto_basis(activations: jax.Array, basis: jax.Array) -> jax.Array:
     return jnp.einsum("lbnk,bdk->lbnd", coeffs, basis)
 
 
-def gap_pairwise_cosine_squared(
+def _pairwise_cosines(
     private_activations: jax.Array,
     eps: float = 1e-8,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute the cosine-squared diversity loss after GAP over the token dimension."""
+) -> jax.Array:
+    """Return cosine similarities after flattening each layer to ``[B*N*D]``."""
     if private_activations.ndim != 4:
         raise ValueError(
             "Expected private activations with shape [L, B, N, D], "
@@ -338,18 +338,37 @@ def gap_pairwise_cosine_squared(
         )
     num_layers = private_activations.shape[0]
     if num_layers < 2:
-        zero = jnp.array(0.0, dtype=private_activations.dtype)
+        return jnp.array(0.0, dtype=private_activations.dtype)
+
+    flattened = private_activations.reshape(num_layers, -1)
+    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
+    normalized = flattened / jnp.maximum(norms, eps)
+    cosine_matrix = normalized @ normalized.T
+    upper_i, upper_j = jnp.triu_indices(num_layers, k=1)
+    return cosine_matrix[upper_i, upper_j]
+
+
+def flattened_pairwise_cosine_squared(
+    private_activations: jax.Array,
+    eps: float = 1e-8,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Match ``feat/common-private-activations`` private loss on flattened layer outputs."""
+    pairwise_cosines = _pairwise_cosines(private_activations, eps=eps)
+    if pairwise_cosines.ndim == 0:
+        zero = pairwise_cosines
         return zero, zero, zero
 
-    pooled = jnp.mean(private_activations, axis=2)
-    norms = jnp.linalg.norm(pooled, axis=-1, keepdims=True)
-    normalized = pooled / jnp.maximum(norms, eps)
-    cosine_matrix = jnp.einsum("lbd,mbd->blm", normalized, normalized)
-    upper_i, upper_j = jnp.triu_indices(num_layers, k=1)
-    pairwise_cosines = cosine_matrix[:, upper_i, upper_j]
     diversity_loss = jnp.mean(jnp.square(pairwise_cosines))
     avg_pairwise_cosine = jnp.mean(pairwise_cosines)
-    avg_private_norm = jnp.mean(jnp.squeeze(norms, axis=-1))
+    private_norms = jnp.linalg.norm(
+        private_activations.reshape(
+            private_activations.shape[0],
+            private_activations.shape[1],
+            -1,
+        ),
+        axis=-1,
+    )
+    avg_private_norm = jnp.mean(private_norms)
     return diversity_loss, avg_pairwise_cosine, avg_private_norm
 
 
@@ -452,7 +471,7 @@ def compute_aux_losses(
         )
         normalized_private_layers = token_layer_norm(sampled_private_layers)
         private_residual = normalized_private_layers - common_mean[None, ...]
-        private_loss, avg_pairwise_cosine, avg_private_norm = gap_pairwise_cosine_squared(
+        private_loss, avg_pairwise_cosine, avg_private_norm = flattened_pairwise_cosine_squared(
             private_residual
         )
     else:

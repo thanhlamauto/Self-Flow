@@ -1443,7 +1443,7 @@ def main():
         help="Number of iterations to linearly decay spatial Gram lambda to zero after spatial-stop-step.",
     )
     parser.add_argument("--lambda-private", "--lambda-div", dest="lambda_private", type=float, default=0.0,
-                        help="Weight for the cosine-squared diversity loss on private residuals.")
+                        help="Weight for the cosine-squared diversity loss on flattened private residuals.")
     parser.add_argument(
         "--private-start-step",
         type=int,
