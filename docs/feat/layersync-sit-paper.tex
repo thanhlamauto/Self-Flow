@@ -1,0 +1,268 @@
+% LaTeX doc for Overleaf
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\StopGrad}{\operatorname{StopGrad}}
+
+\begin{document}
+
+\section*{Training procedure: \texttt{feat/layersync-sit-paper}}
+
+This note summarizes the training objective implemented in branch \texttt{feat/layersync-sit-paper}. The branch uses the vanilla SiT / flow-matching velocity-regression objective on patchified latent tokens, and adds a simple \emph{LayerSync} regularizer that aligns one shallower transformer block with one deeper block.
+
+\subsection*{1. Repo-specific inputs and shapes}
+The training data are VAE latents of spatial size $32\times 32$ with $4$ channels:
+\[
+  \bm{X}_0 \in \mathbb{R}^{B\times 4\times 32\times 32}.
+\]
+The dataloader patchifies each latent with patch size $p=2$, so the model input is
+\[
+  \bm{x}_0 \in \mathbb{R}^{B\times N\times D_{\mathrm{in}}},
+\]
+with
+\[
+  N = \left(\frac{32}{2}\right)^2 = 16^2 = 256,
+  \qquad
+  D_{\mathrm{in}} = p^2 \cdot 4 = 16.
+\]
+Equivalently, for token index $(u,v)$ on the $16\times 16$ token grid,
+\[
+  \bm{x}_0[b,(u,v),:]
+  =
+  \mathrm{vec}\!\left(\bm{X}_0[b,:,2u:2u+2,\,2v:2v+2]\right),
+\]
+with the implementation's patch order $(p_1,p_2,c)$.
+
+The DiT backbone maps these patch tokens to hidden states
+\[
+  \bm{Z}_\ell \in \mathbb{R}^{B\times N\times D},
+  \qquad \ell=1,\dots,L,
+\]
+where $D$ and $L$ depend on \texttt{--model-size}:
+\[
+  (D,L)\in\{(384,12),(768,12),(1024,24),(1152,28)\}.
+\]
+
+\subsection*{2. Main flow-matching / velocity objective}
+At each training step, for every example $b$, the code samples
+\[
+  \tau_b \sim \mathcal{U}(0,1),
+\]
+and Gaussian noise
+\[
+  \bm{x}_1 \sim \mathcal{N}(\bm{0},\bm{I}),
+  \qquad
+  \bm{x}_1 \in \mathbb{R}^{B\times N\times D_{\mathrm{in}}}.
+\]
+The repo time convention is
+\[
+  \tau=0 \;\Longrightarrow\; \text{pure noise},
+  \qquad
+  \tau=1 \;\Longrightarrow\; \text{clean data}.
+\]
+Hence the interpolated input and regression target are
+\[
+  \bm{x}_{\tau,b} = (1-\tau_b)\bm{x}_{1,b} + \tau_b \bm{x}_{0,b},
+  \qquad
+  \bm{v}_b^\star = \bm{x}_{0,b} - \bm{x}_{1,b}.
+\]
+
+The model prediction is
+\[
+  \hat{\bm{v}}_\theta
+  =
+  f_\theta(\bm{x}_\tau,\bm{\tau},\bm{y}),
+\]
+where $\bm{y}$ denotes class labels.
+The main loss is the mean-squared velocity regression loss
+\[
+  \ell_{\mathrm{gen}}
+  =
+  \frac{1}{BND_{\mathrm{in}}}
+  \left\|
+    \hat{\bm{v}}_\theta - \bm{v}^\star
+  \right\|_2^2.
+\]
+
+\paragraph{Implementation detail: internal timestep embedding.}
+Inside \texttt{SelfFlowDiT}, the scalar timestep is flipped before the sinusoidal embedder:
+\[
+  \bar{\tau}_b = 1 - \tau_b.
+\]
+This is only a compatibility detail of the backbone implementation; the training objective itself is still defined by the interpolation above.
+
+\subsection*{3. Conditioning and backbone}
+Each patch token is linearly embedded, augmented with fixed 2D sine-cosine positional embeddings, and processed by $L$ DiT blocks with adaLN-Zero conditioning. The conditioning vector used by every block is
+\[
+  \bm{c}_b = e_t(\bar{\tau}_b) + e_y(\tilde{y}_b),
+\]
+where $e_t$ is the timestep embedder and $e_y$ is the class embedder.
+
+During training, the class embedder uses label dropout with probability
+\[
+  p_{\mathrm{drop}} = 0.1,
+\]
+so $\tilde{y}_b$ is either the original class label or a special null class. This is the standard classifier-free training mechanism already built into the model, not a separate auxiliary loss.
+
+\subsection*{4. LayerSync features}
+If \texttt{--layersync-lambda} is positive, the forward pass also returns two \emph{post-block} hidden states:
+\[
+  \bm{Z}^{(w)} = \bm{Z}_{\ell_w},
+  \qquad
+  \bm{Z}^{(s)} = \bm{Z}_{\ell_s},
+\]
+where
+\[
+  1 \le \ell_w < \ell_s \le L.
+\]
+The CLI arguments \texttt{--layersync-weak-layer} and \texttt{--layersync-strong-layer} specify these indices in 1-based numbering. The branch default is
+\[
+  (\ell_w,\ell_s) = (8,16),
+\]
+which is only valid when the backbone depth satisfies $L\ge 16$.
+
+\subsection*{5. LayerSync loss}
+The LayerSync loss is computed token-wise on the two selected hidden tensors.
+
+\subsubsection*{5.1 Token-wise normalization}
+For every batch item $b$ and token $n$, define
+\[
+  \tilde{\bm{z}}^{(w)}_{b,n}
+  =
+  \frac{\bm{Z}^{(w)}_{b,n,:}}
+       {\|\bm{Z}^{(w)}_{b,n,:}\|_2 + \varepsilon},
+  \qquad
+  \tilde{\bm{z}}^{(s)}_{b,n}
+  =
+  \frac{\StopGrad\!\left(\bm{Z}^{(s)}_{b,n,:}\right)}
+       {\|\bm{Z}^{(s)}_{b,n,:}\|_2 + \varepsilon},
+\]
+with $\varepsilon=10^{-8}$ in the code.
+
+The deeper feature is detached:
+\[
+  \bm{Z}^{(s)} \mapsto \StopGrad\!\left(\bm{Z}^{(s)}\right).
+\]
+So gradients flow only through the shallower layer $\ell_w$.
+
+\subsubsection*{5.2 Mean cosine alignment}
+The token-wise cosine similarity is
+\[
+  c_{b,n}
+  =
+  \left\langle
+    \tilde{\bm{z}}^{(w)}_{b,n},
+    \tilde{\bm{z}}^{(s)}_{b,n}
+  \right\rangle.
+\]
+The code averages this cosine over all batch items and all token positions:
+\[
+  \bar{c}
+  =
+  \frac{1}{BN}
+  \sum_{b=1}^{B}\sum_{n=1}^{N} c_{b,n}.
+\]
+The LayerSync loss is
+\[
+  \ell_{\mathrm{LayerSync}} = -\bar{c}.
+\]
+Therefore minimizing the total objective is equivalent to \emph{maximizing} the average cosine similarity between the shallower layer and the detached deeper layer:
+\[
+  \min \ell_{\mathrm{LayerSync}}
+  \quad\Longleftrightarrow\quad
+  \max \bar{c}.
+\]
+
+Up to an additive constant, one may also view this as minimizing
+\[
+  1-\bar{c},
+\]
+but the implementation uses $-\bar{c}$ directly.
+
+\subsection*{6. Total training objective}
+When LayerSync is enabled, the branch optimizes
+\[
+  \mathcal{L}
+  =
+  \ell_{\mathrm{gen}}
+  +
+  \lambda_{\mathrm{LS}}\,\ell_{\mathrm{LayerSync}},
+\]
+where
+\[
+  \lambda_{\mathrm{LS}} = \texttt{--layersync-lambda}.
+\]
+There is no warmup or decay schedule in this branch:
+\[
+  \lambda_{\mathrm{LS}}^{\mathrm{eff}} = \lambda_{\mathrm{LS}}
+\]
+for all training steps. If \texttt{--layersync-lambda}=0, the auxiliary term is disabled and the model reduces to plain vanilla SiT training.
+
+\subsection*{7. Optimization and EMA}
+The optimizer is AdamW with
+\[
+  \text{learning rate} = \texttt{--learning-rate},
+  \qquad
+  \text{weight decay} = 0.
+\]
+Before AdamW, the gradients are clipped by global norm:
+\[
+  \|\nabla_\theta \mathcal{L}\|_2 \le \texttt{--grad-clip},
+\]
+with default
+\[
+  \texttt{--grad-clip}=1.0.
+\]
+
+The code also maintains an exponential moving average of parameters:
+\[
+  \bm{\theta}_{\mathrm{ema}}
+  \leftarrow
+  \beta\,\bm{\theta}_{\mathrm{ema}}
+  +
+  (1-\beta)\,\bm{\theta},
+\]
+where
+\[
+  \beta = \texttt{--ema-decay},
+  \qquad
+  \text{default } \beta=0.9999.
+\]
+This EMA is used for checkpointing and sampling-time evaluation convenience; the training loss itself is computed on the online parameters $\bm{\theta}$.
+
+\subsection*{8. Step-by-step algorithm per training step}
+For one optimization step:
+\begin{enumerate}
+  \item Read a batch of patchified clean latent tokens $\bm{x}_0$ and labels $\bm{y}$.
+  \item Sample $\tau_b\sim\mathcal{U}(0,1)$ and $\bm{x}_1\sim\mathcal{N}(\bm{0},\bm{I})$.
+  \item Form
+  \[
+    \bm{x}_\tau = (1-\bm{\tau})\bm{x}_1 + \bm{\tau}\bm{x}_0,
+    \qquad
+    \bm{v}^\star = \bm{x}_0 - \bm{x}_1.
+  \]
+  \item Run the DiT backbone on $(\bm{x}_\tau,\bm{\tau},\bm{y})$.
+  \item Compute the main velocity loss $\ell_{\mathrm{gen}}$.
+  \item If LayerSync is enabled, also extract layers $(\ell_w,\ell_s)$, stop-gradient the deeper layer, compute the mean token-wise cosine $\bar{c}$, and set
+  \[
+    \ell_{\mathrm{LayerSync}}=-\bar{c}.
+  \]
+  \item Form the total loss
+  \[
+    \mathcal{L}=\ell_{\mathrm{gen}}+\lambda_{\mathrm{LS}}\ell_{\mathrm{LayerSync}}.
+  \]
+  \item Average gradients across devices, apply gradient clipping and AdamW, then update the EMA parameters.
+\end{enumerate}
+
+\subsection*{9. Interpretation}
+The branch can be summarized as follows:
+\begin{itemize}
+  \item the \textbf{main task} remains standard flow-matching / velocity regression in latent patch space,
+  \item the \textbf{auxiliary task} makes an earlier block imitate the token-wise direction of a deeper block,
+  \item the deeper block is treated as a \textbf{detached target}, so LayerSync behaves like an in-network self-distillation constraint between two depths of the same forward pass.
+\end{itemize}
+
+\end{document}

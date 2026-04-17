@@ -1,0 +1,223 @@
+% LaTeX doc for Overleaf
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\StopGrad}{\operatorname{StopGrad}}
+\newcommand{\vecv}{\operatorname{vec}}
+
+\begin{document}
+
+\section*{Training procedure: \texttt{feat/common-private-activations}}
+
+This section summarizes how training uses ``common/private activation decomposition'' to compute auxiliary losses, and how those losses are combined with the main diffusion (velocity) regression loss.
+
+\subsection*{Notation}
+Let a batch contain $B$ examples.
+\begin{itemize}
+  \item Token activations (per transformer block) have shape $\bm{x}\in \mathbb{R}^{B\times N\times D}$, where $N$ is the number of tokens and $D$ is the hidden size.
+  \item The transformer has $L$ blocks. Denote by $\bm{A}_i\in\mathbb{R}^{B\times N\times D}$ the activation after block $i$ (post-block hidden state).
+  \item The model is denoted by $v_\theta(\cdot)$; conditioning includes timestep $\tau\in[0,1]$ and label (or vector) $\bm{y}$.
+  \item Flattening across all but the layer index is denoted by $\vecv(\cdot)$.
+  \item Cosine similarity is $\cos(\bm{u},\bm{v})=\dfrac{\bm{u}^\top \bm{v}}{\|\bm{u}\|_2\|\bm{v}\|_2}$.
+  \item The code normalizes channels per token using an $\ell_2$ norm over the last dimension; in equations we include it with an implicit $\varepsilon$ for numerical stability.
+\end{itemize}
+
+\subsection*{Main diffusion (velocity) loss}
+Given a training batch $\{(\bm{x}_0,\bm{y})\}$:
+\begin{enumerate}
+  \item Sample independent timesteps for each example:
+  \[
+    \tau_b \sim \mathcal{U}(0,1),\quad b=1,\dots,B.
+  \]
+  \item Sample Gaussian noise:
+  \[
+    \bm{x}_{1,b}\sim \mathcal{N}(\bm{0},\bm{I}),\quad \bm{x}_{1}\in\mathbb{R}^{B\times N\times D}.
+  \]
+  \item Interpolate (repo convention: $\tau=0$ is pure noise, $\tau=1$ is clean data):
+  \[
+    \bm{x}_{\tau,b}=(1-\tau_b)\bm{x}_{1,b}+\tau_b \bm{x}_{0,b},
+  \]
+  and set the regression target:
+  \[
+    \bm{t}_b=\bm{x}_{0,b}-\bm{x}_{1,b}.
+  \]
+  \item Predict with the model:
+  \[
+    \hat{\bm{v}}_\theta = v_\theta(\bm{x}_\tau,\bm{\tau},\bm{y}) \in \mathbb{R}^{B\times N\times D}.
+  \]
+  \item Main loss (code uses a mean over all elements):
+  \[
+    \ell_{\text{diff}} = \frac{1}{BND}\left\|\hat{\bm{v}}_\theta - \bm{t}\right\|_2^2.
+  \]
+\end{enumerate}
+
+\subsection*{Common/private activation decomposition}
+During a forward pass with \texttt{return\_activations=True}, the model outputs activations
+\[
+  \{\bm{A}_i\}_{i=1}^L,\quad \bm{A}_i\in\mathbb{R}^{B\times N\times D}.
+\]
+\paragraph{(1) Channel normalization.}
+The code normalizes each token vector over the last dimension:
+\[
+  \hat{\bm{A}}_i[b,n,:] = \frac{\bm{A}_i[b,n,:]}{\|\bm{A}_i[b,n,:]\|_2+\varepsilon}.
+\]
+\paragraph{(2) Compute the common activation.}
+Two modes are supported via \texttt{common\_agg}.
+\begin{itemize}
+  \item \textbf{Mean aggregation}:
+  \[
+    \bm{A}_{\text{common}}=\frac{1}{L}\sum_{i=1}^L \hat{\bm{A}}_i \in \mathbb{R}^{B\times N\times D}.
+  \]
+
+  \item \textbf{Logit-normal aggregation} (\texttt{common\_agg="logit\_normal"}):
+  
+  Let layer indices use $i\in\{0,\dots,L-1\}$. Define
+  \[
+    u_i=\frac{i+\tfrac{1}{2}}{L},\qquad
+    z_i=\log\frac{u_i}{1-u_i}.
+  \]
+  For a (possibly fractional) center layer $k$:
+  \[
+    u_k=\frac{k+\tfrac{1}{2}}{L},\qquad
+    \mu=z_k.
+  \]
+  With scale $\sigma=\texttt{common\_logit\_normal\_sigma}$, form unnormalized weights
+  \[
+    \tilde{w}_i=\exp\left(-\frac{1}{2}\left(\frac{z_i-\mu}{\sigma}\right)^2\right),
+    \qquad
+    w_i=\frac{\tilde{w}_i}{\sum_{j=0}^{L-1}\tilde{w}_j}.
+  \]
+  Then
+  \[
+    \bm{A}_{\text{common}}=\sum_{i=0}^{L-1} w_i\,\hat{\bm{A}}_i.
+  \]
+  \end{itemize}
+\paragraph{(3) Detach common for private residuals.}
+The private residual uses a stop-gradient copy:
+\[
+  \bm{A}_{\text{common}}^{\dagger}=\StopGrad(\bm{A}_{\text{common}}).
+\]
+\paragraph{(4) Private residuals per layer.}
+For each block $i$:
+\[
+  \bm{A}_i^{\text{priv}}=\hat{\bm{A}}_i-\bm{A}_{\text{common}}^{\dagger}.
+\]
+This creates a separation where ``private'' is defined as the residual after removing the (detached) common component.
+
+\subsection*{Auxiliary losses for common/private activations}
+All cosine-based losses are computed after flattening activations into vectors.
+\paragraph{Flattened vectors.}
+Let
+\[
+  \bm{a}_i = \vecv\!\left(\bm{A}_i^{\text{priv}}\right)\in\mathbb{R}^{BN D},
+  \qquad
+  \bm{a}_{\text{common}}=\vecv(\bm{A}_{\text{common}})\in\mathbb{R}^{BN D}.
+  \]
+
+\subsubsection*{Private diversity loss $\ell_{\text{private}}$}
+The code computes cosine similarities for all layer pairs $i<j$ (optionally subsampled), then averages the squared cosines:
+\[
+  \ell_{\text{private}}
+  = \E_{i<j}\left[\cos\!\left(\bm{a}_i,\bm{a}_j\right)^2\right].
+ \]
+Here $\E_{i<j}$ denotes a mean over all pairs in the upper triangle of the layer-pair matrix; if \texttt{private\_max\_pairs}>0, pairs are subsampled uniformly via a RNG permutation and the mean is taken over the sampled set.
+
+\subsubsection*{Common-private cosine loss $\ell_{\text{common/private}}$}
+This term measures alignment between the flattened common vector and each private layer:
+\[
+  \ell_{\text{common/private}}
+  = \E_{i}\left[\cos\!\left(\bm{a}_{\text{common}},\bm{a}_i\right)^2\right].
+  \]
+If \texttt{common\_private\_max\_layers}>0, the layer index $i$ is sampled uniformly (via permutation) and averaged over the sampled subset.
+
+\subsubsection*{Optional spatial Gram loss $\ell_{\text{spatial}}$}
+Besides cosine-squared terms, the auxiliary loss can also match local Gram structure using a ``sliding window'' objective.
+
+Let $P(\cdot)$ be an optional projector applied to the common activation (identity or a lightweight CNN), producing
+\[
+  \bm{A}_{\text{spatial}} = 
+  \begin{cases}
+    P(\bm{A}_{\text{common}}), & \text{if }P\text{ is enabled},\\
+    \bm{A}_{\text{common}}, & \text{if }P\text{ is identity}.
+  \end{cases}
+  \]
+Let the spatial target be $\bm{X}_{\text{tgt}}=\bm{x}_0$ from the diffusion batch (optionally blurred as a function of timestep when configured).
+
+Assuming $N=H\cdot W$ tokens form a $H\times W$ grid, convert tokens to a grid and extract all valid square windows of side length $s$ (with stride $\Delta$). For each window, normalize channels per token and form a Gram matrix between token positions:
+\[
+  \bm{G}^{\text{feat}}_{b,w,m,n}
+  =
+  \sum_{c=1}^{C}
+  \tilde{X}^{\text{feat}}_{b,w,m,c}\,\tilde{X}^{\text{feat}}_{b,w,n,c},
+  \qquad
+  \bm{G}^{\text{tgt}}_{b,w,m,n}
+  =
+  \sum_{c=1}^{C}
+  \tilde{X}^{\text{tgt}}_{b,w,m,c}\,\tilde{X}^{\text{tgt}}_{b,w,n,c},
+  \]
+where $m,n\in\{1,\dots,s^2\}$ index token positions inside the window, $w$ indexes the sliding window location, and $\tilde{X}$ denotes channel-normalized window tokens (per-token $\ell_2$ normalization).
+
+The per-example spatial loss is then the mean absolute difference between Gram matrices over window locations and token-position pairs:
+\[
+  \ell_{\text{spatial}}
+  =
+  \frac{1}{B}\sum_{b=1}^{B}
+  \left[
+    \frac{1}{|\mathcal{W}|}\sum_{w\in\mathcal{W}}
+    \left(
+      \frac{1}{(s^2)^2}\sum_{m=1}^{s^2}\sum_{n=1}^{s^2}
+      \left|
+        \bm{G}^{\text{feat}}_{b,w,m,n}
+        -
+        \bm{G}^{\text{tgt}}_{b,w,m,n}
+      \right|
+    \right)
+  \right],
+ \]
+with optional example masking based on timestep range (when configured).
+
+\subsection*{Warmup and total training loss}
+The total loss combines diffusion regression with the enabled auxiliary terms:
+\[
+  \mathcal{L}
+  = \ell_{\text{diff}}
+  + \lambda_{\text{spatial}}^{\text{eff}}\ell_{\text{spatial}}
+  + \lambda_{\text{private}}^{\text{eff}}\ell_{\text{private}}
+  + \lambda_{\text{common/private}}^{\text{eff}}\ell_{\text{common/private}}.
+ \]
+For \texttt{feat/common-private-activations}, the key parts are the last two terms.
+
+\subsubsection*{Warmup schedule for private-related coefficients}
+For $\lambda\in\{\lambda_{\text{private}},\lambda_{\text{common/private}}\}$, define:
+\begin{itemize}
+  \item $s$ = current training step (integer),
+  \item $\texttt{start\_step}$ = \texttt{private\_start\_step},
+  \item $\texttt{warmup\_iters}$ = \texttt{private\_warmup\_iters}.
+\end{itemize}
+The effective coefficient is $\lambda^{\text{eff}}(s)=\lambda\cdot \texttt{warmup\_scale}(s)$, where
+\[
+  \texttt{warmup\_scale}(s)=
+  \begin{cases}
+    0, & s<\texttt{start\_step},\\[4pt]
+    1, & s\ge \texttt{start\_step}\ \text{and}\ \texttt{warmup\_iters}\le 0,\\[4pt]
+    \mathrm{clip}\!\left(\dfrac{s-\texttt{start\_step}+1}{\texttt{warmup\_iters}},\,0,\,1\right),
+      & s\ge \texttt{start\_step}\ \text{and}\ \texttt{warmup\_iters}>0.
+  \end{cases}
+ \]
+In addition, if \texttt{lambda\_common\_private}=0 then $\ell_{\text{common/private}}$ is set to zero (no need to sample the extra RNGs).
+
+\subsection*{High-level algorithm (per training step)}
+\begin{enumerate}
+  \item Sample $\tau_b\sim\mathcal{U}(0,1)$ and noise $\bm{x}_1\sim\mathcal{N}(0,\bm{I})$.
+  \item Form $\bm{x}_\tau=(1-\bm{\tau})\bm{x}_1+\bm{\tau}\bm{x}_0$ and target $\bm{t}=\bm{x}_0-\bm{x}_1$.
+  \item Run $v_\theta$ on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to get prediction $\hat{\bm{v}}_\theta$ and block activations $\{\bm{A}_i\}_{i=1}^L$.
+  \item Compute $\bm{A}_{\text{common}}$ (mean or logit-normal) and private residuals $\bm{A}_i^{\text{priv}}$ using a stop-gradient common anchor.
+  \item Compute $\ell_{\text{private}}$ and $\ell_{\text{common/private}}$ via cosine-squared losses.
+  \item Combine with $\ell_{\text{diff}}$ using warmup-scaled coefficients and backpropagate.
+\end{enumerate}
+
+\end{document}
+

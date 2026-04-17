@@ -1,0 +1,276 @@
+% LaTeX doc for Overleaf
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\StopGrad}{\operatorname{StopGrad}}
+
+\begin{document}
+
+\section*{Training procedure: \texttt{feat/private-loss-per-token-mi-paper}}
+
+This note summarizes the training objective implemented in branch \texttt{feat/private-loss-per-token-mi-paper}. The branch keeps the standard Self-Flow / vanilla SiT diffusion objective, and adds two auxiliary losses:
+\begin{itemize}
+  \item a spatial Gram loss on a common representation,
+  \item a \emph{per-token} private diversity loss, motivated as an MI-style proxy.
+\end{itemize}
+
+\subsection*{1. Main diffusion objective}
+For a batch of clean latent tokens
+\[
+  \bm{x}_0 \in \mathbb{R}^{B\times N\times D_{\mathrm{in}}},
+\]
+with class labels / conditioning vector $\bm{y}$, training samples an independent timestep for each example:
+\[
+  \tau_b \sim \mathcal{U}(0,1), \qquad b=1,\dots,B.
+\]
+Gaussian noise is sampled as
+\[
+  \bm{x}_1 \sim \mathcal{N}(\bm{0}, \bm{I}),
+\]
+and the interpolated input is
+\[
+  \bm{x}_{\tau,b} = (1-\tau_b)\bm{x}_{1,b} + \tau_b \bm{x}_{0,b}.
+\]
+The regression target is
+\[
+  \bm{t}_b = \bm{x}_{0,b} - \bm{x}_{1,b}.
+\]
+
+The model predicts a velocity-like output
+\[
+  \hat{\bm{v}}_\theta = v_\theta(\bm{x}_\tau,\bm{\tau},\bm{y}),
+\]
+and the main diffusion loss is
+\[
+  \ell_{\mathrm{diff}}
+  =
+  \frac{1}{BND_{\mathrm{in}}}
+  \left\|
+    \hat{\bm{v}}_\theta - \bm{t}
+  \right\|_2^2.
+\]
+
+\subsection*{2. Per-layer activations}
+During training with auxiliary losses enabled, the model also returns post-block activations
+\[
+  \bm{A}_i \in \mathbb{R}^{B\times N\times D},
+  \qquad i=1,\dots,L,
+\]
+where $L$ is the transformer depth, $N$ is the number of patch tokens, and $D$ is the hidden size.
+
+Before decomposition, each token vector is channel-normalized:
+\[
+  \hat{\bm{A}}_i[b,n,:]
+  =
+  \frac{\bm{A}_i[b,n,:}}
+       {\|\bm{A}_i[b,n,:]\|_2 + \varepsilon}.
+\]
+
+\subsection*{3. Common / private decomposition}
+The branch supports two ways to form a common representation.
+
+\subsubsection*{3.1 Default: common from layer activations}
+By default, the common activation is computed from the normalized layer activations.
+
+\paragraph{Mean aggregation.}
+If \texttt{common\_agg = "mean"}, then
+\[
+  \bm{A}_{\mathrm{common}}
+  =
+  \frac{1}{L}\sum_{i=1}^{L}\hat{\bm{A}}_i.
+\]
+
+\subsection*{4. Spatial Gram loss}
+Let the spatial target be the clean latent tokens $\bm{x}_0$. Assuming the token dimension corresponds to a square grid, reshape
+\[
+  \bm{A}_{\mathrm{common}} \in \mathbb{R}^{B\times N\times D}
+  \quad \text{and} \quad
+  \bm{x}_0 \in \mathbb{R}^{B\times N\times D_{\mathrm{in}}}
+\]
+into token grids of size $H\times W$ with $N=HW$.
+
+For each grid, extract all sliding windows of side length $s$ and stride $\Delta$. A window contains $M=s^2$ tokens. After channel normalization within each window, define the local Gram matrices
+\[
+  G^{\mathrm{feat}}_{b,w,m,n}
+  =
+  \sum_{c}
+  \tilde{X}^{\mathrm{feat}}_{b,w,m,c}\,
+  \tilde{X}^{\mathrm{feat}}_{b,w,n,c},
+\]
+\[
+  G^{\mathrm{tgt}}_{b,w,m,n}
+  =
+  \sum_{c}
+  \tilde{X}^{\mathrm{tgt}}_{b,w,m,c}\,
+  \tilde{X}^{\mathrm{tgt}}_{b,w,n,c},
+\]
+where $w$ indexes the spatial window location.
+
+The spatial loss is the mean absolute Gram mismatch:
+\[
+  \ell_{\mathrm{spatial}}
+  =
+  \frac{1}{B|\mathcal{W}|M^2}
+  \sum_{b=1}^{B}
+  \sum_{w\in\mathcal{W}}
+  \sum_{m=1}^{M}
+  \sum_{n=1}^{M}
+  \left|
+    G^{\mathrm{feat}}_{b,w,m,n}
+    -
+    G^{\mathrm{tgt}}_{b,w,m,n}
+  \right|.
+\]
+
+\paragraph{Optional timestep-dependent blur.}
+If \texttt{spatial\_blur\_by\_timestep} is enabled, the target grid is blurred before the Gram comparison with Gaussian standard deviation
+\[
+  \sigma_b
+  =
+  \sigma_{\max}\,\max(1-\tau_b,0),
+\]
+where $\sigma_{\max} = \texttt{spatial\_blur\_max\_sigma}$.
+
+\subsection*{5. Private loss: per-token MI proxy}
+This branch's key change is the private diversity loss.
+
+\subsubsection*{5.1 Cosine at fixed sample and token}
+For two layers $i$ and $j$, define a cosine \emph{for each sample and token separately}:
+\[
+  c_{ij}(b,n)
+  =
+  \left\langle
+    \frac{\bm{P}_i[b,n,:]}{\|\bm{P}_i[b,n,:]\|_2+\varepsilon},
+    \frac{\bm{P}_j[b,n,:]}{\|\bm{P}_j[b,n,:]\|_2+\varepsilon}
+  \right\rangle.
+\]
+Equivalently,
+\[
+  c_{ij}(b,n)=\cos\big(\bm{P}_i[b,n,:],\bm{P}_j[b,n,:]\big).
+\]
+
+Important: this compares the \emph{same} sample $b$ and the \emph{same} token index $n$ across two layers. It does \textbf{not} explicitly compare tokens from different images to each other.
+
+\subsubsection*{5.2 Averaging over layer pairs, batch, and tokens}
+Let $\mathcal{P}$ be the set of selected layer pairs:
+\begin{itemize}
+  \item if \texttt{private\_pairs} is empty, then $\mathcal{P}=\{(i,j): i<j\}$,
+  \item otherwise, $\mathcal{P}$ is the user-provided subset of layer pairs,
+  \item if \texttt{private\_max\_pairs}>0$, the branch uniformly subsamples at most that many pairs from $\mathcal{P}$ in each iteration.
+\end{itemize}
+
+The private loss is
+\[
+  \ell_{\mathrm{private}}
+  =
+  \frac{1}{|\mathcal{P}|BN}
+  \sum_{(i,j)\in\mathcal{P}}
+  \sum_{b=1}^{B}
+  \sum_{n=1}^{N}
+  \left|c_{ij}(b,n)\right|.
+\]
+
+Thus the objective encourages
+\[
+  \left|c_{ij}(b,n)\right| \approx 0,
+\]
+meaning the private vectors for the same token across different layers become decorrelated. Because the loss uses $\lvert \cos \rvert$ rather than signed cosine, both positive and negative correlations are penalized:
+\[
+  c_{ij}(b,n)=1,\quad c_{ij}(b,n)=-1
+  \quad \Longrightarrow \quad
+  \text{large penalty},
+\]
+whereas
+\[
+  c_{ij}(b,n)=0
+  \quad \Longrightarrow \quad
+  \text{minimum penalty}.
+\]
+Hence this branch uses an orthogonalization-style objective: the optimum is achieved when private vectors from different layers are orthogonal token-wise.
+
+\subsection*{6. Total loss}
+The branch uses
+\[
+  \mathcal{L}
+  =
+  \ell_{\mathrm{diff}}
+  +
+  \lambda_{\mathrm{spatial}}^{\mathrm{eff}} \ell_{\mathrm{spatial}}
+  +
+  \lambda_{\mathrm{private}}^{\mathrm{eff}} \ell_{\mathrm{private}}.
+\]
+Unlike \texttt{feat/common-private-activations}, this branch does \textbf{not} include a separate common/private cosine loss term.
+
+\subsection*{7. Coefficient schedules}
+\subsubsection*{7.1 Private-loss warmup}
+Let $s$ be the current training step, $s_0=\texttt{private\_start\_step}$, and $T=\texttt{private\_warmup\_iters}$. The effective private coefficient is
+\[
+  \lambda_{\mathrm{private}}^{\mathrm{eff}}(s)
+  =
+  \lambda_{\mathrm{private}}\cdot \gamma_{\mathrm{private}}(s),
+\]
+where
+\[
+  \gamma_{\mathrm{private}}(s)
+  =
+  \begin{cases}
+    0, & s < s_0,\\[4pt]
+    1, & s\ge s_0 \text{ and } T\le 0,\\[4pt]
+    \mathrm{clip}\!\left(\dfrac{s-s_0+1}{T},0,1\right), & s\ge s_0 \text{ and } T>0.
+  \end{cases}
+\]
+
+\subsubsection*{7.2 Spatial-loss decay}
+Let $s_{\mathrm{stop}}=\texttt{spatial\_stop\_step}$ and $T_{\mathrm{stop}}=\texttt{spatial\_stop\_warmup\_iters}$. The spatial coefficient is
+\[
+  \lambda_{\mathrm{spatial}}^{\mathrm{eff}}(s)
+  =
+  \lambda_{\mathrm{spatial}}\cdot \gamma_{\mathrm{spatial}}(s),
+\]
+with
+\[
+  \gamma_{\mathrm{spatial}}(s)
+  =
+  \begin{cases}
+    1, & s_{\mathrm{stop}} < 0,\\[4pt]
+    1, & s < s_{\mathrm{stop}},\\[4pt]
+    0, & s\ge s_{\mathrm{stop}} \text{ and } T_{\mathrm{stop}}\le 0,\\[4pt]
+    1-\mathrm{clip}\!\left(\dfrac{s-s_{\mathrm{stop}}+1}{T_{\mathrm{stop}}},0,1\right),
+    & s\ge s_{\mathrm{stop}} \text{ and } T_{\mathrm{stop}}>0.
+  \end{cases}
+\]
+
+\subsection*{8. Step-by-step training algorithm}
+For each optimization step:
+\begin{enumerate}
+  \item Sample $\tau_b\sim\mathcal{U}(0,1)$ and $\bm{x}_1\sim\mathcal{N}(\bm{0},\bm{I})$.
+  \item Build $\bm{x}_\tau=(1-\bm{\tau})\bm{x}_1+\bm{\tau}\bm{x}_0$ and target $\bm{t}=\bm{x}_0-\bm{x}_1$.
+  \item Run the model on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to obtain prediction $\hat{\bm{v}}_\theta$ and activations $\{\bm{A}_i\}_{i=1}^L$.
+  \item Form a common representation either from the activations (mean or logit-normal aggregation) or from a learned common tensor.
+  \item Compute the spatial Gram loss on the common representation.
+  \item Compute the private per-token loss by comparing the same token across selected layer pairs.
+  \item Form
+  \[
+    \mathcal{L}
+    =
+    \ell_{\mathrm{diff}}
+    +
+    \lambda_{\mathrm{spatial}}^{\mathrm{eff}} \ell_{\mathrm{spatial}}
+    +
+    \lambda_{\mathrm{private}}^{\mathrm{eff}} \ell_{\mathrm{private}}.
+  \]
+  \item Backpropagate and update parameters (with EMA on model parameters in the training loop).
+\end{enumerate}
+
+\subsection*{9. Main conceptual difference from the flattened private loss}
+The earlier ``flatten everything'' style computes one cosine per pair of layers after collapsing all batch items and all tokens into a single vector. In contrast, this branch computes cosine \emph{locally} at each $(b,n)$:
+\[
+  c_{ij}(b,n)=\cos(\bm{P}_i[b,n,:], \bm{P}_j[b,n,:]),
+\]
+then averages over $b$, $n$, and layer pairs. Therefore the private loss no longer mixes different images together inside one global cosine statistic.
+
+\end{document}
+
