@@ -13,6 +13,7 @@ DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_ACTIVATION_WINDOW_SIZE = 4
 DEFAULT_SHARED_SUBSPACE_RANK = 6
+DEFAULT_PRIVATE_MAX_PAIRS = DEFAULT_ACTIVATION_WINDOW_SIZE
 DEFAULT_COARSE_TARGET_SIZE = 4
 DEFAULT_PATCH_SIZE = 2
 DEFAULT_LATENT_CHANNELS = 4
@@ -84,6 +85,28 @@ def sample_activation_subset(
         layer_indices = jnp.arange(total_layers, dtype=jnp.int32)
     subset = jnp.take(activations, layer_indices, axis=0)
     return subset, layer_indices
+
+
+def sample_layer_pairs(
+    num_layers: int,
+    *,
+    rng: jax.Array | None,
+    max_pairs: int,
+) -> tuple[jax.Array, int]:
+    """Sample distinct layer pairs ``(i, j)`` with ``i < j``."""
+    if num_layers < 2:
+        return jnp.zeros((0, 2), dtype=jnp.int32), 0
+
+    upper_i, upper_j = jnp.triu_indices(num_layers, k=1)
+    num_available = int(upper_i.shape[0])
+    selected_count = num_available if max_pairs <= 0 else min(max(int(max_pairs), 1), num_available)
+    if selected_count < num_available:
+        if rng is None:
+            raise ValueError("An RNG key is required when sampling random layer pairs.")
+        selected_indices = jnp.sort(jax.random.permutation(rng, num_available)[:selected_count])
+    else:
+        selected_indices = jnp.arange(num_available, dtype=jnp.int32)
+    return jnp.stack([upper_i[selected_indices], upper_j[selected_indices]], axis=-1), selected_count
 
 
 def extract_sliding_windows(
@@ -307,23 +330,39 @@ def shared_subspace_basis(
     mean_activations: jax.Array,
     *,
     rank: int,
+    stopgrad_basis: bool = True,
 ) -> tuple[jax.Array, int]:
-    """Compute the detached right-singular-vector basis ``Q_t`` for each batch item."""
+    """Compute the right-singular-vector basis ``Q_t`` for each batch item."""
     if mean_activations.ndim != 3:
         raise ValueError(
             f"Expected mean activations with rank 3, got shape {mean_activations.shape}"
         )
     effective_rank = min(max(int(rank), 1), mean_activations.shape[-2], mean_activations.shape[-1])
-    detached_mean = jax.lax.stop_gradient(mean_activations).astype(jnp.float32)
-    _, _, vh = jnp.linalg.svd(detached_mean, full_matrices=False)
+    svd_input = mean_activations
+    if stopgrad_basis:
+        svd_input = jax.lax.stop_gradient(svd_input)
+    _, _, vh = jnp.linalg.svd(svd_input.astype(jnp.float32), full_matrices=False)
     basis = jnp.swapaxes(vh[:, :effective_rank, :], 1, 2).astype(mean_activations.dtype)
-    return jax.lax.stop_gradient(basis), effective_rank
+    if stopgrad_basis:
+        basis = jax.lax.stop_gradient(basis)
+    return basis, effective_rank
 
 
-def project_onto_basis(activations: jax.Array, basis: jax.Array) -> jax.Array:
+def project_onto_basis(
+    activations: jax.Array,
+    basis: jax.Array,
+    *,
+    stopgrad_basis: bool = True,
+) -> jax.Array:
     """Apply ``A @ (Q Q^T)`` without explicitly materializing the dense projector."""
-    coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, basis)
-    return jnp.einsum("lbnk,bdk->lbnd", coeffs, basis)
+    projector_basis = basis
+    if stopgrad_basis:
+        projector_basis = jax.lax.stop_gradient(projector_basis)
+    projector_basis_t = jnp.swapaxes(projector_basis, 1, 2)
+    if stopgrad_basis:
+        projector_basis_t = jax.lax.stop_gradient(projector_basis_t)
+    coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, projector_basis)
+    return jnp.einsum("lbnk,bkd->lbnd", coeffs, projector_basis_t)
 
 
 def gap_pairwise_cosine_squared(
@@ -353,6 +392,64 @@ def gap_pairwise_cosine_squared(
     return diversity_loss, avg_pairwise_cosine, avg_private_norm
 
 
+def shuffled_gap_pairwise_cosine_squared(
+    left_private_activations: jax.Array,
+    right_private_activations: jax.Array,
+    *,
+    rng: jax.Array | None,
+    eps: float = 1e-8,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compare random layer pairs after GAP, with a batch derangement on the right side."""
+    if left_private_activations.shape != right_private_activations.shape:
+        raise ValueError(
+            "Left/right private activations must have matching shapes, "
+            f"got {left_private_activations.shape} vs {right_private_activations.shape}"
+        )
+    if left_private_activations.ndim != 4:
+        raise ValueError(
+            "Expected private activations with shape [P, B, N, D], "
+            f"got {left_private_activations.shape}"
+        )
+
+    num_pairs, batch_size = left_private_activations.shape[:2]
+    if num_pairs == 0:
+        zero = jnp.array(0.0, dtype=left_private_activations.dtype)
+        return zero, zero, zero
+
+    pooled_left = jnp.mean(left_private_activations, axis=2)
+    pooled_right = jnp.mean(right_private_activations, axis=2)
+    left_norms = jnp.linalg.norm(pooled_left, axis=-1, keepdims=True)
+    right_norms = jnp.linalg.norm(pooled_right, axis=-1, keepdims=True)
+    normalized_left = pooled_left / jnp.maximum(left_norms, eps)
+    normalized_right = pooled_right / jnp.maximum(right_norms, eps)
+    avg_private_norm = 0.5 * (
+        jnp.mean(jnp.squeeze(left_norms, axis=-1))
+        + jnp.mean(jnp.squeeze(right_norms, axis=-1))
+    )
+
+    if batch_size < 2:
+        zero = jnp.array(0.0, dtype=left_private_activations.dtype)
+        return zero, zero, avg_private_norm
+    if rng is None:
+        raise ValueError("An RNG key is required when shuffling private layer pairs.")
+
+    pair_rngs = jax.random.split(rng, num_pairs)
+    shifts = jax.vmap(
+        lambda key: jax.random.randint(key, shape=(), minval=1, maxval=batch_size)
+    )(pair_rngs)
+    batch_indices = jnp.arange(batch_size, dtype=jnp.int32)
+    shuffled_indices = (batch_indices[None, :] + shifts[:, None]) % batch_size
+    shuffled_right = jnp.take_along_axis(
+        normalized_right,
+        shuffled_indices[..., None],
+        axis=1,
+    )
+    pairwise_cosines = jnp.sum(normalized_left * shuffled_right, axis=-1)
+    diversity_loss = jnp.mean(jnp.square(pairwise_cosines))
+    avg_pairwise_cosine = jnp.mean(pairwise_cosines)
+    return diversity_loss, avg_pairwise_cosine, avg_private_norm
+
+
 def compute_aux_losses(
     activations: Any,
     spatial_target: jax.Array,
@@ -361,6 +458,8 @@ def compute_aux_losses(
     layer_window_rng: jax.Array | None,
     layer_window_size: int = DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank: int = DEFAULT_SHARED_SUBSPACE_RANK,
+    private_max_pairs: int = DEFAULT_PRIVATE_MAX_PAIRS,
+    shared_subspace_stopgrad: bool = True,
     compute_spatial_loss: bool = True,
     compute_diversity_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
@@ -384,9 +483,12 @@ def compute_aux_losses(
         )
 
     common_window_rng = layer_window_rng
-    private_subset_rng = layer_window_rng
+    private_pair_rng = layer_window_rng
+    private_shuffle_rng = layer_window_rng
     if layer_window_rng is not None and compute_diversity_loss:
-        common_window_rng, private_subset_rng = jax.random.split(layer_window_rng)
+        common_window_rng, private_pair_rng, private_shuffle_rng = jax.random.split(
+            layer_window_rng, 3
+        )
 
     windowed_activations, window_start = sample_activation_window(
         activations,
@@ -398,9 +500,14 @@ def compute_aux_losses(
     basis, effective_rank = shared_subspace_basis(
         mean_activations,
         rank=shared_subspace_rank,
+        stopgrad_basis=shared_subspace_stopgrad,
     )
 
-    common = project_onto_basis(normalized_window, basis)
+    common = project_onto_basis(
+        normalized_window,
+        basis,
+        stopgrad_basis=shared_subspace_stopgrad,
+    )
     common_mean = jnp.mean(common, axis=0)
 
     zero = jnp.array(0.0, dtype=normalized_window.dtype)
@@ -445,16 +552,21 @@ def compute_aux_losses(
         }
 
     if compute_diversity_loss:
-        sampled_private_layers, _ = sample_activation_subset(
-            activations,
-            rng=private_subset_rng,
-            sample_size=layer_window_size,
+        layer_pairs, _ = sample_layer_pairs(
+            activations.shape[0],
+            rng=private_pair_rng,
+            max_pairs=private_max_pairs,
         )
-        normalized_private_layers = token_layer_norm(sampled_private_layers)
-        private_residual = normalized_private_layers - common_mean[None, ...]
-        private_loss, avg_pairwise_cosine, avg_private_norm = gap_pairwise_cosine_squared(
-            private_residual
+        left_private_layers = token_layer_norm(jnp.take(activations, layer_pairs[:, 0], axis=0))
+        right_private_layers = token_layer_norm(jnp.take(activations, layer_pairs[:, 1], axis=0))
+        left_private_residual = left_private_layers - common_mean[None, ...]
+        right_private_residual = right_private_layers - common_mean[None, ...]
+        private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_gap_pairwise_cosine_squared(
+            left_private_residual,
+            right_private_residual,
+            rng=private_shuffle_rng,
         )
+        private_residual = jnp.concatenate([left_private_residual, right_private_residual], axis=0)
     else:
         private_loss = zero
         avg_pairwise_cosine = zero
