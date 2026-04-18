@@ -381,6 +381,7 @@ def shuffled_gap_pairwise_cosine_squared(
     right_private_activations: jax.Array,
     *,
     rng: jax.Array | None,
+    half_shuffle: bool = False,
     eps: float = 1e-8,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compare random layer pairs after GAP, with a batch derangement on the right side."""
@@ -418,11 +419,25 @@ def shuffled_gap_pairwise_cosine_squared(
         raise ValueError("An RNG key is required when shuffling private layer pairs.")
 
     pair_rngs = jax.random.split(rng, num_pairs)
-    shifts = jax.vmap(
-        lambda key: jax.random.randint(key, shape=(), minval=1, maxval=batch_size)
-    )(pair_rngs)
     batch_indices = jnp.arange(batch_size, dtype=jnp.int32)
-    shuffled_indices = (batch_indices[None, :] + shifts[:, None]) % batch_size
+
+    def _full_shuffle_indices(key: jax.Array) -> jax.Array:
+        shift = jax.random.randint(key, shape=(), minval=1, maxval=batch_size)
+        return (batch_indices + shift) % batch_size
+
+    def _half_shuffle_indices(key: jax.Array) -> jax.Array:
+        selected_count = batch_size // 2
+        if selected_count < 2:
+            return batch_indices
+        select_key, shift_key = jax.random.split(key)
+        selected_positions = jnp.sort(jax.random.permutation(select_key, batch_size)[:selected_count])
+        shift = jax.random.randint(shift_key, shape=(), minval=1, maxval=selected_count)
+        rotated_sources = jnp.roll(selected_positions, shift)
+        return batch_indices.at[selected_positions].set(rotated_sources)
+
+    shuffled_indices = jax.vmap(
+        _half_shuffle_indices if half_shuffle else _full_shuffle_indices
+    )(pair_rngs)
     shuffled_right = jnp.take_along_axis(
         normalized_right,
         shuffled_indices[..., None],
@@ -443,6 +458,7 @@ def compute_aux_losses(
     layer_window_size: int = DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank: int = DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs: int = DEFAULT_PRIVATE_MAX_PAIRS,
+    half_shuffle_private_loss: bool = False,
     compute_spatial_loss: bool = True,
     compute_diversity_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
@@ -543,6 +559,7 @@ def compute_aux_losses(
             left_private_residual,
             right_private_residual,
             rng=private_shuffle_rng,
+            half_shuffle=half_shuffle_private_loss,
         )
         private_residual = jnp.concatenate([left_private_residual, right_private_residual], axis=0)
     else:
