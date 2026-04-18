@@ -330,39 +330,23 @@ def shared_subspace_basis(
     mean_activations: jax.Array,
     *,
     rank: int,
-    stopgrad_basis: bool = True,
 ) -> tuple[jax.Array, int]:
-    """Compute the right-singular-vector basis ``Q_t`` for each batch item."""
+    """Compute the detached right-singular-vector basis ``Q_t`` for each batch item."""
     if mean_activations.ndim != 3:
         raise ValueError(
             f"Expected mean activations with rank 3, got shape {mean_activations.shape}"
         )
     effective_rank = min(max(int(rank), 1), mean_activations.shape[-2], mean_activations.shape[-1])
-    svd_input = mean_activations
-    if stopgrad_basis:
-        svd_input = jax.lax.stop_gradient(svd_input)
-    _, _, vh = jnp.linalg.svd(svd_input.astype(jnp.float32), full_matrices=False)
+    detached_mean = jax.lax.stop_gradient(mean_activations).astype(jnp.float32)
+    _, _, vh = jnp.linalg.svd(detached_mean, full_matrices=False)
     basis = jnp.swapaxes(vh[:, :effective_rank, :], 1, 2).astype(mean_activations.dtype)
-    if stopgrad_basis:
-        basis = jax.lax.stop_gradient(basis)
-    return basis, effective_rank
+    return jax.lax.stop_gradient(basis), effective_rank
 
 
-def project_onto_basis(
-    activations: jax.Array,
-    basis: jax.Array,
-    *,
-    stopgrad_basis: bool = True,
-) -> jax.Array:
+def project_onto_basis(activations: jax.Array, basis: jax.Array) -> jax.Array:
     """Apply ``A @ (Q Q^T)`` without explicitly materializing the dense projector."""
-    projector_basis = basis
-    if stopgrad_basis:
-        projector_basis = jax.lax.stop_gradient(projector_basis)
-    projector_basis_t = jnp.swapaxes(projector_basis, 1, 2)
-    if stopgrad_basis:
-        projector_basis_t = jax.lax.stop_gradient(projector_basis_t)
-    coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, projector_basis)
-    return jnp.einsum("lbnk,bkd->lbnd", coeffs, projector_basis_t)
+    coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, basis)
+    return jnp.einsum("lbnk,bkd->lbnd", coeffs, jnp.swapaxes(basis, 1, 2))
 
 
 def gap_pairwise_cosine_squared(
@@ -459,7 +443,6 @@ def compute_aux_losses(
     layer_window_size: int = DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank: int = DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs: int = DEFAULT_PRIVATE_MAX_PAIRS,
-    shared_subspace_stopgrad: bool = True,
     compute_spatial_loss: bool = True,
     compute_diversity_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
@@ -500,14 +483,9 @@ def compute_aux_losses(
     basis, effective_rank = shared_subspace_basis(
         mean_activations,
         rank=shared_subspace_rank,
-        stopgrad_basis=shared_subspace_stopgrad,
     )
 
-    common = project_onto_basis(
-        normalized_window,
-        basis,
-        stopgrad_basis=shared_subspace_stopgrad,
-    )
+    common = project_onto_basis(normalized_window, basis)
     common_mean = jnp.mean(common, axis=0)
 
     zero = jnp.array(0.0, dtype=normalized_window.dtype)

@@ -7,6 +7,7 @@ import time
 import threading
 import queue
 import logging
+import warnings
 import zipfile
 from functools import partial
 
@@ -23,6 +24,7 @@ class _AbslDedupFilter(logging.Filter):
     def __init__(self):
         super().__init__()
         self._seen_group_size_warning = False
+        self._seen_diffusers_flax_deprecation = False
 
     def filter(self, record):
         message = record.getMessage()
@@ -35,12 +37,17 @@ class _AbslDedupFilter(logging.Filter):
                 "Re-encode with group_size:1 for best performance."
             )
             record.args = ()
+        if "Flax classes are deprecated and will be removed in Diffusers v1.0.0." in message:
+            if self._seen_diffusers_flax_deprecation:
+                return False
+            self._seen_diffusers_flax_deprecation = True
         return True
 
 
 _absl_dedup_filter = _AbslDedupFilter()
 logging.getLogger("absl").addFilter(_absl_dedup_filter)
 logging.getLogger().addFilter(_absl_dedup_filter)
+warnings.filterwarnings("once", message="Flax classes are deprecated and will be removed in Diffusers v1.0.0.*")
 
 
 def safe_wandb_log(metrics, step=None):
@@ -609,7 +616,6 @@ def train_step(
     layer_window_size=DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank=DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
-    shared_subspace_stopgrad=True,
 ):
     """Vanilla SiT training step with shared-subspace auxiliary losses.
 
@@ -679,7 +685,6 @@ def train_step(
                 layer_window_size=layer_window_size,
                 shared_subspace_rank=shared_subspace_rank,
                 private_max_pairs=private_max_pairs,
-                shared_subspace_stopgrad=shared_subspace_stopgrad,
                 compute_spatial_loss=lambda_spatial != 0.0,
                 compute_diversity_loss=lambda_private != 0.0,
                 spatial_window_size=spatial_window_size,
@@ -825,7 +830,6 @@ def eval_step(
     layer_window_size=DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank=DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
-    shared_subspace_stopgrad=True,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -889,7 +893,6 @@ def eval_step(
             layer_window_size=layer_window_size,
             shared_subspace_rank=shared_subspace_rank,
             private_max_pairs=private_max_pairs,
-            shared_subspace_stopgrad=shared_subspace_stopgrad,
             compute_spatial_loss=lambda_spatial != 0.0,
             compute_diversity_loss=lambda_private != 0.0,
             spatial_window_size=spatial_window_size,
@@ -1487,16 +1490,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--shared-subspace-stopgrad",
-        dest="shared_subspace_stopgrad",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Whether to stop gradients through the shared-subspace SVD path. "
-            "When enabled, the mean activation and basis/projector are treated as detached targets."
-        ),
-    )
-    parser.add_argument(
         "--common-spatial-projector",
         type=str,
         default="identity",
@@ -1754,7 +1747,6 @@ def main():
         f"layer_window_size={args.layer_window_size} "
         f"shared_subspace_rank={args.shared_subspace_rank} "
         f"private_max_pairs={args.private_max_pairs} "
-        f"shared_subspace_stopgrad={args.shared_subspace_stopgrad} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"common_spatial_projector={args.common_spatial_projector}"
@@ -1816,7 +1808,6 @@ def main():
             layer_window_size=args.layer_window_size,
             shared_subspace_rank=args.shared_subspace_rank,
             private_max_pairs=args.private_max_pairs,
-            shared_subspace_stopgrad=args.shared_subspace_stopgrad,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
         ),
@@ -1834,7 +1825,6 @@ def main():
             layer_window_size=args.layer_window_size,
             shared_subspace_rank=args.shared_subspace_rank,
             private_max_pairs=args.private_max_pairs,
-            shared_subspace_stopgrad=args.shared_subspace_stopgrad,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
         ),
@@ -2185,6 +2175,28 @@ def main():
         pr_cap = int(args.pr_max_samples)
         pr_eval_samples = need if pr_full else min(need, pr_cap)
         pr_mode = "full" if pr_full else ("subset" if pr_eval_samples < need else "full")
+        is_enabled = bool(args.inception_score)
+        enabled_metrics = ["FID", "sFID"]
+        if is_enabled:
+            enabled_metrics.append("IS")
+        if pr_enabled:
+            enabled_metrics.append("PR")
+        if args.linear_probe:
+            enabled_metrics.append("LinearProbe")
+        progress_interval = max(global_b * 8, min(need, 512))
+        last_real_log = 0
+        last_fake_log = 0
+
+        log_stage(
+            f"[EVAL] step {step}: bundle={'+'.join(enabled_metrics)} "
+            f"num_samples={need} eval_batch={global_b} "
+            f"(num_devices={num_devices}, fid_eval_local_batch={local_b})"
+        )
+        if int(args.fid_batch_size) != int(global_b):
+            log_stage(
+                f"[EVAL] note: --fid-batch-size={args.fid_batch_size} is not used in the streaming FID hot path; "
+                f"effective eval batch here is {global_b} from num_devices * fid_eval_local_batch."
+            )
 
         def _update_accumulators(acc_pooled, acc_spatial, pooled_feats, spatial_feats, valid_mask):
             pooled = pooled_feats.reshape(num_devices, local_b, 2048)
@@ -2231,6 +2243,9 @@ def main():
                     if pr_real_sampler is not None:
                         pr_real_sampler.add(trim_sharded_batch_to_host(pooled, valid).reshape(valid, -1))
                     seen += valid
+                    if seen >= need or (seen - last_real_log) >= progress_interval:
+                        log_stage(f"[EVAL] real cache progress: {seen}/{need}")
+                        last_real_log = seen
             mu_r, cov_r, n_r = finalize_gaussian_sums(acc_real_pooled)
             mu_rs, cov_rs, n_rs = finalize_gaussian_sums(acc_real_spatial)
             pr_real = pr_real_sampler.get() if pr_real_sampler is not None else None
@@ -2259,7 +2274,6 @@ def main():
         acc_fake_spatial = init_gaussian_sums(2048)
         pr_fake_sampler = ReservoirSampler(pr_eval_samples, seed=int(step)) if pr_enabled else None
         # Inception Score streaming accumulators (host-side; reuse same fake images)
-        is_enabled = bool(args.inception_score)
         splits = int(args.inception_score_splits)
         if is_enabled:
             is_worker = get_is_worker()
@@ -2309,6 +2323,9 @@ def main():
                 pr_fake_sampler.add(trim_sharded_batch_to_host(pooled, valid).reshape(valid, -1))
             produced += valid
             chunk_idx += 1
+            if produced >= need or (produced - last_fake_log) >= progress_interval:
+                log_stage(f"[EVAL] fake pool progress: {produced}/{need}")
+                last_fake_log = produced
 
         mu_f, cov_f, _ = finalize_gaussian_sums(acc_fake_pooled)
         mu_fs, cov_fs, _ = finalize_gaussian_sums(acc_fake_spatial)
@@ -2514,7 +2531,7 @@ def main():
 
                 averaged_val_metrics = {k: v / args.eval_batches for k, v in metric_sums.items()}
                 averaged_val_metrics["train/step"] = global_step
-                logger.log(averaged_val_metrics, step=global_step)
+                safe_wandb_log(averaged_val_metrics, step=global_step)
 
             # Synchronous FID (blocks training; see compute_fid docstring)
             if args.fid_freq > 0 and global_step % args.fid_freq == 0:
