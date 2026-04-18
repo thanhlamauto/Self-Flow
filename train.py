@@ -603,6 +603,7 @@ def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
+    half_shuffle_private_loss=False,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -688,6 +689,7 @@ def train_step(
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
+                half_shuffle_private_loss=half_shuffle_private_loss,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
                 compute_common_private_loss=compute_common_private_loss,
@@ -833,6 +835,7 @@ def eval_step(
     state, ema_params, batch, rng, current_step,
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
+    half_shuffle_private_loss=False,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -912,6 +915,7 @@ def eval_step(
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
+            half_shuffle_private_loss=half_shuffle_private_loss,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
             compute_common_private_loss=compute_common_private_loss,
@@ -1508,6 +1512,16 @@ def main():
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument(
+        "--half-shuffle-private-loss",
+        dest="half_shuffle_private_loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Shuffle only half of each batch when matching sampled private layer pairs. "
+            "The remaining examples stay aligned to preserve same-image cross-layer diversity."
+        ),
+    )
+    parser.add_argument(
         "--common-private-max-layers",
         type=int,
         default=0,
@@ -1852,6 +1866,7 @@ def main():
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
+        f"half_shuffle_private_loss={args.half_shuffle_private_loss} "
         f"common_private_max_layers={args.common_private_max_layers} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
@@ -1921,6 +1936,7 @@ def main():
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            half_shuffle_private_loss=args.half_shuffle_private_loss,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -1947,6 +1963,7 @@ def main():
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
+            half_shuffle_private_loss=args.half_shuffle_private_loss,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,

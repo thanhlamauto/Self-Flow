@@ -245,6 +245,28 @@ def extract_sliding_windows(
     return stacked.reshape(batch, out_h * out_w, window_size * window_size, channels)
 
 
+def sample_layer_pairs(
+    num_layers: int,
+    *,
+    rng: jax.Array | None,
+    max_pairs: int,
+) -> tuple[jax.Array, int]:
+    """Sample distinct layer pairs ``(i, j)`` with ``i < j``."""
+    if num_layers < 2:
+        return jnp.zeros((0, 2), dtype=jnp.int32), 0
+
+    upper_i, upper_j = jnp.triu_indices(num_layers, k=1)
+    num_available = int(upper_i.shape[0])
+    selected_count = num_available if max_pairs <= 0 else min(max(int(max_pairs), 1), num_available)
+    if selected_count < num_available:
+        if rng is None:
+            raise ValueError("An RNG key is required when sampling private-layer pairs.")
+        selected_indices = jnp.sort(jax.random.permutation(rng, num_available)[:selected_count])
+    else:
+        selected_indices = jnp.arange(num_available, dtype=jnp.int32)
+    return jnp.stack([upper_i[selected_indices], upper_j[selected_indices]], axis=-1), selected_count
+
+
 def window_gram_matrix(
     window_tokens: jax.Array,
     eps: float = 1e-8,
@@ -369,6 +391,79 @@ def _mean_pairwise_cosine_squared(
     return jnp.mean(jnp.square(pairwise_cosines))
 
 
+def shuffled_flattened_pairwise_cosine_squared(
+    left_private_activations: jax.Array,
+    right_private_activations: jax.Array,
+    *,
+    rng: jax.Array | None,
+    half_shuffle: bool = False,
+    eps: float = 1e-8,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compare sampled layer pairs after flattening, optionally shuffling only half the batch."""
+    if left_private_activations.shape != right_private_activations.shape:
+        raise ValueError(
+            "Left/right private activations must have matching shapes, "
+            f"got {left_private_activations.shape} vs {right_private_activations.shape}"
+        )
+    if left_private_activations.ndim != 4:
+        raise ValueError(
+            "Expected private activations with shape [P, B, N, D], "
+            f"got {left_private_activations.shape}"
+        )
+
+    num_pairs, batch_size = left_private_activations.shape[:2]
+    if num_pairs == 0:
+        zero = jnp.array(0.0, dtype=left_private_activations.dtype)
+        return zero, zero, zero
+
+    flattened_left = left_private_activations.reshape(num_pairs, batch_size, -1)
+    flattened_right = right_private_activations.reshape(num_pairs, batch_size, -1)
+    left_norms = jnp.linalg.norm(flattened_left, axis=-1, keepdims=True)
+    right_norms = jnp.linalg.norm(flattened_right, axis=-1, keepdims=True)
+    normalized_left = flattened_left / jnp.maximum(left_norms, eps)
+    normalized_right = flattened_right / jnp.maximum(right_norms, eps)
+    avg_private_norm = 0.5 * (
+        jnp.mean(jnp.squeeze(left_norms, axis=-1))
+        + jnp.mean(jnp.squeeze(right_norms, axis=-1))
+    )
+
+    if batch_size < 2:
+        zero = jnp.array(0.0, dtype=left_private_activations.dtype)
+        return zero, zero, avg_private_norm
+    if rng is None:
+        raise ValueError("An RNG key is required when shuffling private layer pairs.")
+
+    pair_rngs = jax.random.split(rng, num_pairs)
+    batch_indices = jnp.arange(batch_size, dtype=jnp.int32)
+
+    def _full_shuffle_indices(key: jax.Array) -> jax.Array:
+        shift = jax.random.randint(key, shape=(), minval=1, maxval=batch_size)
+        return (batch_indices + shift) % batch_size
+
+    def _half_shuffle_indices(key: jax.Array) -> jax.Array:
+        selected_count = batch_size // 2
+        if selected_count < 2:
+            return batch_indices
+        select_key, shift_key = jax.random.split(key)
+        selected_positions = jnp.sort(jax.random.permutation(select_key, batch_size)[:selected_count])
+        shift = jax.random.randint(shift_key, shape=(), minval=1, maxval=selected_count)
+        rotated_sources = jnp.roll(selected_positions, shift)
+        return batch_indices.at[selected_positions].set(rotated_sources)
+
+    shuffled_indices = jax.vmap(
+        _half_shuffle_indices if half_shuffle else _full_shuffle_indices
+    )(pair_rngs)
+    shuffled_right = jnp.take_along_axis(
+        normalized_right,
+        shuffled_indices[..., None],
+        axis=1,
+    )
+    pairwise_cosines = jnp.sum(normalized_left * shuffled_right, axis=-1)
+    diversity_loss = jnp.mean(jnp.square(pairwise_cosines))
+    avg_pairwise_cosine = jnp.mean(pairwise_cosines)
+    return diversity_loss, avg_pairwise_cosine, avg_private_norm
+
+
 def _common_private_cosines(
     common: jax.Array,
     private: jax.Array,
@@ -422,6 +517,7 @@ def compute_aux_losses(
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
+    half_shuffle_private_loss: bool = False,
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
     compute_common_private_loss: bool = True,
@@ -493,10 +589,22 @@ def compute_aux_losses(
         target_blur_max_sigma=spatial_blur_max_sigma,
     )
 
-    private_loss = _mean_pairwise_cosine_squared(
-        private,
-        rng=private_pair_rng,
+    private_sample_rng = private_pair_rng
+    private_shuffle_rng = private_pair_rng
+    if private_pair_rng is not None:
+        private_sample_rng, private_shuffle_rng = jax.random.split(private_pair_rng)
+    layer_pairs, _ = sample_layer_pairs(
+        private.shape[0],
+        rng=private_sample_rng,
         max_pairs=private_max_pairs,
+    )
+    left_private = jnp.take(private, layer_pairs[:, 0], axis=0)
+    right_private = jnp.take(private, layer_pairs[:, 1], axis=0)
+    private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_flattened_pairwise_cosine_squared(
+        left_private,
+        right_private,
+        rng=private_shuffle_rng,
+        half_shuffle=half_shuffle_private_loss,
     )
     if compute_common_private_loss:
         common_private_loss = _mean_common_private_cosine_squared(
@@ -515,15 +623,6 @@ def compute_aux_losses(
         avg_common_private_cosine = jnp.array(0.0, dtype=common.dtype)
 
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
-    private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
-    avg_private_norm = jnp.mean(private_norms)
-
-    pairwise_cosines = _pairwise_cosines(private)
-    if pairwise_cosines.ndim == 0:
-        avg_pairwise_cosine = pairwise_cosines
-    else:
-        avg_pairwise_cosine = jnp.mean(pairwise_cosines)
-
     return {
         "common_activation": common,
         "private_activations": private,
