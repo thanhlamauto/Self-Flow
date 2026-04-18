@@ -51,6 +51,25 @@ python sample.py \
     --batch-size 64
 ```
 
+## Training With DispLoss
+
+This branch also supports a JAX implementation of Dispersive Loss on top of the vanilla SiT objective. It is disabled by default.
+
+```bash
+python train.py \
+    --data-path /path/to/train/*.arrayrecord \
+    --model-size XL \
+    --disp \
+    --disp-lambda 0.5 \
+    --disp-temperature 0.5
+```
+
+When `--disp` is enabled, the training objective becomes:
+
+- main loss: vanilla SiT velocity regression
+- auxiliary loss: batchwise Dispersive Loss on one hidden layer
+- default layer: `depth // 4` (1-based backbone indexing)
+
 ## Command Line Arguments
 
 | Argument | Default | Description |

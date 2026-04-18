@@ -500,102 +500,164 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def train_step(
-    state, ema_params, batch, rng, ema_decay,
-):
-    """Vanilla SiT training step (global timestep; velocity prediction).
+def compute_disp_loss(features, temperature):
+    """Batchwise Dispersive Loss on a chosen hidden activation.
 
-    Repo time convention: tau=0 → pure noise, tau=1 → clean data.
-      x_tau   = (1 - tau) * x1 + tau * x0
-      target  = x0 - x1
-      loss    = E[||v_theta(x_tau, tau) - target||^2]
+    Matches the JAX-style full BxB objective described in the reference
+    implementation: include diagonal self-pairs and average over the full
+    pairwise matrix after normalizing squared L2 distance by feature dim.
     """
-    x0, y = batch  # x0: [local_B, N, D], y: [local_B]
-    local_batch = x0.shape[0]
+    flat = jnp.reshape(features.astype(jnp.float32), (features.shape[0], -1))
+    feature_dim = jnp.float32(flat.shape[1])
+    temperature = jnp.float32(temperature)
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    sq_norm = jnp.sum(flat * flat, axis=1, keepdims=True)
+    dist_sq = sq_norm + sq_norm.T - 2.0 * (flat @ flat.T)
+    dist_sq = jnp.maximum(dist_sq, 0.0) / jnp.maximum(feature_dim, 1.0)
+    return jnp.log(jnp.mean(jnp.exp(-dist_sq / temperature)))
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
-    x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
+def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, disp_temperature=0.5):
+    disp_lambda = jnp.float32(disp_lambda)
+    disp_temperature = jnp.float32(disp_temperature)
 
-    def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
+    def train_step(
+        state, ema_params, batch, rng, ema_decay,
+    ):
+        """Vanilla SiT training step with optional Dispersive Loss regularizer."""
+        x0, y = batch  # x0: [local_B, N, D], y: [local_B]
+        local_batch = x0.shape[0]
+
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
+        x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
+
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
+
+        def loss_fn(params):
+            model_kwargs = dict(
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            if disp_enabled:
+                pred, disp_features = state.apply_fn(
+                    {"params": params},
+                    x_tau,
+                    return_raw_features=disp_layer,
+                    **model_kwargs,
+                )
+                disp_loss = compute_disp_loss(disp_features, disp_temperature)
+            else:
+                pred = state.apply_fn(
+                    {"params": params},
+                    x_tau,
+                    **model_kwargs,
+                )
+                disp_loss = jnp.array(0.0, dtype=jnp.float32)
+
+            gen_loss = jnp.mean((pred - target) ** 2)
+            loss = gen_loss + disp_lambda * disp_loss
+            v_abs_mean = jnp.mean(jnp.abs(target))
+            v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+            return loss, (gen_loss, disp_loss, v_abs_mean, v_pred_abs_mean)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (gen_loss, disp_loss, v_abs, v_pred)), grads = grad_fn(state.params)
+
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        gen_loss = jax.lax.pmean(gen_loss, axis_name="batch")
+        disp_loss = jax.lax.pmean(disp_loss, axis_name="batch")
+        v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+        v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+        grads = jax.lax.pmean(grads, axis_name="batch")
+
+        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+        param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+
+        state = state.apply_gradients(grads=grads)
+        ema_params = ema_update(ema_params, state.params, ema_decay)
+
+        metrics = {
+            "train/loss": loss,
+            "train/loss_gen": gen_loss,
+            "train/loss_disp": disp_loss,
+            "train/ema_decay": ema_decay,
+            "train/grad_norm": grad_norm,
+            "train/param_norm": param_norm,
+            "train/v_abs_mean": v_abs,
+            "train/v_pred_abs_mean": v_pred,
+        }
+        return state, ema_params, metrics, rng
+
+    return train_step
+
+
+def make_eval_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, disp_temperature=0.5):
+    disp_lambda = jnp.float32(disp_lambda)
+    disp_temperature = jnp.float32(disp_temperature)
+
+    def eval_step(
+        state, ema_params, batch, rng,
+    ):
+        """Vanilla SiT validation step with optional Dispersive Loss regularizer."""
+        del ema_params
+        x0, y = batch
+        local_batch = x0.shape[0]
+
+        rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+
+        tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+        x1 = jax.random.normal(noise_rng, x0.shape)
+
+        x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+        target = x0 - x1
+
+        model_kwargs = dict(
             timesteps=tau,
             vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
+            deterministic=True,
         )
-        loss = jnp.mean((pred - target) ** 2)
+        if disp_enabled:
+            pred, disp_features = state.apply_fn(
+                {"params": state.params},
+                x_tau,
+                return_raw_features=disp_layer,
+                **model_kwargs,
+            )
+            disp_loss = compute_disp_loss(disp_features, disp_temperature)
+        else:
+            pred = state.apply_fn(
+                {"params": state.params},
+                x_tau,
+                **model_kwargs,
+            )
+            disp_loss = jnp.array(0.0, dtype=jnp.float32)
+
+        gen_loss = jnp.mean((pred - target) ** 2)
+        loss = gen_loss + disp_lambda * disp_loss
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        gen_loss = jax.lax.pmean(gen_loss, axis_name="batch")
+        disp_loss = jax.lax.pmean(disp_loss, axis_name="batch")
+        v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
+        v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
-    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
+        metrics = {
+            "val/loss": loss,
+            "val/loss_gen": gen_loss,
+            "val/loss_disp": disp_loss,
+            "val/v_abs_mean": v_abs_mean,
+            "val/v_pred_abs_mean": v_pred_abs_mean,
+        }
+        return metrics, rng
 
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
-
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
-
-    metrics = {
-        "train/loss": loss,
-        "train/ema_decay": ema_decay,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
-        "train/v_abs_mean": v_abs,
-        "train/v_pred_abs_mean": v_pred,
-    }
-    return state, ema_params, metrics, rng
-
-
-def eval_step(
-    state, ema_params, batch, rng,
-):
-    """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
-    x0, y = batch
-    local_batch = x0.shape[0]
-
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
-
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
-    x1 = jax.random.normal(noise_rng, x0.shape)
-
-    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
-    target = x0 - x1
-
-    pred = state.apply_fn(
-        {"params": state.params},
-        x_tau,
-        timesteps=tau,
-        vector=y,
-        deterministic=True,
-    )
-    loss = jnp.mean((pred - target) ** 2)
-    v_abs_mean = jnp.mean(jnp.abs(target))
-    v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
-    v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
-
-    metrics = {
-        "val/loss": loss,
-        "val/v_abs_mean": v_abs_mean,
-        "val/v_pred_abs_mean": v_pred_abs_mean,
-    }
-    return metrics, rng
+    return eval_step
 
 
 def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=42):
@@ -1077,6 +1139,29 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--disp",
+        action="store_true",
+        help="Enable Dispersive Loss regularization on one backbone hidden layer.",
+    )
+    parser.add_argument(
+        "--disp-lambda",
+        type=float,
+        default=0.5,
+        help="Weight for Dispersive Loss when --disp is enabled (JAX reference default: 0.5).",
+    )
+    parser.add_argument(
+        "--disp-temperature",
+        type=float,
+        default=0.5,
+        help="Temperature tau in exp(-distance/tau) for Dispersive Loss (must be > 0).",
+    )
+    parser.add_argument(
+        "--disp-layer",
+        type=int,
+        default=None,
+        help="1-based backbone layer index for Dispersive Loss. Default: depth // 4.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1224,6 +1309,10 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.disp_lambda < 0:
+        raise ValueError("--disp-lambda must be >= 0")
+    if args.disp_temperature <= 0:
+        raise ValueError("--disp-temperature must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1249,6 +1338,11 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    disp_layer = None
+    if args.disp:
+        disp_layer = int(args.disp_layer if args.disp_layer is not None else max(1, depth // 4))
+        if not 1 <= disp_layer <= depth:
+            raise ValueError(f"--disp-layer must be in [1, {depth}] for model depth {depth}")
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1257,6 +1351,13 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.disp:
+        log_stage(
+            f"DispLoss: enabled lambda={args.disp_lambda} "
+            f"temperature={args.disp_temperature} layer={disp_layer}"
+        )
+    else:
+        log_stage("DispLoss: disabled")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1295,8 +1396,20 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
-    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
+    train_step_fn = make_train_step(
+        disp_enabled=args.disp,
+        disp_layer=disp_layer,
+        disp_lambda=args.disp_lambda,
+        disp_temperature=args.disp_temperature,
+    )
+    eval_step_fn = make_eval_step(
+        disp_enabled=args.disp,
+        disp_layer=disp_layer,
+        disp_lambda=args.disp_lambda,
+        disp_temperature=args.disp_temperature,
+    )
+    pmapped_train_step = jax.pmap(train_step_fn, axis_name="batch")
+    pmapped_eval_step = jax.pmap(eval_step_fn, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
