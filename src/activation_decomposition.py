@@ -392,14 +392,14 @@ def gap_pairwise_cosine_squared(
     return diversity_loss, avg_pairwise_cosine, avg_private_norm
 
 
-def shuffled_gap_pairwise_cosine_squared(
+def shuffled_flattened_pairwise_cosine_squared(
     left_private_activations: jax.Array,
     right_private_activations: jax.Array,
     *,
     rng: jax.Array | None,
     eps: float = 1e-8,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compare random layer pairs after GAP, with a batch derangement on the right side."""
+    """Compare random layer pairs after flattening tokens and channels, with a batch derangement on the right side."""
     if left_private_activations.shape != right_private_activations.shape:
         raise ValueError(
             "Left/right private activations must have matching shapes, "
@@ -416,12 +416,12 @@ def shuffled_gap_pairwise_cosine_squared(
         zero = jnp.array(0.0, dtype=left_private_activations.dtype)
         return zero, zero, zero
 
-    pooled_left = jnp.mean(left_private_activations, axis=2)
-    pooled_right = jnp.mean(right_private_activations, axis=2)
-    left_norms = jnp.linalg.norm(pooled_left, axis=-1, keepdims=True)
-    right_norms = jnp.linalg.norm(pooled_right, axis=-1, keepdims=True)
-    normalized_left = pooled_left / jnp.maximum(left_norms, eps)
-    normalized_right = pooled_right / jnp.maximum(right_norms, eps)
+    flattened_left = left_private_activations.reshape(num_pairs, batch_size, -1)
+    flattened_right = right_private_activations.reshape(num_pairs, batch_size, -1)
+    left_norms = jnp.linalg.norm(flattened_left, axis=-1, keepdims=True)
+    right_norms = jnp.linalg.norm(flattened_right, axis=-1, keepdims=True)
+    normalized_left = flattened_left / jnp.maximum(left_norms, eps)
+    normalized_right = flattened_right / jnp.maximum(right_norms, eps)
     avg_private_norm = 0.5 * (
         jnp.mean(jnp.squeeze(left_norms, axis=-1))
         + jnp.mean(jnp.squeeze(right_norms, axis=-1))
@@ -561,7 +561,7 @@ def compute_aux_losses(
         right_private_layers = token_layer_norm(jnp.take(activations, layer_pairs[:, 1], axis=0))
         left_private_residual = left_private_layers - common_mean[None, ...]
         right_private_residual = right_private_layers - common_mean[None, ...]
-        private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_gap_pairwise_cosine_squared(
+        private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_flattened_pairwise_cosine_squared(
             left_private_residual,
             right_private_residual,
             rng=private_shuffle_rng,

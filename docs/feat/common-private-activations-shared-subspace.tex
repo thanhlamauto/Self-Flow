@@ -392,31 +392,29 @@ then subtracts the same shared common tensor:
 \]
 Thus the private branch measures what remains in randomly chosen layers after removing the common component distilled from the consecutive window.
 
-Each side is globally average-pooled over tokens:
+Each side is flattened over both token and hidden dimensions:
 \[
-  \bm{q}^{\mathrm{L}}_{p}[b,:]
+  \bm{f}^{\mathrm{L}}_{p}[b,:]
   =
-  \frac{1}{N_{\mathrm{tok}}}
-  \sum_{n=1}^{N_{\mathrm{tok}}}
-  \bm{R}^{\mathrm{L}}_{p}[b,n,:],
+  \operatorname{vec}\!\bigl(\bm{R}^{\mathrm{L}}_{p}[b,:,:]\bigr)
+  \in \mathbb{R}^{N_{\mathrm{tok}}D},
   \qquad
-  \bm{q}^{\mathrm{R}}_{p}[b,:]
+  \bm{f}^{\mathrm{R}}_{p}[b,:]
   =
-  \frac{1}{N_{\mathrm{tok}}}
-  \sum_{n=1}^{N_{\mathrm{tok}}}
-  \bm{R}^{\mathrm{R}}_{p}[b,n,:],
+  \operatorname{vec}\!\bigl(\bm{R}^{\mathrm{R}}_{p}[b,:,:]\bigr)
+  \in \mathbb{R}^{N_{\mathrm{tok}}D},
 \]
 and then $\ell_2$-normalized:
 \[
-  \hat{\bm{q}}^{\mathrm{L}}_{p}[b,:]
+  \hat{\bm{f}}^{\mathrm{L}}_{p}[b,:]
   =
-  \frac{\bm{q}^{\mathrm{L}}_{p}[b,:]}
-       {\|\bm{q}^{\mathrm{L}}_{p}[b,:]\|_2+\varepsilon},
+  \frac{\bm{f}^{\mathrm{L}}_{p}[b,:]}
+       {\|\bm{f}^{\mathrm{L}}_{p}[b,:]\|_2+\varepsilon},
   \qquad
-  \hat{\bm{q}}^{\mathrm{R}}_{p}[b,:]
+  \hat{\bm{f}}^{\mathrm{R}}_{p}[b,:]
   =
-  \frac{\bm{q}^{\mathrm{R}}_{p}[b,:]}
-       {\|\bm{q}^{\mathrm{R}}_{p}[b,:]\|_2+\varepsilon}.
+  \frac{\bm{f}^{\mathrm{R}}_{p}[b,:]}
+       {\|\bm{f}^{\mathrm{R}}_{p}[b,:]\|_2+\varepsilon}.
 \]
 
 For each sampled pair $p$, the code draws a non-zero cyclic batch shift
@@ -435,8 +433,8 @@ for every batch index $b$, so the right-hand side is always matched against a \e
 \[
   c_p(b)
   =
-  \hat{\bm{q}}^{\mathrm{L}}_{p}[b,:]^\top
-  \hat{\bm{q}}^{\mathrm{R}}_{p}[\pi_p(b),:].
+  \hat{\bm{f}}^{\mathrm{L}}_{p}[b,:]^\top
+  \hat{\bm{f}}^{\mathrm{R}}_{p}[\pi_p(b),:].
 \]
 The private loss is the batch-and-pair average of squared cosines:
 \[
@@ -520,7 +518,7 @@ where
   \item Uniformly sample one consecutive window $\mathcal{W}$ of size $m$, token-normalize it, average it, and compute a rank-$k$ shared subspace via truncated SVD. Depending on \texttt{--shared-subspace-stopgrad}, this SVD path is either detached or fully differentiable.
   \item Project the normalized window activations onto the shared subspace and average them to obtain $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$.
   \item Project $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ through the common-spatial head, build the coarse timestep-interpolated target, embed it with the patch embedder, token-normalize it, and compute the local Gram loss in token-feature space.
-  \item Independently sample random layer pairs from the full depth, token-normalize both sides, subtract $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$, global-average-pool over tokens, batch-shuffle one side with a non-zero cyclic shift, and compute the cosine-squared private loss.
+  \item Independently sample random layer pairs from the full depth, token-normalize both sides, subtract $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$, flatten each residual over $N_{\mathrm{tok}}D$, batch-shuffle one side with a non-zero cyclic shift, and compute the cosine-squared private loss.
   \item Form
   \[
     \mathcal{L}
