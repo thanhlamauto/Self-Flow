@@ -68,6 +68,11 @@ def modulate_per_token(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+def modulate_grid(x, shift, scale):
+    """Channel-last modulation for NHWC spatial grids."""
+    return x * (1 + scale[:, None, None, :]) + shift[:, None, None, :]
+
+
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations."""
     hidden_size: int
@@ -343,13 +348,9 @@ class SelfFlowDiT(nn.Module):
             )
         else:
             self.common_spatial_projector_head = None
-        self.common_spatial_projector_to_hidden = (
-            nn.Dense(
-                self.hidden_size,
-                name="common_spatial_projector_to_hidden",
-            )
-            if self.common_spatial_projector_head is not None
-            else None
+        self.common_spatial_projector_to_patch = nn.Dense(
+            self.patch_size * self.patch_size * self.in_channels,
+            name="common_spatial_projector_to_patch",
         )
         self.common_spatial_projector_norm = nn.LayerNorm(
             epsilon=1e-6,
@@ -358,36 +359,66 @@ class SelfFlowDiT(nn.Module):
             name="common_spatial_projector_norm",
         )
         self.common_spatial_projector_shift = nn.Dense(
-            self.hidden_size,
+            self.in_channels,
             kernel_init=nn.initializers.zeros_init(),
             bias_init=nn.initializers.zeros_init(),
             name="common_spatial_projector_shift",
         )
         self.common_spatial_projector_scale = nn.Dense(
-            self.hidden_size,
+            self.in_channels,
             name="common_spatial_projector_scale",
         )
 
+    def _patchified_tokens_to_latent_grid(self, tokens: jax.Array) -> jax.Array:
+        """Convert ``[B, N, p*p*C]`` patchified latent tokens into an NHWC latent grid."""
+        b, num_tokens, patch_dim = tokens.shape
+        expected_tokens = self.grid_size * self.grid_size
+        expected_patch_dim = self.patch_size * self.patch_size * self.in_channels
+        if num_tokens != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} tokens for a {self.grid_size}x{self.grid_size} grid, "
+                f"got {num_tokens}"
+            )
+        if patch_dim != expected_patch_dim:
+            raise ValueError(f"Expected patch dim {expected_patch_dim}, got {patch_dim}")
+
+        tokens = tokens.reshape(
+            b,
+            self.grid_size,
+            self.grid_size,
+            self.patch_size,
+            self.patch_size,
+            self.in_channels,
+        )
+        tokens = jnp.transpose(tokens, (0, 1, 3, 2, 4, 5))
+        return tokens.reshape(
+            b,
+            self.grid_size * self.patch_size,
+            self.grid_size * self.patch_size,
+            self.in_channels,
+        )
+
     def project_common_spatial(self, common_tokens: jax.Array, timesteps: jax.Array) -> jax.Array:
-        """Project A_common into a timestep-conditioned token-space tensor Z."""
+        """Project A_common into a timestep-conditioned ``32x32x4`` latent grid."""
         if self.common_spatial_projector_head is not None:
             common_tokens = self.common_spatial_projector_head(common_tokens)
-            common_tokens = self.common_spatial_projector_to_hidden(common_tokens)
+        common_tokens = self.common_spatial_projector_to_patch(common_tokens)
+        common_grid = self._patchified_tokens_to_latent_grid(common_tokens)
 
         timesteps = 1.0 - timesteps
         timestep_features = self.t_embedder(timesteps)
         timestep_features = nn.swish(timestep_features)
         shift = self.common_spatial_projector_shift(timestep_features)
         scale = self.common_spatial_projector_scale(timestep_features)
-        return modulate(
-            self.common_spatial_projector_norm(common_tokens),
+        return modulate_grid(
+            self.common_spatial_projector_norm(common_grid),
             shift,
             scale,
         )
 
     def project_spatial_target(self, target_tokens: jax.Array) -> jax.Array:
-        """Embed patchified latent targets into the same token-space dimension as A_common."""
-        return self.patch_embed(target_tokens)
+        """Convert patchified latent targets back into a ``32x32x4`` latent grid."""
+        return self._patchified_tokens_to_latent_grid(target_tokens)
 
     @nn.compact
     def __call__(
@@ -447,6 +478,9 @@ class SelfFlowDiT(nn.Module):
         zs = None
         block_summaries = [] if return_block_summaries else None
         activations = [] if return_activations else None
+        if return_activations:
+            # ``h_0``: token representation before the first transformer block.
+            activations.append(x)
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -483,7 +517,7 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
         if return_activations:
-            activations = jnp.stack(activations, axis=0)  # (depth, B, N, D)
+            activations = jnp.stack(activations, axis=0)  # (depth + 1, B, N, D)
 
         outputs = [x]
         if return_features or return_raw_features:

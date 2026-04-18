@@ -326,29 +326,6 @@ def local_window_gram_loss(
     return spatial_loss, spatial_metrics
 
 
-def shared_subspace_basis(
-    mean_activations: jax.Array,
-    *,
-    rank: int,
-) -> tuple[jax.Array, int]:
-    """Compute the detached right-singular-vector basis ``Q_t`` for each batch item."""
-    if mean_activations.ndim != 3:
-        raise ValueError(
-            f"Expected mean activations with rank 3, got shape {mean_activations.shape}"
-        )
-    effective_rank = min(max(int(rank), 1), mean_activations.shape[-2], mean_activations.shape[-1])
-    detached_mean = jax.lax.stop_gradient(mean_activations).astype(jnp.float32)
-    _, _, vh = jnp.linalg.svd(detached_mean, full_matrices=False)
-    basis = jnp.swapaxes(vh[:, :effective_rank, :], 1, 2).astype(mean_activations.dtype)
-    return jax.lax.stop_gradient(basis), effective_rank
-
-
-def project_onto_basis(activations: jax.Array, basis: jax.Array) -> jax.Array:
-    """Apply ``A @ (Q Q^T)`` without explicitly materializing the dense projector."""
-    coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, basis)
-    return jnp.einsum("lbnk,bkd->lbnd", coeffs, jnp.swapaxes(basis, 1, 2))
-
-
 def gap_pairwise_cosine_squared(
     private_activations: jax.Array,
     eps: float = 1e-8,
@@ -469,8 +446,13 @@ def compute_aux_losses(
     common_spatial_project_fn: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
     spatial_target_project_fn: Callable[[jax.Array], jax.Array] | None = None,
 ) -> dict[str, jax.Array]:
-    """Compute auxiliary losses for the shared-subspace decomposition objective."""
+    """Compute auxiliary losses for the common/private update decomposition."""
     activations = collect_activations(activations)
+    if activations.shape[0] < 2:
+        raise ValueError(
+            "Expected activations to include h_0 and at least one transformer block, "
+            f"got shape {activations.shape}"
+        )
     if spatial_target.ndim != 3:
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
     if timesteps.ndim != 1:
@@ -481,28 +463,19 @@ def compute_aux_losses(
             f"got {spatial_target.shape[0]} vs {timesteps.shape[0]}"
         )
 
-    common_window_rng = layer_window_rng
-    private_pair_rng = layer_window_rng
-    private_shuffle_rng = layer_window_rng
-    if layer_window_rng is not None and compute_diversity_loss:
-        common_window_rng, private_pair_rng, private_shuffle_rng = jax.random.split(
-            layer_window_rng, 3
-        )
+    input_activation = activations[0]
+    block_activations = activations[1:]
 
     windowed_activations, window_start = sample_activation_window(
-        activations,
-        rng=common_window_rng,
+        block_activations,
+        rng=layer_window_rng,
         window_size=layer_window_size,
     )
+    normalized_input = token_layer_norm(input_activation)
     normalized_window = token_layer_norm(windowed_activations)
-    mean_activations = jnp.mean(normalized_window, axis=0)
-    basis, effective_rank = shared_subspace_basis(
-        mean_activations,
-        rank=shared_subspace_rank,
-    )
-
-    common = project_onto_basis(normalized_window, basis)
-    common_mean = jnp.mean(common, axis=0)
+    update_window = normalized_window - jax.lax.stop_gradient(normalized_input)[None, ...]
+    common_mean = jnp.mean(jax.lax.stop_gradient(update_window), axis=0)
+    private_residual = update_window - common_mean[None, ...]
 
     zero = jnp.array(0.0, dtype=normalized_window.dtype)
     if compute_spatial_loss:
@@ -512,7 +485,15 @@ def compute_aux_losses(
             raise ValueError("A target projector is required when compute_spatial_loss=True.")
 
         projected_common = common_spatial_project_fn(common_mean, timesteps)
-        feature_grid = tokens_to_grid(projected_common).astype(jnp.float32)
+        if projected_common.ndim == 4:
+            feature_grid = projected_common.astype(jnp.float32)
+        elif projected_common.ndim == 3:
+            feature_grid = tokens_to_grid(projected_common).astype(jnp.float32)
+        else:
+            raise ValueError(
+                "Expected projected common activations with rank 3 or 4, "
+                f"got shape {projected_common.shape}"
+            )
         target_grid = build_coarse_spatial_target(
             spatial_target,
             timesteps,
@@ -525,8 +506,15 @@ def compute_aux_losses(
             patch_size=patch_size,
         )
         target_features = spatial_target_project_fn(target_tokens)
-        target_features = token_layer_norm(target_features)
-        target_feature_grid = tokens_to_grid(target_features).astype(jnp.float32)
+        if target_features.ndim == 4:
+            target_feature_grid = target_features.astype(jnp.float32)
+        elif target_features.ndim == 3:
+            target_feature_grid = tokens_to_grid(target_features).astype(jnp.float32)
+        else:
+            raise ValueError(
+                "Expected projected spatial targets with rank 3 or 4, "
+                f"got shape {target_features.shape}"
+            )
         spatial_loss, spatial_metrics = local_window_gram_loss(
             feature_grid,
             jax.lax.stop_gradient(target_feature_grid),
@@ -546,29 +534,32 @@ def compute_aux_losses(
         }
 
     if compute_diversity_loss:
-        layer_pairs, _ = sample_layer_pairs(
-            activations.shape[0],
-            rng=private_pair_rng,
-            max_pairs=private_max_pairs,
-        )
-        left_private_layers = token_layer_norm(jnp.take(activations, layer_pairs[:, 0], axis=0))
-        right_private_layers = token_layer_norm(jnp.take(activations, layer_pairs[:, 1], axis=0))
-        left_private_residual = left_private_layers - common_mean[None, ...]
-        right_private_residual = right_private_layers - common_mean[None, ...]
-        private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_gap_pairwise_cosine_squared(
-            left_private_residual,
-            right_private_residual,
-            rng=private_shuffle_rng,
-            half_shuffle=half_shuffle_private_loss,
-        )
-        private_residual = jnp.concatenate([left_private_residual, right_private_residual], axis=0)
+        if private_max_pairs > 0 and private_residual.shape[0] > 1:
+            layer_pairs, _ = sample_layer_pairs(
+                private_residual.shape[0],
+                rng=layer_window_rng,
+                max_pairs=private_max_pairs,
+            )
+            left_private_residual = jnp.take(private_residual, layer_pairs[:, 0], axis=0)
+            right_private_residual = jnp.take(private_residual, layer_pairs[:, 1], axis=0)
+            private_loss, avg_pairwise_cosine, avg_private_norm = shuffled_gap_pairwise_cosine_squared(
+                left_private_residual,
+                right_private_residual,
+                rng=layer_window_rng,
+                half_shuffle=half_shuffle_private_loss,
+            )
+        else:
+            private_loss, avg_pairwise_cosine, avg_private_norm = gap_pairwise_cosine_squared(
+                private_residual,
+            )
     else:
         private_loss = zero
         avg_pairwise_cosine = zero
         avg_private_norm = zero
-        private_residual = normalized_window - common
 
-    common_norm = jnp.mean(jnp.linalg.norm(common_mean.reshape(common_mean.shape[0], -1), axis=-1))
+    common_norm = jnp.mean(
+        jnp.linalg.norm(common_mean.reshape(common_mean.shape[0], -1), axis=-1)
+    )
 
     return {
         "common_activation": common_mean,
@@ -581,5 +572,5 @@ def compute_aux_losses(
         "avg_pairwise_private_cosine": avg_pairwise_cosine,
         "layer_window_start": window_start.astype(normalized_window.dtype),
         "layer_window_size": jnp.asarray(windowed_activations.shape[0], dtype=normalized_window.dtype),
-        "shared_subspace_rank": jnp.asarray(effective_rank, dtype=normalized_window.dtype),
+        "shared_subspace_rank": zero,
     }
