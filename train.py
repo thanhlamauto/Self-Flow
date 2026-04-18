@@ -609,7 +609,6 @@ def train_step(
     layer_window_size=DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank=DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
-    shared_subspace_stopgrad=True,
 ):
     """Vanilla SiT training step with shared-subspace auxiliary losses.
 
@@ -679,7 +678,6 @@ def train_step(
                 layer_window_size=layer_window_size,
                 shared_subspace_rank=shared_subspace_rank,
                 private_max_pairs=private_max_pairs,
-                shared_subspace_stopgrad=shared_subspace_stopgrad,
                 compute_spatial_loss=lambda_spatial != 0.0,
                 compute_diversity_loss=lambda_private != 0.0,
                 spatial_window_size=spatial_window_size,
@@ -825,7 +823,6 @@ def eval_step(
     layer_window_size=DEFAULT_ACTIVATION_WINDOW_SIZE,
     shared_subspace_rank=DEFAULT_SHARED_SUBSPACE_RANK,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
-    shared_subspace_stopgrad=True,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -889,7 +886,6 @@ def eval_step(
             layer_window_size=layer_window_size,
             shared_subspace_rank=shared_subspace_rank,
             private_max_pairs=private_max_pairs,
-            shared_subspace_stopgrad=shared_subspace_stopgrad,
             compute_spatial_loss=lambda_spatial != 0.0,
             compute_diversity_loss=lambda_private != 0.0,
             spatial_window_size=spatial_window_size,
@@ -1487,16 +1483,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--shared-subspace-stopgrad",
-        dest="shared_subspace_stopgrad",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Whether to stop gradients through the shared-subspace SVD path. "
-            "When enabled, the mean activation and basis/projector are treated as detached targets."
-        ),
-    )
-    parser.add_argument(
         "--common-spatial-projector",
         type=str,
         default="identity",
@@ -1754,7 +1740,6 @@ def main():
         f"layer_window_size={args.layer_window_size} "
         f"shared_subspace_rank={args.shared_subspace_rank} "
         f"private_max_pairs={args.private_max_pairs} "
-        f"shared_subspace_stopgrad={args.shared_subspace_stopgrad} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"common_spatial_projector={args.common_spatial_projector}"
@@ -1816,7 +1801,6 @@ def main():
             layer_window_size=args.layer_window_size,
             shared_subspace_rank=args.shared_subspace_rank,
             private_max_pairs=args.private_max_pairs,
-            shared_subspace_stopgrad=args.shared_subspace_stopgrad,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
         ),
@@ -1834,7 +1818,6 @@ def main():
             layer_window_size=args.layer_window_size,
             shared_subspace_rank=args.shared_subspace_rank,
             private_max_pairs=args.private_max_pairs,
-            shared_subspace_stopgrad=args.shared_subspace_stopgrad,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
         ),

@@ -130,40 +130,30 @@ Within the sampled window, the mean normalized activation is
   \frac{1}{m}\sum_{\ell\in\mathcal{W}}\tilde{\bm{A}}_\ell
   \in \mathbb{R}^{B\times N_{\mathrm{tok}}\times D}.
 \]
-For each batch item $b$, the code computes a truncated right-singular-vector basis from
+The code detaches this tensor:
 \[
-  \bm{M}_b = \bm{U}_b \bm{\Sigma}_b \bm{V}_b^\top
+  \bm{M}^{\dagger} = \StopGrad(\bm{M}).
 \]
-and keeps the first $k_{\mathrm{eff}}$ right singular vectors:
+For each batch item $b$, it computes an SVD
+\[
+  \bm{M}^{\dagger}_b = \bm{U}_b \bm{\Sigma}_b \bm{V}_b^\top,
+\]
+and extracts the first $k_{\mathrm{eff}}$ right singular vectors:
 \[
   \bm{Q}_b
   =
   \left[\bm{v}_{b,1}, \dots, \bm{v}_{b,k_{\mathrm{eff}}}\right]
   \in \mathbb{R}^{D\times k_{\mathrm{eff}}}.
 \]
-
-The stop-gradient behavior is controlled by
-\[
-  \texttt{--shared-subspace-stopgrad}.
-\]
-When this flag is enabled, the implementation uses
-\[
-  \bm{M}_b^\dagger = \StopGrad(\bm{M}_b),
-  \qquad
-  \bm{Q}_b^\dagger = \StopGrad(\bm{Q}_b),
-\]
-so the SVD path is treated as a detached target extractor. When the flag is disabled, the same formulas below are used but without the detachments.
-
 Equivalently, the shared projector is
 \[
-  \bm{P}_b = \bm{Q}_b^\sharp (\bm{Q}_b^\sharp)^\top \in \mathbb{R}^{D\times D},
+  \bm{P}_b = \bm{Q}_b \bm{Q}_b^\top \in \mathbb{R}^{D\times D}.
 \]
-where $\bm{Q}_b^\sharp$ denotes either $\bm{Q}_b^\dagger$ or $\bm{Q}_b$ depending on the CLI toggle.
 The implementation does not explicitly materialize $\bm{P}_b$; it applies the projector as
 \[
   \tilde{\bm{A}}_\ell \bm{P}
   =
-  (\tilde{\bm{A}}_\ell \bm{Q}^\sharp)(\bm{Q}^\sharp)^\top.
+  (\tilde{\bm{A}}_\ell \bm{Q}) \bm{Q}^\top.
 \]
 
 \subsection*{5. Common decomposition from the shared window}
@@ -515,7 +505,7 @@ where
     \bm{t} = \bm{x}_0 - \bm{x}_1.
   \]
   \item Run the DiT on $(\bm{x}_\tau,\bm{\tau},\bm{y})$ to get $\hat{\bm{v}}_\theta$ and block activations $\{\bm{A}_\ell\}_{\ell=1}^{L}$.
-  \item Uniformly sample one consecutive window $\mathcal{W}$ of size $m$, token-normalize it, average it, and compute a rank-$k$ shared subspace via truncated SVD. Depending on \texttt{--shared-subspace-stopgrad}, this SVD path is either detached or fully differentiable.
+  \item Uniformly sample one consecutive window $\mathcal{W}$ of size $m$, token-normalize it, average it, detach the mean activation, and compute a rank-$k$ shared subspace via truncated SVD.
   \item Project the normalized window activations onto the shared subspace and average them to obtain $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$.
   \item Project $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$ through the common-spatial head, build the coarse timestep-interpolated target, embed it with the patch embedder, token-normalize it, and compute the local Gram loss in token-feature space.
   \item Independently sample random layer pairs from the full depth, token-normalize both sides, subtract $\bm{A}^{\mathrm{com}}_{\mathrm{mean}}$, flatten each residual over $N_{\mathrm{tok}}D$, batch-shuffle one side with a non-zero cyclic shift, and compute the cosine-squared private loss.
