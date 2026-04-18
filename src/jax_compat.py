@@ -4,29 +4,41 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax import sharding as js
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 def replicate_to_local_devices(tree, devices=None):
     """Replicate a pytree across local devices for pmap inputs.
 
-    The old flax.jax_utils.replicate() path relied on jax.device_put_replicated,
-    and our first compatibility shim used jax.device_put_sharded. Newer JAX
-    versions deprecate both helpers in favor of jax.device_put with explicit
-    sharding metadata. For pmap inputs we need the legacy shape convention:
-    each leaf has a leading device axis of length n_local_devices.
+    Mirrors the official JAX drop-in replacement for the deprecated
+    device_put_replicated API using jax.device_put + NamedSharding.
     """
     devices = tuple(devices) if devices is not None else tuple(jax.local_devices())
-    sharding = js.PositionalSharding(devices)
+    mesh = Mesh(np.array(devices), ("x",))
+    sharding = NamedSharding(mesh, P("x"))
 
-    def _stack_for_devices(x):
+    def _replicate_leaf(x):
         arr = jnp.asarray(x)
-        return jnp.broadcast_to(arr, (len(devices),) + arr.shape)
+        return jax.device_put(jnp.stack([arr] * len(devices)), sharding)
 
-    stacked_tree = jax.tree_util.tree_map(_stack_for_devices, tree)
-    return jax.device_put(stacked_tree, sharding)
+    return jax.tree_util.tree_map(_replicate_leaf, tree)
 
 
 def unreplicate_from_local_devices(tree):
-    """Return the first local replica from a replicated pytree."""
-    return jax.tree_util.tree_map(lambda x: x[0], tree)
+    """Return one local replica from a replicated pytree.
+
+    On newer pmap implementations, indexing a sharded array with x[0] can
+    trigger unnecessary resharding or even fail in multi-host settings. Prefer
+    reading the first addressable shard directly when available.
+    """
+
+    def _first_local_replica(x):
+        if hasattr(x, "addressable_shards"):
+            shard = x.addressable_shards[0].data
+            if getattr(shard, "ndim", 0) > 0 and shard.shape[0] == 1:
+                return jnp.squeeze(shard, axis=0)
+            return shard
+        return x[0]
+
+    return jax.tree_util.tree_map(_first_local_replica, tree)
