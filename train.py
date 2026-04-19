@@ -307,8 +307,7 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
         images = jnp.transpose(images, (0, 2, 3, 1))
         return ((images / 2.0 + 0.5).clip(0, 1)).astype(jnp.float32)
 
-    from flax.jax_utils import replicate
-    vae_params_repl = replicate(vae_params)
+    vae_params_repl = replicate_tree(vae_params)
     log_stage(f"[VAE-TPU] Flax VAE decode ready trên {num_devices} TPU device(s).")
     return _decode_pmap, vae_params_repl
 
@@ -409,7 +408,6 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.training import train_state, checkpoints
-from flax import jax_utils
 import numpy as np
 try:
     import grain.python as grain
@@ -432,6 +430,7 @@ from src.metrics import (
     precision_recall_knn,
     trim_sharded_batch_to_host,
 )
+from src.jax_compat import replicate_tree, unreplicate_tree
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
@@ -439,7 +438,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
+    online params. Caller should replicate both via ``replicate_tree``.
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -1418,11 +1417,11 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
-    state = jax_utils.replicate(state)
-    ema_params = jax_utils.replicate(ema_params)
+    state = replicate_tree(state)
+    ema_params = replicate_tree(ema_params)
     rng = jax.random.split(rng, num_devices)
-    ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
+    ema_decay_rep = replicate_tree(jnp.float32(args.ema_decay))
+    layersync_lambda_rep = replicate_tree(jnp.float32(args.layersync_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -2174,8 +2173,8 @@ def main():
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    unreplicated_params = unreplicate_tree(state.params)
+    unreplicated_ema = unreplicate_tree(ema_params)
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,

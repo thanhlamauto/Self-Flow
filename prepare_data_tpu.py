@@ -401,8 +401,8 @@ def run_encoding(
         return latents_nchw
 
     # Replicate PMAP Params across devices
-    from flax.jax_utils import replicate
-    vae_params_repl = replicate(vae_params)
+    from src.jax_compat import replicate_tree
+    vae_params_repl = replicate_tree(vae_params)
     
     # 3. Setup DataLoader
     dataloader, num_samples = get_dataloader(data_dir, split, batch_size)
