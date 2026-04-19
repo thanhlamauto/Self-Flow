@@ -125,27 +125,48 @@ The code detaches this tensor:
 \[
   \bm{M}^{\dagger} = \StopGrad(\bm{M}).
 \]
-For each batch item $b$, it computes an SVD
+For each batch item $b$, the implementation now takes the \emph{dual Gram view} and forms
 \[
-  \bm{M}^{\dagger}_b = \bm{U}_b \bm{\Sigma}_b \bm{V}_b^\top,
-\]
-and extracts the first $k_{\mathrm{eff}}$ right singular vectors:
-\[
-  \bm{Q}_b
+  \bm{G}_b
   =
-  \left[\bm{v}_{b,1}, \dots, \bm{v}_{b,k_{\mathrm{eff}}}\right]
+  \bm{M}^{\dagger}_b \bm{M}^{\dagger\top}_b
+  \in \mathbb{R}^{N_{\mathrm{tok}}\times N_{\mathrm{tok}}},
+\]
+then eigendecomposes
+\[
+  \bm{G}_b
+  =
+  \bm{U}_b \bm{\Lambda}_b \bm{U}_b^\top,
+  \qquad
+  \bm{\Lambda}_b = \bm{\Sigma}_b^2.
+\]
+Let
+\[
+  \bm{U}_{b,k}
+  =
+  \left[\bm{u}_{b,1}, \dots, \bm{u}_{b,k_{\mathrm{eff}}}\right]
+  \in \mathbb{R}^{N_{\mathrm{tok}}\times k_{\mathrm{eff}}}
+\]
+be the top eigenspace. The code maps this dual basis back to feature space as
+\[
+  \bm{B}_b
+  =
+  \bm{M}_b^{\dagger\top}\bm{U}_{b,k}\bm{\Lambda}_{b,k}^{-1/2}
   \in \mathbb{R}^{D\times k_{\mathrm{eff}}}.
 \]
-Equivalently, the shared projector is
-\[
-  \bm{P}_b = \bm{Q}_b \bm{Q}_b^\top \in \mathbb{R}^{D\times D}.
-\]
-The implementation does not explicitly materialize $\bm{P}_b$; it applies the projector as
+In exact arithmetic, $\operatorname{span}(\bm{B}_b)$ is the same as the top right-singular
+subspace from the truncated SVD of $\bm{M}^{\dagger}_b$.
+
+The implementation does not explicitly materialize the dense projector. Instead, it applies the
+orthogonal projector onto $\operatorname{span}(\bm{B}_b)$ as
 \[
   \tilde{\bm{A}}_\ell \bm{P}
   =
-  (\tilde{\bm{A}}_\ell \bm{Q}) \bm{Q}^\top.
+  (\tilde{\bm{A}}_\ell \bm{B})
+  (\bm{B}^\top \bm{B})^{+}
+  \bm{B}^\top.
 \]
+When $\bm{B}$ has orthonormal columns, this reduces to $(\tilde{\bm{A}}_\ell \bm{B})\bm{B}^\top$.
 
 \subsection*{5. Common-private decomposition}
 For each layer $\ell$ inside the sampled window,

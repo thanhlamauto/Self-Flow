@@ -308,22 +308,48 @@ def shared_subspace_basis(
     *,
     rank: int,
 ) -> tuple[jax.Array, int]:
-    """Compute the detached right-singular-vector basis ``Q_t`` for each batch item."""
+    """Compute a detached feature-space basis from the dual Gram matrix ``M M^T``.
+
+    For each batch item, we form ``G = M M^T`` in token space, take its top eigenspace,
+    then map that left-singular subspace back into feature space via
+    ``B = M^T U Lambda^{-1/2}``. In exact arithmetic the columns of ``B`` match the top
+    right singular vectors of ``M`` up to signs / rotations within degenerate blocks.
+    """
     if mean_activations.ndim != 3:
         raise ValueError(
             f"Expected mean activations with rank 3, got shape {mean_activations.shape}"
         )
     effective_rank = min(max(int(rank), 1), mean_activations.shape[-2], mean_activations.shape[-1])
     detached_mean = jax.lax.stop_gradient(mean_activations).astype(jnp.float32)
-    _, _, vh = jnp.linalg.svd(detached_mean, full_matrices=False)
-    basis = jnp.swapaxes(vh[:, :effective_rank, :], 1, 2).astype(mean_activations.dtype)
+    dual_gram = jnp.einsum("bnd,bmd->bnm", detached_mean, detached_mean)
+    eigenvalues, eigenvectors = jnp.linalg.eigh(dual_gram)
+    top_eigenvalues = jnp.flip(eigenvalues[:, -effective_rank:], axis=-1)
+    top_eigenvectors = jnp.flip(eigenvectors[:, :, -effective_rank:], axis=-1)
+
+    # ``G`` is PSD, but a small clamp keeps the dual-to-primal lift stable numerically.
+    eps = jnp.asarray(1e-6, dtype=detached_mean.dtype)
+    positive_eigenvalues = jnp.maximum(top_eigenvalues, 0.0)
+    inverse_sqrt = jnp.where(
+        positive_eigenvalues > eps,
+        jax.lax.rsqrt(positive_eigenvalues),
+        0.0,
+    )
+    basis = jnp.einsum(
+        "bnd,bnk,bk->bdk",
+        detached_mean,
+        top_eigenvectors,
+        inverse_sqrt,
+    ).astype(mean_activations.dtype)
     return jax.lax.stop_gradient(basis), effective_rank
 
 
 def project_onto_basis(activations: jax.Array, basis: jax.Array) -> jax.Array:
-    """Apply ``A @ (Q Q^T)`` without explicitly materializing the dense projector."""
+    """Project onto ``span(basis)`` without explicitly materializing a dense projector."""
     coeffs = jnp.einsum("lbnd,bdk->lbnk", activations, basis)
-    return jnp.einsum("lbnk,bdk->lbnd", coeffs, basis)
+    basis_gram = jnp.einsum("bdk,bdj->bkj", basis, basis).astype(jnp.float32)
+    basis_gram_pinv = jnp.linalg.pinv(basis_gram, hermitian=True).astype(basis.dtype)
+    projected_coeffs = jnp.einsum("lbnk,bkj->lbnj", coeffs, basis_gram_pinv)
+    return jnp.einsum("lbnk,bdk->lbnd", projected_coeffs, basis)
 
 
 def gap_pairwise_cosine_squared(
