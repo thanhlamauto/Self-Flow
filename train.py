@@ -550,7 +550,8 @@ def compute_layersync_loss(raw_features):
 
     cosine = jnp.sum(z_weak * z_strong, axis=-1)
     mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+    mean_cosine_squared = jnp.mean(jnp.square(cosine))
+    return mean_cosine_squared, mean_cosine
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
