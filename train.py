@@ -540,8 +540,12 @@ def resolve_layersync_config(args, depth):
     return weak_layer, strong_layer
 
 
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
+def compute_layersync_loss(raw_features, *, weak_layer, strong_layer):
+    all_features = jnp.stack(raw_features, axis=0)
+    # Keep the common anchor fixed so LayerSync still only updates the weak branch.
+    common_feature = jax.lax.stop_gradient(jnp.mean(all_features, axis=0))
+    z_weak = all_features[int(weak_layer) - 1] - common_feature
+    z_strong = all_features[int(strong_layer) - 1] - common_feature
     eps = jnp.float32(1e-8)
 
     z_strong = jax.lax.stop_gradient(z_strong)
@@ -565,6 +569,8 @@ def train_step(
     *,
     layersync_enabled,
     layersync_capture_layers,
+    layersync_weak_layer,
+    layersync_strong_layer,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -595,7 +601,11 @@ def train_step(
                 rngs={"dropout": drop_rng},
                 return_raw_features=layersync_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            loss_layersync, layersync_cosine = compute_layersync_loss(
+                raw_features,
+                weak_layer=layersync_weak_layer,
+                strong_layer=layersync_strong_layer,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -657,6 +667,8 @@ def eval_step(
     *,
     layersync_enabled,
     layersync_capture_layers,
+    layersync_weak_layer,
+    layersync_strong_layer,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -679,7 +691,11 @@ def eval_step(
             deterministic=True,
             return_raw_features=layersync_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        loss_layersync, layersync_cosine = compute_layersync_loss(
+            raw_features,
+            weak_layer=layersync_weak_layer,
+            strong_layer=layersync_strong_layer,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -1397,12 +1413,14 @@ def main():
     )
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
+    layersync_weak_layer = None
+    layersync_strong_layer = None
     if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+        layersync_weak_layer, layersync_strong_layer = resolve_layersync_config(args, config["depth"])
+        layersync_capture_layers = tuple(range(1, depth + 1))
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"weak_layer={layersync_weak_layer} strong_layer={layersync_strong_layer}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
@@ -1450,6 +1468,8 @@ def main():
             train_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            layersync_weak_layer=layersync_weak_layer,
+            layersync_strong_layer=layersync_strong_layer,
         ),
         axis_name="batch",
     )
@@ -1458,6 +1478,8 @@ def main():
             eval_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            layersync_weak_layer=layersync_weak_layer,
+            layersync_strong_layer=layersync_strong_layer,
         ),
         axis_name="batch",
     )
