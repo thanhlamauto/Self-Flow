@@ -545,6 +545,12 @@ def _masked_mean(values, mask):
     return jnp.sum(values * mask) / denom
 
 
+def _token_layer_norm(x, eps=1e-6):
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+    return (x - mean) * jax.lax.rsqrt(variance + eps)
+
+
 def _zero_layersync_metrics(dtype=jnp.float32):
     zero = jnp.array(0.0, dtype=dtype)
     return {
@@ -560,7 +566,7 @@ def _zero_layersync_metrics(dtype=jnp.float32):
 
 
 def compute_layersync_loss(raw_features, *, weak_layer, strong_layer, norm_floor):
-    all_features = jnp.stack(raw_features, axis=0)
+    all_features = _token_layer_norm(jnp.stack(raw_features, axis=0))
     # Keep the common anchor fixed so LayerSync still only updates the weak branch.
     common_feature = jax.lax.stop_gradient(jnp.mean(all_features, axis=0))
     weak_residual = all_features[int(weak_layer) - 1] - common_feature
