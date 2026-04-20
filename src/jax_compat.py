@@ -1,20 +1,41 @@
 from typing import Any, Sequence
 
 import jax
-import jax.numpy as jnp
+import numpy as np
 
 
-def _as_replicable_array(x: Any) -> jax.Array:
-    if isinstance(x, jax.Array):
-        return x
-    return jnp.asarray(x)
+def _as_host_array(x: Any) -> np.ndarray:
+    return np.asarray(x)
 
 
-def _replicate_leaf(x: Any, *, sharding: jax.sharding.PositionalSharding, num_devices: int) -> Any:
+def _build_replicate_sharding(devices: Sequence[jax.Device], value_ndim: int) -> Any:
+    sharding_mod = getattr(jax, "sharding", None)
+    if sharding_mod is None:
+        return None
+
+    positional = getattr(sharding_mod, "PositionalSharding", None)
+    if positional is not None:
+        return positional(devices)
+
+    mesh_cls = getattr(sharding_mod, "Mesh", None)
+    named_cls = getattr(sharding_mod, "NamedSharding", None)
+    partition_spec = getattr(sharding_mod, "PartitionSpec", None)
+    if mesh_cls is None or named_cls is None or partition_spec is None:
+        return None
+
+    mesh = mesh_cls(np.asarray(devices, dtype=object), ("devices",))
+    spec = partition_spec("devices", *([None] * value_ndim))
+    return named_cls(mesh, spec)
+
+
+def _replicate_leaf(x: Any, *, devices: Sequence[jax.Device], num_devices: int) -> Any:
     if x is None:
         return None
-    arr = _as_replicable_array(x)
-    stacked = jnp.broadcast_to(jnp.expand_dims(arr, axis=0), (num_devices,) + arr.shape)
+    arr = _as_host_array(x)
+    stacked = np.broadcast_to(np.expand_dims(arr, axis=0), (num_devices,) + arr.shape)
+    sharding = _build_replicate_sharding(devices, arr.ndim)
+    if sharding is None:
+        return stacked
     return jax.device_put(stacked, sharding)
 
 
@@ -25,11 +46,10 @@ def replicate(tree: Any, devices: Sequence[jax.Device] | None = None) -> Any:
     devices = tuple(devices)
     if not devices:
         raise ValueError("replicate() requires at least one device.")
-    sharding = jax.sharding.PositionalSharding(devices)
     num_devices = len(devices)
 
     return jax.tree_util.tree_map(
-        lambda x: _replicate_leaf(x, sharding=sharding, num_devices=num_devices),
+        lambda x: _replicate_leaf(x, devices=devices, num_devices=num_devices),
         tree,
     )
 
