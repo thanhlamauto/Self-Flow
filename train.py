@@ -307,7 +307,6 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
         images = jnp.transpose(images, (0, 2, 3, 1))
         return ((images / 2.0 + 0.5).clip(0, 1)).astype(jnp.float32)
 
-    from flax.jax_utils import replicate
     vae_params_repl = replicate(vae_params)
     log_stage(f"[VAE-TPU] Flax VAE decode ready trên {num_devices} TPU device(s).")
     return _decode_pmap, vae_params_repl
@@ -409,12 +408,12 @@ import jax.numpy as jnp
 import optax
 import wandb
 from flax.training import train_state, checkpoints
-from flax import jax_utils
 import numpy as np
 try:
     import grain.python as grain
 except ImportError:
     grain = None
+from src.jax_compat import device_put_replicated, replicate, unreplicate
 from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -439,7 +438,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
-    online params.  Caller should replicate both via jax_utils.replicate.
+    online params. Caller should replicate both before pmapping.
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -540,8 +539,16 @@ def resolve_layersync_config(args, depth):
     return weak_layer, strong_layer
 
 
+def _spatial_norm_tokens(x, eps=1e-6):
+    mean = jnp.mean(x, axis=1, keepdims=True)
+    variance = jnp.mean(jnp.square(x - mean), axis=1, keepdims=True)
+    return (x - mean) * jax.lax.rsqrt(variance + eps)
+
+
 def compute_layersync_loss(raw_features):
     z_weak, z_strong = raw_features
+    z_weak = _spatial_norm_tokens(z_weak)
+    z_strong = _spatial_norm_tokens(z_strong)
     eps = jnp.float32(1e-8)
 
     z_strong = jax.lax.stop_gradient(z_strong)
@@ -1417,11 +1424,11 @@ def main():
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
-    state = jax_utils.replicate(state)
-    ema_params = jax_utils.replicate(ema_params)
+    state = replicate(state)
+    ema_params = replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
-    ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
+    ema_decay_rep = replicate(jnp.float32(args.ema_decay))
+    layersync_lambda_rep = replicate(jnp.float32(args.layersync_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1615,8 +1622,8 @@ def main():
                 raise ValueError(f"Probe file missing key 'W': {args.probe_save_path!r}")
             W = np.asarray(data["W"], dtype=np.float32)
             b = np.asarray(data["b"], dtype=np.float32) if "b" in data else np.zeros((W.shape[1],), dtype=np.float32)
-            W_repl = jax.device_put_replicated(jnp.array(W), jax.local_devices())
-            b_repl = jax.device_put_replicated(jnp.array(b), jax.local_devices())
+            W_repl = device_put_replicated(jnp.array(W), jax.local_devices())
+            b_repl = device_put_replicated(jnp.array(b), jax.local_devices())
             _probe_weights[0] = (W_repl, b_repl)
         return _probe_weights[0]
 
@@ -2173,8 +2180,8 @@ def main():
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    unreplicated_params = unreplicate(state.params)
+    unreplicated_ema    = unreplicate(ema_params)
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,
