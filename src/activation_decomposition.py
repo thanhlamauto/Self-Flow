@@ -13,6 +13,9 @@ DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 DEFAULT_TIMESTEP_BLUR_SCHEDULE = "linear"
 DEFAULT_TIMESTEP_BLUR_EXP_RATE = 5.0
+COMMON_MEAN_START_LAYER = 3
+COMMON_MEAN_END_LAYER = 9
+SPATIAL_TARGET_LAYER = 10
 
 
 def _layer_logit_normal_weights(
@@ -74,30 +77,41 @@ def compute_common_private(
     agg: str = "mean",
     logit_normal_center_layer: float = 0.0,
     logit_normal_sigma: float = 1.0,
+    common_mean_start_layer: int = COMMON_MEAN_START_LAYER,
+    common_mean_end_layer: int = COMMON_MEAN_END_LAYER,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute differentiable common activation and private residuals.
 
-    ``agg="mean"`` uses ``A_common = mean_i A_i`` (default). ``agg="logit_normal"`` uses
-    ``A_common = sum_i w_i A_i`` with ``w`` a normalized Gaussian bump on ``logit((i+0.5)/L)``
-    centered at the same mapping of ``logit_normal_center_layer`` (0-based; fractional ``k``
-    allowed). ``logit_normal_sigma`` is the Gaussian std on that logit scale (larger =>
-    flatter weights, converging to ``mean`` when ``sigma`` is large).
+    ``A_common`` is the mean of the normalized post-block activations from
+    ``common_mean_start_layer`` through ``common_mean_end_layer`` inclusive
+    (1-based indexing). ``A_private`` remains the full normalized activation
+    stack with the detached common activation removed from every layer.
+    Aggregation arguments are retained for call-site compatibility and are
+    ignored.
     """
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
-    num_layers = activations.shape[0]
-    if agg == "mean":
-        common = jnp.mean(activations, axis=0)
-    elif agg == "logit_normal":
-        w = _layer_logit_normal_weights(
-            num_layers,
-            logit_normal_center_layer,
-            logit_normal_sigma,
-            activations.dtype,
+    del agg, logit_normal_center_layer, logit_normal_sigma
+
+    common_start = int(common_mean_start_layer) - 1
+    common_end = int(common_mean_end_layer)
+    if common_mean_start_layer <= 0:
+        raise ValueError(
+            f"common_mean_start_layer must be >= 1, got {common_mean_start_layer}"
         )
-        common = jnp.tensordot(w, activations, axes=(0, 0))
-    else:
-        raise ValueError(f"Unknown common aggregation {agg!r}; expected 'mean' or 'logit_normal'.")
+    if common_mean_end_layer < common_mean_start_layer:
+        raise ValueError(
+            "common_mean_end_layer must be >= common_mean_start_layer, "
+            f"got {common_mean_end_layer} < {common_mean_start_layer}"
+        )
+    if activations.shape[0] < common_end:
+        raise ValueError(
+            "Expected activations to include the requested A_common layer range "
+            f"[{common_mean_start_layer}, {common_mean_end_layer}], "
+            f"got only {activations.shape[0]} layers."
+        )
+
+    common = jnp.mean(activations[common_start:common_end], axis=0)
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]
     return common, common_anchor, private
@@ -418,7 +432,6 @@ def _mean_common_private_cosine_squared(
 
 def compute_aux_losses(
     activations: Any,
-    spatial_target: jax.Array,
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
@@ -435,12 +448,22 @@ def compute_aux_losses(
     common_agg: str = "mean",
     common_logit_normal_center_layer: float = 0.0,
     common_logit_normal_sigma: float = 1.0,
+    common_mean_start_layer: int = COMMON_MEAN_START_LAYER,
+    common_mean_end_layer: int = COMMON_MEAN_END_LAYER,
+    spatial_target_layer: int = SPATIAL_TARGET_LAYER,
     common_spatial_project_fn: Callable[[jax.Array], jax.Array] | None = None,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses and logging metrics for activation decomposition."""
     activations = collect_activations(activations)
-    if spatial_target.ndim != 3:
-        raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
+    spatial_target_index = int(spatial_target_layer) - 1
+    if spatial_target_layer <= 0:
+        raise ValueError(f"spatial_target_layer must be >= 1, got {spatial_target_layer}")
+    if activations.shape[0] <= spatial_target_index:
+        raise ValueError(
+            f"Expected activations to include layer {spatial_target_layer} for the spatial target, "
+            f"got only {activations.shape[0]} layers."
+        )
+    spatial_target = jax.lax.stop_gradient(activations[spatial_target_index])
     needs_timesteps = spatial_blur_by_timestep or spatial_timestep_range is not None
     if needs_timesteps:
         if timesteps is None:
@@ -476,6 +499,8 @@ def compute_aux_losses(
         agg=common_agg,
         logit_normal_center_layer=common_logit_normal_center_layer,
         logit_normal_sigma=common_logit_normal_sigma,
+        common_mean_start_layer=common_mean_start_layer,
+        common_mean_end_layer=common_mean_end_layer,
     )
     spatial_common = (
         common_spatial_project_fn(common)

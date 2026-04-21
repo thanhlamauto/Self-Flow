@@ -425,6 +425,9 @@ except ImportError:
     grain = None
 from src.model import SelfFlowDiT
 from src.activation_decomposition import (
+    COMMON_MEAN_END_LAYER,
+    COMMON_MEAN_START_LAYER,
+    SPATIAL_TARGET_LAYER,
     compute_aux_losses,
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     DEFAULT_SPATIAL_WINDOW_SIZE,
@@ -618,6 +621,9 @@ def train_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_mean_start_layer=COMMON_MEAN_START_LAYER,
+    common_mean_end_layer=COMMON_MEAN_END_LAYER,
+    spatial_target_layer=SPATIAL_TARGET_LAYER,
     common_spatial_projector="identity",
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
@@ -684,7 +690,6 @@ def train_step(
                 common_spatial_project_fn = None
             aux_metrics = compute_aux_losses(
                 activations,
-                spatial_target=x0,
                 timesteps=tau,
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
@@ -701,6 +706,9 @@ def train_step(
                 common_agg=common_agg,
                 common_logit_normal_center_layer=common_logit_normal_center_layer,
                 common_logit_normal_sigma=common_logit_normal_sigma,
+                common_mean_start_layer=common_mean_start_layer,
+                common_mean_end_layer=common_mean_end_layer,
+                spatial_target_layer=spatial_target_layer,
                 common_spatial_project_fn=common_spatial_project_fn,
             )
             l_diff = jnp.mean((pred - target) ** 2)
@@ -848,6 +856,9 @@ def eval_step(
     common_agg="mean",
     common_logit_normal_center_layer=0.0,
     common_logit_normal_sigma=1.0,
+    common_mean_start_layer=COMMON_MEAN_START_LAYER,
+    common_mean_end_layer=COMMON_MEAN_END_LAYER,
+    spatial_target_layer=SPATIAL_TARGET_LAYER,
     common_spatial_projector="identity",
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
@@ -908,7 +919,6 @@ def eval_step(
             common_spatial_project_fn = None
         aux_metrics = compute_aux_losses(
             activations,
-            spatial_target=x0,
             timesteps=tau,
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
@@ -925,6 +935,9 @@ def eval_step(
             common_agg=common_agg,
             common_logit_normal_center_layer=common_logit_normal_center_layer,
             common_logit_normal_sigma=common_logit_normal_sigma,
+            common_mean_start_layer=common_mean_start_layer,
+            common_mean_end_layer=common_mean_end_layer,
+            spatial_target_layer=spatial_target_layer,
             common_spatial_project_fn=common_spatial_project_fn,
         )
     else:
@@ -1542,6 +1555,32 @@ def main():
         ),
     )
     parser.add_argument(
+        "--common-mean-start-layer",
+        type=int,
+        default=COMMON_MEAN_START_LAYER,
+        help=(
+            "1-based inclusive start block index used when averaging activations "
+            "to form A_common for the spatial loss path."
+        ),
+    )
+    parser.add_argument(
+        "--common-mean-end-layer",
+        type=int,
+        default=COMMON_MEAN_END_LAYER,
+        help=(
+            "1-based inclusive end block index used when averaging activations "
+            "to form A_common for the spatial loss path."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-target-layer",
+        type=int,
+        default=SPATIAL_TARGET_LAYER,
+        help=(
+            "1-based block index used as the stop-gradient spatial target activation."
+        ),
+    )
+    parser.add_argument(
         "--common-spatial-projector",
         type=str,
         default="identity",
@@ -1781,6 +1820,12 @@ def main():
         raise ValueError("--private-warmup-iters must be >= 0")
     if args.common_agg == "logit_normal" and args.common_logit_normal_sigma <= 0:
         raise ValueError("--common-logit-normal-sigma must be > 0 when --common-agg=logit_normal")
+    if args.common_mean_start_layer <= 0:
+        raise ValueError("--common-mean-start-layer must be >= 1")
+    if args.common_mean_end_layer < args.common_mean_start_layer:
+        raise ValueError("--common-mean-end-layer must be >= --common-mean-start-layer")
+    if args.spatial_target_layer <= 0:
+        raise ValueError("--spatial-target-layer must be >= 1")
     if args.common_spatial_projector_width <= 0:
         raise ValueError("--common-spatial-projector-width must be > 0")
     if args.common_spatial_projector_depth <= 0:
@@ -1834,6 +1879,14 @@ def main():
         common_spatial_projector_kernel_size=args.common_spatial_projector_kernel_size,
     )
     depth = int(config["depth"])
+    if args.common_mean_end_layer > depth:
+        raise ValueError(
+            f"--common-mean-end-layer ({args.common_mean_end_layer}) must be <= model depth ({depth})"
+        )
+    if args.spatial_target_layer > depth:
+        raise ValueError(
+            f"--spatial-target-layer ({args.spatial_target_layer}) must be <= model depth ({depth})"
+        )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1863,6 +1916,9 @@ def main():
         f"common_agg={args.common_agg} "
         f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
         f"common_logit_normal_sigma={args.common_logit_normal_sigma} "
+        f"common_mean_start_layer={args.common_mean_start_layer} "
+        f"common_mean_end_layer={args.common_mean_end_layer} "
+        f"spatial_target_layer={args.spatial_target_layer} "
         f"common_spatial_projector={args.common_spatial_projector}"
     )
     if args.common_spatial_projector == "cnn":
@@ -1932,6 +1988,9 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_mean_start_layer=args.common_mean_start_layer,
+            common_mean_end_layer=args.common_mean_end_layer,
+            spatial_target_layer=args.spatial_target_layer,
             common_spatial_projector=args.common_spatial_projector,
         ),
         axis_name="batch",
@@ -1958,6 +2017,9 @@ def main():
             common_agg=args.common_agg,
             common_logit_normal_center_layer=args.common_logit_normal_center_layer,
             common_logit_normal_sigma=args.common_logit_normal_sigma,
+            common_mean_start_layer=args.common_mean_start_layer,
+            common_mean_end_layer=args.common_mean_end_layer,
+            spatial_target_layer=args.spatial_target_layer,
             common_spatial_projector=args.common_spatial_projector,
         ),
         axis_name="batch",
