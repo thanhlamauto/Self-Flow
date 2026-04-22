@@ -430,6 +430,7 @@ from src.activation_decomposition import (
     DEFAULT_PRIVATE_MAX_LAYERS,
     DEFAULT_PRIVATE_MAX_PAIRS,
     DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    DEFAULT_SPATIAL_LOSS_TYPE,
     DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     DEFAULT_TIMESTEP_BLUR_SCHEDULE,
 )
@@ -577,7 +578,7 @@ def _scheduled_lambda_spatial(
     stop_step=-1,
     stop_warmup_iters=0,
 ):
-    """Optional early-stop + linear ramp-down schedule for spatial Gram loss."""
+    """Optional early-stop + linear ramp-down schedule for the spatial auxiliary loss."""
     lambda_spatial = jnp.asarray(lambda_spatial, dtype=jnp.float32)
     current_step = jnp.asarray(current_step, dtype=jnp.int32)
     stop_step = jnp.asarray(stop_step, dtype=jnp.int32)
@@ -607,6 +608,7 @@ def train_step(
     private_max_layers=DEFAULT_PRIVATE_MAX_LAYERS,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
     spatial_align_max_layers=DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    spatial_loss_type=DEFAULT_SPATIAL_LOSS_TYPE,
     spatial_window_size=0,
     spatial_window_stride=0,
     spatial_timestep_range=None,
@@ -682,6 +684,7 @@ def train_step(
                 spatial_align_rng=spatial_align_rng,
                 spatial_align_max_layers=spatial_align_max_layers,
                 compute_spatial_loss=compute_spatial_loss,
+                spatial_loss_type=spatial_loss_type,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_timestep_range=spatial_timestep_range,
@@ -820,6 +823,7 @@ def eval_step(
     private_max_layers=DEFAULT_PRIVATE_MAX_LAYERS,
     private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
     spatial_align_max_layers=DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    spatial_loss_type=DEFAULT_SPATIAL_LOSS_TYPE,
     spatial_window_size=0,
     spatial_window_stride=0,
     spatial_timestep_range=None,
@@ -889,6 +893,7 @@ def eval_step(
             spatial_align_rng=spatial_align_rng,
             spatial_align_max_layers=spatial_align_max_layers,
             compute_spatial_loss=compute_spatial_loss,
+            spatial_loss_type=spatial_loss_type,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_timestep_range=spatial_timestep_range,
@@ -1440,7 +1445,7 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for randomly aligning sampled intermediate layers to the final hidden layer via local Gram loss.")
+                        help="Weight for randomly aligning sampled intermediate layers to the final hidden layer via the selected spatial auxiliary loss.")
     parser.add_argument(
         "--spatial-stop-step",
         type=int,
@@ -1486,6 +1491,17 @@ def main():
         help="If > 0, randomly sample at most this many intermediate layers per iteration for spatial alignment to the final layer. Use 0 for all eligible layers.",
     )
     parser.add_argument(
+        "--spatial-loss-type",
+        type=str,
+        default=DEFAULT_SPATIAL_LOSS_TYPE,
+        choices=["local_gram", "global_linear_cka"],
+        help=(
+            "Spatial alignment loss to use. "
+            "'local_gram' keeps the existing sliding-window Gram matching; "
+            "'global_linear_cka' uses token-space linear CKA on full N x D activations."
+        ),
+    )
+    parser.add_argument(
         "--common-spatial-projector",
         type=str,
         default="identity",
@@ -1514,9 +1530,9 @@ def main():
         help="Legacy CNN projector kernel size. Must be a positive odd integer.",
     )
     parser.add_argument("--spatial-window-size", type=int, default=0,
-                        help="Uniform sliding window size for local Gram spatial loss. Use 0 to enable model-specific defaults.")
+                        help="Uniform sliding window size for local Gram spatial loss. Use 0 to enable model-specific defaults. Ignored for --spatial-loss-type=global_linear_cka.")
     parser.add_argument("--spatial-window-stride", type=int, default=0,
-                        help="Uniform sliding window stride for local Gram spatial loss. Use 0 to enable model-specific defaults.")
+                        help="Uniform sliding window stride for local Gram spatial loss. Use 0 to enable model-specific defaults. Ignored for --spatial-loss-type=global_linear_cka.")
     parser.add_argument(
         "--spatial-timestep-range",
         type=float,
@@ -1794,6 +1810,7 @@ def main():
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
+        f"spatial_loss_type={args.spatial_loss_type} "
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
@@ -1860,6 +1877,7 @@ def main():
             private_max_layers=args.private_max_layers,
             private_max_pairs=args.private_max_pairs,
             spatial_align_max_layers=args.spatial_align_max_layers,
+            spatial_loss_type=args.spatial_loss_type,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_timestep_range=args.spatial_timestep_range,
@@ -1883,6 +1901,7 @@ def main():
             private_max_layers=args.private_max_layers,
             private_max_pairs=args.private_max_pairs,
             spatial_align_max_layers=args.spatial_align_max_layers,
+            spatial_loss_type=args.spatial_loss_type,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_timestep_range=args.spatial_timestep_range,

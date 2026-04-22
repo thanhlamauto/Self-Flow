@@ -11,6 +11,7 @@ import jax.numpy as jnp
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_SPATIAL_ALIGN_MAX_LAYERS = 2
+DEFAULT_SPATIAL_LOSS_TYPE = "local_gram"
 DEFAULT_PRIVATE_MAX_LAYERS = 6
 DEFAULT_PRIVATE_MAX_PAIRS = 0
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
@@ -303,6 +304,99 @@ def local_window_gram_loss(
     )
 
 
+def global_linear_cka_loss(
+    feature_tokens: jax.Array,
+    target_tokens: jax.Array,
+    eps: float = 1e-8,
+    sample_mask: jax.Array | None = None,
+    target_blur_sigmas: jax.Array | None = None,
+    target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Compute global token-space linear CKA on `[B, N, D]` tokens.
+
+    This path intentionally avoids token-wise L2 normalization before CKA. We only
+    center across tokens, then compute the standard linear CKA in token space
+    using `N x N` Gram matrices because `N < D` in the current DiT setups.
+    """
+    if feature_tokens.ndim != 3:
+        raise ValueError(f"Expected feature tokens with rank 3, got shape {feature_tokens.shape}")
+    if target_tokens.ndim != 3:
+        raise ValueError(f"Expected target tokens with rank 3, got shape {target_tokens.shape}")
+    if feature_tokens.shape != target_tokens.shape:
+        raise ValueError(
+            "Feature and target tokens must match in batch/token/channel dims, "
+            f"got {feature_tokens.shape} vs {target_tokens.shape}"
+        )
+
+    if target_blur_sigmas is not None:
+        target_grid = tokens_to_grid(target_tokens)
+        target_grid = _apply_separable_gaussian_blur(
+            target_grid,
+            target_blur_sigmas,
+            max_sigma=target_blur_max_sigma,
+        )
+        target_tokens = target_grid.reshape(target_tokens.shape)
+
+    feature_centered = feature_tokens - jnp.mean(feature_tokens, axis=1, keepdims=True)
+    target_centered = target_tokens - jnp.mean(target_tokens, axis=1, keepdims=True)
+
+    cross_gram = jnp.einsum("bnd,bmd->bnm", feature_centered, target_centered)
+    feature_gram = jnp.einsum("bnd,bmd->bnm", feature_centered, feature_centered)
+    target_gram = jnp.einsum("bnd,bmd->bnm", target_centered, target_centered)
+
+    numerator = jnp.sum(jnp.square(cross_gram), axis=(-2, -1))
+    denom_feature = jnp.sqrt(jnp.sum(jnp.square(feature_gram), axis=(-2, -1)) + eps)
+    denom_target = jnp.sqrt(jnp.sum(jnp.square(target_gram), axis=(-2, -1)) + eps)
+    cka = numerator / jnp.maximum(denom_feature * denom_target, eps)
+    cka = jnp.clip(cka, 0.0, 1.0)
+    example_losses = 1.0 - cka
+
+    if sample_mask is not None:
+        if sample_mask.ndim != 1:
+            raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
+        if sample_mask.shape[0] != feature_tokens.shape[0]:
+            raise ValueError(
+                "Sample mask batch size and feature batch size must match, "
+                f"got {sample_mask.shape[0]} vs {feature_tokens.shape[0]}"
+            )
+        mask = sample_mask.astype(feature_tokens.dtype)
+        active_count = jnp.sum(mask)
+        spatial_loss = jnp.where(
+            active_count > 0,
+            jnp.sum(example_losses * mask) / active_count,
+            jnp.array(0.0, dtype=feature_tokens.dtype),
+        )
+        active_fraction = active_count / jnp.maximum(
+            jnp.asarray(feature_tokens.shape[0], dtype=feature_tokens.dtype),
+            jnp.array(1.0, dtype=feature_tokens.dtype),
+        )
+        blur_sigma_mean = (
+            jnp.where(
+                active_count > 0,
+                jnp.sum(target_blur_sigmas.astype(feature_tokens.dtype) * mask) / active_count,
+                jnp.array(0.0, dtype=feature_tokens.dtype),
+            )
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=feature_tokens.dtype)
+        )
+    else:
+        spatial_loss = jnp.mean(example_losses)
+        active_fraction = jnp.array(1.0, dtype=feature_tokens.dtype)
+        blur_sigma_mean = (
+            jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=feature_tokens.dtype)
+        )
+
+    spatial_metrics = {
+        "spatial_num_windows": jnp.array(1.0, dtype=feature_tokens.dtype),
+        "spatial_window_area": jnp.asarray(feature_tokens.shape[1], dtype=feature_tokens.dtype),
+        "spatial_active_fraction": active_fraction,
+        "spatial_blur_sigma_mean": blur_sigma_mean,
+    }
+    return spatial_loss, spatial_metrics
+
+
 def _pairwise_cosine_matrix(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     num_layers = private.shape[0]
     if num_layers == 0:
@@ -447,6 +541,7 @@ def _mean_sampled_spatial_alignment_loss(
     *,
     spatial_align_rng: jax.Array | None,
     spatial_align_max_layers: int,
+    spatial_loss_type: str,
     spatial_window_size: int,
     spatial_window_stride: int,
     spatial_sample_mask: jax.Array | None,
@@ -483,21 +578,35 @@ def _mean_sampled_spatial_alignment_loss(
     blur_sigma_means = []
     for layer_offset in range(num_candidates):
         layer_index = layer_offset + 1
-        window_size, stride = _resolve_spatial_window(
-            layer_index,
-            model_size=model_size,
-            default_window_size=spatial_window_size,
-            default_stride=spatial_window_stride,
-        )
-        layer_loss, layer_metrics = local_window_gram_loss(
-            candidate_layers[layer_offset],
-            target_layer,
-            window_size=window_size,
-            stride=stride,
-            sample_mask=spatial_sample_mask,
-            target_blur_sigmas=blur_sigmas,
-            target_blur_max_sigma=spatial_blur_max_sigma,
-        )
+        if spatial_loss_type == "local_gram":
+            window_size, stride = _resolve_spatial_window(
+                layer_index,
+                model_size=model_size,
+                default_window_size=spatial_window_size,
+                default_stride=spatial_window_stride,
+            )
+            layer_loss, layer_metrics = local_window_gram_loss(
+                candidate_layers[layer_offset],
+                target_layer,
+                window_size=window_size,
+                stride=stride,
+                sample_mask=spatial_sample_mask,
+                target_blur_sigmas=blur_sigmas,
+                target_blur_max_sigma=spatial_blur_max_sigma,
+            )
+        elif spatial_loss_type == "global_linear_cka":
+            layer_loss, layer_metrics = global_linear_cka_loss(
+                candidate_layers[layer_offset],
+                target_layer,
+                sample_mask=spatial_sample_mask,
+                target_blur_sigmas=blur_sigmas,
+                target_blur_max_sigma=spatial_blur_max_sigma,
+            )
+        else:
+            raise ValueError(
+                f"Unknown spatial loss type {spatial_loss_type!r}; "
+                "expected 'local_gram' or 'global_linear_cka'."
+            )
         losses.append(layer_loss)
         num_windows.append(layer_metrics["spatial_num_windows"])
         window_areas.append(layer_metrics["spatial_window_area"])
@@ -543,11 +652,21 @@ def compute_aux_losses(
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_blur_schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     spatial_blur_exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+    spatial_loss_type: str = DEFAULT_SPATIAL_LOSS_TYPE,
     model_size: str | None = None,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses for consecutive-layer deltas and spatial alignment."""
     activations = collect_activations(activations)
     normalized_activations, private = compute_private_deltas(activations)
+    if spatial_loss_type == "local_gram":
+        spatial_activations = normalized_activations
+    elif spatial_loss_type == "global_linear_cka":
+        spatial_activations = activations
+    else:
+        raise ValueError(
+            f"Unknown spatial loss type {spatial_loss_type!r}; "
+            "expected 'local_gram' or 'global_linear_cka'."
+        )
 
     needs_timesteps = compute_spatial_loss and (
         spatial_blur_by_timestep or spatial_timestep_range is not None
@@ -559,10 +678,10 @@ def compute_aux_losses(
             )
         if timesteps.ndim != 1:
             raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
-        if timesteps.shape[0] != normalized_activations.shape[1]:
+        if timesteps.shape[0] != spatial_activations.shape[1]:
             raise ValueError(
                 "Timesteps batch size and activation batch size must match, "
-                f"got {timesteps.shape[0]} vs {normalized_activations.shape[1]}"
+                f"got {timesteps.shape[0]} vs {spatial_activations.shape[1]}"
             )
 
     if compute_spatial_loss and spatial_blur_by_timestep:
@@ -585,9 +704,10 @@ def compute_aux_losses(
 
     if compute_spatial_loss:
         spatial_loss, spatial_metrics = _mean_sampled_spatial_alignment_loss(
-            normalized_activations,
+            spatial_activations,
             spatial_align_rng=spatial_align_rng,
             spatial_align_max_layers=spatial_align_max_layers,
+            spatial_loss_type=spatial_loss_type,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_sample_mask=spatial_sample_mask,
@@ -623,7 +743,7 @@ def compute_aux_losses(
         private_loss = jnp.array(0.0, dtype=private.dtype)
         private_selected_pairs = jnp.array(0.0, dtype=private.dtype)
 
-    target_activation = jax.lax.stop_gradient(normalized_activations[-1])
+    target_activation = jax.lax.stop_gradient(spatial_activations[-1])
     target_norm = jnp.mean(jnp.linalg.norm(target_activation.reshape(target_activation.shape[0], -1), axis=-1))
     private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
     avg_private_norm = jnp.mean(private_norms)
