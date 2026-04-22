@@ -12,6 +12,7 @@ DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
 DEFAULT_SPATIAL_ALIGN_MAX_LAYERS = 2
 DEFAULT_SPATIAL_LOSS_TYPE = "local_gram"
+DEFAULT_SPATIAL_TARGET_SVD_RANK = 0
 DEFAULT_PRIVATE_MAX_LAYERS = 6
 DEFAULT_PRIVATE_MAX_PAIRS = 0
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
@@ -199,6 +200,53 @@ def window_gram_matrix(
     return jnp.einsum("bwmc,bwnc->bwmn", normalized, normalized)
 
 
+def _apply_truncated_svd_to_tokens(
+    tokens: jax.Array,
+    rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
+) -> tuple[jax.Array, jax.Array]:
+    """Apply batched truncated SVD to `[B, N, D]` tokens and return effective rank."""
+    if tokens.ndim != 3:
+        raise ValueError(f"Expected tokens with rank 3, got shape {tokens.shape}")
+
+    max_rank = min(tokens.shape[1], tokens.shape[2])
+    if rank <= 0:
+        return tokens, jnp.array(0.0, dtype=tokens.dtype)
+
+    effective_rank = min(rank, max_rank)
+    if effective_rank >= max_rank:
+        return tokens, jnp.asarray(effective_rank, dtype=tokens.dtype)
+
+    u, singular_values, vh = jnp.linalg.svd(tokens, full_matrices=False)
+    u = u[:, :, :effective_rank]
+    singular_values = singular_values[:, :effective_rank]
+    vh = vh[:, :effective_rank, :]
+    truncated_tokens = jnp.einsum("bnr,br,brd->bnd", u, singular_values, vh)
+    return truncated_tokens, jnp.asarray(effective_rank, dtype=tokens.dtype)
+
+
+def _prepare_spatial_target_tokens(
+    target_tokens: jax.Array,
+    *,
+    target_blur_sigmas: jax.Array | None = None,
+    target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    target_svd_rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
+) -> tuple[jax.Array, jax.Array]:
+    """Apply optional blur then truncated SVD to the spatial target tokens."""
+    if target_tokens.ndim != 3:
+        raise ValueError(f"Expected target tokens with rank 3, got shape {target_tokens.shape}")
+
+    if target_blur_sigmas is not None:
+        target_grid = tokens_to_grid(target_tokens)
+        target_grid = _apply_separable_gaussian_blur(
+            target_grid,
+            target_blur_sigmas,
+            max_sigma=target_blur_max_sigma,
+        )
+        target_tokens = target_grid.reshape(target_tokens.shape)
+
+    return _apply_truncated_svd_to_tokens(target_tokens, rank=target_svd_rank)
+
+
 def local_window_gram_loss_from_grids(
     feature_grid: jax.Array,
     target_grid: jax.Array,
@@ -208,6 +256,7 @@ def local_window_gram_loss_from_grids(
     sample_mask: jax.Array | None = None,
     target_blur_sigmas: jax.Array | None = None,
     target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    target_svd_rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compare local Gram structure between two `[B, H, W, D]` grids."""
     if feature_grid.ndim != 4:
@@ -220,12 +269,18 @@ def local_window_gram_loss_from_grids(
             f"got {feature_grid.shape[:3]} vs {target_grid.shape[:3]}"
         )
 
-    if target_blur_sigmas is not None:
-        target_grid = _apply_separable_gaussian_blur(
-            target_grid,
-            target_blur_sigmas,
-            max_sigma=target_blur_max_sigma,
+    if target_blur_sigmas is not None or target_svd_rank > 0:
+        batch, height, width, channels = target_grid.shape
+        target_tokens = target_grid.reshape(batch, height * width, channels)
+        target_tokens, effective_rank = _prepare_spatial_target_tokens(
+            target_tokens,
+            target_blur_sigmas=target_blur_sigmas,
+            target_blur_max_sigma=target_blur_max_sigma,
+            target_svd_rank=target_svd_rank,
         )
+        target_grid = target_tokens.reshape(target_grid.shape)
+    else:
+        effective_rank = jnp.array(0.0, dtype=target_grid.dtype)
 
     feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
     target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
@@ -275,6 +330,7 @@ def local_window_gram_loss_from_grids(
         "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_grid.dtype),
         "spatial_active_fraction": active_fraction,
         "spatial_blur_sigma_mean": blur_sigma_mean,
+        "spatial_target_svd_rank": effective_rank,
     }
     return spatial_loss, spatial_metrics
 
@@ -288,6 +344,7 @@ def local_window_gram_loss(
     sample_mask: jax.Array | None = None,
     target_blur_sigmas: jax.Array | None = None,
     target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    target_svd_rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Convert `[B, N, D]` tokens to `[B, H, W, D]` before the local Gram loss."""
     feature_grid = tokens_to_grid(feature_tokens)
@@ -301,6 +358,7 @@ def local_window_gram_loss(
         sample_mask=sample_mask,
         target_blur_sigmas=target_blur_sigmas,
         target_blur_max_sigma=target_blur_max_sigma,
+        target_svd_rank=target_svd_rank,
     )
 
 
@@ -311,6 +369,7 @@ def global_linear_cka_loss(
     sample_mask: jax.Array | None = None,
     target_blur_sigmas: jax.Array | None = None,
     target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+    target_svd_rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compute global token-space linear CKA on `[B, N, D]` tokens.
 
@@ -328,14 +387,12 @@ def global_linear_cka_loss(
             f"got {feature_tokens.shape} vs {target_tokens.shape}"
         )
 
-    if target_blur_sigmas is not None:
-        target_grid = tokens_to_grid(target_tokens)
-        target_grid = _apply_separable_gaussian_blur(
-            target_grid,
-            target_blur_sigmas,
-            max_sigma=target_blur_max_sigma,
-        )
-        target_tokens = target_grid.reshape(target_tokens.shape)
+    target_tokens, effective_rank = _prepare_spatial_target_tokens(
+        target_tokens,
+        target_blur_sigmas=target_blur_sigmas,
+        target_blur_max_sigma=target_blur_max_sigma,
+        target_svd_rank=target_svd_rank,
+    )
 
     feature_centered = feature_tokens - jnp.mean(feature_tokens, axis=1, keepdims=True)
     target_centered = target_tokens - jnp.mean(target_tokens, axis=1, keepdims=True)
@@ -393,6 +450,7 @@ def global_linear_cka_loss(
         "spatial_window_area": jnp.asarray(feature_tokens.shape[1], dtype=feature_tokens.dtype),
         "spatial_active_fraction": active_fraction,
         "spatial_blur_sigma_mean": blur_sigma_mean,
+        "spatial_target_svd_rank": effective_rank,
     }
     return spatial_loss, spatial_metrics
 
@@ -547,6 +605,7 @@ def _mean_sampled_spatial_alignment_loss(
     spatial_sample_mask: jax.Array | None,
     blur_sigmas: jax.Array | None,
     spatial_blur_max_sigma: float,
+    spatial_target_svd_rank: int,
     model_size: str | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     dtype = activations.dtype
@@ -561,6 +620,7 @@ def _mean_sampled_spatial_alignment_loss(
             "spatial_window_area": zero,
             "spatial_active_fraction": zero,
             "spatial_blur_sigma_mean": zero,
+            "spatial_target_svd_rank": zero,
             "spatial_selected_layers": zero,
         }
 
@@ -576,6 +636,7 @@ def _mean_sampled_spatial_alignment_loss(
     window_areas = []
     active_fractions = []
     blur_sigma_means = []
+    target_svd_ranks = []
     for layer_offset in range(num_candidates):
         layer_index = layer_offset + 1
         if spatial_loss_type == "local_gram":
@@ -593,6 +654,7 @@ def _mean_sampled_spatial_alignment_loss(
                 sample_mask=spatial_sample_mask,
                 target_blur_sigmas=blur_sigmas,
                 target_blur_max_sigma=spatial_blur_max_sigma,
+                target_svd_rank=spatial_target_svd_rank,
             )
         elif spatial_loss_type == "global_linear_cka":
             layer_loss, layer_metrics = global_linear_cka_loss(
@@ -601,6 +663,7 @@ def _mean_sampled_spatial_alignment_loss(
                 sample_mask=spatial_sample_mask,
                 target_blur_sigmas=blur_sigmas,
                 target_blur_max_sigma=spatial_blur_max_sigma,
+                target_svd_rank=spatial_target_svd_rank,
             )
         else:
             raise ValueError(
@@ -612,12 +675,14 @@ def _mean_sampled_spatial_alignment_loss(
         window_areas.append(layer_metrics["spatial_window_area"])
         active_fractions.append(layer_metrics["spatial_active_fraction"])
         blur_sigma_means.append(layer_metrics["spatial_blur_sigma_mean"])
+        target_svd_ranks.append(layer_metrics["spatial_target_svd_rank"])
 
     losses = jnp.stack(losses)
     num_windows = jnp.stack(num_windows)
     window_areas = jnp.stack(window_areas)
     active_fractions = jnp.stack(active_fractions)
     blur_sigma_means = jnp.stack(blur_sigma_means)
+    target_svd_ranks = jnp.stack(target_svd_ranks)
     selected_layers = jnp.sum(selection_mask)
 
     spatial_loss = jnp.where(
@@ -630,6 +695,7 @@ def _mean_sampled_spatial_alignment_loss(
         "spatial_window_area": _masked_mean(window_areas, selection_mask, dtype),
         "spatial_active_fraction": _masked_mean(active_fractions, selection_mask, dtype),
         "spatial_blur_sigma_mean": _masked_mean(blur_sigma_means, selection_mask, dtype),
+        "spatial_target_svd_rank": _masked_mean(target_svd_ranks, selection_mask, dtype),
         "spatial_selected_layers": selected_layers,
     }
     return spatial_loss, spatial_metrics
@@ -653,6 +719,7 @@ def compute_aux_losses(
     spatial_blur_schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     spatial_blur_exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     spatial_loss_type: str = DEFAULT_SPATIAL_LOSS_TYPE,
+    spatial_target_svd_rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
     model_size: str | None = None,
 ) -> dict[str, jax.Array]:
     """Compute auxiliary losses for consecutive-layer deltas and spatial alignment."""
@@ -713,6 +780,7 @@ def compute_aux_losses(
             spatial_sample_mask=spatial_sample_mask,
             blur_sigmas=blur_sigmas,
             spatial_blur_max_sigma=spatial_blur_max_sigma,
+            spatial_target_svd_rank=spatial_target_svd_rank,
             model_size=model_size,
         )
     else:
@@ -723,6 +791,7 @@ def compute_aux_losses(
             "spatial_window_area": zero,
             "spatial_active_fraction": zero,
             "spatial_blur_sigma_mean": zero,
+            "spatial_target_svd_rank": zero,
             "spatial_selected_layers": zero,
         }
 

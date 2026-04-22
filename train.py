@@ -431,6 +431,7 @@ from src.activation_decomposition import (
     DEFAULT_PRIVATE_MAX_PAIRS,
     DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
     DEFAULT_SPATIAL_LOSS_TYPE,
+    DEFAULT_SPATIAL_TARGET_SVD_RANK,
     DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     DEFAULT_TIMESTEP_BLUR_SCHEDULE,
 )
@@ -537,6 +538,7 @@ def _zero_aux_metrics(dtype):
             "spatial_window_area": zero,
             "spatial_active_fraction": zero,
             "spatial_blur_sigma_mean": zero,
+            "spatial_target_svd_rank": zero,
             "spatial_selected_layers": zero,
         },
         "target_norm": zero,
@@ -616,6 +618,7 @@ def train_step(
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_blur_schedule=DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     spatial_blur_exp_rate=DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+    spatial_target_svd_rank=DEFAULT_SPATIAL_TARGET_SVD_RANK,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -692,6 +695,7 @@ def train_step(
                 spatial_blur_max_sigma=spatial_blur_max_sigma,
                 spatial_blur_schedule=spatial_blur_schedule,
                 spatial_blur_exp_rate=spatial_blur_exp_rate,
+                spatial_target_svd_rank=spatial_target_svd_rank,
                 model_size=model_size,
             )
             l_diff = jnp.mean((pred - target) ** 2)
@@ -813,6 +817,7 @@ def train_step(
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["train/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["train/spatial_target_svd_rank"] = spatial_metrics["spatial_target_svd_rank"]
     metrics["train/spatial_selected_layers"] = spatial_metrics["spatial_selected_layers"]
     return state, ema_params, metrics, rng
 
@@ -831,6 +836,7 @@ def eval_step(
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_blur_schedule=DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     spatial_blur_exp_rate=DEFAULT_TIMESTEP_BLUR_EXP_RATE,
+    spatial_target_svd_rank=DEFAULT_SPATIAL_TARGET_SVD_RANK,
     spatial_stop_step=-1,
     spatial_stop_warmup_iters=0,
     private_start_step=0,
@@ -901,6 +907,7 @@ def eval_step(
             spatial_blur_max_sigma=spatial_blur_max_sigma,
             spatial_blur_schedule=spatial_blur_schedule,
             spatial_blur_exp_rate=spatial_blur_exp_rate,
+            spatial_target_svd_rank=spatial_target_svd_rank,
             model_size=model_size,
         )
     else:
@@ -953,6 +960,7 @@ def eval_step(
     metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["val/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["val/spatial_target_svd_rank"] = spatial_metrics["spatial_target_svd_rank"]
     metrics["val/spatial_selected_layers"] = spatial_metrics["spatial_selected_layers"]
     return metrics, rng
 
@@ -1580,6 +1588,16 @@ def main():
             "Larger values increase the concavity/convexity. Ignored when --spatial-blur-schedule=linear."
         ),
     )
+    parser.add_argument(
+        "--spatial-target-svd-rank",
+        type=int,
+        default=DEFAULT_SPATIAL_TARGET_SVD_RANK,
+        help=(
+            "If > 0, apply truncated SVD to the spatial-loss target after any optional blur, "
+            "keeping only this many singular components per sample (clipped to min(N, D)). "
+            "Use 0 to disable."
+        ),
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1766,6 +1784,8 @@ def main():
         args.spatial_timestep_range = (spatial_tau_min, spatial_tau_max)
     if args.spatial_blur_max_sigma < 0:
         raise ValueError("--spatial-blur-max-sigma must be >= 0")
+    if args.spatial_target_svd_rank < 0:
+        raise ValueError("--spatial-target-svd-rank must be >= 0")
     if args.spatial_blur_schedule != "linear" and args.spatial_blur_exp_rate <= 0:
         raise ValueError("--spatial-blur-exp-rate must be > 0 for exponential spatial blur schedules")
 
@@ -1826,6 +1846,7 @@ def main():
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
         f"spatial_blur_schedule={args.spatial_blur_schedule} "
         f"spatial_blur_exp_rate={args.spatial_blur_exp_rate} "
+        f"spatial_target_svd_rank={args.spatial_target_svd_rank} "
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1885,6 +1906,7 @@ def main():
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             spatial_blur_schedule=args.spatial_blur_schedule,
             spatial_blur_exp_rate=args.spatial_blur_exp_rate,
+            spatial_target_svd_rank=args.spatial_target_svd_rank,
             model_size=args.model_size,
         ),
         axis_name="batch",
@@ -1909,6 +1931,7 @@ def main():
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             spatial_blur_schedule=args.spatial_blur_schedule,
             spatial_blur_exp_rate=args.spatial_blur_exp_rate,
+            spatial_target_svd_rank=args.spatial_target_svd_rank,
             model_size=args.model_size,
         ),
         axis_name="batch",
