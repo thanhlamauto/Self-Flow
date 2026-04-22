@@ -569,11 +569,11 @@ def _dct_feature_basis(feature_dim, rank, dtype=jnp.float32):
 
 def _stabilize_tall_matrix(z, eps=1e-6):
     eye = jnp.eye(z.shape[-2], z.shape[-1], dtype=z.dtype)
-    return z + jnp.asarray(eps, dtype=z.dtype) * eye[None, :, :]
+    return z + jnp.asarray(eps, dtype=z.dtype) * eye
 
 
 def _projector_from_basis(q):
-    return jnp.einsum("bnk,bmk->bnm", q, q)
+    return jnp.einsum("...nk,...mk->...nm", q, q)
 
 
 def _projector_overlap(p_a, p_b, rank):
