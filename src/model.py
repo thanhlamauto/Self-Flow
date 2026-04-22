@@ -324,8 +324,8 @@ class SelfFlowDiT(nn.Module):
             raw_single = True
 
         if raw_layers:
-            if any(layer <= 0 for layer in raw_layers):
-                raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+            if any(layer < 0 for layer in raw_layers):
+                raise ValueError(f"return_raw_features layers must be >= 0, got {raw_layers}")
             if any(layer > self.depth for layer in raw_layers):
                 raise ValueError(
                     f"return_raw_features layers must be <= model depth ({self.depth}), got {raw_layers}"
@@ -378,6 +378,12 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
+        if raw_layers and 0 in raw_layers:
+            if raw_single:
+                zs = x
+            else:
+                for idx in raw_positions[0]:
+                    raw_zs[idx] = x
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
