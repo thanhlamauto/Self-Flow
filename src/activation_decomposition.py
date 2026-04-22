@@ -204,11 +204,17 @@ def _apply_truncated_svd_to_tokens(
     tokens: jax.Array,
     rank: int = DEFAULT_SPATIAL_TARGET_SVD_RANK,
 ) -> tuple[jax.Array, jax.Array]:
-    """Apply batched truncated SVD to `[B, N, D]` tokens and return effective rank."""
+    """Project `[B, N, D]` tokens onto the top singular subspace of rank `r`.
+
+    We avoid `jnp.linalg.svd(... )[:, :, :r]` because that still computes the
+    full SVD. Instead, we compute an exact rank-`r` projection via eigenvectors
+    of the smaller Gram matrix (`N x N` when `N <= D`, otherwise `D x D`).
+    """
     if tokens.ndim != 3:
         raise ValueError(f"Expected tokens with rank 3, got shape {tokens.shape}")
 
-    max_rank = min(tokens.shape[1], tokens.shape[2])
+    num_tokens, channels = tokens.shape[1], tokens.shape[2]
+    max_rank = min(num_tokens, channels)
     if rank <= 0:
         return tokens, jnp.array(0.0, dtype=tokens.dtype)
 
@@ -216,11 +222,18 @@ def _apply_truncated_svd_to_tokens(
     if effective_rank >= max_rank:
         return tokens, jnp.asarray(effective_rank, dtype=tokens.dtype)
 
-    u, singular_values, vh = jnp.linalg.svd(tokens, full_matrices=False)
-    u = u[:, :, :effective_rank]
-    singular_values = singular_values[:, :effective_rank]
-    vh = vh[:, :effective_rank, :]
-    truncated_tokens = jnp.einsum("bnr,br,brd->bnd", u, singular_values, vh)
+    if num_tokens <= channels:
+        left_gram = jnp.einsum("bnd,bmd->bnm", tokens, tokens)
+        _, left_vectors = jnp.linalg.eigh(left_gram)
+        top_left_vectors = left_vectors[:, :, -effective_rank:]
+        coefficients = jnp.einsum("bnr,bnd->brd", top_left_vectors, tokens)
+        truncated_tokens = jnp.einsum("bnr,brd->bnd", top_left_vectors, coefficients)
+    else:
+        right_gram = jnp.einsum("bnd,bne->bde", tokens, tokens)
+        _, right_vectors = jnp.linalg.eigh(right_gram)
+        top_right_vectors = right_vectors[:, :, -effective_rank:]
+        coefficients = jnp.einsum("bnd,bdr->bnr", tokens, top_right_vectors)
+        truncated_tokens = jnp.einsum("bnr,bdr->bnd", coefficients, top_right_vectors)
     return truncated_tokens, jnp.asarray(effective_rank, dtype=tokens.dtype)
 
 
@@ -245,6 +258,87 @@ def _prepare_spatial_target_tokens(
         target_tokens = target_grid.reshape(target_tokens.shape)
 
     return _apply_truncated_svd_to_tokens(target_tokens, rank=target_svd_rank)
+
+
+def _reduce_spatial_example_losses(
+    example_losses: jax.Array,
+    *,
+    batch_size: int,
+    dtype: jnp.dtype,
+    sample_mask: jax.Array | None = None,
+    target_blur_sigmas: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Reduce per-example spatial losses and report active/blur metrics."""
+    if sample_mask is not None:
+        if sample_mask.ndim != 1:
+            raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
+        if sample_mask.shape[0] != batch_size:
+            raise ValueError(
+                "Sample mask batch size and feature batch size must match, "
+                f"got {sample_mask.shape[0]} vs {batch_size}"
+            )
+        mask = sample_mask.astype(dtype)
+        active_count = jnp.sum(mask)
+        spatial_loss = jnp.where(
+            active_count > 0,
+            jnp.sum(example_losses * mask) / active_count,
+            jnp.array(0.0, dtype=dtype),
+        )
+        active_fraction = active_count / jnp.maximum(
+            jnp.asarray(batch_size, dtype=dtype),
+            jnp.array(1.0, dtype=dtype),
+        )
+        blur_sigma_mean = (
+            jnp.where(
+                active_count > 0,
+                jnp.sum(target_blur_sigmas.astype(dtype) * mask) / active_count,
+                jnp.array(0.0, dtype=dtype),
+            )
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=dtype)
+        )
+    else:
+        spatial_loss = jnp.mean(example_losses)
+        active_fraction = jnp.array(1.0, dtype=dtype)
+        blur_sigma_mean = (
+            jnp.mean(target_blur_sigmas.astype(dtype))
+            if target_blur_sigmas is not None
+            else jnp.array(0.0, dtype=dtype)
+        )
+    return spatial_loss, active_fraction, blur_sigma_mean
+
+
+def _local_window_gram_loss_from_prepared_grids(
+    feature_grid: jax.Array,
+    target_grid: jax.Array,
+    window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
+    stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
+    eps: float = 1e-8,
+    sample_mask: jax.Array | None = None,
+    target_blur_sigmas: jax.Array | None = None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Compare local Gram structure using a target grid that is already prepared."""
+    feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
+    target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
+    feature_grams = window_gram_matrix(feature_windows, eps=eps)
+    target_grams = window_gram_matrix(target_windows, eps=eps)
+
+    window_losses = jnp.mean(jnp.abs(feature_grams - target_grams), axis=(-2, -1))
+    example_losses = jnp.mean(window_losses, axis=-1)
+    spatial_loss, active_fraction, blur_sigma_mean = _reduce_spatial_example_losses(
+        example_losses,
+        batch_size=feature_grid.shape[0],
+        dtype=feature_grid.dtype,
+        sample_mask=sample_mask,
+        target_blur_sigmas=target_blur_sigmas,
+    )
+    spatial_metrics = {
+        "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_grid.dtype),
+        "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_grid.dtype),
+        "spatial_active_fraction": active_fraction,
+        "spatial_blur_sigma_mean": blur_sigma_mean,
+    }
+    return spatial_loss, spatial_metrics
 
 
 def local_window_gram_loss_from_grids(
@@ -282,56 +376,16 @@ def local_window_gram_loss_from_grids(
     else:
         effective_rank = jnp.array(0.0, dtype=target_grid.dtype)
 
-    feature_windows = extract_sliding_windows(feature_grid, window_size, stride=stride)
-    target_windows = extract_sliding_windows(target_grid, window_size, stride=stride)
-    feature_grams = window_gram_matrix(feature_windows, eps=eps)
-    target_grams = window_gram_matrix(target_windows, eps=eps)
-
-    window_losses = jnp.mean(jnp.abs(feature_grams - target_grams), axis=(-2, -1))
-    example_losses = jnp.mean(window_losses, axis=-1)
-    if sample_mask is not None:
-        if sample_mask.ndim != 1:
-            raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
-        if sample_mask.shape[0] != feature_grid.shape[0]:
-            raise ValueError(
-                "Sample mask batch size and feature batch size must match, "
-                f"got {sample_mask.shape[0]} vs {feature_grid.shape[0]}"
-            )
-        mask = sample_mask.astype(feature_grid.dtype)
-        active_count = jnp.sum(mask)
-        spatial_loss = jnp.where(
-            active_count > 0,
-            jnp.sum(example_losses * mask) / active_count,
-            jnp.array(0.0, dtype=feature_grid.dtype),
-        )
-        active_fraction = active_count / jnp.maximum(
-            jnp.asarray(feature_grid.shape[0], dtype=feature_grid.dtype),
-            jnp.array(1.0, dtype=feature_grid.dtype),
-        )
-        blur_sigma_mean = (
-            jnp.where(
-                active_count > 0,
-                jnp.sum(target_blur_sigmas.astype(feature_grid.dtype) * mask) / active_count,
-                jnp.array(0.0, dtype=feature_grid.dtype),
-            )
-            if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_grid.dtype)
-        )
-    else:
-        spatial_loss = jnp.mean(example_losses)
-        active_fraction = jnp.array(1.0, dtype=feature_grid.dtype)
-        blur_sigma_mean = (
-            jnp.mean(target_blur_sigmas.astype(feature_grid.dtype))
-            if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_grid.dtype)
-        )
-    spatial_metrics = {
-        "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_grid.dtype),
-        "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_grid.dtype),
-        "spatial_active_fraction": active_fraction,
-        "spatial_blur_sigma_mean": blur_sigma_mean,
-        "spatial_target_svd_rank": effective_rank,
-    }
+    spatial_loss, spatial_metrics = _local_window_gram_loss_from_prepared_grids(
+        feature_grid,
+        target_grid,
+        window_size=window_size,
+        stride=stride,
+        eps=eps,
+        sample_mask=sample_mask,
+        target_blur_sigmas=target_blur_sigmas,
+    )
+    spatial_metrics["spatial_target_svd_rank"] = effective_rank
     return spatial_loss, spatial_metrics
 
 
@@ -394,6 +448,35 @@ def global_linear_cka_loss(
         target_svd_rank=target_svd_rank,
     )
 
+    spatial_loss, spatial_metrics = _global_linear_cka_loss_with_prepared_target(
+        feature_tokens,
+        target_tokens,
+        eps=eps,
+        sample_mask=sample_mask,
+        target_blur_sigmas=target_blur_sigmas,
+    )
+    spatial_metrics["spatial_target_svd_rank"] = effective_rank
+    return spatial_loss, spatial_metrics
+
+
+def _global_linear_cka_loss_with_prepared_target(
+    feature_tokens: jax.Array,
+    target_tokens: jax.Array,
+    eps: float = 1e-8,
+    sample_mask: jax.Array | None = None,
+    target_blur_sigmas: jax.Array | None = None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Compute global token-space linear CKA with a target that is already prepared."""
+    if feature_tokens.ndim != 3:
+        raise ValueError(f"Expected feature tokens with rank 3, got shape {feature_tokens.shape}")
+    if target_tokens.ndim != 3:
+        raise ValueError(f"Expected target tokens with rank 3, got shape {target_tokens.shape}")
+    if feature_tokens.shape != target_tokens.shape:
+        raise ValueError(
+            "Feature and target tokens must match in batch/token/channel dims, "
+            f"got {feature_tokens.shape} vs {target_tokens.shape}"
+        )
+
     feature_centered = feature_tokens - jnp.mean(feature_tokens, axis=1, keepdims=True)
     target_centered = target_tokens - jnp.mean(target_tokens, axis=1, keepdims=True)
 
@@ -408,49 +491,19 @@ def global_linear_cka_loss(
     cka = jnp.clip(cka, 0.0, 1.0)
     example_losses = 1.0 - cka
 
-    if sample_mask is not None:
-        if sample_mask.ndim != 1:
-            raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
-        if sample_mask.shape[0] != feature_tokens.shape[0]:
-            raise ValueError(
-                "Sample mask batch size and feature batch size must match, "
-                f"got {sample_mask.shape[0]} vs {feature_tokens.shape[0]}"
-            )
-        mask = sample_mask.astype(feature_tokens.dtype)
-        active_count = jnp.sum(mask)
-        spatial_loss = jnp.where(
-            active_count > 0,
-            jnp.sum(example_losses * mask) / active_count,
-            jnp.array(0.0, dtype=feature_tokens.dtype),
-        )
-        active_fraction = active_count / jnp.maximum(
-            jnp.asarray(feature_tokens.shape[0], dtype=feature_tokens.dtype),
-            jnp.array(1.0, dtype=feature_tokens.dtype),
-        )
-        blur_sigma_mean = (
-            jnp.where(
-                active_count > 0,
-                jnp.sum(target_blur_sigmas.astype(feature_tokens.dtype) * mask) / active_count,
-                jnp.array(0.0, dtype=feature_tokens.dtype),
-            )
-            if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_tokens.dtype)
-        )
-    else:
-        spatial_loss = jnp.mean(example_losses)
-        active_fraction = jnp.array(1.0, dtype=feature_tokens.dtype)
-        blur_sigma_mean = (
-            jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
-            if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_tokens.dtype)
-        )
+    spatial_loss, active_fraction, blur_sigma_mean = _reduce_spatial_example_losses(
+        example_losses,
+        batch_size=feature_tokens.shape[0],
+        dtype=feature_tokens.dtype,
+        sample_mask=sample_mask,
+        target_blur_sigmas=target_blur_sigmas,
+    )
 
     spatial_metrics = {
         "spatial_num_windows": jnp.array(1.0, dtype=feature_tokens.dtype),
         "spatial_window_area": jnp.asarray(feature_tokens.shape[1], dtype=feature_tokens.dtype),
         "spatial_active_fraction": active_fraction,
         "spatial_blur_sigma_mean": blur_sigma_mean,
-        "spatial_target_svd_rank": effective_rank,
     }
     return spatial_loss, spatial_metrics
 
@@ -475,20 +528,18 @@ def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     return cosine_matrix[upper_indices]
 
 
-def _sample_layer_mask(
+def _sample_layer_indices(
     num_layers: int,
     max_layers: int,
-    dtype: jnp.dtype,
     rng: jax.Array | None = None,
 ) -> jax.Array:
     if num_layers == 0:
-        return jnp.zeros((0,), dtype=dtype)
+        return jnp.zeros((0,), dtype=jnp.int32)
     if max_layers and max_layers > 0 and num_layers > max_layers:
         if rng is None:
             raise ValueError("An RNG key is required when sampling layer indices.")
-        indices = jax.random.permutation(rng, num_layers)[:max_layers]
-        return jnp.zeros((num_layers,), dtype=dtype).at[indices].set(1.0)
-    return jnp.ones((num_layers,), dtype=dtype)
+        return jax.random.permutation(rng, num_layers)[:max_layers]
+    return jnp.arange(num_layers, dtype=jnp.int32)
 
 
 def _sample_private_layer_mask(
@@ -515,17 +566,6 @@ def _sample_private_layer_mask(
     remaining_indices = jnp.arange(1, num_layers, dtype=jnp.int32)
     extra_indices = jax.random.permutation(rng, remaining_indices)[:sampled_layers - 1]
     return selection_mask.at[extra_indices].set(1.0)
-
-
-def _masked_mean(values: jax.Array, mask: jax.Array, dtype: jnp.dtype) -> jax.Array:
-    if values.shape[0] == 0:
-        return jnp.array(0.0, dtype=dtype)
-    count = jnp.sum(mask)
-    return jnp.where(
-        count > 0,
-        jnp.sum(values * mask) / count,
-        jnp.array(0.0, dtype=dtype),
-    )
 
 
 def _mean_masked_pairwise_cosine_squared(
@@ -594,6 +634,33 @@ def _resolve_spatial_window(
     return DEFAULT_SPATIAL_WINDOW_SIZE, DEFAULT_SPATIAL_WINDOW_STRIDE
 
 
+def _resolve_spatial_window_options(
+    num_layers: int,
+    *,
+    model_size: str | None,
+    default_window_size: int,
+    default_stride: int,
+) -> tuple[tuple[tuple[int, int], ...], jax.Array]:
+    """Return unique static window configs and a per-layer config id."""
+    window_options: list[tuple[int, int]] = []
+    option_ids: list[int] = []
+    option_lookup: dict[tuple[int, int], int] = {}
+    for layer_offset in range(num_layers):
+        window_config = _resolve_spatial_window(
+            layer_offset + 1,
+            model_size=model_size,
+            default_window_size=default_window_size,
+            default_stride=default_stride,
+        )
+        option_id = option_lookup.get(window_config)
+        if option_id is None:
+            option_id = len(window_options)
+            option_lookup[window_config] = option_id
+            window_options.append(window_config)
+        option_ids.append(option_id)
+    return tuple(window_options), jnp.asarray(option_ids, dtype=jnp.int32)
+
+
 def _mean_sampled_spatial_alignment_loss(
     activations: jax.Array,
     *,
@@ -624,11 +691,19 @@ def _mean_sampled_spatial_alignment_loss(
             "spatial_selected_layers": zero,
         }
 
-    selection_mask = _sample_layer_mask(
+    selected_indices = _sample_layer_indices(
         num_candidates,
         spatial_align_max_layers,
-        dtype=dtype,
         rng=spatial_align_rng,
+    )
+    selected_count = selected_indices.shape[0]
+    selected_layers = jnp.asarray(selected_count, dtype=dtype)
+
+    prepared_target_layer, effective_rank = _prepare_spatial_target_tokens(
+        target_layer,
+        target_blur_sigmas=blur_sigmas,
+        target_blur_max_sigma=spatial_blur_max_sigma,
+        target_svd_rank=spatial_target_svd_rank,
     )
 
     losses = []
@@ -636,66 +711,74 @@ def _mean_sampled_spatial_alignment_loss(
     window_areas = []
     active_fractions = []
     blur_sigma_means = []
-    target_svd_ranks = []
-    for layer_offset in range(num_candidates):
-        layer_index = layer_offset + 1
-        if spatial_loss_type == "local_gram":
-            window_size, stride = _resolve_spatial_window(
-                layer_index,
-                model_size=model_size,
-                default_window_size=spatial_window_size,
-                default_stride=spatial_window_stride,
-            )
-            layer_loss, layer_metrics = local_window_gram_loss(
+    if spatial_loss_type == "local_gram":
+        prepared_target_grid = tokens_to_grid(prepared_target_layer)
+        window_options, layer_option_ids = _resolve_spatial_window_options(
+            num_candidates,
+            model_size=model_size,
+            default_window_size=spatial_window_size,
+            default_stride=spatial_window_stride,
+        )
+
+        def _make_local_gram_branch(window_size: int, stride: int):
+            def _branch(feature_grid: jax.Array):
+                return _local_window_gram_loss_from_prepared_grids(
+                    feature_grid,
+                    prepared_target_grid,
+                    window_size=window_size,
+                    stride=stride,
+                    sample_mask=spatial_sample_mask,
+                    target_blur_sigmas=blur_sigmas,
+                )
+            return _branch
+
+        local_gram_branches = tuple(
+            _make_local_gram_branch(window_size, stride)
+            for window_size, stride in window_options
+        )
+
+        for selected_pos in range(selected_count):
+            layer_offset = selected_indices[selected_pos]
+            feature_grid = tokens_to_grid(candidate_layers[layer_offset])
+            option_id = layer_option_ids[layer_offset]
+            layer_loss, layer_metrics = jax.lax.switch(option_id, local_gram_branches, feature_grid)
+            losses.append(layer_loss)
+            num_windows.append(layer_metrics["spatial_num_windows"])
+            window_areas.append(layer_metrics["spatial_window_area"])
+            active_fractions.append(layer_metrics["spatial_active_fraction"])
+            blur_sigma_means.append(layer_metrics["spatial_blur_sigma_mean"])
+    elif spatial_loss_type == "global_linear_cka":
+        for selected_pos in range(selected_count):
+            layer_offset = selected_indices[selected_pos]
+            layer_loss, layer_metrics = _global_linear_cka_loss_with_prepared_target(
                 candidate_layers[layer_offset],
-                target_layer,
-                window_size=window_size,
-                stride=stride,
+                prepared_target_layer,
                 sample_mask=spatial_sample_mask,
                 target_blur_sigmas=blur_sigmas,
-                target_blur_max_sigma=spatial_blur_max_sigma,
-                target_svd_rank=spatial_target_svd_rank,
             )
-        elif spatial_loss_type == "global_linear_cka":
-            layer_loss, layer_metrics = global_linear_cka_loss(
-                candidate_layers[layer_offset],
-                target_layer,
-                sample_mask=spatial_sample_mask,
-                target_blur_sigmas=blur_sigmas,
-                target_blur_max_sigma=spatial_blur_max_sigma,
-                target_svd_rank=spatial_target_svd_rank,
-            )
-        else:
-            raise ValueError(
-                f"Unknown spatial loss type {spatial_loss_type!r}; "
-                "expected 'local_gram' or 'global_linear_cka'."
-            )
-        losses.append(layer_loss)
-        num_windows.append(layer_metrics["spatial_num_windows"])
-        window_areas.append(layer_metrics["spatial_window_area"])
-        active_fractions.append(layer_metrics["spatial_active_fraction"])
-        blur_sigma_means.append(layer_metrics["spatial_blur_sigma_mean"])
-        target_svd_ranks.append(layer_metrics["spatial_target_svd_rank"])
+            losses.append(layer_loss)
+            num_windows.append(layer_metrics["spatial_num_windows"])
+            window_areas.append(layer_metrics["spatial_window_area"])
+            active_fractions.append(layer_metrics["spatial_active_fraction"])
+            blur_sigma_means.append(layer_metrics["spatial_blur_sigma_mean"])
+    else:
+        raise ValueError(
+            f"Unknown spatial loss type {spatial_loss_type!r}; "
+            "expected 'local_gram' or 'global_linear_cka'."
+        )
 
     losses = jnp.stack(losses)
     num_windows = jnp.stack(num_windows)
     window_areas = jnp.stack(window_areas)
     active_fractions = jnp.stack(active_fractions)
     blur_sigma_means = jnp.stack(blur_sigma_means)
-    target_svd_ranks = jnp.stack(target_svd_ranks)
-    selected_layers = jnp.sum(selection_mask)
-
-    spatial_loss = jnp.where(
-        selected_layers > 0,
-        jnp.sum(losses * selection_mask) / selected_layers,
-        jnp.array(0.0, dtype=dtype),
-    )
+    spatial_loss = jnp.mean(losses)
     spatial_metrics = {
-        "spatial_num_windows": _masked_mean(num_windows, selection_mask, dtype),
-        "spatial_window_area": _masked_mean(window_areas, selection_mask, dtype),
-        "spatial_active_fraction": _masked_mean(active_fractions, selection_mask, dtype),
-        "spatial_blur_sigma_mean": _masked_mean(blur_sigma_means, selection_mask, dtype),
-        "spatial_target_svd_rank": _masked_mean(target_svd_ranks, selection_mask, dtype),
+        "spatial_num_windows": jnp.mean(num_windows),
+        "spatial_window_area": jnp.mean(window_areas),
+        "spatial_active_fraction": jnp.mean(active_fractions),
+        "spatial_blur_sigma_mean": jnp.mean(blur_sigma_means),
+        "spatial_target_svd_rank": effective_rank,
         "spatial_selected_layers": selected_layers,
     }
     return spatial_loss, spatial_metrics
