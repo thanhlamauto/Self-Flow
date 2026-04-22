@@ -546,10 +546,11 @@ def resolve_layersync_config(args, depth):
     return weak_layer, strong_layer
 
 
-def safe_l2_normalize(x, eps=jnp.float32(1e-8)):
+def safe_l2_normalize(x, eps=1e-8):
     # Layer deltas can be exactly zero at initialization because adaLN-Zero
     # makes early DiT blocks close to identity. Clamping the squared norm keeps
     # the backward pass finite even when the delta vector is all zeros.
+    eps = jnp.asarray(eps, dtype=x.dtype)
     squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
     inv_norm = jax.lax.rsqrt(jnp.maximum(squared_norm, eps * eps))
     return x * inv_norm
