@@ -1,55 +1,21 @@
-"""Helper utilities for common/private activation decomposition in DiT."""
+"""Helper utilities for layer-delta activation regularization in DiT."""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
 DEFAULT_SPATIAL_WINDOW_SIZE = 3
 DEFAULT_SPATIAL_WINDOW_STRIDE = 1
+DEFAULT_SPATIAL_ALIGN_MAX_LAYERS = 2
+DEFAULT_PRIVATE_MAX_LAYERS = 6
+DEFAULT_PRIVATE_MAX_PAIRS = 0
 DEFAULT_MAX_TIMESTEP_BLUR_SIGMA = 3.0
 DEFAULT_TIMESTEP_BLUR_SCHEDULE = "linear"
 DEFAULT_TIMESTEP_BLUR_EXP_RATE = 5.0
-
-
-def _layer_logit_normal_weights(
-    num_layers: int,
-    center_layer: float | jax.Array,
-    logit_sigma: float | jax.Array,
-    dtype: jnp.dtype,
-) -> jax.Array:
-    """Nonnegative weights over layer index, peak near ``center_layer`` (Gaussian on log-depth).
-
-    For layer ``i`` we map ``u_i = (i + 0.5) / L`` in ``(0, 1)``, set ``z_i = logit(u_i)``, and
-    use weights ``w_i ∝ exp(-0.5 * ((z_i - mu) / sigma)^2)`` with ``mu = logit(u_c)`` for the
-    same mapping of ``center_layer``. We normalize ``w`` to sum to ``1``.
-
-    We intentionally **do not** multiply by the logit-normal Jacobian ``1/(u(1-u))``. The full
-    PDF strongly up-weights boundary layers (small ``u`` or ``u`` near ``1``), which makes
-    gradients through ``A_common`` ill-conditioned and breaks the intuitive limit
-    ``sigma → ∞`` (uniform weights → same as ``mean``). This RBF on ``z`` is stable and recovers
-    uniform weights (hence ``mean`` aggregation) as ``sigma`` grows.
-    """
-    L = num_layers
-    i = jnp.arange(L, dtype=dtype)
-    u = (i + 0.5) / jnp.maximum(L, 1)
-    eps = jnp.asarray(1e-6, dtype=dtype)
-    u = jnp.clip(u, eps, jnp.asarray(1.0, dtype=dtype) - eps)
-    z = jnp.log(u / (jnp.asarray(1.0, dtype=dtype) - u))
-
-    k = jnp.asarray(center_layer, dtype=dtype)
-    k = jnp.clip(k, jnp.asarray(0.0, dtype=dtype), jnp.maximum(L - 1, 0).astype(dtype))
-    u_c = (k + 0.5) / jnp.maximum(L, 1)
-    u_c = jnp.clip(u_c, eps, jnp.asarray(1.0, dtype=dtype) - eps)
-    mu = jnp.log(u_c / (jnp.asarray(1.0, dtype=dtype) - u_c))
-
-    s = jnp.maximum(jnp.asarray(logit_sigma, dtype=dtype), eps)
-    log_w = -0.5 * jnp.square((z - mu) / s)
-    w = jnp.exp(log_w - jnp.max(log_w))
-    return w / jnp.maximum(jnp.sum(w), eps)
 
 
 def collect_activations(activations: Any) -> jax.Array:
@@ -68,48 +34,6 @@ def collect_activations(activations: Any) -> jax.Array:
     raise TypeError(f"Unsupported activation container type: {type(activations)!r}")
 
 
-def compute_common_private(
-    activations: Any,
-    *,
-    agg: str = "mean",
-    logit_normal_center_layer: float = 0.0,
-    logit_normal_sigma: float = 1.0,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute differentiable common activation and private residuals.
-
-    ``agg="mean"`` uses ``A_common = mean_i A_i`` (default). ``agg="logit_normal"`` uses
-    ``A_common = sum_i w_i A_i`` with ``w`` a normalized Gaussian bump on ``logit((i+0.5)/L)``
-    centered at the same mapping of ``logit_normal_center_layer`` (0-based; fractional ``k``
-    allowed). ``logit_normal_sigma`` is the Gaussian std on that logit scale (larger =>
-    flatter weights, converging to ``mean`` when ``sigma`` is large).
-    """
-    activations = collect_activations(activations)
-    activations = _normalize_channels(activations)
-    num_layers = activations.shape[0]
-    if agg == "mean":
-        common = jnp.mean(activations, axis=0)
-    elif agg == "logit_normal":
-        w = _layer_logit_normal_weights(
-            num_layers,
-            logit_normal_center_layer,
-            logit_normal_sigma,
-            activations.dtype,
-        )
-        common = jnp.tensordot(w, activations, axes=(0, 0))
-    else:
-        raise ValueError(f"Unknown common aggregation {agg!r}; expected 'mean' or 'logit_normal'.")
-    common_anchor = jax.lax.stop_gradient(common)
-    private = activations - common_anchor[None, ...]
-    return common, common_anchor, private
-
-
-def gram_matrix(x: jax.Array) -> jax.Array:
-    """Compute batched Gram matrices from `[B, N, D]` to `[B, N, N]`."""
-    if x.ndim != 3:
-        raise ValueError(f"Expected input with rank 3, got shape {x.shape}")
-    return jnp.einsum("bnd,bmd->bnm", x, x)
-
-
 def tokens_to_grid(x: jax.Array) -> jax.Array:
     """Reshape `[B, N, C]` tokens into a square spatial grid `[B, H, W, C]`."""
     if x.ndim != 3:
@@ -125,13 +49,33 @@ def _normalize_channels(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
+def compute_private_deltas(
+    activations: Any,
+    eps: float = 1e-8,
+) -> tuple[jax.Array, jax.Array]:
+    """Return normalized layer activations and consecutive layer deltas.
+
+    Layer deltas follow the user's requested definition:
+    `private_i = activation_i - activation_{i-1}`.
+    """
+    activations = collect_activations(activations)
+    if activations.shape[0] < 2:
+        raise ValueError(
+            "Need at least two activation tensors to form consecutive layer deltas, "
+            f"got {activations.shape[0]}"
+        )
+    normalized_activations = _normalize_channels(activations, eps=eps)
+    private = normalized_activations[1:] - jax.lax.stop_gradient(normalized_activations[:-1])
+    return normalized_activations, private
+
+
 def _timestep_dependent_blur_sigmas(
     timesteps: jax.Array,
     max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
 ) -> jax.Array:
-    """Map ``tau`` in ``[0, 1]`` to blur sigma with selectable decay curvature."""
+    """Map `tau` in `[0, 1]` to blur sigma with selectable decay curvature."""
     tau = jnp.clip(timesteps, 0.0, 1.0)
     if schedule == "linear":
         blur_scale = 1.0 - tau
@@ -223,9 +167,7 @@ def extract_sliding_windows(
 
     batch, height, width, channels = grid.shape
     if window_size > height or window_size > width:
-        raise ValueError(
-            f"Window size {window_size} exceeds grid size {(height, width)}"
-        )
+        raise ValueError(f"Window size {window_size} exceeds grid size {(height, width)}")
 
     out_h = (height - window_size) // stride + 1
     out_w = (width - window_size) // stride + 1
@@ -241,7 +183,7 @@ def extract_sliding_windows(
                 ]
             )
 
-    stacked = jnp.stack(window_tokens, axis=3)  # [B, out_h, out_w, window_area, C]
+    stacked = jnp.stack(window_tokens, axis=3)
     return stacked.reshape(batch, out_h * out_w, window_size * window_size, channels)
 
 
@@ -251,16 +193,14 @@ def window_gram_matrix(
 ) -> jax.Array:
     """Compute normalized local Gram matrices for `[B, W, M, C]` window tokens."""
     if window_tokens.ndim != 4:
-        raise ValueError(
-            f"Expected window tokens with rank 4, got shape {window_tokens.shape}"
-        )
+        raise ValueError(f"Expected window tokens with rank 4, got shape {window_tokens.shape}")
     normalized = _normalize_channels(window_tokens, eps=eps)
     return jnp.einsum("bwmc,bwnc->bwmn", normalized, normalized)
 
 
-def local_window_gram_loss(
-    feature_tokens: jax.Array,
-    target_tokens: jax.Array,
+def local_window_gram_loss_from_grids(
+    feature_grid: jax.Array,
+    target_grid: jax.Array,
     window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
     eps: float = 1e-8,
@@ -268,14 +208,17 @@ def local_window_gram_loss(
     target_blur_sigmas: jax.Array | None = None,
     target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Compare local Gram structure between feature and target sliding windows."""
-    feature_grid = tokens_to_grid(feature_tokens)
-    target_grid = tokens_to_grid(target_tokens)
+    """Compare local Gram structure between two `[B, H, W, D]` grids."""
+    if feature_grid.ndim != 4:
+        raise ValueError(f"Expected feature grid with rank 4, got shape {feature_grid.shape}")
+    if target_grid.ndim != 4:
+        raise ValueError(f"Expected target grid with rank 4, got shape {target_grid.shape}")
     if feature_grid.shape[:3] != target_grid.shape[:3]:
         raise ValueError(
             "Feature and target grids must match in batch/height/width, "
             f"got {feature_grid.shape[:3]} vs {target_grid.shape[:3]}"
         )
+
     if target_blur_sigmas is not None:
         target_grid = _apply_separable_gaussian_blur(
             target_grid,
@@ -293,46 +236,81 @@ def local_window_gram_loss(
     if sample_mask is not None:
         if sample_mask.ndim != 1:
             raise ValueError(f"Expected sample mask with rank 1, got shape {sample_mask.shape}")
-        if sample_mask.shape[0] != feature_tokens.shape[0]:
+        if sample_mask.shape[0] != feature_grid.shape[0]:
             raise ValueError(
                 "Sample mask batch size and feature batch size must match, "
-                f"got {sample_mask.shape[0]} vs {feature_tokens.shape[0]}"
+                f"got {sample_mask.shape[0]} vs {feature_grid.shape[0]}"
             )
-        mask = sample_mask.astype(feature_tokens.dtype)
+        mask = sample_mask.astype(feature_grid.dtype)
         active_count = jnp.sum(mask)
         spatial_loss = jnp.where(
             active_count > 0,
             jnp.sum(example_losses * mask) / active_count,
-            jnp.array(0.0, dtype=feature_tokens.dtype),
+            jnp.array(0.0, dtype=feature_grid.dtype),
         )
         active_fraction = active_count / jnp.maximum(
-            jnp.asarray(feature_tokens.shape[0], dtype=feature_tokens.dtype),
-            jnp.array(1.0, dtype=feature_tokens.dtype),
+            jnp.asarray(feature_grid.shape[0], dtype=feature_grid.dtype),
+            jnp.array(1.0, dtype=feature_grid.dtype),
         )
         blur_sigma_mean = (
             jnp.where(
                 active_count > 0,
-                jnp.sum(target_blur_sigmas.astype(feature_tokens.dtype) * mask) / active_count,
-                jnp.array(0.0, dtype=feature_tokens.dtype),
+                jnp.sum(target_blur_sigmas.astype(feature_grid.dtype) * mask) / active_count,
+                jnp.array(0.0, dtype=feature_grid.dtype),
             )
             if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_tokens.dtype)
+            else jnp.array(0.0, dtype=feature_grid.dtype)
         )
     else:
         spatial_loss = jnp.mean(example_losses)
-        active_fraction = jnp.array(1.0, dtype=feature_tokens.dtype)
+        active_fraction = jnp.array(1.0, dtype=feature_grid.dtype)
         blur_sigma_mean = (
-            jnp.mean(target_blur_sigmas.astype(feature_tokens.dtype))
+            jnp.mean(target_blur_sigmas.astype(feature_grid.dtype))
             if target_blur_sigmas is not None
-            else jnp.array(0.0, dtype=feature_tokens.dtype)
+            else jnp.array(0.0, dtype=feature_grid.dtype)
         )
     spatial_metrics = {
-        "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_tokens.dtype),
-        "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_tokens.dtype),
+        "spatial_num_windows": jnp.asarray(feature_windows.shape[1], dtype=feature_grid.dtype),
+        "spatial_window_area": jnp.asarray(feature_windows.shape[2], dtype=feature_grid.dtype),
         "spatial_active_fraction": active_fraction,
         "spatial_blur_sigma_mean": blur_sigma_mean,
     }
     return spatial_loss, spatial_metrics
+
+
+def local_window_gram_loss(
+    feature_tokens: jax.Array,
+    target_tokens: jax.Array,
+    window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
+    stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
+    eps: float = 1e-8,
+    sample_mask: jax.Array | None = None,
+    target_blur_sigmas: jax.Array | None = None,
+    target_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Convert `[B, N, D]` tokens to `[B, H, W, D]` before the local Gram loss."""
+    feature_grid = tokens_to_grid(feature_tokens)
+    target_grid = tokens_to_grid(target_tokens)
+    return local_window_gram_loss_from_grids(
+        feature_grid,
+        target_grid,
+        window_size=window_size,
+        stride=stride,
+        eps=eps,
+        sample_mask=sample_mask,
+        target_blur_sigmas=target_blur_sigmas,
+        target_blur_max_sigma=target_blur_max_sigma,
+    )
+
+
+def _pairwise_cosine_matrix(private: jax.Array, eps: float = 1e-8) -> jax.Array:
+    num_layers = private.shape[0]
+    if num_layers == 0:
+        return jnp.zeros((0, 0), dtype=private.dtype)
+    flattened = private.reshape(num_layers, -1)
+    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
+    normalized = flattened / jnp.maximum(norms, eps)
+    return normalized @ normalized.T
 
 
 def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
@@ -340,108 +318,240 @@ def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     num_layers = private.shape[0]
     if num_layers < 2:
         return jnp.array(0.0, dtype=private.dtype)
-
-    flattened = private.reshape(num_layers, -1)
-    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
-    normalized = flattened / jnp.maximum(norms, eps)
-    cosine_matrix = normalized @ normalized.T
+    cosine_matrix = _pairwise_cosine_matrix(private, eps=eps)
     upper_indices = jnp.triu_indices(num_layers, k=1)
     return cosine_matrix[upper_indices]
 
 
-def _mean_pairwise_cosine_squared(
-    private: jax.Array,
-    eps: float = 1e-8,
+def _sample_layer_mask(
+    num_layers: int,
+    max_layers: int,
+    dtype: jnp.dtype,
     rng: jax.Array | None = None,
-    max_pairs: int = 0,
 ) -> jax.Array:
-    """Average squared cosine similarity over all or sampled layer pairs."""
-    pairwise_cosines = _pairwise_cosines(private, eps=eps)
-    if pairwise_cosines.ndim == 0:
-        return pairwise_cosines
-
-    if max_pairs and max_pairs > 0 and pairwise_cosines.shape[0] > max_pairs:
+    if num_layers == 0:
+        return jnp.zeros((0,), dtype=dtype)
+    if max_layers and max_layers > 0 and num_layers > max_layers:
         if rng is None:
-            raise ValueError("An RNG key is required when sampling private-layer pairs.")
-        indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
-        pairwise_cosines = pairwise_cosines[indices]
+            raise ValueError("An RNG key is required when sampling layer indices.")
+        indices = jax.random.permutation(rng, num_layers)[:max_layers]
+        return jnp.zeros((num_layers,), dtype=dtype).at[indices].set(1.0)
+    return jnp.ones((num_layers,), dtype=dtype)
 
-    return jnp.mean(jnp.square(pairwise_cosines))
 
-
-def _common_private_cosines(
-    common: jax.Array,
-    private: jax.Array,
-    eps: float = 1e-8,
+def _sample_private_layer_mask(
+    num_layers: int,
+    max_layers: int,
+    dtype: jnp.dtype,
+    rng: jax.Array | None = None,
 ) -> jax.Array:
-    """Return cosine similarities between ``A_common`` and each private layer ``B_i``."""
-    if common.ndim != 3:
-        raise ValueError(f"Expected common activation with rank 3, got shape {common.shape}")
-    if private.ndim != 4:
-        raise ValueError(f"Expected private activations with rank 4, got shape {private.shape}")
-    if private.shape[1:] != common.shape:
-        raise ValueError(
-            "Private activations must match common activation in batch/token/channel dims, "
-            f"got {private.shape[1:]} vs {common.shape}"
-        )
+    """Sample private layers while always keeping layer 1 (index 0 in private deltas)."""
+    if num_layers == 0:
+        return jnp.zeros((0,), dtype=dtype)
 
-    common_flat = common.reshape(-1)
-    private_flat = private.reshape(private.shape[0], -1)
-    common_norm = common_flat / jnp.maximum(jnp.linalg.norm(common_flat), eps)
-    private_norms = private_flat / jnp.maximum(
-        jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
-        eps,
+    if max_layers <= 0 or max_layers >= num_layers:
+        return jnp.ones((num_layers,), dtype=dtype)
+
+    sampled_layers = max(1, min(max_layers, num_layers))
+    selection_mask = jnp.zeros((num_layers,), dtype=dtype).at[0].set(1.0)
+    if sampled_layers == 1:
+        return selection_mask
+
+    if rng is None:
+        raise ValueError("An RNG key is required when sampling private layers.")
+
+    remaining_indices = jnp.arange(1, num_layers, dtype=jnp.int32)
+    extra_indices = jax.random.permutation(rng, remaining_indices)[:sampled_layers - 1]
+    return selection_mask.at[extra_indices].set(1.0)
+
+
+def _masked_mean(values: jax.Array, mask: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    if values.shape[0] == 0:
+        return jnp.array(0.0, dtype=dtype)
+    count = jnp.sum(mask)
+    return jnp.where(
+        count > 0,
+        jnp.sum(values * mask) / count,
+        jnp.array(0.0, dtype=dtype),
     )
-    return private_norms @ common_norm
 
 
-def _mean_common_private_cosine_squared(
-    common: jax.Array,
+def _mean_masked_pairwise_cosine_squared(
     private: jax.Array,
+    selection_mask: jax.Array,
+    max_pairs: int = DEFAULT_PRIVATE_MAX_PAIRS,
     eps: float = 1e-8,
-    rng: jax.Array | None = None,
-    max_layers: int = 0,
-) -> jax.Array:
-    """Average squared cosine similarity between ``A_common`` and all or sampled ``B_i``."""
-    common_private_cosines = _common_private_cosines(common, private, eps=eps)
-    if common_private_cosines.ndim == 0:
-        return common_private_cosines
+) -> tuple[jax.Array, jax.Array]:
+    """Average squared cosine similarity over ordered sampled pairs.
 
-    if max_layers and max_layers > 0 and common_private_cosines.shape[0] > max_layers:
-        if rng is None:
-            raise ValueError("An RNG key is required when sampling common/private layers.")
-        indices = jax.random.permutation(rng, common_private_cosines.shape[0])[:max_layers]
-        common_private_cosines = common_private_cosines[indices]
+    Pair order follows the requested deterministic traversal over sampled layers:
+    `(1, l2), (1, l3), ..., (l2, l3), ...`, truncated once `max_pairs` is reached.
+    """
+    num_layers = private.shape[0]
+    if num_layers < 2:
+        zero = jnp.array(0.0, dtype=private.dtype)
+        return zero, zero
 
-    return jnp.mean(jnp.square(common_private_cosines))
+    cosine_matrix = _pairwise_cosine_matrix(private, eps=eps)
+    pair_i = []
+    pair_j = []
+    for i in range(num_layers):
+        for j in range(i + 1, num_layers):
+            pair_i.append(i)
+            pair_j.append(j)
+
+    if not pair_i:
+        zero = jnp.array(0.0, dtype=private.dtype)
+        return zero, zero
+
+    pair_i = jnp.asarray(pair_i, dtype=jnp.int32)
+    pair_j = jnp.asarray(pair_j, dtype=jnp.int32)
+    ordered_pair_mask = selection_mask[pair_i] * selection_mask[pair_j]
+    if max_pairs > 0:
+        pair_rank = jnp.cumsum(ordered_pair_mask.astype(jnp.int32))
+        ordered_pair_mask = ordered_pair_mask * (pair_rank <= max_pairs).astype(private.dtype)
+
+    pair_values = jnp.square(cosine_matrix[pair_i, pair_j])
+    pair_count = jnp.sum(ordered_pair_mask)
+    loss = jnp.where(
+        pair_count > 0,
+        jnp.sum(pair_values * ordered_pair_mask) / pair_count,
+        jnp.array(0.0, dtype=private.dtype),
+    )
+    return loss, pair_count
+
+
+def _resolve_spatial_window(
+    layer_index: int,
+    *,
+    model_size: str | None,
+    default_window_size: int,
+    default_stride: int,
+) -> tuple[int, int]:
+    if default_window_size > 0 and default_stride > 0:
+        return default_window_size, default_stride
+
+    if model_size is not None and model_size.upper() == "B":
+        if 1 <= layer_index <= 4:
+            return 2, 2
+        if 5 <= layer_index <= 10:
+            return 8, 8
+        if layer_index == 11:
+            return 4, 4
+
+    return DEFAULT_SPATIAL_WINDOW_SIZE, DEFAULT_SPATIAL_WINDOW_STRIDE
+
+
+def _mean_sampled_spatial_alignment_loss(
+    activations: jax.Array,
+    *,
+    spatial_align_rng: jax.Array | None,
+    spatial_align_max_layers: int,
+    spatial_window_size: int,
+    spatial_window_stride: int,
+    spatial_sample_mask: jax.Array | None,
+    blur_sigmas: jax.Array | None,
+    spatial_blur_max_sigma: float,
+    model_size: str | None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    dtype = activations.dtype
+    candidate_layers = activations[1:-1]
+    target_layer = jax.lax.stop_gradient(activations[-1])
+    num_candidates = candidate_layers.shape[0]
+
+    if num_candidates == 0:
+        zero = jnp.array(0.0, dtype=dtype)
+        return zero, {
+            "spatial_num_windows": zero,
+            "spatial_window_area": zero,
+            "spatial_active_fraction": zero,
+            "spatial_blur_sigma_mean": zero,
+            "spatial_selected_layers": zero,
+        }
+
+    selection_mask = _sample_layer_mask(
+        num_candidates,
+        spatial_align_max_layers,
+        dtype=dtype,
+        rng=spatial_align_rng,
+    )
+
+    losses = []
+    num_windows = []
+    window_areas = []
+    active_fractions = []
+    blur_sigma_means = []
+    for layer_offset in range(num_candidates):
+        layer_index = layer_offset + 1
+        window_size, stride = _resolve_spatial_window(
+            layer_index,
+            model_size=model_size,
+            default_window_size=spatial_window_size,
+            default_stride=spatial_window_stride,
+        )
+        layer_loss, layer_metrics = local_window_gram_loss(
+            candidate_layers[layer_offset],
+            target_layer,
+            window_size=window_size,
+            stride=stride,
+            sample_mask=spatial_sample_mask,
+            target_blur_sigmas=blur_sigmas,
+            target_blur_max_sigma=spatial_blur_max_sigma,
+        )
+        losses.append(layer_loss)
+        num_windows.append(layer_metrics["spatial_num_windows"])
+        window_areas.append(layer_metrics["spatial_window_area"])
+        active_fractions.append(layer_metrics["spatial_active_fraction"])
+        blur_sigma_means.append(layer_metrics["spatial_blur_sigma_mean"])
+
+    losses = jnp.stack(losses)
+    num_windows = jnp.stack(num_windows)
+    window_areas = jnp.stack(window_areas)
+    active_fractions = jnp.stack(active_fractions)
+    blur_sigma_means = jnp.stack(blur_sigma_means)
+    selected_layers = jnp.sum(selection_mask)
+
+    spatial_loss = jnp.where(
+        selected_layers > 0,
+        jnp.sum(losses * selection_mask) / selected_layers,
+        jnp.array(0.0, dtype=dtype),
+    )
+    spatial_metrics = {
+        "spatial_num_windows": _masked_mean(num_windows, selection_mask, dtype),
+        "spatial_window_area": _masked_mean(window_areas, selection_mask, dtype),
+        "spatial_active_fraction": _masked_mean(active_fractions, selection_mask, dtype),
+        "spatial_blur_sigma_mean": _masked_mean(blur_sigma_means, selection_mask, dtype),
+        "spatial_selected_layers": selected_layers,
+    }
+    return spatial_loss, spatial_metrics
 
 
 def compute_aux_losses(
     activations: Any,
-    spatial_target: jax.Array,
     timesteps: jax.Array | None = None,
-    private_pair_rng: jax.Array | None = None,
-    private_max_pairs: int = 0,
-    common_private_rng: jax.Array | None = None,
-    common_private_max_layers: int = 0,
-    compute_common_private_loss: bool = True,
-    spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
-    spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
+    private_layer_rng: jax.Array | None = None,
+    private_max_layers: int = DEFAULT_PRIVATE_MAX_LAYERS,
+    private_max_pairs: int = DEFAULT_PRIVATE_MAX_PAIRS,
+    compute_private_loss: bool = True,
+    spatial_align_rng: jax.Array | None = None,
+    spatial_align_max_layers: int = DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    compute_spatial_loss: bool = True,
+    spatial_window_size: int = 0,
+    spatial_window_stride: int = 0,
     spatial_timestep_range: tuple[float, float] | None = None,
     spatial_blur_by_timestep: bool = False,
     spatial_blur_max_sigma: float = DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
     spatial_blur_schedule: str = DEFAULT_TIMESTEP_BLUR_SCHEDULE,
     spatial_blur_exp_rate: float = DEFAULT_TIMESTEP_BLUR_EXP_RATE,
-    common_agg: str = "mean",
-    common_logit_normal_center_layer: float = 0.0,
-    common_logit_normal_sigma: float = 1.0,
-    common_spatial_project_fn: Callable[[jax.Array], jax.Array] | None = None,
+    model_size: str | None = None,
 ) -> dict[str, jax.Array]:
-    """Compute auxiliary losses and logging metrics for activation decomposition."""
+    """Compute auxiliary losses for consecutive-layer deltas and spatial alignment."""
     activations = collect_activations(activations)
-    if spatial_target.ndim != 3:
-        raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
-    needs_timesteps = spatial_blur_by_timestep or spatial_timestep_range is not None
+    normalized_activations, private = compute_private_deltas(activations)
+
+    needs_timesteps = compute_spatial_loss and (
+        spatial_blur_by_timestep or spatial_timestep_range is not None
+    )
     if needs_timesteps:
         if timesteps is None:
             raise ValueError(
@@ -449,12 +559,13 @@ def compute_aux_losses(
             )
         if timesteps.ndim != 1:
             raise ValueError(f"Expected timesteps with rank 1, got shape {timesteps.shape}")
-        if timesteps.shape[0] != spatial_target.shape[0]:
+        if timesteps.shape[0] != normalized_activations.shape[1]:
             raise ValueError(
-                "Timesteps batch size and spatial target batch size must match, "
-                f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
+                "Timesteps batch size and activation batch size must match, "
+                f"got {timesteps.shape[0]} vs {normalized_activations.shape[1]}"
             )
-    if spatial_blur_by_timestep:
+
+    if compute_spatial_loss and spatial_blur_by_timestep:
         blur_sigmas = _timestep_dependent_blur_sigmas(
             timesteps,
             max_sigma=spatial_blur_max_sigma,
@@ -463,7 +574,8 @@ def compute_aux_losses(
         )
     else:
         blur_sigmas = None
-    if spatial_timestep_range is not None:
+
+    if compute_spatial_loss and spatial_timestep_range is not None:
         spatial_tau_min, spatial_tau_max = spatial_timestep_range
         spatial_tau_min = jnp.asarray(spatial_tau_min, dtype=timesteps.dtype)
         spatial_tau_max = jnp.asarray(spatial_tau_max, dtype=timesteps.dtype)
@@ -471,50 +583,48 @@ def compute_aux_losses(
     else:
         spatial_sample_mask = None
 
-    common, common_anchor, private = compute_common_private(
-        activations,
-        agg=common_agg,
-        logit_normal_center_layer=common_logit_normal_center_layer,
-        logit_normal_sigma=common_logit_normal_sigma,
-    )
-    spatial_common = (
-        common_spatial_project_fn(common)
-        if common_spatial_project_fn is not None
-        else common
-    )
-
-    spatial_loss, spatial_metrics = local_window_gram_loss(
-        spatial_common,
-        spatial_target,
-        window_size=spatial_window_size,
-        stride=spatial_window_stride,
-        sample_mask=spatial_sample_mask,
-        target_blur_sigmas=blur_sigmas,
-        target_blur_max_sigma=spatial_blur_max_sigma,
-    )
-
-    private_loss = _mean_pairwise_cosine_squared(
-        private,
-        rng=private_pair_rng,
-        max_pairs=private_max_pairs,
-    )
-    if compute_common_private_loss:
-        common_private_loss = _mean_common_private_cosine_squared(
-            common,
-            private,
-            rng=common_private_rng,
-            max_layers=common_private_max_layers,
+    if compute_spatial_loss:
+        spatial_loss, spatial_metrics = _mean_sampled_spatial_alignment_loss(
+            normalized_activations,
+            spatial_align_rng=spatial_align_rng,
+            spatial_align_max_layers=spatial_align_max_layers,
+            spatial_window_size=spatial_window_size,
+            spatial_window_stride=spatial_window_stride,
+            spatial_sample_mask=spatial_sample_mask,
+            blur_sigmas=blur_sigmas,
+            spatial_blur_max_sigma=spatial_blur_max_sigma,
+            model_size=model_size,
         )
-        common_private_cosines = _common_private_cosines(common, private)
-        if common_private_cosines.ndim == 0:
-            avg_common_private_cosine = common_private_cosines
-        else:
-            avg_common_private_cosine = jnp.mean(common_private_cosines)
     else:
-        common_private_loss = jnp.array(0.0, dtype=common.dtype)
-        avg_common_private_cosine = jnp.array(0.0, dtype=common.dtype)
+        zero = jnp.array(0.0, dtype=normalized_activations.dtype)
+        spatial_loss = zero
+        spatial_metrics = {
+            "spatial_num_windows": zero,
+            "spatial_window_area": zero,
+            "spatial_active_fraction": zero,
+            "spatial_blur_sigma_mean": zero,
+            "spatial_selected_layers": zero,
+        }
 
-    common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
+    if compute_private_loss:
+        private_selection_mask = _sample_private_layer_mask(
+            private.shape[0],
+            private_max_layers,
+            dtype=private.dtype,
+            rng=private_layer_rng,
+        )
+        private_loss, private_selected_pairs = _mean_masked_pairwise_cosine_squared(
+            private,
+            private_selection_mask,
+            max_pairs=private_max_pairs,
+        )
+    else:
+        private_selection_mask = jnp.zeros((private.shape[0],), dtype=private.dtype)
+        private_loss = jnp.array(0.0, dtype=private.dtype)
+        private_selected_pairs = jnp.array(0.0, dtype=private.dtype)
+
+    target_activation = jax.lax.stop_gradient(normalized_activations[-1])
+    target_norm = jnp.mean(jnp.linalg.norm(target_activation.reshape(target_activation.shape[0], -1), axis=-1))
     private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
     avg_private_norm = jnp.mean(private_norms)
 
@@ -525,14 +635,14 @@ def compute_aux_losses(
         avg_pairwise_cosine = jnp.mean(pairwise_cosines)
 
     return {
-        "common_activation": common,
+        "target_activation": target_activation,
         "private_activations": private,
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
-        "loss_common_private": common_private_loss,
         "spatial_metrics": spatial_metrics,
-        "norm_common": common_norm,
+        "target_norm": target_norm,
         "avg_private_norm": avg_private_norm,
         "avg_pairwise_private_cosine": avg_pairwise_cosine,
-        "avg_common_private_cosine": avg_common_private_cosine,
+        "private_selected_layers": jnp.sum(private_selection_mask),
+        "private_selected_pairs": private_selected_pairs,
     }

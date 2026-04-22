@@ -392,7 +392,7 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
-        activations = [] if return_activations else None
+        activations = [x] if return_activations else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -406,7 +406,7 @@ class SelfFlowDiT(nn.Module):
                 block_summaries.append(jnp.mean(x, axis=1))
 
             if return_activations:
-                # Full post-block hidden state: (B, N, D)
+                # Layer 0 is the patch-embedded input; later entries are post-block states.
                 activations.append(x)
             
             if (i + 1) == return_features:

@@ -427,8 +427,9 @@ from src.model import SelfFlowDiT
 from src.activation_decomposition import (
     compute_aux_losses,
     DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
-    DEFAULT_SPATIAL_WINDOW_SIZE,
-    DEFAULT_SPATIAL_WINDOW_STRIDE,
+    DEFAULT_PRIVATE_MAX_LAYERS,
+    DEFAULT_PRIVATE_MAX_PAIRS,
+    DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
     DEFAULT_TIMESTEP_BLUR_EXP_RATE,
     DEFAULT_TIMESTEP_BLUR_SCHEDULE,
 )
@@ -530,17 +531,18 @@ def _zero_aux_metrics(dtype):
     return {
         "loss_spatial": zero,
         "loss_private": zero,
-        "loss_common_private": zero,
         "spatial_metrics": {
             "spatial_num_windows": zero,
             "spatial_window_area": zero,
             "spatial_active_fraction": zero,
             "spatial_blur_sigma_mean": zero,
+            "spatial_selected_layers": zero,
         },
-        "norm_common": zero,
+        "target_norm": zero,
         "avg_private_norm": zero,
         "avg_pairwise_private_cosine": zero,
-        "avg_common_private_cosine": zero,
+        "private_selected_layers": zero,
+        "private_selected_pairs": zero,
     }
 
 
@@ -601,11 +603,12 @@ def _scheduled_lambda_spatial(
 
 def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
-    lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
-    private_max_pairs=0,
-    common_private_max_layers=0,
-    spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
-    spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    lambda_spatial=0.0, lambda_private=0.0,
+    private_max_layers=DEFAULT_PRIVATE_MAX_LAYERS,
+    private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
+    spatial_align_max_layers=DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    spatial_window_size=0,
+    spatial_window_stride=0,
     spatial_timestep_range=None,
     spatial_blur_by_timestep=False,
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
@@ -615,10 +618,7 @@ def train_step(
     spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
-    common_agg="mean",
-    common_logit_normal_center_layer=0.0,
-    common_logit_normal_sigma=1.0,
-    common_spatial_projector="identity",
+    model_size=None,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -641,22 +641,20 @@ def train_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    effective_lambda_common_private, common_private_warmup_scale = _scheduled_lambda_private(
-        lambda_common_private,
-        current_step,
-        start_step=private_start_step,
-        warmup_iters=private_warmup_iters,
-    )
-    compute_common_private_loss = lambda_common_private != 0.0
-    use_aux_losses = any(
-        weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
-    )
+    compute_spatial_loss = lambda_spatial != 0.0
+    compute_private_loss = lambda_private != 0.0
+    use_aux_losses = compute_spatial_loss or compute_private_loss
 
-    if compute_common_private_loss:
-        rng, tau_rng, noise_rng, drop_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 6)
+    if use_aux_losses:
+        rng, tau_rng, noise_rng, drop_rng, private_layer_rng, spatial_align_rng = jax.random.split(rng, 6)
+        if not compute_private_loss:
+            private_layer_rng = None
+        if not compute_spatial_loss:
+            spatial_align_rng = None
     else:
-        rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
-        common_private_rng = None
+        rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+        private_layer_rng = None
+        spatial_align_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -674,23 +672,16 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            if lambda_spatial != 0.0 and common_spatial_projector != "identity":
-                common_spatial_project_fn = lambda common_tokens: state.apply_fn(
-                    {"params": params},
-                    common_tokens,
-                    method=SelfFlowDiT.project_common_spatial,
-                )
-            else:
-                common_spatial_project_fn = None
             aux_metrics = compute_aux_losses(
                 activations,
-                spatial_target=x0,
                 timesteps=tau,
-                private_pair_rng=private_pair_rng,
+                private_layer_rng=private_layer_rng,
+                private_max_layers=private_max_layers,
                 private_max_pairs=private_max_pairs,
-                common_private_rng=common_private_rng,
-                common_private_max_layers=common_private_max_layers,
-                compute_common_private_loss=compute_common_private_loss,
+                compute_private_loss=compute_private_loss,
+                spatial_align_rng=spatial_align_rng,
+                spatial_align_max_layers=spatial_align_max_layers,
+                compute_spatial_loss=compute_spatial_loss,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
                 spatial_timestep_range=spatial_timestep_range,
@@ -698,20 +689,15 @@ def train_step(
                 spatial_blur_max_sigma=spatial_blur_max_sigma,
                 spatial_blur_schedule=spatial_blur_schedule,
                 spatial_blur_exp_rate=spatial_blur_exp_rate,
-                common_agg=common_agg,
-                common_logit_normal_center_layer=common_logit_normal_center_layer,
-                common_logit_normal_sigma=common_logit_normal_sigma,
-                common_spatial_project_fn=common_spatial_project_fn,
+                model_size=model_size,
             )
             l_diff = jnp.mean((pred - target) ** 2)
             l_spatial = aux_metrics["loss_spatial"]
             l_private = aux_metrics["loss_private"]
-            l_common_private = aux_metrics["loss_common_private"]
             loss = (
                 l_diff
                 + effective_lambda_spatial * l_spatial
                 + effective_lambda_private * l_private
-                + effective_lambda_common_private * l_common_private
             )
             return loss, (
                 jnp.mean(jnp.abs(target)),
@@ -719,12 +705,12 @@ def train_step(
                 l_diff,
                 l_spatial,
                 l_private,
-                l_common_private,
                 aux_metrics["spatial_metrics"],
-                aux_metrics["norm_common"],
+                aux_metrics["target_norm"],
                 aux_metrics["avg_private_norm"],
                 aux_metrics["avg_pairwise_private_cosine"],
-                aux_metrics["avg_common_private_cosine"],
+                aux_metrics["private_selected_layers"],
+                aux_metrics["private_selected_pairs"],
             )
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -736,12 +722,12 @@ def train_step(
                 l_diff,
                 l_spatial,
                 l_private,
-                l_common_private,
                 spatial_metrics,
-                norm_common,
+                target_norm,
                 avg_private_norm,
                 avg_pairwise_private_cosine,
-                avg_common_private_cosine,
+                private_selected_layers,
+                private_selected_pairs,
             ),
         ), grads = grad_fn(state.params)
 
@@ -751,12 +737,12 @@ def train_step(
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
         l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
         l_private = jax.lax.pmean(l_private, axis_name="batch")
-        l_common_private = jax.lax.pmean(l_common_private, axis_name="batch")
         spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
-        norm_common = jax.lax.pmean(norm_common, axis_name="batch")
+        target_norm = jax.lax.pmean(target_norm, axis_name="batch")
         avg_private_norm = jax.lax.pmean(avg_private_norm, axis_name="batch")
         avg_pairwise_private_cosine = jax.lax.pmean(avg_pairwise_private_cosine, axis_name="batch")
-        avg_common_private_cosine = jax.lax.pmean(avg_common_private_cosine, axis_name="batch")
+        private_selected_layers = jax.lax.pmean(private_selected_layers, axis_name="batch")
+        private_selected_pairs = jax.lax.pmean(private_selected_pairs, axis_name="batch")
         grads = jax.lax.pmean(grads, axis_name="batch")
     else:
         def loss_fn(params):
@@ -786,12 +772,12 @@ def train_step(
         l_diff = jax.lax.pmean(l_diff, axis_name="batch")
         l_spatial = jnp.array(0.0, dtype=loss.dtype)
         l_private = jnp.array(0.0, dtype=loss.dtype)
-        l_common_private = jnp.array(0.0, dtype=loss.dtype)
         spatial_metrics = jax.lax.pmean(_zero_aux_metrics(target.dtype)["spatial_metrics"], axis_name="batch")
-        norm_common = jnp.array(0.0, dtype=loss.dtype)
+        target_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_private_norm = jnp.array(0.0, dtype=loss.dtype)
         avg_pairwise_private_cosine = jnp.array(0.0, dtype=loss.dtype)
-        avg_common_private_cosine = jnp.array(0.0, dtype=loss.dtype)
+        private_selected_layers = jnp.array(0.0, dtype=loss.dtype)
+        private_selected_pairs = jnp.array(0.0, dtype=loss.dtype)
         grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -805,17 +791,15 @@ def train_step(
         "train/l_diff": l_diff,
         "train/l_spatial": l_spatial,
         "train/l_private": l_private,
-        "train/l_common_private": l_common_private,
         "train/lambda_spatial_effective": effective_lambda_spatial,
         "train/spatial_stop_scale": spatial_stop_scale,
         "train/lambda_private_effective": effective_lambda_private,
         "train/private_warmup_scale": private_warmup_scale,
-        "train/lambda_common_private_effective": effective_lambda_common_private,
-        "train/common_private_warmup_scale": common_private_warmup_scale,
-        "train/common_norm": norm_common,
+        "train/target_norm": target_norm,
         "train/private_avg_norm": avg_private_norm,
         "train/private_pairwise_cosine": avg_pairwise_private_cosine,
-        "train/common_private_cosine": avg_common_private_cosine,
+        "train/private_selected_layers": private_selected_layers,
+        "train/private_selected_pairs": private_selected_pairs,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -826,16 +810,18 @@ def train_step(
     metrics["train/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["train/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["train/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["train/spatial_selected_layers"] = spatial_metrics["spatial_selected_layers"]
     return state, ema_params, metrics, rng
 
 
 def eval_step(
     state, ema_params, batch, rng, current_step,
-    lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
-    private_max_pairs=0,
-    common_private_max_layers=0,
-    spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
-    spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
+    lambda_spatial=0.0, lambda_private=0.0,
+    private_max_layers=DEFAULT_PRIVATE_MAX_LAYERS,
+    private_max_pairs=DEFAULT_PRIVATE_MAX_PAIRS,
+    spatial_align_max_layers=DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+    spatial_window_size=0,
+    spatial_window_stride=0,
     spatial_timestep_range=None,
     spatial_blur_by_timestep=False,
     spatial_blur_max_sigma=DEFAULT_MAX_TIMESTEP_BLUR_SIGMA,
@@ -845,10 +831,7 @@ def eval_step(
     spatial_stop_warmup_iters=0,
     private_start_step=0,
     private_warmup_iters=0,
-    common_agg="mean",
-    common_logit_normal_center_layer=0.0,
-    common_logit_normal_sigma=1.0,
-    common_spatial_projector="identity",
+    model_size=None,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -865,22 +848,20 @@ def eval_step(
         start_step=private_start_step,
         warmup_iters=private_warmup_iters,
     )
-    effective_lambda_common_private, common_private_warmup_scale = _scheduled_lambda_private(
-        lambda_common_private,
-        current_step,
-        start_step=private_start_step,
-        warmup_iters=private_warmup_iters,
-    )
-    compute_common_private_loss = lambda_common_private != 0.0
-    use_aux_losses = any(
-        weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
-    )
+    compute_spatial_loss = lambda_spatial != 0.0
+    compute_private_loss = lambda_private != 0.0
+    use_aux_losses = compute_spatial_loss or compute_private_loss
 
-    if compute_common_private_loss:
-        rng, tau_rng, noise_rng, private_pair_rng, common_private_rng = jax.random.split(rng, 5)
+    if use_aux_losses:
+        rng, tau_rng, noise_rng, private_layer_rng, spatial_align_rng = jax.random.split(rng, 5)
+        if not compute_private_loss:
+            private_layer_rng = None
+        if not compute_spatial_loss:
+            spatial_align_rng = None
     else:
-        rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
-        common_private_rng = None
+        rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+        private_layer_rng = None
+        spatial_align_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -898,23 +879,16 @@ def eval_step(
     )
     if use_aux_losses:
         pred, activations = outputs
-        if lambda_spatial != 0.0 and common_spatial_projector != "identity":
-            common_spatial_project_fn = lambda common_tokens: state.apply_fn(
-                {"params": state.params},
-                common_tokens,
-                method=SelfFlowDiT.project_common_spatial,
-            )
-        else:
-            common_spatial_project_fn = None
         aux_metrics = compute_aux_losses(
             activations,
-            spatial_target=x0,
             timesteps=tau,
-            private_pair_rng=private_pair_rng,
+            private_layer_rng=private_layer_rng,
+            private_max_layers=private_max_layers,
             private_max_pairs=private_max_pairs,
-            common_private_rng=common_private_rng,
-            common_private_max_layers=common_private_max_layers,
-            compute_common_private_loss=compute_common_private_loss,
+            compute_private_loss=compute_private_loss,
+            spatial_align_rng=spatial_align_rng,
+            spatial_align_max_layers=spatial_align_max_layers,
+            compute_spatial_loss=compute_spatial_loss,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,
             spatial_timestep_range=spatial_timestep_range,
@@ -922,10 +896,7 @@ def eval_step(
             spatial_blur_max_sigma=spatial_blur_max_sigma,
             spatial_blur_schedule=spatial_blur_schedule,
             spatial_blur_exp_rate=spatial_blur_exp_rate,
-            common_agg=common_agg,
-            common_logit_normal_center_layer=common_logit_normal_center_layer,
-            common_logit_normal_sigma=common_logit_normal_sigma,
-            common_spatial_project_fn=common_spatial_project_fn,
+            model_size=model_size,
         )
     else:
         pred = outputs
@@ -934,13 +905,11 @@ def eval_step(
     l_diff = jnp.mean((pred - target) ** 2)
     l_spatial = aux_metrics["loss_spatial"]
     l_private = aux_metrics["loss_private"]
-    l_common_private = aux_metrics["loss_common_private"]
     spatial_metrics = aux_metrics["spatial_metrics"]
     loss = (
         l_diff
         + effective_lambda_spatial * l_spatial
         + effective_lambda_private * l_private
-        + effective_lambda_common_private * l_common_private
     )
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -949,12 +918,12 @@ def eval_step(
     l_diff = jax.lax.pmean(l_diff, axis_name="batch")
     l_spatial = jax.lax.pmean(l_spatial, axis_name="batch")
     l_private = jax.lax.pmean(l_private, axis_name="batch")
-    l_common_private = jax.lax.pmean(l_common_private, axis_name="batch")
     spatial_metrics = jax.lax.pmean(spatial_metrics, axis_name="batch")
-    common_norm = jax.lax.pmean(aux_metrics["norm_common"], axis_name="batch")
+    target_norm = jax.lax.pmean(aux_metrics["target_norm"], axis_name="batch")
     avg_private_norm = jax.lax.pmean(aux_metrics["avg_private_norm"], axis_name="batch")
     avg_pairwise_private_cosine = jax.lax.pmean(aux_metrics["avg_pairwise_private_cosine"], axis_name="batch")
-    avg_common_private_cosine = jax.lax.pmean(aux_metrics["avg_common_private_cosine"], axis_name="batch")
+    private_selected_layers = jax.lax.pmean(aux_metrics["private_selected_layers"], axis_name="batch")
+    private_selected_pairs = jax.lax.pmean(aux_metrics["private_selected_pairs"], axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -963,17 +932,15 @@ def eval_step(
         "val/l_diff": l_diff,
         "val/l_spatial": l_spatial,
         "val/l_private": l_private,
-        "val/l_common_private": l_common_private,
         "val/lambda_spatial_effective": effective_lambda_spatial,
         "val/spatial_stop_scale": spatial_stop_scale,
         "val/lambda_private_effective": effective_lambda_private,
         "val/private_warmup_scale": private_warmup_scale,
-        "val/lambda_common_private_effective": effective_lambda_common_private,
-        "val/common_private_warmup_scale": common_private_warmup_scale,
-        "val/common_norm": common_norm,
+        "val/target_norm": target_norm,
         "val/private_avg_norm": avg_private_norm,
         "val/private_pairwise_cosine": avg_pairwise_private_cosine,
-        "val/common_private_cosine": avg_common_private_cosine,
+        "val/private_selected_layers": private_selected_layers,
+        "val/private_selected_pairs": private_selected_pairs,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -981,6 +948,7 @@ def eval_step(
     metrics["val/spatial_window_area"] = spatial_metrics["spatial_window_area"]
     metrics["val/spatial_active_fraction"] = spatial_metrics["spatial_active_fraction"]
     metrics["val/spatial_blur_sigma_mean"] = spatial_metrics["spatial_blur_sigma_mean"]
+    metrics["val/spatial_selected_layers"] = spatial_metrics["spatial_selected_layers"]
     return metrics, rng
 
 
@@ -1472,7 +1440,7 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
-                        help="Weight for sliding-window local Gram spatial loss.")
+                        help="Weight for randomly aligning sampled intermediate layers to the final hidden layer via local Gram loss.")
     parser.add_argument(
         "--spatial-stop-step",
         type=int,
@@ -1486,13 +1454,7 @@ def main():
         help="Number of iterations to linearly decay spatial Gram lambda to zero after spatial-stop-step.",
     )
     parser.add_argument("--lambda-private", type=float, default=0.0,
-                        help="Weight for private diversity auxiliary loss.")
-    parser.add_argument(
-        "--lambda-common-private",
-        type=float,
-        default=0.0,
-        help="Weight for the auxiliary cosine-squared loss that separates A_common from sampled B_i layers.",
-    )
+                        help="Weight for private delta diversity loss on consecutive-layer differences.")
     parser.add_argument(
         "--private-start-step",
         type=int,
@@ -1505,41 +1467,23 @@ def main():
         default=0,
         help="Number of iterations to linearly warm up private diversity lambda after start step.",
     )
-    parser.add_argument("--private-max-pairs", type=int, default=0,
-                        help="If > 0, randomly sample at most this many layer pairs per iteration for L_private.")
     parser.add_argument(
-        "--common-private-max-layers",
+        "--private-max-layers",
         type=int,
-        default=0,
-        help="If > 0, randomly sample at most this many B_i layers per iteration for the A_common-vs-B_i separation loss.",
+        default=DEFAULT_PRIVATE_MAX_LAYERS,
+        help="If > 0, sample at most this many private delta layers per iteration for L_private, always including layer 1. Use 0 for all layers.",
     )
     parser.add_argument(
-        "--common-agg",
-        type=str,
-        default="mean",
-        choices=["mean", "logit_normal"],
-        help=(
-            "How to form A_common from per-layer activations: 'mean' (default) or 'logit_normal' "
-            "(weighted sum sum_i w_i A_i with w = softmax of a Gaussian in logit(depth) space)."
-        ),
+        "--private-max-pairs",
+        type=int,
+        default=DEFAULT_PRIVATE_MAX_PAIRS,
+        help="If > 0, traverse private pairs in deterministic order over the sampled layers and stop after this many pairs.",
     )
     parser.add_argument(
-        "--common-logit-normal-center-layer",
-        type=float,
-        default=0.0,
-        help=(
-            "0-based layer index (fractional allowed) at which the logit-space Gaussian weights are centered; "
-            "only used when --common-agg=logit_normal."
-        ),
-    )
-    parser.add_argument(
-        "--common-logit-normal-sigma",
-        type=float,
-        default=1.0,
-        help=(
-            "Std-dev on the logit (depth) scale for the Gaussian weight bump; larger => flatter (→ mean). "
-            "Only used when --common-agg=logit_normal."
-        ),
+        "--spatial-align-max-layers",
+        type=int,
+        default=DEFAULT_SPATIAL_ALIGN_MAX_LAYERS,
+        help="If > 0, randomly sample at most this many intermediate layers per iteration for spatial alignment to the final layer. Use 0 for all eligible layers.",
     )
     parser.add_argument(
         "--common-spatial-projector",
@@ -1547,32 +1491,32 @@ def main():
         default="identity",
         choices=["identity", "cnn"],
         help=(
-            "Optional projector applied to A_common before the spatial Gram loss. "
-            "'identity' keeps the current behavior; 'cnn' uses a lightweight locality-preserving CNN head."
+            "Legacy projector option kept for compatibility. "
+            "The current layer-delta auxiliary losses do not use this path."
         ),
     )
     parser.add_argument(
         "--common-spatial-projector-width",
         type=int,
         default=256,
-        help="Channel width of the CNN projector used before the spatial Gram loss.",
+        help="Legacy CNN projector width (currently unused by the layer-delta auxiliary losses).",
     )
     parser.add_argument(
         "--common-spatial-projector-depth",
         type=int,
         default=2,
-        help="Number of residual 3x3 CNN blocks in the A_common spatial projector.",
+        help="Legacy CNN projector depth (currently unused by the layer-delta auxiliary losses).",
     )
     parser.add_argument(
         "--common-spatial-projector-kernel-size",
         type=int,
         default=3,
-        help="Kernel size of the CNN projector blocks. Must be a positive odd integer.",
+        help="Legacy CNN projector kernel size. Must be a positive odd integer.",
     )
-    parser.add_argument("--spatial-window-size", type=int, default=DEFAULT_SPATIAL_WINDOW_SIZE,
-                        help="Sliding window size for local Gram spatial loss.")
-    parser.add_argument("--spatial-window-stride", type=int, default=DEFAULT_SPATIAL_WINDOW_STRIDE,
-                        help="Sliding window stride for local Gram spatial loss.")
+    parser.add_argument("--spatial-window-size", type=int, default=0,
+                        help="Uniform sliding window size for local Gram spatial loss. Use 0 to enable model-specific defaults.")
+    parser.add_argument("--spatial-window-stride", type=int, default=0,
+                        help="Uniform sliding window stride for local Gram spatial loss. Use 0 to enable model-specific defaults.")
     parser.add_argument(
         "--spatial-timestep-range",
         type=float,
@@ -1767,10 +1711,12 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if args.private_max_layers < 0:
+        raise ValueError("--private-max-layers must be >= 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
-    if args.common_private_max_layers < 0:
-        raise ValueError("--common-private-max-layers must be >= 0")
+    if args.spatial_align_max_layers < 0:
+        raise ValueError("--spatial-align-max-layers must be >= 0")
     if args.spatial_stop_step < -1:
         raise ValueError("--spatial-stop-step must be >= -1")
     if args.spatial_stop_warmup_iters < 0:
@@ -1779,8 +1725,6 @@ def main():
         raise ValueError("--private-start-step must be >= 0")
     if args.private_warmup_iters < 0:
         raise ValueError("--private-warmup-iters must be >= 0")
-    if args.common_agg == "logit_normal" and args.common_logit_normal_sigma <= 0:
-        raise ValueError("--common-logit-normal-sigma must be > 0 when --common-agg=logit_normal")
     if args.common_spatial_projector_width <= 0:
         raise ValueError("--common-spatial-projector-width must be > 0")
     if args.common_spatial_projector_depth <= 0:
@@ -1790,10 +1734,15 @@ def main():
         or args.common_spatial_projector_kernel_size % 2 == 0
     ):
         raise ValueError("--common-spatial-projector-kernel-size must be a positive odd integer")
-    if args.spatial_window_size <= 0:
-        raise ValueError("--spatial-window-size must be > 0")
-    if args.spatial_window_stride <= 0:
-        raise ValueError("--spatial-window-stride must be > 0")
+    if args.spatial_window_size < 0:
+        raise ValueError("--spatial-window-size must be >= 0")
+    if args.spatial_window_stride < 0:
+        raise ValueError("--spatial-window-stride must be >= 0")
+    if (args.spatial_window_size == 0) != (args.spatial_window_stride == 0):
+        raise ValueError(
+            "--spatial-window-size and --spatial-window-stride must both be 0 "
+            "(for model defaults) or both be positive."
+        )
     if args.spatial_timestep_range is not None:
         spatial_tau_min, spatial_tau_max = args.spatial_timestep_range
         if spatial_tau_min < 0.0 or spatial_tau_max > 1.0 or spatial_tau_min > spatial_tau_max:
@@ -1848,11 +1797,11 @@ def main():
         f"spatial_stop_step={args.spatial_stop_step} "
         f"spatial_stop_warmup_iters={args.spatial_stop_warmup_iters} "
         f"lambda_private={args.lambda_private} "
-        f"lambda_common_private={args.lambda_common_private} "
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
+        f"private_max_layers={args.private_max_layers} "
         f"private_max_pairs={args.private_max_pairs} "
-        f"common_private_max_layers={args.common_private_max_layers} "
+        f"spatial_align_max_layers={args.spatial_align_max_layers} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
         f"spatial_timestep_range={args.spatial_timestep_range} "
@@ -1860,18 +1809,7 @@ def main():
         f"spatial_blur_max_sigma={args.spatial_blur_max_sigma} "
         f"spatial_blur_schedule={args.spatial_blur_schedule} "
         f"spatial_blur_exp_rate={args.spatial_blur_exp_rate} "
-        f"common_agg={args.common_agg} "
-        f"common_logit_normal_center_layer={args.common_logit_normal_center_layer} "
-        f"common_logit_normal_sigma={args.common_logit_normal_sigma} "
-        f"common_spatial_projector={args.common_spatial_projector}"
     )
-    if args.common_spatial_projector == "cnn":
-        log_stage(
-            "A_common spatial projector: "
-            f"width={args.common_spatial_projector_width} "
-            f"depth={args.common_spatial_projector_depth} "
-            f"kernel={args.common_spatial_projector_kernel_size}"
-        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1917,11 +1855,11 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
-            lambda_common_private=args.lambda_common_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
+            private_max_layers=args.private_max_layers,
             private_max_pairs=args.private_max_pairs,
-            common_private_max_layers=args.common_private_max_layers,
+            spatial_align_max_layers=args.spatial_align_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_timestep_range=args.spatial_timestep_range,
@@ -1929,10 +1867,7 @@ def main():
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             spatial_blur_schedule=args.spatial_blur_schedule,
             spatial_blur_exp_rate=args.spatial_blur_exp_rate,
-            common_agg=args.common_agg,
-            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
-            common_logit_normal_sigma=args.common_logit_normal_sigma,
-            common_spatial_projector=args.common_spatial_projector,
+            model_size=args.model_size,
         ),
         axis_name="batch",
     )
@@ -1943,11 +1878,11 @@ def main():
             spatial_stop_step=args.spatial_stop_step,
             spatial_stop_warmup_iters=args.spatial_stop_warmup_iters,
             lambda_private=args.lambda_private,
-            lambda_common_private=args.lambda_common_private,
             private_start_step=args.private_start_step,
             private_warmup_iters=args.private_warmup_iters,
+            private_max_layers=args.private_max_layers,
             private_max_pairs=args.private_max_pairs,
-            common_private_max_layers=args.common_private_max_layers,
+            spatial_align_max_layers=args.spatial_align_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
             spatial_timestep_range=args.spatial_timestep_range,
@@ -1955,10 +1890,7 @@ def main():
             spatial_blur_max_sigma=args.spatial_blur_max_sigma,
             spatial_blur_schedule=args.spatial_blur_schedule,
             spatial_blur_exp_rate=args.spatial_blur_exp_rate,
-            common_agg=args.common_agg,
-            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
-            common_logit_normal_sigma=args.common_logit_normal_sigma,
-            common_spatial_projector=args.common_spatial_projector,
+            model_size=args.model_size,
         ),
         axis_name="batch",
     )
