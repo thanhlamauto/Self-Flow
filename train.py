@@ -511,12 +511,15 @@ def _cli_flag_was_set(flag_name):
 
 
 def resolve_layersync_config(args, depth):
+    anchor_layer = int(args.layersync_anchor_layer)
     weak_layer = int(args.layersync_weak_layer)
     strong_layer = int(args.layersync_strong_layer)
 
     uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
+        not _cli_flag_was_set("--layersync-anchor-layer")
+        and not _cli_flag_was_set("--layersync-weak-layer")
         and not _cli_flag_was_set("--layersync-strong-layer")
+        and anchor_layer == DEFAULT_LAYERSYNC_ANCHOR_LAYER
         and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
         and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
     )
@@ -528,14 +531,18 @@ def resolve_layersync_config(args, depth):
             "on smaller backbones."
         )
 
+    if not (0 <= anchor_layer <= depth):
+        raise ValueError(
+            f"--layersync-anchor-layer must be in [0, {depth}], got {anchor_layer}"
+        )
     if not (1 <= weak_layer <= depth):
         raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
     if not (1 <= strong_layer <= depth):
         raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if DEFAULT_LAYERSYNC_ANCHOR_LAYER > depth:
+    if anchor_layer >= weak_layer:
         raise ValueError(
-            f"LayerSync anchor layer {DEFAULT_LAYERSYNC_ANCHOR_LAYER} requires model depth >= "
-            f"{DEFAULT_LAYERSYNC_ANCHOR_LAYER}, got {depth}"
+            "--layersync-anchor-layer must be strictly less than --layersync-weak-layer "
+            f"(got {anchor_layer} and {weak_layer})"
         )
     if weak_layer >= strong_layer:
         raise ValueError(
@@ -543,7 +550,7 @@ def resolve_layersync_config(args, depth):
             f"(got {weak_layer} and {strong_layer})"
         )
 
-    return weak_layer, strong_layer
+    return anchor_layer, weak_layer, strong_layer
 
 
 def safe_l2_normalize(x, eps=1e-8):
@@ -1223,6 +1230,15 @@ def main():
         help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
     )
     parser.add_argument(
+        "--layersync-anchor-layer",
+        type=int,
+        default=DEFAULT_LAYERSYNC_ANCHOR_LAYER,
+        help=(
+            "Anchor layer subtracted before LayerSync alignment. "
+            "0 means the pre-block hidden state right after PatchEmbed + positional embedding."
+        ),
+    )
+    parser.add_argument(
         "--layersync-weak-layer",
         type=int,
         default=DEFAULT_LAYERSYNC_WEAK_LAYER,
@@ -1418,15 +1434,15 @@ def main():
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
     if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
+        anchor_layer, weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = (
-            DEFAULT_LAYERSYNC_ANCHOR_LAYER,
+            anchor_layer,
             weak_layer,
             strong_layer,
         )
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"anchor_layer={DEFAULT_LAYERSYNC_ANCHOR_LAYER} "
+            f"anchor_layer={anchor_layer} "
             f"weak_layer={weak_layer} strong_layer={strong_layer}"
         )
     else:

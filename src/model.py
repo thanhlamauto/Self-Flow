@@ -323,8 +323,8 @@ class SelfFlowDiT(nn.Module):
             raw_single = True
 
         if raw_layers:
-            if any(layer <= 0 for layer in raw_layers):
-                raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+            if any(layer < 0 for layer in raw_layers):
+                raise ValueError(f"return_raw_features layers must be >= 0, got {raw_layers}")
             if any(layer > self.depth for layer in raw_layers):
                 raise ValueError(
                     f"return_raw_features layers must be <= model depth ({self.depth}), got {raw_layers}"
@@ -333,6 +333,10 @@ class SelfFlowDiT(nn.Module):
                 raw_positions = {}
                 for idx, layer in enumerate(raw_layers):
                     raw_positions.setdefault(layer, []).append(idx)
+
+        zs = None
+        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
+        block_summaries = [] if return_block_summaries else None
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -345,6 +349,12 @@ class SelfFlowDiT(nn.Module):
             embed_dim=self.hidden_size
         )(x)
         x = x + self.pos_embed_val
+        if raw_layers and ((0 in raw_positions) if raw_positions is not None else (0 in raw_layers)):
+            if raw_single:
+                zs = x
+            else:
+                for idx in raw_positions[0]:
+                    raw_zs[idx] = x
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
         y_embedder = LabelEmbedder(
@@ -373,9 +383,6 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
-        zs = None
-        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
-        block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
