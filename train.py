@@ -536,9 +536,12 @@ def _normalize_residual_updates(hidden_states, eps=1e-6):
     return (residual_updates - mean) / jnp.sqrt(var + jnp.float32(eps))
 
 
-def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8):
+def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_name=None):
     delta_i = jax.lax.dynamic_index_in_dim(normalized_updates, pair_i, axis=0, keepdims=False)
     delta_j = jax.lax.dynamic_index_in_dim(normalized_updates, pair_j, axis=0, keepdims=False)
+    if axis_name is not None:
+        delta_i = jax.lax.all_gather(delta_i, axis_name=axis_name, axis=0, tiled=True)
+        delta_j = jax.lax.all_gather(delta_j, axis_name=axis_name, axis=0, tiled=True)
 
     numer = jnp.sum(delta_i * delta_j, axis=(-2, -1))
     denom = (
@@ -551,7 +554,14 @@ def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8):
     return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq)
 
 
-def compute_anti_collapse_loss(normalized_updates, gamma):
+def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
+    if axis_name is not None:
+        normalized_updates = jax.lax.all_gather(
+            normalized_updates,
+            axis_name=axis_name,
+            axis=1,
+            tiled=True,
+        )
     sigma = jnp.std(normalized_updates, axis=(1, 2))
     shortfall = jnp.maximum(jnp.float32(gamma) - sigma, 0.0)
     loss = jnp.mean(jnp.square(shortfall))
@@ -566,6 +576,7 @@ def compute_residual_regularizer_losses(
     pair_i,
     pair_j,
     gamma,
+    axis_name=None,
     *,
     compute_dir,
     compute_ac,
@@ -577,6 +588,7 @@ def compute_residual_regularizer_losses(
             normalized_updates,
             pair_i=pair_i,
             pair_j=pair_j,
+            axis_name=axis_name,
         )
     else:
         dir_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -587,6 +599,7 @@ def compute_residual_regularizer_losses(
         ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac = compute_anti_collapse_loss(
             normalized_updates,
             gamma=gamma,
+            axis_name=axis_name,
         )
     else:
         ac_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -666,6 +679,7 @@ def train_step(
                 pair_i=dir_pair_i,
                 pair_j=dir_pair_j,
                 gamma=ac_gamma,
+                axis_name="batch",
                 compute_dir=dir_enabled,
                 compute_ac=ac_enabled,
             )
@@ -760,8 +774,8 @@ def train_step(
         "train/loss_ac": loss_ac,
         "train/dir_lambda": dir_lambda,
         "train/ac_lambda": ac_lambda,
-        "train/dir_pair_i": dir_pair_i_metric + 1.0,
-        "train/dir_pair_j": dir_pair_j_metric + 1.0,
+        "train/dir_pair_i": (dir_pair_i_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
+        "train/dir_pair_j": (dir_pair_j_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "train/dir_cosine": dir_cosine,
         "train/dir_cosine_sq": dir_cosine_sq,
         "train/ac_sigma_mean": ac_sigma_mean,
@@ -826,6 +840,7 @@ def eval_step(
             pair_i=dir_pair_i,
             pair_j=dir_pair_j,
             gamma=ac_gamma,
+            axis_name="batch",
             compute_dir=dir_enabled,
             compute_ac=ac_enabled,
         )
@@ -877,8 +892,8 @@ def eval_step(
         "val/loss_ac": loss_ac,
         "val/dir_lambda": dir_lambda,
         "val/ac_lambda": ac_lambda,
-        "val/dir_pair_i": dir_pair_i_metric + 1.0,
-        "val/dir_pair_j": dir_pair_j_metric + 1.0,
+        "val/dir_pair_i": (dir_pair_i_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
+        "val/dir_pair_j": (dir_pair_j_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "val/dir_cosine": dir_cosine,
         "val/dir_cosine_sq": dir_cosine_sq,
         "val/ac_sigma_mean": ac_sigma_mean,
@@ -1539,8 +1554,14 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
+    if args.dir_lambda < 0.0:
+        raise ValueError("--dir-lambda must be non-negative")
+    if args.ac_lambda < 0.0:
+        raise ValueError("--ac-lambda must be non-negative")
+    if args.diversity_gap < 1:
+        raise ValueError("--diversity-gap must be >= 1")
+    if args.ac_gamma < 0.0:
+        raise ValueError("--ac-gamma must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1574,17 +1595,31 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
-        log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
-        )
+    residual_reg_enabled = (args.dir_lambda > 0.0) or (args.ac_lambda > 0.0)
+    dir_enabled = args.dir_lambda > 0.0
+    ac_enabled = args.ac_lambda > 0.0
+    residual_reg_capture_layers = None
+    dir_pair_choices_i = None
+    dir_pair_choices_j = None
+    if residual_reg_enabled:
+        residual_reg_capture_layers = tuple(range(0, depth + 1))
+        if dir_enabled:
+            dir_pair_choices_i, dir_pair_choices_j = build_diversity_pair_indices(
+                depth,
+                args.diversity_gap,
+            )
+            log_stage(
+                f"Residual regularizer ENABLED: dir_lambda={args.dir_lambda} ac_lambda={args.ac_lambda} "
+                f"gap={args.diversity_gap} gamma={args.ac_gamma} "
+                f"valid_pairs={int(dir_pair_choices_i.shape[0])}"
+            )
+        else:
+            log_stage(
+                f"Residual regularizer ENABLED: dir_lambda=0.0 ac_lambda={args.ac_lambda} "
+                f"gap={args.diversity_gap} gamma={args.ac_gamma}"
+            )
     else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
+        log_stage("Residual regularizer DISABLED: dir_lambda=0.0 ac_lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1600,7 +1635,29 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
+    dir_lambda_rep = jax_utils.replicate(jnp.float32(args.dir_lambda))
+    ac_lambda_rep = jax_utils.replicate(jnp.float32(args.ac_lambda))
+    zero_pair_rep = jax_utils.replicate(jnp.int32(0))
+    dir_pair_rng = jax.random.PRNGKey(123)
+
+    def next_dir_pair_rep():
+        nonlocal dir_pair_rng
+        if not dir_enabled:
+            return zero_pair_rep, zero_pair_rep
+        dir_pair_rng, draw_rng = jax.random.split(dir_pair_rng)
+        draw = int(
+            jax.random.randint(
+                draw_rng,
+                shape=(),
+                minval=0,
+                maxval=dir_pair_choices_i.shape[0],
+                dtype=jnp.int32,
+            )
+        )
+        return (
+            jax_utils.replicate(jnp.int32(dir_pair_choices_i[draw])),
+            jax_utils.replicate(jnp.int32(dir_pair_choices_j[draw])),
+        )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1627,16 +1684,22 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            residual_reg_enabled=residual_reg_enabled,
+            dir_enabled=dir_enabled,
+            ac_enabled=ac_enabled,
+            residual_reg_capture_layers=residual_reg_capture_layers,
+            ac_gamma=args.ac_gamma,
         ),
         axis_name="batch",
     )
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            residual_reg_enabled=residual_reg_enabled,
+            dir_enabled=dir_enabled,
+            ac_enabled=ac_enabled,
+            residual_reg_capture_layers=residual_reg_capture_layers,
+            ac_gamma=args.ac_gamma,
         ),
         axis_name="batch",
     )
@@ -1910,8 +1973,17 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_dir_pair_i_rep, probe_dir_pair_j_rep = next_dir_pair_rep()
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state,
+            ema_params,
+            (probe_x, probe_y),
+            rng,
+            ema_decay_rep,
+            dir_lambda_rep,
+            ac_lambda_rep,
+            probe_dir_pair_i_rep,
+            probe_dir_pair_j_rep,
         )
         block_pytree(probe_metrics)
 
@@ -2274,8 +2346,17 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            train_dir_pair_i_rep, train_dir_pair_j_rep = next_dir_pair_rep()
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                dir_lambda_rep,
+                ac_lambda_rep,
+                train_dir_pair_i_rep,
+                train_dir_pair_j_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2301,8 +2382,16 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    eval_dir_pair_i_rep, eval_dir_pair_j_rep = next_dir_pair_rep()
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state,
+                        ema_params,
+                        (val_x, val_y),
+                        rng,
+                        dir_lambda_rep,
+                        ac_lambda_rep,
+                        eval_dir_pair_i_rep,
+                        eval_dir_pair_j_rep,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
