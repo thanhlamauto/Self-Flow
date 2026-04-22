@@ -3,6 +3,7 @@ import sys
 import argparse
 import glob
 import pickle
+import math
 import time
 import threading
 import queue
@@ -367,8 +368,8 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_DIR_GAP = 3
+DEFAULT_AC_GAMMA = 0.3
 
 
 def build_model_config(model_size):
@@ -502,55 +503,106 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
-    )
-
-
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
-
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
-    )
-    if uses_default_pair and strong_layer > depth:
+def build_diversity_pair_indices(depth, gap):
+    if depth < 2:
+        raise ValueError(f"Model depth must be >= 2 for residual regularization, got {depth}")
+    if gap < 1:
+        raise ValueError(f"--diversity-gap must be >= 1, got {gap}")
+    if gap >= depth:
         raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
+            f"--diversity-gap must be smaller than model depth ({depth}), got {gap}"
         )
 
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
+    pair_i = []
+    pair_j = []
+    for i in range(depth):
+        for j in range(i + gap, depth):
+            pair_i.append(i)
+            pair_j.append(j)
+
+    if not pair_i:
         raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
+            f"No valid layer pairs satisfy j - i >= {gap} for model depth {depth}"
         )
 
-    return weak_layer, strong_layer
+    return np.asarray(pair_i, dtype=np.int32), np.asarray(pair_j, dtype=np.int32)
 
 
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
+def _normalize_residual_updates(hidden_states, eps=1e-6):
+    hidden_states = jnp.stack(hidden_states, axis=0).astype(jnp.float32)
+    residual_updates = hidden_states[1:] - hidden_states[:-1]
+    mean = jnp.mean(residual_updates, axis=-1, keepdims=True)
+    var = jnp.mean(jnp.square(residual_updates - mean), axis=-1, keepdims=True)
+    return (residual_updates - mean) / jnp.sqrt(var + jnp.float32(eps))
 
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
 
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8):
+    delta_i = jax.lax.dynamic_index_in_dim(normalized_updates, pair_i, axis=0, keepdims=False)
+    delta_j = jax.lax.dynamic_index_in_dim(normalized_updates, pair_j, axis=0, keepdims=False)
+
+    numer = jnp.sum(delta_i * delta_j, axis=(-2, -1))
+    denom = (
+        jnp.linalg.norm(delta_i, axis=(-2, -1))
+        * jnp.linalg.norm(delta_j, axis=(-2, -1))
+        + jnp.float32(eps)
+    )
+    cosine = numer / denom
+    cosine_sq = jnp.square(cosine)
+    return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq)
+
+
+def compute_anti_collapse_loss(normalized_updates, gamma):
+    sigma = jnp.std(normalized_updates, axis=(1, 2))
+    shortfall = jnp.maximum(jnp.float32(gamma) - sigma, 0.0)
+    loss = jnp.mean(jnp.square(shortfall))
+    sigma_mean = jnp.mean(sigma)
+    sigma_min = jnp.min(sigma)
+    alive_frac = jnp.mean((sigma >= jnp.float32(gamma)).astype(jnp.float32))
+    return loss, sigma_mean, sigma_min, alive_frac
+
+
+def compute_residual_regularizer_losses(
+    hidden_states,
+    pair_i,
+    pair_j,
+    gamma,
+    *,
+    compute_dir,
+    compute_ac,
+):
+    normalized_updates = _normalize_residual_updates(hidden_states)
+
+    if compute_dir:
+        dir_loss, dir_cosine, dir_cosine_sq = compute_direction_loss(
+            normalized_updates,
+            pair_i=pair_i,
+            pair_j=pair_j,
+        )
+    else:
+        dir_loss = jnp.array(0.0, dtype=jnp.float32)
+        dir_cosine = jnp.array(0.0, dtype=jnp.float32)
+        dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
+
+    if compute_ac:
+        ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac = compute_anti_collapse_loss(
+            normalized_updates,
+            gamma=gamma,
+        )
+    else:
+        ac_loss = jnp.array(0.0, dtype=jnp.float32)
+        ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
+        ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
+        ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
+
+    return (
+        dir_loss,
+        dir_cosine,
+        dir_cosine_sq,
+        ac_loss,
+        ac_sigma_mean,
+        ac_sigma_min,
+        ac_alive_frac,
+    )
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -561,10 +613,16 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
+    dir_lambda,
+    ac_lambda,
+    dir_pair_i,
+    dir_pair_j,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    residual_reg_enabled,
+    dir_enabled,
+    ac_enabled,
+    residual_reg_capture_layers,
+    ac_gamma,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -585,17 +643,32 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
-            pred, raw_features = state.apply_fn(
+        if residual_reg_enabled:
+            pred, hidden_states = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_raw_features=residual_reg_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            (
+                loss_dir,
+                dir_cosine,
+                dir_cosine_sq,
+                loss_ac,
+                ac_sigma_mean,
+                ac_sigma_min,
+                ac_alive_frac,
+            ) = compute_residual_regularizer_losses(
+                hidden_states,
+                pair_i=dir_pair_i,
+                pair_j=dir_pair_j,
+                gamma=ac_gamma,
+                compute_dir=dir_enabled,
+                compute_ac=ac_enabled,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,25 +678,71 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            loss_dir = jnp.array(0.0, dtype=jnp.float32)
+            dir_cosine = jnp.array(0.0, dtype=jnp.float32)
+            dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
+            loss_ac = jnp.array(0.0, dtype=jnp.float32)
+            ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
+            ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
+            ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss_reg = dir_lambda * loss_dir + ac_lambda * loss_ac
+        loss = loss_gen + loss_reg
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_reg,
+            loss_dir,
+            dir_cosine,
+            dir_cosine_sq,
+            loss_ac,
+            ac_sigma_mean,
+            ac_sigma_min,
+            ac_alive_frac,
+            dir_pair_i,
+            dir_pair_j,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_reg,
+            loss_dir,
+            dir_cosine,
+            dir_cosine_sq,
+            loss_ac,
+            ac_sigma_mean,
+            ac_sigma_min,
+            ac_alive_frac,
+            dir_pair_i_metric,
+            dir_pair_j_metric,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
+    loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
+    dir_cosine = jax.lax.pmean(dir_cosine, axis_name="batch")
+    dir_cosine_sq = jax.lax.pmean(dir_cosine_sq, axis_name="batch")
+    loss_ac = jax.lax.pmean(loss_ac, axis_name="batch")
+    ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
+    ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
+    ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
+    dir_pair_i_metric = jax.lax.pmean(dir_pair_i_metric.astype(jnp.float32), axis_name="batch")
+    dir_pair_j_metric = jax.lax.pmean(dir_pair_j_metric.astype(jnp.float32), axis_name="batch")
+    dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
+    ac_lambda = jax.lax.pmean(ac_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +755,18 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/loss_reg": loss_reg,
+        "train/loss_dir": loss_dir,
+        "train/loss_ac": loss_ac,
+        "train/dir_lambda": dir_lambda,
+        "train/ac_lambda": ac_lambda,
+        "train/dir_pair_i": dir_pair_i_metric + 1.0,
+        "train/dir_pair_j": dir_pair_j_metric + 1.0,
+        "train/dir_cosine": dir_cosine,
+        "train/dir_cosine_sq": dir_cosine_sq,
+        "train/ac_sigma_mean": ac_sigma_mean,
+        "train/ac_sigma_min": ac_sigma_min,
+        "train/ac_alive_frac": ac_alive_frac,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -653,10 +781,16 @@ def eval_step(
     ema_params,
     batch,
     rng,
-    layersync_lambda,
+    dir_lambda,
+    ac_lambda,
+    dir_pair_i,
+    dir_pair_j,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    residual_reg_enabled,
+    dir_enabled,
+    ac_enabled,
+    residual_reg_capture_layers,
+    ac_gamma,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -670,16 +804,31 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
-        pred, raw_features = state.apply_fn(
+    if residual_reg_enabled:
+        pred, hidden_states = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_raw_features=residual_reg_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        (
+            loss_dir,
+            dir_cosine,
+            dir_cosine_sq,
+            loss_ac,
+            ac_sigma_mean,
+            ac_sigma_min,
+            ac_alive_frac,
+        ) = compute_residual_regularizer_losses(
+            hidden_states,
+            pair_i=dir_pair_i,
+            pair_j=dir_pair_j,
+            gamma=ac_gamma,
+            compute_dir=dir_enabled,
+            compute_ac=ac_enabled,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,19 +837,34 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        loss_dir = jnp.array(0.0, dtype=jnp.float32)
+        dir_cosine = jnp.array(0.0, dtype=jnp.float32)
+        dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
+        loss_ac = jnp.array(0.0, dtype=jnp.float32)
+        ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
+        ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
+        ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss_reg = dir_lambda * loss_dir + ac_lambda * loss_ac
+    loss = loss_gen + loss_reg
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
+    loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
+    dir_cosine = jax.lax.pmean(dir_cosine, axis_name="batch")
+    dir_cosine_sq = jax.lax.pmean(dir_cosine_sq, axis_name="batch")
+    loss_ac = jax.lax.pmean(loss_ac, axis_name="batch")
+    ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
+    ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
+    ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
+    dir_pair_i_metric = jax.lax.pmean(dir_pair_i.astype(jnp.float32), axis_name="batch")
+    dir_pair_j_metric = jax.lax.pmean(dir_pair_j.astype(jnp.float32), axis_name="batch")
+    dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
+    ac_lambda = jax.lax.pmean(ac_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +872,18 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/loss_reg": loss_reg,
+        "val/loss_dir": loss_dir,
+        "val/loss_ac": loss_ac,
+        "val/dir_lambda": dir_lambda,
+        "val/ac_lambda": ac_lambda,
+        "val/dir_pair_i": dir_pair_i_metric + 1.0,
+        "val/dir_pair_j": dir_pair_j_metric + 1.0,
+        "val/dir_cosine": dir_cosine,
+        "val/dir_cosine_sq": dir_cosine_sq,
+        "val/ac_sigma_mean": ac_sigma_mean,
+        "val/ac_sigma_min": ac_sigma_min,
+        "val/ac_alive_frac": ac_alive_frac,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1197,22 +1370,28 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
-        "--layersync-lambda",
+        "--dir-lambda",
         type=float,
         default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
+        help="Weight for the residual direction-diversity loss. 0.0 disables the diversity term.",
     )
     parser.add_argument(
-        "--layersync-weak-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
+        "--ac-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for the anti-collapse loss. 0.0 disables the anti-collapse term.",
     )
     parser.add_argument(
-        "--layersync-strong-layer",
+        "--diversity-gap",
         type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
+        default=DEFAULT_DIR_GAP,
+        help="Minimum block distance g used to form valid diversity pairs (j - i >= g).",
+    )
+    parser.add_argument(
+        "--ac-gamma",
+        type=float,
+        default=DEFAULT_AC_GAMMA,
+        help="Minimum per-channel std target for the anti-collapse hinge loss.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
