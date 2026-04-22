@@ -560,10 +560,11 @@ def compute_layersync_loss(raw_features):
     z_anchor, z_weak, z_strong = raw_features
     eps = jnp.float32(1e-8)
 
-    z_anchor = jax.lax.stop_gradient(z_anchor)
+    z_anchor_stop = jax.lax.stop_gradient(z_anchor)
+    # Keep the live anchor on the weak branch so the residual skip gradient
+    # cancels out and LayerSync optimizes the actual weak-layer delta.
     z_weak = z_weak - z_anchor
-    z_strong = z_strong - z_anchor
-    z_strong = jax.lax.stop_gradient(z_strong)
+    z_strong = jax.lax.stop_gradient(z_strong - z_anchor_stop)
     z_weak = safe_l2_normalize(z_weak, eps=eps)
     z_strong = safe_l2_normalize(z_strong, eps=eps)
 
