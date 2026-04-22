@@ -369,6 +369,7 @@ DIT_VARIANTS = {
 
 DEFAULT_LAYERSYNC_WEAK_LAYER = 8
 DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_LAYERSYNC_ANCHOR_LAYER = 3
 
 
 def build_model_config(model_size):
@@ -531,6 +532,11 @@ def resolve_layersync_config(args, depth):
         raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
     if not (1 <= strong_layer <= depth):
         raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
+    if DEFAULT_LAYERSYNC_ANCHOR_LAYER > depth:
+        raise ValueError(
+            f"LayerSync anchor layer {DEFAULT_LAYERSYNC_ANCHOR_LAYER} requires model depth >= "
+            f"{DEFAULT_LAYERSYNC_ANCHOR_LAYER}, got {depth}"
+        )
     if weak_layer >= strong_layer:
         raise ValueError(
             "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
@@ -541,9 +547,12 @@ def resolve_layersync_config(args, depth):
 
 
 def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
+    z_anchor, z_weak, z_strong = raw_features
     eps = jnp.float32(1e-8)
 
+    z_anchor = jax.lax.stop_gradient(z_anchor)
+    z_weak = z_weak - z_anchor
+    z_strong = z_strong - z_anchor
     z_strong = jax.lax.stop_gradient(z_strong)
     z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
     z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
@@ -1399,9 +1408,14 @@ def main():
     layersync_capture_layers = None
     if layersync_enabled:
         weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+        layersync_capture_layers = (
+            DEFAULT_LAYERSYNC_ANCHOR_LAYER,
+            weak_layer,
+            strong_layer,
+        )
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
+            f"anchor_layer={DEFAULT_LAYERSYNC_ANCHOR_LAYER} "
             f"weak_layer={weak_layer} strong_layer={strong_layer}"
         )
     else:
