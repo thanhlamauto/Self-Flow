@@ -546,6 +546,15 @@ def resolve_layersync_config(args, depth):
     return weak_layer, strong_layer
 
 
+def safe_l2_normalize(x, eps=jnp.float32(1e-8)):
+    # Layer deltas can be exactly zero at initialization because adaLN-Zero
+    # makes early DiT blocks close to identity. Clamping the squared norm keeps
+    # the backward pass finite even when the delta vector is all zeros.
+    squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
+    inv_norm = jax.lax.rsqrt(jnp.maximum(squared_norm, eps * eps))
+    return x * inv_norm
+
+
 def compute_layersync_loss(raw_features):
     z_anchor, z_weak, z_strong = raw_features
     eps = jnp.float32(1e-8)
@@ -554,8 +563,8 @@ def compute_layersync_loss(raw_features):
     z_weak = z_weak - z_anchor
     z_strong = z_strong - z_anchor
     z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
+    z_weak = safe_l2_normalize(z_weak, eps=eps)
+    z_strong = safe_l2_normalize(z_strong, eps=eps)
 
     cosine = jnp.sum(z_weak * z_strong, axis=-1)
     mean_cosine = jnp.mean(cosine)
