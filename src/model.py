@@ -304,6 +304,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
+        return_patch_embed: bool = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -344,6 +345,8 @@ class SelfFlowDiT(nn.Module):
             in_channels=self.in_channels, 
             embed_dim=self.hidden_size
         )(x)
+        if return_patch_embed:
+            return x
         x = x + self.pos_embed_val
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)

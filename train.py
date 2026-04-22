@@ -367,8 +367,8 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_ALIGNMENT_METHOD = "qba"
+DEFAULT_ALIGNMENT_RANK = 16
 
 
 def build_model_config(model_size):
@@ -410,6 +410,7 @@ import optax
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
+from flax.core import freeze, unfreeze
 import numpy as np
 try:
     import grain.python as grain
@@ -435,7 +436,7 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEFAULT_ALIGNMENT_RANK):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -462,7 +463,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, drop_rng, align_rng = jax.random.split(rng, 3)
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
@@ -470,6 +471,19 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         vector=dummy_vec,
         deterministic=False,
     )
+
+    params = unfreeze(variables["params"])
+    proj_limit = math.sqrt(6.0 / float(config["hidden_size"] + align_rank))
+    params["align_qba_layer_proj"] = {
+        "kernel": jax.random.uniform(
+            align_rng,
+            (config["hidden_size"], align_rank),
+            minval=-proj_limit,
+            maxval=proj_limit,
+            dtype=jnp.float32,
+        ),
+    }
+    params = freeze(params)
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -479,7 +493,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
         tx=tx,
     )
     # EMA params start as an exact copy of the initial online params
@@ -502,55 +516,137 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
-    )
-
-
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
-
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
-    )
-    if uses_default_pair and strong_layer > depth:
+def resolve_alignment_config(args, depth, target_feature_dim):
+    align_rank = int(args.align_rank)
+    max_rank = int(target_feature_dim)
+    if not (1 <= align_rank <= max_rank):
         raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
+            f"--align-rank must be in [1, {max_rank}] because the alignment target has feature dim {target_feature_dim}"
         )
 
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
+    align_layer_arg = depth if args.align_layer is None else args.align_layer
+    if isinstance(align_layer_arg, str):
+        align_layer_arg = align_layer_arg.strip().lower()
+
+    if align_layer_arg == "random":
+        return {
+            "mode": "random",
+            "display": "random",
+            "fixed_layer": None,
+            "fixed_layer_index": None,
+            "capture_layers": tuple(range(1, depth + 1)),
+            "rank": align_rank,
+        }
+
+    align_layer = int(align_layer_arg)
+    if not (1 <= align_layer <= depth):
+        raise ValueError(f"--align-layer must be in [1, {depth}] or 'random', got {align_layer_arg}")
+
+    return {
+        "mode": "fixed",
+        "display": str(align_layer),
+        "fixed_layer": align_layer,
+        "fixed_layer_index": align_layer - 1,
+        "capture_layers": align_layer,
+        "rank": align_rank,
+    }
+
+
+def _center_patch_tokens(tokens):
+    tokens = tokens.astype(jnp.float32)
+    return tokens - jnp.mean(tokens, axis=1, keepdims=True)
+
+
+def _dct_feature_basis(feature_dim, rank, dtype=jnp.float32):
+    positions = jnp.arange(feature_dim, dtype=dtype)
+    basis_cols = []
+    for idx in range(rank):
+        scale = jnp.sqrt(jnp.array(1.0 / feature_dim if idx == 0 else 2.0 / feature_dim, dtype=dtype))
+        basis_cols.append(scale * jnp.cos(jnp.pi * (positions + 0.5) * idx / feature_dim))
+    return jnp.stack(basis_cols, axis=1)
+
+
+def _stabilize_tall_matrix(z, eps=1e-6):
+    eye = jnp.eye(z.shape[-2], z.shape[-1], dtype=z.dtype)
+    return z + jnp.asarray(eps, dtype=z.dtype) * eye[None, :, :]
+
+
+def _projector_from_basis(q):
+    return jnp.einsum("bnk,bmk->bnm", q, q)
+
+
+def _projector_overlap(p_a, p_b, rank):
+    rank_float = jnp.float32(max(rank, 1))
+    return jnp.mean(jnp.sum(p_a * p_b, axis=(-2, -1)) / rank_float)
+
+
+def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index):
+    if align_layer_mode == "fixed":
+        return raw_features
+    if align_layer_mode == "random":
+        stacked = jnp.stack(raw_features, axis=0)
+        return jax.lax.dynamic_index_in_dim(stacked, align_layer_index, axis=0, keepdims=False)
+    raise ValueError(f"Unsupported align_layer_mode: {align_layer_mode}")
+
+
+def _tsvd_basis_single(tokens, rank):
+    u, _, _ = jnp.linalg.svd(tokens, full_matrices=False)
+    return u[:, :rank]
+
+
+def _qr_basis_single(tokens, rank):
+    q, _ = jnp.linalg.qr(_stabilize_tall_matrix(tokens), mode="reduced")
+    return q[:, :rank]
+
+
+def compute_alignment_loss(method, layer_tokens, target_tokens, params, rank, ortho_lambda):
+    layer_tokens = _center_patch_tokens(layer_tokens)
+    target_tokens = jax.lax.stop_gradient(_center_patch_tokens(target_tokens))
+
+    if method == "tsvd":
+        q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
+        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_basis_single, in_axes=(0, None))(target_tokens, rank))
+        p_layer = _projector_from_basis(q_layer)
+        p_target = _projector_from_basis(q_target)
+        spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
+        ortho_loss = jnp.array(0.0, dtype=jnp.float32)
+        total_loss = spatial_loss
+        overlap = _projector_overlap(p_layer, p_target, rank)
+        return total_loss, spatial_loss, ortho_loss, overlap
+
+    if method == "qba":
+        layer_kernel = params["align_qba_layer_proj"]["kernel"].astype(jnp.float32)
+        # Layer-0 tokens are the fixed target, so we use a deterministic
+        # orthogonal bottleneck on the patch feature basis instead of
+        # learning a second projector on the stop-gradient side.
+        target_kernel = jax.lax.stop_gradient(
+            _dct_feature_basis(target_tokens.shape[-1], rank, dtype=jnp.float32)
         )
+        z_layer = jnp.einsum("bnd,dk->bnk", layer_tokens, layer_kernel)
+        z_target = jnp.einsum("bnd,dk->bnk", target_tokens, target_kernel)
+        q_layer = jax.vmap(_qr_basis_single, in_axes=(0, None))(z_layer, rank)
+        q_target = jax.lax.stop_gradient(jax.vmap(_qr_basis_single, in_axes=(0, None))(z_target, rank))
+        p_layer = _projector_from_basis(q_layer)
+        p_target = _projector_from_basis(q_target)
+        spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
+        gram = layer_kernel.T @ layer_kernel
+        ortho_loss = jnp.sum((gram - jnp.eye(rank, dtype=jnp.float32)) ** 2)
+        total_loss = spatial_loss + jnp.float32(ortho_lambda) * ortho_loss
+        overlap = _projector_overlap(p_layer, p_target, rank)
+        return total_loss, spatial_loss, ortho_loss, overlap
 
-    return weak_layer, strong_layer
+    raise ValueError(f"Unsupported alignment method: {method}")
 
 
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
-
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
-
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+def extract_layer0_target_tokens(state, params, x0, y):
+    return state.apply_fn(
+        {"params": params},
+        x0,
+        timesteps=jnp.zeros((x0.shape[0],), dtype=jnp.float32),
+        vector=y,
+        deterministic=True,
+        return_patch_embed=True,
+    )
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -561,10 +657,15 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
+    align_lambda,
+    align_layer_index,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    align_enabled,
+    align_layer_mode,
+    align_capture_layers,
+    align_method,
+    align_rank,
+    align_ortho_lambda,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -585,7 +686,7 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
+        if align_enabled:
             pred, raw_features = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -593,9 +694,18 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_raw_features=align_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
+            target_tokens = extract_layer0_target_tokens(state, params, x0, y)
+            loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
+                align_method,
+                layer_tokens=layer_tokens,
+                target_tokens=target_tokens,
+                params=params,
+                rank=align_rank,
+                ortho_lambda=align_ortho_lambda,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,25 +715,39 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            loss_align = jnp.array(0.0, dtype=jnp.float32)
+            align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
+            align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
+            align_overlap = jnp.array(0.0, dtype=jnp.float32)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss = loss_gen + align_lambda * loss_align
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_align,
+            align_spatial_loss,
+            align_ortho_loss,
+            align_overlap,
+            align_layer_index,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, loss_align, align_spatial_loss, align_ortho_loss, align_overlap, align_layer_index_metric)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    align_spatial_loss = jax.lax.pmean(align_spatial_loss, axis_name="batch")
+    align_ortho_loss = jax.lax.pmean(align_ortho_loss, axis_name="batch")
+    align_overlap = jax.lax.pmean(align_overlap, axis_name="batch")
+    align_layer_index_metric = jax.lax.pmean(align_layer_index_metric.astype(jnp.float32), axis_name="batch")
+    align_lambda = jax.lax.pmean(align_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +760,12 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/loss_align": loss_align,
+        "train/loss_align_spatial": align_spatial_loss,
+        "train/loss_align_ortho": align_ortho_loss,
+        "train/align_lambda": align_lambda,
+        "train/align_overlap": align_overlap,
+        "train/align_layer": align_layer_index_metric + 1.0,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -653,12 +780,18 @@ def eval_step(
     ema_params,
     batch,
     rng,
-    layersync_lambda,
+    align_lambda,
+    align_layer_index,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    align_enabled,
+    align_layer_mode,
+    align_capture_layers,
+    align_method,
+    align_rank,
+    align_ortho_lambda,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
+    del ema_params
     x0, y = batch
     local_batch = x0.shape[0]
 
@@ -670,16 +803,25 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
+    if align_enabled:
         pred, raw_features = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_raw_features=align_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
+        target_tokens = extract_layer0_target_tokens(state, state.params, x0, y)
+        loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
+            align_method,
+            layer_tokens=layer_tokens,
+            target_tokens=target_tokens,
+            params=state.params,
+            rank=align_rank,
+            ortho_lambda=align_ortho_lambda,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,19 +830,24 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        loss_align = jnp.array(0.0, dtype=jnp.float32)
+        align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
+        align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
+        align_overlap = jnp.array(0.0, dtype=jnp.float32)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss = loss_gen + align_lambda * loss_align
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    align_spatial_loss = jax.lax.pmean(align_spatial_loss, axis_name="batch")
+    align_ortho_loss = jax.lax.pmean(align_ortho_loss, axis_name="batch")
+    align_overlap = jax.lax.pmean(align_overlap, axis_name="batch")
+    align_layer_index_metric = jax.lax.pmean(align_layer_index.astype(jnp.float32), axis_name="batch")
+    align_lambda = jax.lax.pmean(align_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +855,12 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/loss_align": loss_align,
+        "val/loss_align_spatial": align_spatial_loss,
+        "val/loss_align_ortho": align_ortho_loss,
+        "val/align_lambda": align_lambda,
+        "val/align_overlap": align_overlap,
+        "val/align_layer": align_layer_index_metric + 1.0,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1197,22 +1347,35 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
-        "--layersync-lambda",
+        "--align-lambda",
         type=float,
         default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
+        help="Weight for the layer-0 subspace alignment loss. 0.0 disables alignment.",
     )
     parser.add_argument(
-        "--layersync-weak-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
+        "--align-method",
+        type=str,
+        default=DEFAULT_ALIGNMENT_METHOD,
+        choices=["tsvd", "qba"],
+        help="Subspace alignment method used to align one backbone layer to layer 0.",
     )
     parser.add_argument(
-        "--layersync-strong-layer",
+        "--align-layer",
+        type=str,
+        default=None,
+        help="1-based backbone layer aligned to layer 0, or 'random' to sample one layer per iteration. Default: final backbone block.",
+    )
+    parser.add_argument(
+        "--align-rank",
         type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
+        default=DEFAULT_ALIGNMENT_RANK,
+        help="Subspace rank k. Must be <= hidden_size because the target is PatchEmbed(x0) before positional encoding.",
+    )
+    parser.add_argument(
+        "--align-ortho-lambda",
+        type=float,
+        default=0.01,
+        help="Orthogonality penalty weight for QBA. Ignored when --align-method=tsvd.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1360,8 +1523,10 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
+    if args.align_lambda < 0.0:
+        raise ValueError("--align-lambda must be non-negative")
+    if args.align_ortho_lambda < 0.0:
+        raise ValueError("--align-ortho-lambda must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1387,6 +1552,12 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    target_feature_dim = int(config["hidden_size"])
+    patch_dim = config["in_channels"] * config["patch_size"] ** 2
+    alignment_config = resolve_alignment_config(args, depth, target_feature_dim)
+    align_layer_mode = alignment_config["mode"]
+    align_capture_layers = alignment_config["capture_layers"]
+    align_rank = alignment_config["rank"]
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1395,17 +1566,17 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+    align_enabled = args.align_lambda > 0.0
+    if align_enabled:
         log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"Alignment ENABLED: lambda={args.align_lambda} method={args.align_method} "
+            f"layer={alignment_config['display']} rank={align_rank} ortho_lambda={args.align_ortho_lambda}"
         )
     else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
+        log_stage(
+            f"Alignment DISABLED: lambda=0.0 method={args.align_method} "
+            f"layer={alignment_config['display']} rank={align_rank}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1416,15 +1587,33 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        align_rank=align_rank,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
-
-    patch_dim = config["in_channels"] * config["patch_size"] ** 2
+    align_lambda_rep = jax_utils.replicate(jnp.float32(args.align_lambda))
+    align_layer_rng = jax.random.PRNGKey(123)
+    fixed_align_layer_index_rep = None
+    if align_layer_mode == "fixed":
+        fixed_align_layer_index_rep = jax_utils.replicate(
+            jnp.int32(alignment_config["fixed_layer_index"])
+        )
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
+
+    def next_align_layer_index_rep():
+        nonlocal align_layer_rng
+        if align_layer_mode == "fixed":
+            return fixed_align_layer_index_rep
+        align_layer_rng, draw_rng = jax.random.split(align_layer_rng)
+        draw = jax.random.randint(draw_rng, shape=(), minval=0, maxval=depth, dtype=jnp.int32)
+        return jax_utils.replicate(draw)
 
     total_steps = args.epochs * args.steps_per_epoch
 
@@ -1448,16 +1637,24 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            align_enabled=align_enabled,
+            align_layer_mode=align_layer_mode,
+            align_capture_layers=align_capture_layers,
+            align_method=args.align_method,
+            align_rank=align_rank,
+            align_ortho_lambda=args.align_ortho_lambda,
         ),
         axis_name="batch",
     )
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            align_enabled=align_enabled,
+            align_layer_mode=align_layer_mode,
+            align_capture_layers=align_capture_layers,
+            align_method=args.align_method,
+            align_rank=align_rank,
+            align_ortho_lambda=args.align_ortho_lambda,
         ),
         axis_name="batch",
     )
@@ -1731,8 +1928,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_align_layer_index_rep = next_align_layer_index_rep()
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, align_lambda_rep, probe_align_layer_index_rep
         )
         block_pytree(probe_metrics)
 
@@ -2095,8 +2293,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            train_align_layer_index_rep = next_align_layer_index_rep()
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, align_lambda_rep, train_align_layer_index_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2122,8 +2321,9 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    eval_align_layer_index_rep = next_align_layer_index_rep()
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state, ema_params, (val_x, val_y), rng, align_lambda_rep, eval_align_layer_index_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
