@@ -499,26 +499,23 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
-def compute_disp_loss(features, temperature):
-    """Batchwise Dispersive Loss on a chosen hidden activation.
+def compute_disp_loss(features):
+    """Batchwise Dispersive Loss matching the upstream DispLoss objective.
 
-    Matches the JAX-style full BxB objective described in the reference
-    implementation: include diagonal self-pairs and average over the full
-    pairwise matrix after normalizing squared L2 distance by feature dim.
+    This uses the full BxB matrix, including diagonal self-pairs, after
+    normalizing squared L2 distance by the flattened feature dimension.
     """
     flat = jnp.reshape(features.astype(jnp.float32), (features.shape[0], -1))
     feature_dim = jnp.float32(flat.shape[1])
-    temperature = jnp.float32(temperature)
 
     sq_norm = jnp.sum(flat * flat, axis=1, keepdims=True)
     dist_sq = sq_norm + sq_norm.T - 2.0 * (flat @ flat.T)
     dist_sq = jnp.maximum(dist_sq, 0.0) / jnp.maximum(feature_dim, 1.0)
-    return jnp.log(jnp.mean(jnp.exp(-dist_sq / temperature)))
+    return jnp.log(jnp.mean(jnp.exp(-dist_sq)))
 
 
-def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, disp_temperature=0.5):
+def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.25):
     disp_lambda = jnp.float32(disp_lambda)
-    disp_temperature = jnp.float32(disp_temperature)
 
     def train_step(
         state, ema_params, batch, rng, ema_decay,
@@ -549,7 +546,7 @@ def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, dis
                     return_raw_features=disp_layer,
                     **model_kwargs,
                 )
-                disp_loss = compute_disp_loss(disp_features, disp_temperature)
+                disp_loss = compute_disp_loss(disp_features)
             else:
                 pred = state.apply_fn(
                     {"params": params},
@@ -595,9 +592,8 @@ def make_train_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, dis
     return train_step
 
 
-def make_eval_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, disp_temperature=0.5):
+def make_eval_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.25):
     disp_lambda = jnp.float32(disp_lambda)
-    disp_temperature = jnp.float32(disp_temperature)
 
     def eval_step(
         state, ema_params, batch, rng,
@@ -627,7 +623,7 @@ def make_eval_step(*, disp_enabled=False, disp_layer=None, disp_lambda=0.5, disp
                 return_raw_features=disp_layer,
                 **model_kwargs,
             )
-            disp_loss = compute_disp_loss(disp_features, disp_temperature)
+            disp_loss = compute_disp_loss(disp_features)
         else:
             pred = state.apply_fn(
                 {"params": state.params},
@@ -1146,20 +1142,20 @@ def main():
     parser.add_argument(
         "--disp-lambda",
         type=float,
-        default=0.5,
-        help="Weight for Dispersive Loss when --disp is enabled (JAX reference default: 0.5).",
+        default=0.25,
+        help="Weight for Dispersive Loss when --disp is enabled (upstream default: 0.25).",
     )
     parser.add_argument(
         "--disp-temperature",
         type=float,
-        default=0.5,
-        help="Temperature tau in exp(-distance/tau) for Dispersive Loss (must be > 0).",
+        default=1.0,
+        help="Deprecated compatibility flag. Ignored: upstream DispLoss uses exp(-distance) with no temperature term.",
     )
     parser.add_argument(
         "--disp-layer",
         type=int,
         default=None,
-        help="1-based backbone layer index for Dispersive Loss. Default: depth // 4.",
+        help="1-based backbone layer index for Dispersive Loss. Default: final backbone block.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1310,8 +1306,6 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.disp_lambda < 0:
         raise ValueError("--disp-lambda must be >= 0")
-    if args.disp_temperature <= 0:
-        raise ValueError("--disp-temperature must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1339,7 +1333,7 @@ def main():
     depth = int(config["depth"])
     disp_layer = None
     if args.disp:
-        disp_layer = int(args.disp_layer if args.disp_layer is not None else max(1, depth // 4))
+        disp_layer = int(args.disp_layer if args.disp_layer is not None else depth)
         if not 1 <= disp_layer <= depth:
             raise ValueError(f"--disp-layer must be in [1, {depth}] for model depth {depth}")
 
@@ -1352,9 +1346,10 @@ def main():
     )
     if args.disp:
         log_stage(
-            f"DispLoss: enabled lambda={args.disp_lambda} "
-            f"temperature={args.disp_temperature} layer={disp_layer}"
+            f"DispLoss: enabled lambda={args.disp_lambda} layer={disp_layer}"
         )
+        if args.disp_temperature != 1.0:
+            log_stage("DispLoss: ignoring deprecated --disp-temperature; upstream objective has no temperature term")
     else:
         log_stage("DispLoss: disabled")
 
@@ -1399,13 +1394,11 @@ def main():
         disp_enabled=args.disp,
         disp_layer=disp_layer,
         disp_lambda=args.disp_lambda,
-        disp_temperature=args.disp_temperature,
     )
     eval_step_fn = make_eval_step(
         disp_enabled=args.disp,
         disp_layer=disp_layer,
         disp_lambda=args.disp_lambda,
-        disp_temperature=args.disp_temperature,
     )
     pmapped_train_step = jax.pmap(train_step_fn, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step_fn, axis_name="batch")
