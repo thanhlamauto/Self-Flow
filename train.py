@@ -578,9 +578,14 @@ def _projector_from_basis(q):
     return jnp.einsum("...nk,...mk->...nm", q, q)
 
 
-def _projector_overlap(p_a, p_b, rank):
+def _basis_overlap_trace(q_a, q_b):
+    cross = jnp.einsum("...nk,...nl->...kl", q_a, q_b)
+    return jnp.sum(jnp.square(cross), axis=(-2, -1))
+
+
+def _projector_overlap_from_basis(q_a, q_b, rank):
     rank_float = jnp.float32(max(rank, 1))
-    return jnp.mean(jnp.sum(p_a * p_b, axis=(-2, -1)) / rank_float)
+    return jnp.mean(_basis_overlap_trace(q_a, q_b) / rank_float)
 
 
 def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index):
@@ -632,12 +637,11 @@ def compute_alignment_loss(
             )
         q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
         q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_basis_single, in_axes=(0, None))(target_tokens, rank))
-        p_layer = _projector_from_basis(q_layer)
-        p_target = _projector_from_basis(q_target)
-        spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
+        overlap_trace = _basis_overlap_trace(q_layer, q_target)
+        spatial_loss = jnp.mean(jnp.float32(2.0 * rank) - jnp.float32(2.0) * overlap_trace)
         ortho_loss = jnp.array(0.0, dtype=jnp.float32)
         total_loss = spatial_loss
-        overlap = _projector_overlap(p_layer, p_target, rank)
+        overlap = _projector_overlap_from_basis(q_layer, q_target, rank)
         return total_loss, spatial_loss, ortho_loss, overlap
 
     if method == "qba":
@@ -652,27 +656,30 @@ def compute_alignment_loss(
         z_target = jnp.einsum("bnd,dk->bnk", target_tokens, target_kernel)
         q_layer = jax.vmap(_qr_basis_single, in_axes=(0, None))(z_layer, rank)
         q_target = jax.lax.stop_gradient(jax.vmap(_qr_basis_single, in_axes=(0, None))(z_target, rank))
-        p_layer = _projector_from_basis(q_layer)
-        p_target = _projector_from_basis(q_target)
-        spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
+        overlap_trace = _basis_overlap_trace(q_layer, q_target)
+        spatial_loss = jnp.mean(jnp.float32(2.0 * rank) - jnp.float32(2.0) * overlap_trace)
         gram = layer_kernel.T @ layer_kernel
         ortho_loss = jnp.sum((gram - jnp.eye(rank, dtype=jnp.float32)) ** 2)
         total_loss = spatial_loss + jnp.float32(ortho_lambda) * ortho_loss
-        overlap = _projector_overlap(p_layer, p_target, rank)
+        overlap = _projector_overlap_from_basis(q_layer, q_target, rank)
         return total_loss, spatial_loss, ortho_loss, overlap
 
     raise ValueError(f"Unsupported alignment method: {method}")
 
 
-def extract_layer0_target_tokens(state, params, x0, y):
-    return state.apply_fn(
-        {"params": params},
-        x0,
-        timesteps=jnp.zeros((x0.shape[0],), dtype=jnp.float32),
-        vector=y,
-        deterministic=True,
-        return_patch_embed=True,
-    )
+def extract_layer0_target_tokens(params, x0):
+    patch_proj_params = None
+    for module_name, module_params in params.items():
+        if module_name.startswith("PatchedPatchEmbed_") and "proj" in module_params:
+            patch_proj_params = module_params["proj"]
+            break
+    if patch_proj_params is None:
+        raise KeyError("Could not find PatchedPatchEmbed projection params in model parameter tree")
+
+    target_tokens = jnp.einsum("bnd,df->bnf", x0, patch_proj_params["kernel"])
+    if "bias" in patch_proj_params:
+        target_tokens = target_tokens + patch_proj_params["bias"]
+    return target_tokens
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -724,7 +731,7 @@ def train_step(
                 return_raw_features=align_capture_layers,
             )
             layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
-            target_tokens = extract_layer0_target_tokens(state, params, x0, y)
+            target_tokens = extract_layer0_target_tokens(params, x0)
             loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
                 align_method,
                 layer_tokens=layer_tokens,
@@ -843,7 +850,7 @@ def eval_step(
             return_raw_features=align_capture_layers,
         )
         layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
-        target_tokens = extract_layer0_target_tokens(state, state.params, x0, y)
+        target_tokens = extract_layer0_target_tokens(state.params, x0)
         loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
             align_method,
             layer_tokens=layer_tokens,
