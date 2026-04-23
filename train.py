@@ -372,6 +372,9 @@ DEFAULT_ALIGNMENT_METHOD = "qba"
 DEFAULT_ALIGNMENT_RANK = 16
 DEFAULT_TSVD_DITHER_SCALE = 1e-5
 DEFAULT_TSVD_ALIGN_WARMUP_STEPS = 25_000
+DEFAULT_TSVD_TRAIN_SOLVER = "exact-st"
+DEFAULT_TSVD_EVAL_SOLVER = "exact"
+DEFAULT_TSVD_POWER_ITERS = 2
 
 
 def build_model_config(model_size):
@@ -614,23 +617,35 @@ def _tsvd_exact_basis_single(tokens, rank):
     return jnp.flip(eigvecs[:, -rank:], axis=-1)
 
 
-def _tsvd_iter_basis_single(tokens, rank):
-    # Backpropagating through eigenvectors is undefined at repeated eigenvalues.
-    # Subspace iteration gives a stable surrogate gradient for the TSVD projector.
+def _tsvd_iter_basis_single(tokens, rank, num_iters):
+    # Fast TSVD-style subspace iteration. This applies XX^T to q as
+    # X(X^T q), avoiding the full N x N Gram matrix and eigensolver.
     q = _dct_feature_basis(tokens.shape[0], rank, dtype=tokens.dtype)
-    gram = jnp.matmul(tokens, tokens.T)
-    gram = jnp.float32(0.5) * (gram + gram.T)
-    for _ in range(4):
-        z = jnp.matmul(gram, q)
+    for _ in range(num_iters):
+        z = jnp.matmul(tokens.T, q)
+        z = jnp.matmul(tokens, z)
         q, _ = jnp.linalg.qr(_stabilize_tall_matrix(z), mode="reduced")
         q = q[:, :rank]
     return q
 
 
-def _tsvd_basis_single(tokens, rank):
-    q_iter = _tsvd_iter_basis_single(tokens, rank)
+def _tsvd_basis_single(tokens, rank, solver, num_iters):
+    if solver == "iter":
+        return _tsvd_iter_basis_single(tokens, rank, num_iters)
+    if solver == "exact":
+        return _tsvd_exact_basis_single(tokens, rank)
+    if solver != "exact-st":
+        raise ValueError(f"Unsupported TSVD solver: {solver}")
+
+    q_iter = _tsvd_iter_basis_single(tokens, rank, num_iters)
     q_exact = _tsvd_exact_basis_single(tokens, rank)
     return q_iter + jax.lax.stop_gradient(q_exact - q_iter)
+
+
+def _tsvd_target_basis_single(tokens, rank, solver, num_iters):
+    if solver == "exact-st":
+        return _tsvd_exact_basis_single(tokens, rank)
+    return _tsvd_basis_single(tokens, rank, solver, num_iters)
 
 
 def _tsvd_dithered_tokens_single(tokens, rng, dither_scale):
@@ -654,6 +669,8 @@ def compute_alignment_loss(
     *,
     tsvd_dither_rng=None,
     tsvd_dither_scale=0.0,
+    tsvd_solver=DEFAULT_TSVD_TRAIN_SOLVER,
+    tsvd_power_iters=DEFAULT_TSVD_POWER_ITERS,
 ):
     layer_tokens = _center_patch_tokens(layer_tokens)
     target_tokens = jax.lax.stop_gradient(_center_patch_tokens(target_tokens))
@@ -666,8 +683,10 @@ def compute_alignment_loss(
                 batch_keys,
                 tsvd_dither_scale,
             )
-        q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
-        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_exact_basis_single, in_axes=(0, None))(target_tokens, rank))
+        layer_basis_fn = lambda tokens: _tsvd_basis_single(tokens, rank, tsvd_solver, tsvd_power_iters)
+        target_basis_fn = lambda tokens: _tsvd_target_basis_single(tokens, rank, tsvd_solver, tsvd_power_iters)
+        q_layer = jax.vmap(layer_basis_fn)(layer_tokens)
+        q_target = jax.lax.stop_gradient(jax.vmap(target_basis_fn)(target_tokens))
         overlap_trace = _basis_overlap_trace(q_layer, q_target)
         spatial_loss = jnp.mean(jnp.float32(2.0 * rank) - jnp.float32(2.0) * overlap_trace)
         ortho_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -734,6 +753,8 @@ def train_step(
     align_rank,
     align_ortho_lambda,
     align_tsvd_dither_scale,
+    align_tsvd_solver,
+    align_tsvd_power_iters,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -775,6 +796,8 @@ def train_step(
                 ortho_lambda=align_ortho_lambda,
                 tsvd_dither_rng=align_rng if align_method == "tsvd" else None,
                 tsvd_dither_scale=align_tsvd_dither_scale,
+                tsvd_solver=align_tsvd_solver,
+                tsvd_power_iters=align_tsvd_power_iters,
             )
         else:
             pred = state.apply_fn(
@@ -860,6 +883,8 @@ def eval_step(
     align_rank,
     align_ortho_lambda,
     align_tsvd_dither_scale,
+    align_tsvd_solver,
+    align_tsvd_power_iters,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     del ema_params
@@ -894,6 +919,8 @@ def eval_step(
             ortho_lambda=align_ortho_lambda,
             tsvd_dither_rng=None,
             tsvd_dither_scale=align_tsvd_dither_scale,
+            tsvd_solver=align_tsvd_solver,
+            tsvd_power_iters=align_tsvd_power_iters,
         )
     else:
         pred = state.apply_fn(
@@ -1454,13 +1481,33 @@ def main():
         "--align-tsvd-dither-scale",
         type=float,
         default=DEFAULT_TSVD_DITHER_SCALE,
-        help="Relative RMS scale of micro-Gaussian dither added before exact TSVD on the train-side. Ignored when --align-method=qba.",
+        help="Relative RMS scale of micro-Gaussian dither added before train-side TSVD. Ignored when --align-method=qba.",
     )
     parser.add_argument(
         "--align-tsvd-warmup-steps",
         type=int,
         default=DEFAULT_TSVD_ALIGN_WARMUP_STEPS,
         help="Initial training steps that skip TSVD alignment entirely before applying --align-lambda. Ignored when --align-method=qba.",
+    )
+    parser.add_argument(
+        "--align-tsvd-train-solver",
+        type=str,
+        default=DEFAULT_TSVD_TRAIN_SOLVER,
+        choices=["iter", "exact", "exact-st"],
+        help="TSVD basis solver for training. 'iter' avoids full Gram eigendecomposition; 'exact-st' keeps exact forward with iterative backward.",
+    )
+    parser.add_argument(
+        "--align-tsvd-eval-solver",
+        type=str,
+        default=DEFAULT_TSVD_EVAL_SOLVER,
+        choices=["iter", "exact", "exact-st"],
+        help="TSVD basis solver for validation metrics. Default exact for monitoring the true TSVD objective.",
+    )
+    parser.add_argument(
+        "--align-tsvd-power-iters",
+        type=int,
+        default=DEFAULT_TSVD_POWER_ITERS,
+        help="Number of subspace-iteration steps used by TSVD iter/exact-st solvers. Ignored by exact solver.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1616,6 +1663,8 @@ def main():
         raise ValueError("--align-tsvd-dither-scale must be non-negative")
     if args.align_tsvd_warmup_steps < 0:
         raise ValueError("--align-tsvd-warmup-steps must be non-negative")
+    if args.align_tsvd_power_iters <= 0:
+        raise ValueError("--align-tsvd-power-iters must be greater than 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1662,6 +1711,9 @@ def main():
         extra_align_note = (
             f" tsvd_dither_scale={args.align_tsvd_dither_scale}"
             f" tsvd_warmup_steps={align_warmup_steps}"
+            f" tsvd_train_solver={args.align_tsvd_train_solver}"
+            f" tsvd_eval_solver={args.align_tsvd_eval_solver}"
+            f" tsvd_power_iters={args.align_tsvd_power_iters}"
             if args.align_method == "tsvd"
             else ""
         )
@@ -1753,6 +1805,8 @@ def main():
                 align_rank=align_rank,
                 align_ortho_lambda=args.align_ortho_lambda,
                 align_tsvd_dither_scale=args.align_tsvd_dither_scale,
+                align_tsvd_solver=args.align_tsvd_train_solver,
+                align_tsvd_power_iters=args.align_tsvd_power_iters,
             ),
             axis_name="batch",
         )
@@ -1768,6 +1822,8 @@ def main():
                 align_rank=align_rank,
                 align_ortho_lambda=args.align_ortho_lambda,
                 align_tsvd_dither_scale=args.align_tsvd_dither_scale,
+                align_tsvd_solver=args.align_tsvd_eval_solver,
+                align_tsvd_power_iters=args.align_tsvd_power_iters,
             ),
             axis_name="batch",
         )

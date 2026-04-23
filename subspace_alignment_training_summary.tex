@@ -51,12 +51,12 @@ Before extracting any subspace, both representations are centered over the patch
 \]
 This removes the global token bias and keeps only relative spatial variation across patches.
 
-\paragraph{TSVD by Gram eigendecomposition.}
+\paragraph{TSVD subspace extraction.}
 The TSVD branch extracts a $k$-dimensional subspace over patches. In principle one may compute
 \[
 \bar{H}_\ell = U_H \Sigma_H V_H^\top
 \]
-and keep the first $k$ columns of $U_H$. In implementation, we use the equivalent Gram formulation
+and keep the first $k$ columns of $U_H$. The exact reference computation uses the equivalent Gram formulation
 \[
 G_H = \bar{H}_\ell \bar{H}_\ell^\top = U_H \Sigma_H^2 U_H^\top,
 \]
@@ -85,7 +85,7 @@ P = Q Q^\top,
 \]
 the optimization target is unchanged even if the basis vectors themselves rotate inside the same subspace.
 
-To reduce the chance of spectral degeneracy in the train-side TSVD, we add a very small Gaussian perturbation before forming $G_H$:
+To reduce the chance of spectral degeneracy in the train-side TSVD, we add a very small Gaussian perturbation before extracting $Q_H$:
 \[
 \tilde{H}_\ell = \bar{H}_\ell + \alpha \,\mathrm{RMS}(\bar{H}_\ell)\,\varepsilon,
 \qquad
@@ -93,7 +93,13 @@ To reduce the chance of spectral degeneracy in the train-side TSVD, we add a ver
 \]
 This perturbation is only used on the train side. The target branch stays clean and is stop-gradient.
 
-For additional numerical stability, the implementation uses the exact Gram eigenspace in the forward pass, but sends the backward pass through a stabilized subspace-iteration surrogate. This keeps the TSVD projector target unchanged while avoiding undefined eigenvector gradients at repeated or nearly repeated eigenvalues.
+For exact TSVD training, the forward pass uses the exact Gram eigenspace above. To avoid undefined eigenvector gradients at repeated or nearly repeated eigenvalues, the backward pass is routed through a stabilized subspace-iteration surrogate. Starting from a fixed orthonormal basis $Q^{(0)}$, the surrogate repeatedly applies the patch Gram operator without materializing the full Gram matrix:
+\[
+Z^{(r)} = X^\top Q^{(r)}, \qquad
+\tilde{Q}^{(r+1)} = X Z^{(r)}, \qquad
+Q^{(r+1)} = \mathrm{QR}(\tilde{Q}^{(r+1)}).
+\]
+The default train solver is therefore exact in the forward objective, while the surrogate only controls the gradient path. A faster purely iterative train solver remains available as an optional speed/debug setting, and validation keeps the exact Gram eigensolver by default.
 
 \paragraph{TSVD warmup.}
 When TSVD alignment is enabled, the first
