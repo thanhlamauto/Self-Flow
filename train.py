@@ -370,6 +370,9 @@ DIT_VARIANTS = {
 
 DEFAULT_DIR_GAP = 3
 DEFAULT_AC_GAMMA = 0.3
+RESIDUAL_NORM_EPS = 1e-4
+RESIDUAL_NORM_INV_STD_MAX = 10.0
+RESIDUAL_NORM_CLIP = 10.0
 
 
 def build_model_config(model_size):
@@ -528,12 +531,72 @@ def build_diversity_pair_indices(depth, gap):
     return np.asarray(pair_i, dtype=np.int32), np.asarray(pair_j, dtype=np.int32)
 
 
-def _normalize_residual_updates(hidden_states, eps=1e-6):
+def _normalize_residual_updates(
+    hidden_states,
+    eps=RESIDUAL_NORM_EPS,
+    inv_std_max=RESIDUAL_NORM_INV_STD_MAX,
+    clip_value=RESIDUAL_NORM_CLIP,
+):
     hidden_states = jnp.stack(hidden_states, axis=0).astype(jnp.float32)
     residual_updates = hidden_states[1:] - hidden_states[:-1]
+    residual_updates = jnp.nan_to_num(
+        residual_updates,
+        nan=0.0,
+        posinf=jnp.float32(clip_value),
+        neginf=-jnp.float32(clip_value),
+    )
     mean = jnp.mean(residual_updates, axis=-1, keepdims=True)
-    var = jnp.mean(jnp.square(residual_updates - mean), axis=-1, keepdims=True)
-    return (residual_updates - mean) / jnp.sqrt(var + jnp.float32(eps))
+    centered = residual_updates - mean
+    var = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
+    inv_std = jax.lax.rsqrt(jnp.maximum(var, jnp.float32(eps)))
+    # Residual updates can be near-zero because the DiT blocks are zero-initialized;
+    # cap the whitening gain and stop gradients through the variance term to avoid
+    # occasional large spikes from the regularizer branch.
+    inv_std = jnp.minimum(inv_std, jnp.float32(inv_std_max))
+    normalized = centered * jax.lax.stop_gradient(inv_std)
+    normalized = jnp.clip(normalized, -jnp.float32(clip_value), jnp.float32(clip_value))
+    return jnp.nan_to_num(
+        normalized,
+        nan=0.0,
+        posinf=jnp.float32(clip_value),
+        neginf=-jnp.float32(clip_value),
+    )
+
+
+def _tree_all_finite(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.array(True)
+    return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
+
+
+def _pmap_metric_leaf_to_host_scalar(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return float(x)
+    if isinstance(x, (str, bytes, type(None))):
+        return x
+    if isinstance(x, (list, tuple, dict)):
+        return x
+    if isinstance(x, np.ndarray):
+        arr = np.asarray(x, dtype=np.float64).ravel()
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return float("nan")
+        return float(finite.mean())
+    if isinstance(x, np.generic):
+        return float(np.asarray(x, dtype=np.float64))
+    try:
+        arr = np.asarray(jax.device_get(x), dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        return x
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float("nan")
+    return float(finite.mean())
 
 
 def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_name=None):
@@ -549,7 +612,7 @@ def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_na
         * jnp.linalg.norm(delta_j, axis=(-2, -1))
         + jnp.float32(eps)
     )
-    cosine = numer / denom
+    cosine = jnp.nan_to_num(numer / denom, nan=0.0, posinf=0.0, neginf=0.0)
     cosine_sq = jnp.square(cosine)
     return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq)
 
@@ -562,7 +625,12 @@ def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
             axis=1,
             tiled=True,
         )
-    sigma = jnp.std(normalized_updates, axis=(1, 2))
+    sigma = jnp.nan_to_num(
+        jnp.std(normalized_updates, axis=(1, 2)),
+        nan=0.0,
+        posinf=jnp.float32(RESIDUAL_NORM_CLIP),
+        neginf=0.0,
+    )
     shortfall = jnp.maximum(jnp.float32(gamma) - sigma, 0.0)
     loss = jnp.mean(jnp.square(shortfall))
     sigma_mean = jnp.mean(sigma)
@@ -761,9 +829,29 @@ def train_step(
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+    update_is_finite = (
+        jnp.isfinite(loss)
+        & jnp.isfinite(loss_gen)
+        & jnp.isfinite(loss_reg)
+        & _tree_all_finite(grads)
+        & _tree_all_finite(state.params)
+        & _tree_all_finite(ema_params)
+    )
 
-    state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+    def _apply_updates(_):
+        new_state = state.apply_gradients(grads=grads)
+        new_ema_params = ema_update(ema_params, new_state.params, ema_decay)
+        return new_state, new_ema_params
+
+    def _skip_updates(_):
+        return state, ema_params
+
+    state, ema_params = jax.lax.cond(
+        update_is_finite,
+        _apply_updates,
+        _skip_updates,
+        operand=None,
+    )
 
     metrics = {
         "train/loss": loss,
@@ -786,6 +874,7 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/nonfinite_skip": 1.0 - update_is_finite.astype(jnp.float32),
     }
     return state, ema_params, metrics, rng
 
@@ -976,11 +1065,7 @@ def next_validation_batch(val_iterator, data_pattern, batch_size):
 
 
 def replicated_metrics_to_host(metrics):
-    metrics_cpu = jax.device_get(metrics)
-    return jax.tree_util.tree_map(
-        lambda value: float(value[0]) if getattr(value, "shape", ()) else float(value),
-        metrics_cpu,
-    )
+    return jax.tree_util.tree_map(_pmap_metric_leaf_to_host_scalar, metrics)
 
 
 class AsyncWandbLogger:
@@ -1004,7 +1089,10 @@ class AsyncWandbLogger:
 
             # Perform jax.device_get to block *only* the worker thread
             try:
-                metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
+                metrics_cpu = jax.tree_util.tree_map(
+                    _pmap_metric_leaf_to_host_scalar,
+                    jax.device_get(metrics),
+                )
                 safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
                 log_stage(f"WandB logging failed: {e}")
@@ -2363,7 +2451,7 @@ def main():
 
             # Async metric logging
             if args.log_freq > 0 and global_step % args.log_freq == 0:
-                cpu_metrics = jax.tree_util.tree_map(lambda m: m[0], metrics)
+                cpu_metrics = jax.tree_util.tree_map(_pmap_metric_leaf_to_host_scalar, metrics)
                 t1 = time.time()
                 cpu_metrics["perf/train_step_time"] = (t1 - t0) / args.log_freq
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
