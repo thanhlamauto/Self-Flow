@@ -531,20 +531,17 @@ def build_diversity_pair_indices(depth, gap):
     return np.asarray(pair_i, dtype=np.int32), np.asarray(pair_j, dtype=np.int32)
 
 
+def _residual_updates_from_hidden_states(hidden_states):
+    hidden_states = jnp.stack(hidden_states, axis=0).astype(jnp.float32)
+    return hidden_states[1:] - hidden_states[:-1]
+
+
 def _normalize_residual_updates(
-    hidden_states,
+    residual_updates,
     eps=RESIDUAL_NORM_EPS,
     inv_std_max=RESIDUAL_NORM_INV_STD_MAX,
     clip_value=RESIDUAL_NORM_CLIP,
 ):
-    hidden_states = jnp.stack(hidden_states, axis=0).astype(jnp.float32)
-    residual_updates = hidden_states[1:] - hidden_states[:-1]
-    residual_updates = jnp.nan_to_num(
-        residual_updates,
-        nan=0.0,
-        posinf=jnp.float32(clip_value),
-        neginf=-jnp.float32(clip_value),
-    )
     mean = jnp.mean(residual_updates, axis=-1, keepdims=True)
     centered = residual_updates - mean
     var = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
@@ -554,13 +551,7 @@ def _normalize_residual_updates(
     # occasional large spikes from the regularizer branch.
     inv_std = jnp.minimum(inv_std, jnp.float32(inv_std_max))
     normalized = centered * jax.lax.stop_gradient(inv_std)
-    normalized = jnp.clip(normalized, -jnp.float32(clip_value), jnp.float32(clip_value))
-    return jnp.nan_to_num(
-        normalized,
-        nan=0.0,
-        posinf=jnp.float32(clip_value),
-        neginf=-jnp.float32(clip_value),
-    )
+    return jnp.clip(normalized, -jnp.float32(clip_value), jnp.float32(clip_value))
 
 
 def _tree_all_finite(tree):
@@ -568,6 +559,10 @@ def _tree_all_finite(tree):
     if not leaves:
         return jnp.array(True)
     return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
+
+
+def _all_finite(x):
+    return jnp.all(jnp.isfinite(x))
 
 
 def _tree_nan_to_num(tree):
@@ -623,15 +618,16 @@ def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_na
     if axis_name is not None:
         delta_i = jax.lax.all_gather(delta_i, axis_name=axis_name, axis=0, tiled=True)
         delta_j = jax.lax.all_gather(delta_j, axis_name=axis_name, axis=0, tiled=True)
+    dir_inputs_all_finite = _all_finite(delta_i) & _all_finite(delta_j)
 
     numer = jnp.sum(delta_i * delta_j, axis=(-2, -1))
     denom = (
         _safe_l2_norm(delta_i, axis=(-2, -1), eps=eps, keepdims=False)
         * _safe_l2_norm(delta_j, axis=(-2, -1), eps=eps, keepdims=False)
     )
-    cosine = jnp.nan_to_num(numer / denom, nan=0.0, posinf=0.0, neginf=0.0)
+    cosine = numer / denom
     cosine_sq = jnp.square(cosine)
-    return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq)
+    return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq), dir_inputs_all_finite
 
 
 def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
@@ -642,18 +638,14 @@ def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
             axis=1,
             tiled=True,
         )
-    sigma = jnp.nan_to_num(
-        _safe_std(normalized_updates, axis=(1, 2), eps=1e-6, keepdims=False),
-        nan=0.0,
-        posinf=jnp.float32(RESIDUAL_NORM_CLIP),
-        neginf=0.0,
-    )
+    ac_inputs_all_finite = _all_finite(normalized_updates)
+    sigma = _safe_std(normalized_updates, axis=(1, 2), eps=1e-6, keepdims=False)
     shortfall = jnp.maximum(jnp.float32(gamma) - sigma, 0.0)
     loss = jnp.mean(jnp.square(shortfall))
     sigma_mean = jnp.mean(sigma)
     sigma_min = jnp.min(sigma)
     alive_frac = jnp.mean((sigma >= jnp.float32(gamma)).astype(jnp.float32))
-    return loss, sigma_mean, sigma_min, alive_frac
+    return loss, sigma_mean, sigma_min, alive_frac, ac_inputs_all_finite
 
 
 def compute_residual_regularizer_losses(
@@ -666,10 +658,13 @@ def compute_residual_regularizer_losses(
     compute_dir,
     compute_ac,
 ):
-    normalized_updates = _normalize_residual_updates(hidden_states)
+    residual_updates = _residual_updates_from_hidden_states(hidden_states)
+    residual_updates_all_finite = _all_finite(residual_updates)
+    normalized_updates = _normalize_residual_updates(residual_updates)
+    normalized_updates_all_finite = _all_finite(normalized_updates)
 
     if compute_dir:
-        dir_loss, dir_cosine, dir_cosine_sq = compute_direction_loss(
+        dir_loss, dir_cosine, dir_cosine_sq, dir_inputs_all_finite = compute_direction_loss(
             normalized_updates,
             pair_i=pair_i,
             pair_j=pair_j,
@@ -679,9 +674,10 @@ def compute_residual_regularizer_losses(
         dir_loss = jnp.array(0.0, dtype=jnp.float32)
         dir_cosine = jnp.array(0.0, dtype=jnp.float32)
         dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
+        dir_inputs_all_finite = jnp.array(True)
 
     if compute_ac:
-        ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac = compute_anti_collapse_loss(
+        ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac, ac_inputs_all_finite = compute_anti_collapse_loss(
             normalized_updates,
             gamma=gamma,
             axis_name=axis_name,
@@ -691,6 +687,7 @@ def compute_residual_regularizer_losses(
         ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
         ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
         ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
+        ac_inputs_all_finite = jnp.array(True)
 
     return (
         dir_loss,
@@ -700,6 +697,10 @@ def compute_residual_regularizer_losses(
         ac_sigma_mean,
         ac_sigma_min,
         ac_alive_frac,
+        residual_updates_all_finite,
+        normalized_updates_all_finite,
+        dir_inputs_all_finite,
+        ac_inputs_all_finite,
     )
 
 
@@ -759,6 +760,10 @@ def train_step(
                 ac_sigma_mean,
                 ac_sigma_min,
                 ac_alive_frac,
+                residual_updates_all_finite,
+                normalized_updates_all_finite,
+                dir_inputs_all_finite,
+                ac_inputs_all_finite,
             ) = compute_residual_regularizer_losses(
                 hidden_states,
                 pair_i=dir_pair_i,
@@ -784,6 +789,10 @@ def train_step(
             ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
             ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
             ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
+            residual_updates_all_finite = jnp.array(True)
+            normalized_updates_all_finite = jnp.array(True)
+            dir_inputs_all_finite = jnp.array(True)
+            ac_inputs_all_finite = jnp.array(True)
 
         loss_gen = jnp.mean((pred - target) ** 2)
         loss_reg = dir_lambda * loss_dir + ac_lambda * loss_ac
@@ -802,6 +811,10 @@ def train_step(
             ac_sigma_mean,
             ac_sigma_min,
             ac_alive_frac,
+            residual_updates_all_finite,
+            normalized_updates_all_finite,
+            dir_inputs_all_finite,
+            ac_inputs_all_finite,
             dir_pair_i,
             dir_pair_j,
         )
@@ -821,6 +834,10 @@ def train_step(
             ac_sigma_mean,
             ac_sigma_min,
             ac_alive_frac,
+            residual_updates_all_finite,
+            normalized_updates_all_finite,
+            dir_inputs_all_finite,
+            ac_inputs_all_finite,
             dir_pair_i_metric,
             dir_pair_j_metric,
         ),
@@ -838,6 +855,10 @@ def train_step(
     ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
     ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
     ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
+    residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
+    normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
+    dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+    ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
     dir_pair_i_metric = jax.lax.pmean(dir_pair_i_metric.astype(jnp.float32), axis_name="batch")
     dir_pair_j_metric = jax.lax.pmean(dir_pair_j_metric.astype(jnp.float32), axis_name="batch")
     dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
@@ -852,6 +873,10 @@ def train_step(
         & jnp.isfinite(loss_gen)
         & jnp.isfinite(loss_reg)
         & grad_is_finite
+        & residual_updates_all_finite.astype(bool)
+        & normalized_updates_all_finite.astype(bool)
+        & dir_inputs_all_finite.astype(bool)
+        & ac_inputs_all_finite.astype(bool)
         & _tree_all_finite(state.params)
         & _tree_all_finite(ema_params)
     )
@@ -887,6 +912,10 @@ def train_step(
         "train/ac_sigma_mean": ac_sigma_mean,
         "train/ac_sigma_min": ac_sigma_min,
         "train/ac_alive_frac": ac_alive_frac,
+        "train/residual_updates_all_finite": residual_updates_all_finite,
+        "train/normalized_updates_all_finite": normalized_updates_all_finite,
+        "train/dir_inputs_all_finite": dir_inputs_all_finite,
+        "train/ac_inputs_all_finite": ac_inputs_all_finite,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -943,6 +972,10 @@ def eval_step(
             ac_sigma_mean,
             ac_sigma_min,
             ac_alive_frac,
+            residual_updates_all_finite,
+            normalized_updates_all_finite,
+            dir_inputs_all_finite,
+            ac_inputs_all_finite,
         ) = compute_residual_regularizer_losses(
             hidden_states,
             pair_i=dir_pair_i,
@@ -967,6 +1000,10 @@ def eval_step(
         ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
         ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
         ac_alive_frac = jnp.array(0.0, dtype=jnp.float32)
+        residual_updates_all_finite = jnp.array(True)
+        normalized_updates_all_finite = jnp.array(True)
+        dir_inputs_all_finite = jnp.array(True)
+        ac_inputs_all_finite = jnp.array(True)
 
     loss_gen = jnp.mean((pred - target) ** 2)
     loss_reg = dir_lambda * loss_dir + ac_lambda * loss_ac
@@ -984,6 +1021,10 @@ def eval_step(
     ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
     ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
     ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
+    residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
+    normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
+    dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+    ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
     dir_pair_i_metric = jax.lax.pmean(dir_pair_i.astype(jnp.float32), axis_name="batch")
     dir_pair_j_metric = jax.lax.pmean(dir_pair_j.astype(jnp.float32), axis_name="batch")
     dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
@@ -1007,6 +1048,10 @@ def eval_step(
         "val/ac_sigma_mean": ac_sigma_mean,
         "val/ac_sigma_min": ac_sigma_min,
         "val/ac_alive_frac": ac_alive_frac,
+        "val/residual_updates_all_finite": residual_updates_all_finite,
+        "val/normalized_updates_all_finite": normalized_updates_all_finite,
+        "val/dir_inputs_all_finite": dir_inputs_all_finite,
+        "val/ac_inputs_all_finite": ac_inputs_all_finite,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
