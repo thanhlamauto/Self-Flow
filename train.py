@@ -568,6 +568,13 @@ def _safe_l2_norm(x, axis, eps=1e-8, keepdims=False):
 
 def compute_scaffold_basis(clean_latent, scaffold_rank):
     clean_latent = _center_patchwise(clean_latent.astype(jnp.float32))
+    # Normalize the centered clean latent per sample so the scaffold tracks
+    # spatial structure more than overall latent amplitude.
+    clean_latent = clean_latent / _safe_l2_norm(
+        clean_latent,
+        axis=(-2, -1),
+        keepdims=True,
+    )
     gram = jnp.einsum("bnd,bmd->bnm", clean_latent, clean_latent)
     gram = gram / jnp.float32(clean_latent.shape[-1])
     gram = 0.5 * (gram + jnp.swapaxes(gram, -1, -2))
