@@ -367,8 +367,7 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_SCAFFOLD_RANK = 4
 
 
 def build_model_config(model_size):
@@ -502,55 +501,172 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
+def _dedupe_preserve_order(values):
+    out = []
+    seen = set()
+    for value in values:
+        value = int(value)
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return tuple(out)
+
+
+def default_scaffold_layers(depth):
+    return _dedupe_preserve_order(
+        max(2, min(depth, int(round(depth * frac))))
+        for frac in (1.0 / 3.0, 0.5, 2.0 / 3.0)
     )
 
 
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
-
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
-    )
-    if uses_default_pair and strong_layer > depth:
-        raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
+def resolve_scaffold_regularizer_config(args, depth):
+    if args.scaffold_layers is None or str(args.scaffold_layers).strip() == "":
+        scaffold_layers = default_scaffold_layers(depth)
+    else:
+        scaffold_layers = _dedupe_preserve_order(
+            int(token.strip())
+            for token in str(args.scaffold_layers).split(",")
+            if token.strip()
         )
 
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
-        )
+    if not scaffold_layers:
+        raise ValueError("--scaffold-layers must contain at least one layer index")
+    for layer in scaffold_layers:
+        if not (2 <= layer <= depth):
+            raise ValueError(
+                f"--scaffold-layers entries must be in [2, {depth}] so layer updates can use X_(l-1); got {layer}"
+            )
 
-    return weak_layer, strong_layer
+    capture_layers = tuple(sorted(set(scaffold_layers + tuple(layer - 1 for layer in scaffold_layers))))
+    return scaffold_layers, capture_layers
 
 
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
+def compute_regularizer_lambdas(args, global_step):
+    scaffold_lambda = float(args.scaffold_lambda)
+    role_lambda = float(args.role_lambda) if global_step >= int(args.role_start_step) else 0.0
+
+    if role_lambda <= 0.0 or args.var_lambda <= 0.0:
+        var_lambda = 0.0
+    elif args.var_decay_steps > 0:
+        role_step = max(int(global_step) - int(args.role_start_step), 0)
+        decay = max(0.0, 1.0 - (role_step / float(args.var_decay_steps)))
+        var_lambda = float(args.var_lambda) * decay
+    else:
+        var_lambda = float(args.var_lambda)
+
+    return scaffold_lambda, role_lambda, var_lambda
+
+
+def _center_patchwise(x):
+    return x - jnp.mean(x, axis=1, keepdims=True)
+
+
+def _safe_l2_norm(x, axis, eps=1e-8, keepdims=False):
+    sq_norm = jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims)
+    return jnp.sqrt(sq_norm + jnp.float32(eps))
+
+
+def compute_scaffold_basis(clean_latent, scaffold_rank):
+    clean_latent = _center_patchwise(clean_latent.astype(jnp.float32))
+    gram = jnp.einsum("bnd,bmd->bnm", clean_latent, clean_latent)
+    gram = gram / jnp.float32(clean_latent.shape[-1])
+    gram = 0.5 * (gram + jnp.swapaxes(gram, -1, -2))
+    _, eigvecs = jnp.linalg.eigh(gram)
+    basis = jnp.flip(eigvecs[..., -scaffold_rank:], axis=-1)
+    return jax.lax.stop_gradient(basis)
+
+
+def project_onto_scaffold(scaffold_basis, centered_hidden):
+    return jnp.einsum("bnk,bnd->bkd", scaffold_basis, centered_hidden)
+
+
+def compute_scaffold_regularizer_losses(
+    clean_latent,
+    raw_features,
+    *,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_floor,
+    var_floor,
+):
     eps = jnp.float32(1e-8)
+    scaffold_basis = compute_scaffold_basis(clean_latent, scaffold_rank)
 
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
+    if not isinstance(raw_features, tuple):
+        raw_features = (raw_features,)
+    feature_map = {
+        int(layer): feature.astype(jnp.float32)
+        for layer, feature in zip(scaffold_capture_layers, raw_features)
+    }
 
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+    scaffold_scores = []
+    scaffold_losses = []
+    scaffold_updates = []
+    scaffold_update_norms = []
+    for layer in scaffold_target_layers:
+        hidden = _center_patchwise(feature_map[int(layer)])
+        hidden_proj = project_onto_scaffold(scaffold_basis, hidden)
+        hidden_energy = jnp.sum(jnp.square(hidden), axis=(-2, -1))
+        scaffold_energy = jnp.sum(jnp.square(hidden_proj), axis=(-2, -1))
+        score = scaffold_energy / (hidden_energy + eps)
+        scaffold_scores.append(score)
+        scaffold_losses.append(jnp.square(jnp.maximum(jnp.float32(scaffold_floor) - score, 0.0)))
+
+        delta = _center_patchwise(feature_map[int(layer)] - feature_map[int(layer) - 1])
+        delta_proj = project_onto_scaffold(scaffold_basis, delta)
+        scaffold_updates.append(delta_proj)
+        norm_scale = jnp.sqrt(jnp.float32(delta_proj.shape[-2] * delta_proj.shape[-1]))
+        scaffold_update_norms.append(_safe_l2_norm(delta_proj, axis=(-2, -1), eps=eps) / norm_scale)
+
+    scaffold_scores = jnp.stack(scaffold_scores, axis=0)
+    scaffold_losses = jnp.stack(scaffold_losses, axis=0)
+    scaffold_updates = jnp.stack(scaffold_updates, axis=0)
+    scaffold_update_norms = jnp.stack(scaffold_update_norms, axis=0)
+
+    loss_scaf = jnp.mean(scaffold_losses)
+    scaffold_score_mean = jnp.mean(scaffold_scores)
+    scaffold_score_min = jnp.min(scaffold_scores)
+
+    if scaffold_updates.shape[0] >= 2:
+        flat_updates = scaffold_updates.reshape(scaffold_updates.shape[0], scaffold_updates.shape[1], -1)
+        pair_cos_sq = []
+        pair_cos_abs = []
+        for i in range(flat_updates.shape[0] - 1):
+            for j in range(i + 1, flat_updates.shape[0]):
+                numer = jnp.sum(flat_updates[i] * flat_updates[j], axis=-1)
+                denom = (
+                    _safe_l2_norm(flat_updates[i], axis=-1, eps=eps)
+                    * _safe_l2_norm(flat_updates[j], axis=-1, eps=eps)
+                )
+                cosine = numer / denom
+                pair_cos_sq.append(jnp.square(cosine))
+                pair_cos_abs.append(jnp.abs(cosine))
+        pair_cos_sq = jnp.stack(pair_cos_sq, axis=0)
+        pair_cos_abs = jnp.stack(pair_cos_abs, axis=0)
+        loss_role = jnp.mean(pair_cos_sq)
+        role_cosine_abs_mean = jnp.mean(pair_cos_abs)
+        role_pair_count = jnp.array(pair_cos_sq.shape[0], dtype=jnp.float32)
+    else:
+        loss_role = jnp.array(0.0, dtype=jnp.float32)
+        role_cosine_abs_mean = jnp.array(0.0, dtype=jnp.float32)
+        role_pair_count = jnp.array(0.0, dtype=jnp.float32)
+
+    loss_var = jnp.mean(jnp.square(jnp.maximum(jnp.float32(var_floor) - scaffold_update_norms, 0.0)))
+    scaffold_update_norm_mean = jnp.mean(scaffold_update_norms)
+    scaffold_update_norm_min = jnp.min(scaffold_update_norms)
+
+    return (
+        loss_scaf,
+        scaffold_score_mean,
+        scaffold_score_min,
+        loss_role,
+        role_cosine_abs_mean,
+        role_pair_count,
+        loss_var,
+        scaffold_update_norm_mean,
+        scaffold_update_norm_min,
+    )
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -561,10 +677,16 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
+    scaffold_lambda,
+    role_lambda,
+    var_lambda,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    scaffold_enabled,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_floor,
+    var_floor,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -585,7 +707,7 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
+        if scaffold_enabled:
             pred, raw_features = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -593,9 +715,27 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_raw_features=scaffold_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            (
+                loss_scaf,
+                scaffold_score_mean,
+                scaffold_score_min,
+                loss_role,
+                role_cosine_abs_mean,
+                role_pair_count,
+                loss_var,
+                scaffold_update_norm_mean,
+                scaffold_update_norm_min,
+            ) = compute_scaffold_regularizer_losses(
+                x0,
+                raw_features,
+                scaffold_target_layers=scaffold_target_layers,
+                scaffold_capture_layers=scaffold_capture_layers,
+                scaffold_rank=scaffold_rank,
+                scaffold_floor=scaffold_floor,
+                var_floor=var_floor,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,25 +745,78 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            loss_scaf = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_score_mean = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_score_min = jnp.array(0.0, dtype=jnp.float32)
+            loss_role = jnp.array(0.0, dtype=jnp.float32)
+            role_cosine_abs_mean = jnp.array(0.0, dtype=jnp.float32)
+            role_pair_count = jnp.array(0.0, dtype=jnp.float32)
+            loss_var = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_update_norm_mean = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_update_norm_min = jnp.array(0.0, dtype=jnp.float32)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss_reg = (
+            scaffold_lambda * loss_scaf
+            + role_lambda * loss_role
+            + var_lambda * loss_var
+        )
+        loss = loss_gen + loss_reg
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_reg,
+            loss_scaf,
+            scaffold_score_mean,
+            scaffold_score_min,
+            loss_role,
+            role_cosine_abs_mean,
+            role_pair_count,
+            loss_var,
+            scaffold_update_norm_mean,
+            scaffold_update_norm_min,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_reg,
+            loss_scaf,
+            scaffold_score_mean,
+            scaffold_score_min,
+            loss_role,
+            role_cosine_abs_mean,
+            role_pair_count,
+            loss_var,
+            scaffold_update_norm_mean,
+            scaffold_update_norm_min,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
+    loss_scaf = jax.lax.pmean(loss_scaf, axis_name="batch")
+    scaffold_score_mean = jax.lax.pmean(scaffold_score_mean, axis_name="batch")
+    scaffold_score_min = jax.lax.pmean(scaffold_score_min, axis_name="batch")
+    loss_role = jax.lax.pmean(loss_role, axis_name="batch")
+    role_cosine_abs_mean = jax.lax.pmean(role_cosine_abs_mean, axis_name="batch")
+    role_pair_count = jax.lax.pmean(role_pair_count, axis_name="batch")
+    loss_var = jax.lax.pmean(loss_var, axis_name="batch")
+    scaffold_update_norm_mean = jax.lax.pmean(scaffold_update_norm_mean, axis_name="batch")
+    scaffold_update_norm_min = jax.lax.pmean(scaffold_update_norm_min, axis_name="batch")
+    scaffold_lambda = jax.lax.pmean(scaffold_lambda, axis_name="batch")
+    role_lambda = jax.lax.pmean(role_lambda, axis_name="batch")
+    var_lambda = jax.lax.pmean(var_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +829,19 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/loss_reg": loss_reg,
+        "train/loss_scaf": loss_scaf,
+        "train/loss_role": loss_role,
+        "train/loss_var": loss_var,
+        "train/scaffold_lambda": scaffold_lambda,
+        "train/role_lambda": role_lambda,
+        "train/var_lambda": var_lambda,
+        "train/scaffold_score_mean": scaffold_score_mean,
+        "train/scaffold_score_min": scaffold_score_min,
+        "train/role_cosine_abs_mean": role_cosine_abs_mean,
+        "train/role_pair_count": role_pair_count,
+        "train/scaffold_update_norm_mean": scaffold_update_norm_mean,
+        "train/scaffold_update_norm_min": scaffold_update_norm_min,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -653,10 +856,16 @@ def eval_step(
     ema_params,
     batch,
     rng,
-    layersync_lambda,
+    scaffold_lambda,
+    role_lambda,
+    var_lambda,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    scaffold_enabled,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_floor,
+    var_floor,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -670,16 +879,34 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
+    if scaffold_enabled:
         pred, raw_features = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_raw_features=scaffold_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        (
+            loss_scaf,
+            scaffold_score_mean,
+            scaffold_score_min,
+            loss_role,
+            role_cosine_abs_mean,
+            role_pair_count,
+            loss_var,
+            scaffold_update_norm_mean,
+            scaffold_update_norm_min,
+        ) = compute_scaffold_regularizer_losses(
+            x0,
+            raw_features,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=scaffold_rank,
+            scaffold_floor=scaffold_floor,
+            var_floor=var_floor,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,19 +915,41 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        loss_scaf = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_score_mean = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_score_min = jnp.array(0.0, dtype=jnp.float32)
+        loss_role = jnp.array(0.0, dtype=jnp.float32)
+        role_cosine_abs_mean = jnp.array(0.0, dtype=jnp.float32)
+        role_pair_count = jnp.array(0.0, dtype=jnp.float32)
+        loss_var = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_update_norm_mean = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_update_norm_min = jnp.array(0.0, dtype=jnp.float32)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss_reg = (
+        scaffold_lambda * loss_scaf
+        + role_lambda * loss_role
+        + var_lambda * loss_var
+    )
+    loss = loss_gen + loss_reg
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
+    loss_scaf = jax.lax.pmean(loss_scaf, axis_name="batch")
+    scaffold_score_mean = jax.lax.pmean(scaffold_score_mean, axis_name="batch")
+    scaffold_score_min = jax.lax.pmean(scaffold_score_min, axis_name="batch")
+    loss_role = jax.lax.pmean(loss_role, axis_name="batch")
+    role_cosine_abs_mean = jax.lax.pmean(role_cosine_abs_mean, axis_name="batch")
+    role_pair_count = jax.lax.pmean(role_pair_count, axis_name="batch")
+    loss_var = jax.lax.pmean(loss_var, axis_name="batch")
+    scaffold_update_norm_mean = jax.lax.pmean(scaffold_update_norm_mean, axis_name="batch")
+    scaffold_update_norm_min = jax.lax.pmean(scaffold_update_norm_min, axis_name="batch")
+    scaffold_lambda = jax.lax.pmean(scaffold_lambda, axis_name="batch")
+    role_lambda = jax.lax.pmean(role_lambda, axis_name="batch")
+    var_lambda = jax.lax.pmean(var_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +957,19 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/loss_reg": loss_reg,
+        "val/loss_scaf": loss_scaf,
+        "val/loss_role": loss_role,
+        "val/loss_var": loss_var,
+        "val/scaffold_lambda": scaffold_lambda,
+        "val/role_lambda": role_lambda,
+        "val/var_lambda": var_lambda,
+        "val/scaffold_score_mean": scaffold_score_mean,
+        "val/scaffold_score_min": scaffold_score_min,
+        "val/role_cosine_abs_mean": role_cosine_abs_mean,
+        "val/role_pair_count": role_pair_count,
+        "val/scaffold_update_norm_mean": scaffold_update_norm_mean,
+        "val/scaffold_update_norm_min": scaffold_update_norm_min,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1197,22 +1456,64 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
-        "--layersync-lambda",
+        "--scaffold-lambda",
         type=float,
         default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
+        help="Weight for the scaffold-retention hinge loss. 0.0 disables the scaffold floor term.",
     )
     parser.add_argument(
-        "--layersync-weak-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
+        "--role-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for the scaffold-update role-diversity loss. 0.0 disables the role term.",
     )
     parser.add_argument(
-        "--layersync-strong-layer",
+        "--var-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for the anti-collapse variance floor on scaffold updates. 0.0 disables the term.",
+    )
+    parser.add_argument(
+        "--scaffold-layers",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated 1-based layers to regularize, e.g. '8,12,16'. "
+            "If omitted, picks a small middle-layer set automatically."
+        ),
+    )
+    parser.add_argument(
+        "--scaffold-rank",
         type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
+        default=DEFAULT_SCAFFOLD_RANK,
+        help="Top-k scaffold rank extracted from the centered clean latent Gram matrix.",
+    )
+    parser.add_argument(
+        "--scaffold-floor",
+        type=float,
+        default=0.25,
+        help="Hinge floor tau for scaffold energy retention c_{l,t}.",
+    )
+    parser.add_argument(
+        "--var-floor",
+        type=float,
+        default=0.05,
+        help="Hinge floor gamma for normalized scaffold-update magnitude.",
+    )
+    parser.add_argument(
+        "--role-start-step",
+        type=int,
+        default=0,
+        help="Global step at which the role loss starts contributing.",
+    )
+    parser.add_argument(
+        "--var-decay-steps",
+        type=int,
+        default=10000,
+        help=(
+            "Linear decay length for var_lambda after role loss starts. "
+            "Set to 0 to keep var_lambda constant."
+        ),
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1360,8 +1661,22 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
+    if args.scaffold_lambda < 0.0:
+        raise ValueError("--scaffold-lambda must be non-negative")
+    if args.role_lambda < 0.0:
+        raise ValueError("--role-lambda must be non-negative")
+    if args.var_lambda < 0.0:
+        raise ValueError("--var-lambda must be non-negative")
+    if args.scaffold_rank <= 0:
+        raise ValueError("--scaffold-rank must be greater than 0")
+    if not (0.0 <= args.scaffold_floor <= 1.0):
+        raise ValueError("--scaffold-floor must be in [0, 1]")
+    if args.var_floor < 0.0:
+        raise ValueError("--var-floor must be non-negative")
+    if args.role_start_step < 0:
+        raise ValueError("--role-start-step must be non-negative")
+    if args.var_decay_steps < 0:
+        raise ValueError("--var-decay-steps must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1395,17 +1710,47 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
-        log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+    patch_dim = config["in_channels"] * config["patch_size"] ** 2
+    n_patches = (config["input_size"] // config["patch_size"]) ** 2
+    if args.scaffold_rank > n_patches:
+        raise ValueError(
+            f"--scaffold-rank must be <= number of patches ({n_patches}), got {args.scaffold_rank}"
         )
+
+    scaffold_enabled = any(
+        value > 0.0 for value in (args.scaffold_lambda, args.role_lambda, args.var_lambda)
+    )
+    scaffold_target_layers = ()
+    scaffold_capture_layers = ()
+    if scaffold_enabled:
+        scaffold_target_layers, scaffold_capture_layers = resolve_scaffold_regularizer_config(
+            args, config["depth"]
+        )
+        if args.role_lambda > 0.0 and len(scaffold_target_layers) < 2:
+            raise ValueError("--role-lambda requires at least two scaffold layers")
+        log_stage(
+            "Scaffold regularizer ENABLED: "
+            f"scaffold_lambda={args.scaffold_lambda} "
+            f"role_lambda={args.role_lambda} "
+            f"var_lambda={args.var_lambda} "
+            f"layers={','.join(str(layer) for layer in scaffold_target_layers)} "
+            f"rank={args.scaffold_rank} "
+            f"scaffold_floor={args.scaffold_floor} "
+            f"var_floor={args.var_floor}"
+        )
+        if args.role_lambda > 0.0:
+            log_stage(f"Role loss starts at global step {args.role_start_step}.")
+        if args.var_lambda > 0.0:
+            if args.role_lambda <= 0.0:
+                log_stage("Variance floor configured, but it will stay inactive until role_lambda > 0.")
+            elif args.var_decay_steps > 0:
+                log_stage(
+                    f"Variance floor decays linearly to 0 over {args.var_decay_steps} step(s) after role start."
+                )
+            else:
+                log_stage("Variance floor stays constant for the full run.")
     else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
+        log_stage("Scaffold regularizer DISABLED: scaffold_lambda=role_lambda=var_lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1421,12 +1766,9 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
 
-    patch_dim = config["in_channels"] * config["patch_size"] ** 2
-    n_patches = (config["input_size"] // config["patch_size"]) ** 2
-
-    total_steps = args.epochs * args.steps_per_epoch
+    def replicate_scalar(value):
+        return jax_utils.replicate(jnp.float32(value))
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1448,16 +1790,24 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            scaffold_enabled=scaffold_enabled,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=args.scaffold_rank,
+            scaffold_floor=args.scaffold_floor,
+            var_floor=args.var_floor,
         ),
         axis_name="batch",
     )
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            scaffold_enabled=scaffold_enabled,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=args.scaffold_rank,
+            scaffold_floor=args.scaffold_floor,
+            var_floor=args.var_floor,
         ),
         axis_name="batch",
     )
@@ -1731,8 +2081,16 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_scaffold_lambda, probe_role_lambda, probe_var_lambda = compute_regularizer_lambdas(args, 0)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state,
+            ema_params,
+            (probe_x, probe_y),
+            rng,
+            ema_decay_rep,
+            replicate_scalar(probe_scaffold_lambda),
+            replicate_scalar(probe_role_lambda),
+            replicate_scalar(probe_var_lambda),
         )
         block_pytree(probe_metrics)
 
@@ -2094,9 +2452,20 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
+            current_scaffold_lambda, current_role_lambda, current_var_lambda = compute_regularizer_lambdas(
+                args, global_step
+            )
+
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                replicate_scalar(current_scaffold_lambda),
+                replicate_scalar(current_role_lambda),
+                replicate_scalar(current_var_lambda),
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2116,6 +2485,12 @@ def main():
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
+                eval_scaffold_lambda, eval_role_lambda, eval_var_lambda = compute_regularizer_lambdas(
+                    args, global_step
+                )
+                eval_scaffold_lambda_rep = replicate_scalar(eval_scaffold_lambda)
+                eval_role_lambda_rep = replicate_scalar(eval_role_lambda)
+                eval_var_lambda_rep = replicate_scalar(eval_var_lambda)
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
                         val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
@@ -2123,7 +2498,13 @@ def main():
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state,
+                        ema_params,
+                        (val_x, val_y),
+                        rng,
+                        eval_scaffold_lambda_rep,
+                        eval_role_lambda_rep,
+                        eval_var_lambda_rep,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
