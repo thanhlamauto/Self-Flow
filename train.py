@@ -511,6 +511,10 @@ def compute_disp_loss(features):
     sq_norm = jnp.sum(flat * flat, axis=1, keepdims=True)
     dist_sq = sq_norm + sq_norm.T - 2.0 * (flat @ flat.T)
     dist_sq = jnp.maximum(dist_sq, 0.0) / jnp.maximum(feature_dim, 1.0)
+    # Upstream uses pdist() for off-diagonal pairs and appends exact zeros for
+    # self-pairs. Force the diagonal to zero to avoid cancellation noise once
+    # hidden activations become large.
+    dist_sq = dist_sq * (1.0 - jnp.eye(dist_sq.shape[0], dtype=dist_sq.dtype))
     return jnp.log(jnp.mean(jnp.exp(-dist_sq)))
 
 
