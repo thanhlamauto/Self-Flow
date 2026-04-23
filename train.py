@@ -1523,6 +1523,15 @@ def main():
         help="Minimum per-channel std target for the anti-collapse hinge loss.",
     )
     parser.add_argument(
+        "--ac-stop-step",
+        type=int,
+        default=0,
+        help=(
+            "Disable the anti-collapse loss after this global step. "
+            "Step counting starts at 1. Set to 0 to keep it enabled for the full run."
+        ),
+    )
+    parser.add_argument(
         "--debug-finite-checks",
         action="store_true",
         help=(
@@ -1689,6 +1698,8 @@ def main():
         raise ValueError("--diversity-gap must be >= 1")
     if args.ac_gamma < 0.0:
         raise ValueError("--ac-gamma must be non-negative")
+    if args.ac_stop_step < 0:
+        raise ValueError("--ac-stop-step must be >= 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1745,6 +1756,8 @@ def main():
             )
     else:
         log_stage("Residual regularizer DISABLED: dir_lambda=0.0 ac_lambda=0.0")
+    if ac_enabled and args.ac_stop_step > 0:
+        log_stage(f"Anti-collapse loss will stop after global step {args.ac_stop_step}.")
     if args.debug_finite_checks:
         log_stage("Debug finite checks ENABLED: residual tensors, params, and EMA are scanned each step.")
     else:
@@ -1768,6 +1781,7 @@ def main():
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
     dir_lambda_rep = jax_utils.replicate(jnp.float32(args.dir_lambda))
     ac_lambda_rep = jax_utils.replicate(jnp.float32(args.ac_lambda))
+    zero_lambda_rep = jax_utils.replicate(jnp.float32(0.0))
     zero_pair_rep = jax_utils.replicate(jnp.int32(0))
     dir_pair_rng = jax.random.PRNGKey(123)
 
@@ -1812,29 +1826,45 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            residual_reg_enabled=residual_reg_enabled,
-            dir_enabled=dir_enabled,
-            ac_enabled=ac_enabled,
-            ac_gamma=args.ac_gamma,
-            debug_finite_checks=args.debug_finite_checks,
-            log_norm_metrics=args.log_grad_param_norms,
-        ),
-        axis_name="batch",
-    )
-    pmapped_eval_step = jax.pmap(
-        functools.partial(
-            eval_step,
-            residual_reg_enabled=residual_reg_enabled,
-            dir_enabled=dir_enabled,
-            ac_enabled=ac_enabled,
-            ac_gamma=args.ac_gamma,
-            debug_finite_checks=args.debug_finite_checks,
-        ),
-        axis_name="batch",
-    )
+    def build_pmapped_steps(*, current_ac_enabled):
+        current_residual_reg_enabled = dir_enabled or current_ac_enabled
+        train_fn = jax.pmap(
+            functools.partial(
+                train_step,
+                residual_reg_enabled=current_residual_reg_enabled,
+                dir_enabled=dir_enabled,
+                ac_enabled=current_ac_enabled,
+                ac_gamma=args.ac_gamma,
+                debug_finite_checks=args.debug_finite_checks,
+                log_norm_metrics=args.log_grad_param_norms,
+            ),
+            axis_name="batch",
+        )
+        eval_fn = jax.pmap(
+            functools.partial(
+                eval_step,
+                residual_reg_enabled=current_residual_reg_enabled,
+                dir_enabled=dir_enabled,
+                ac_enabled=current_ac_enabled,
+                ac_gamma=args.ac_gamma,
+                debug_finite_checks=args.debug_finite_checks,
+            ),
+            axis_name="batch",
+        )
+        return train_fn, eval_fn
+
+    pmapped_train_step, pmapped_eval_step = build_pmapped_steps(current_ac_enabled=ac_enabled)
+    pmapped_train_step_no_ac = None
+    pmapped_eval_step_no_ac = None
+    if ac_enabled and args.ac_stop_step > 0:
+        pmapped_train_step_no_ac, pmapped_eval_step_no_ac = build_pmapped_steps(current_ac_enabled=False)
+
+    def ac_is_active_for_step(step_number):
+        if not ac_enabled:
+            return False
+        if args.ac_stop_step <= 0:
+            return True
+        return step_number <= args.ac_stop_step
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -2456,6 +2486,7 @@ def main():
     # ── Training loop ─────────────────────────────────────────────────────────
     global_step = 0
     t0 = time.time()
+    ac_stop_logged = False
 
     for epoch in range(args.epochs):
         for step in range(args.steps_per_epoch):
@@ -2478,20 +2509,27 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            train_step_number = global_step + 1
+            train_ac_active = ac_is_active_for_step(train_step_number)
+            train_step_fn = pmapped_train_step if (pmapped_train_step_no_ac is None or train_ac_active) else pmapped_train_step_no_ac
+            train_ac_lambda_rep = ac_lambda_rep if train_ac_active else zero_lambda_rep
             train_dir_pair_i_rep, train_dir_pair_j_rep = next_dir_pair_rep()
-            state, ema_params, metrics, rng = pmapped_train_step(
+            state, ema_params, metrics, rng = train_step_fn(
                 state,
                 ema_params,
                 (batch_x, batch_y),
                 rng,
                 ema_decay_rep,
                 dir_lambda_rep,
-                ac_lambda_rep,
+                train_ac_lambda_rep,
                 train_dir_pair_i_rep,
                 train_dir_pair_j_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
+            if (not train_ac_active) and not ac_stop_logged:
+                log_stage(f"Anti-collapse loss disabled from global step {global_step}.")
+                ac_stop_logged = True
 
             # Async metric logging
             if args.log_freq > 0 and global_step % args.log_freq == 0:
@@ -2514,14 +2552,17 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    eval_ac_active = ac_is_active_for_step(global_step)
+                    eval_step_fn = pmapped_eval_step if (pmapped_eval_step_no_ac is None or eval_ac_active) else pmapped_eval_step_no_ac
+                    eval_ac_lambda_rep = ac_lambda_rep if eval_ac_active else zero_lambda_rep
                     eval_dir_pair_i_rep, eval_dir_pair_j_rep = next_dir_pair_rep()
-                    val_metrics, rng = pmapped_eval_step(
+                    val_metrics, rng = eval_step_fn(
                         state,
                         ema_params,
                         (val_x, val_y),
                         rng,
                         dir_lambda_rep,
-                        ac_lambda_rep,
+                        eval_ac_lambda_rep,
                         eval_dir_pair_i_rep,
                         eval_dir_pair_j_rep,
                     )
