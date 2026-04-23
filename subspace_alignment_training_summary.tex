@@ -70,6 +70,21 @@ Q_H = \mathrm{TopEig}_k(G_H), \qquad Q_T = \mathrm{TopEig}_k(G_T),
 \]
 with $Q_H,Q_T \in \mathbb{R}^{N \times k}$ and orthonormal columns.
 
+\paragraph{Why this is equivalent to full TSVD.}
+If one ran full TSVD on $X \in \mathbb{R}^{N \times D}$ and wrote
+\[
+X = U \Sigma V^\top,
+\]
+then the left singular vectors used by TSVD are exactly the eigenvectors of
+\[
+X X^\top = U \Sigma^2 U^\top.
+\]
+So, for the purpose of extracting the top-$k$ patch subspace, \emph{full SVD on $X$} and \emph{eigendecomposition of $X X^\top$} return the same object. In the generic case they recover the same ordered directions. When singular values are repeated, the basis inside that repeated eigenspace is not unique, but the span is still the same. Since the loss only depends on the projector
+\[
+P = Q Q^\top,
+\]
+the optimization target is unchanged even if the basis vectors themselves rotate inside the same subspace.
+
 To reduce the chance of spectral degeneracy during backpropagation through the train-side eigendecomposition, we add a very small Gaussian perturbation before forming $G_H$:
 \[
 \tilde{H}_\ell = \bar{H}_\ell + \alpha \,\mathrm{RMS}(\bar{H}_\ell)\,\varepsilon,
