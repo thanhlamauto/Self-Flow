@@ -370,9 +370,6 @@ DIT_VARIANTS = {
 
 DEFAULT_DIR_GAP = 3
 DEFAULT_AC_GAMMA = 0.3
-RESIDUAL_NORM_EPS = 1e-4
-RESIDUAL_NORM_INV_STD_MAX = 10.0
-RESIDUAL_NORM_CLIP = 10.0
 
 
 def build_model_config(model_size):
@@ -531,29 +528,6 @@ def build_diversity_pair_indices(depth, gap):
     return np.asarray(pair_i, dtype=np.int32), np.asarray(pair_j, dtype=np.int32)
 
 
-def _residual_updates_from_hidden_states(hidden_states):
-    hidden_states = jnp.stack(hidden_states, axis=0).astype(jnp.float32)
-    return hidden_states[1:] - hidden_states[:-1]
-
-
-def _normalize_residual_updates(
-    residual_updates,
-    eps=RESIDUAL_NORM_EPS,
-    inv_std_max=RESIDUAL_NORM_INV_STD_MAX,
-    clip_value=RESIDUAL_NORM_CLIP,
-):
-    mean = jnp.mean(residual_updates, axis=-1, keepdims=True)
-    centered = residual_updates - mean
-    var = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
-    inv_std = jax.lax.rsqrt(jnp.maximum(var, jnp.float32(eps)))
-    # Residual updates can be near-zero because the DiT blocks are zero-initialized;
-    # cap the whitening gain and stop gradients through the variance term to avoid
-    # occasional large spikes from the regularizer branch.
-    inv_std = jnp.minimum(inv_std, jnp.float32(inv_std_max))
-    normalized = centered * jax.lax.stop_gradient(inv_std)
-    return jnp.clip(normalized, -jnp.float32(clip_value), jnp.float32(clip_value))
-
-
 def _tree_all_finite(tree):
     leaves = jax.tree_util.tree_leaves(tree)
     if not leaves:
@@ -575,12 +549,6 @@ def _tree_nan_to_num(tree):
 def _safe_l2_norm(x, axis, eps=1e-8, keepdims=False):
     sq_norm = jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims)
     return jnp.sqrt(sq_norm + jnp.float32(eps))
-
-
-def _safe_std(x, axis, eps=1e-6, keepdims=False):
-    mean = jnp.mean(x, axis=axis, keepdims=True)
-    var = jnp.mean(jnp.square(x - mean), axis=axis, keepdims=keepdims)
-    return jnp.sqrt(var + jnp.float32(eps))
 
 
 def _pmap_metric_leaf_to_host_scalar(x):
@@ -612,14 +580,7 @@ def _pmap_metric_leaf_to_host_scalar(x):
     return float(finite.mean())
 
 
-def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_name=None):
-    delta_i = jax.lax.dynamic_index_in_dim(normalized_updates, pair_i, axis=0, keepdims=False)
-    delta_j = jax.lax.dynamic_index_in_dim(normalized_updates, pair_j, axis=0, keepdims=False)
-    if axis_name is not None:
-        delta_i = jax.lax.all_gather(delta_i, axis_name=axis_name, axis=0, tiled=True)
-        delta_j = jax.lax.all_gather(delta_j, axis_name=axis_name, axis=0, tiled=True)
-    dir_inputs_all_finite = _all_finite(delta_i) & _all_finite(delta_j)
-
+def compute_direction_loss_from_deltas(delta_i, delta_j, eps=1e-8):
     numer = jnp.sum(delta_i * delta_j, axis=(-2, -1))
     denom = (
         _safe_l2_norm(delta_i, axis=(-2, -1), eps=eps, keepdims=False)
@@ -627,61 +588,68 @@ def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_na
     )
     cosine = numer / denom
     cosine_sq = jnp.square(cosine)
-    return jnp.mean(cosine_sq), jnp.mean(cosine), jnp.mean(cosine_sq), dir_inputs_all_finite
+    return jnp.mean(cosine_sq), jnp.mean(cosine)
 
 
-def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
-    if axis_name is not None:
-        normalized_updates = jax.lax.all_gather(
-            normalized_updates,
-            axis_name=axis_name,
-            axis=1,
-            tiled=True,
-        )
-    ac_inputs_all_finite = _all_finite(normalized_updates)
-    sigma = _safe_std(normalized_updates, axis=(1, 2), eps=1e-6, keepdims=False)
+def compute_anti_collapse_loss_from_moments(local_sum, local_sumsq, local_count, gamma, axis_name=None):
+    if axis_name is None:
+        total_sum = local_sum
+        total_sumsq = local_sumsq
+        total_count = local_count
+    else:
+        total_sum = jax.lax.psum(local_sum, axis_name=axis_name)
+        total_sumsq = jax.lax.psum(local_sumsq, axis_name=axis_name)
+        total_count = jax.lax.psum(local_count, axis_name=axis_name)
+    mean = total_sum / total_count
+    var = jnp.maximum(total_sumsq / total_count - jnp.square(mean), 0.0)
+    sigma = jnp.sqrt(var + jnp.float32(1e-6))
     shortfall = jnp.maximum(jnp.float32(gamma) - sigma, 0.0)
     loss = jnp.mean(jnp.square(shortfall))
     sigma_mean = jnp.mean(sigma)
     sigma_min = jnp.min(sigma)
     alive_frac = jnp.mean((sigma >= jnp.float32(gamma)).astype(jnp.float32))
-    return loss, sigma_mean, sigma_min, alive_frac, ac_inputs_all_finite
+    return loss, sigma_mean, sigma_min, alive_frac
 
 
-def compute_residual_regularizer_losses(
-    hidden_states,
-    pair_i,
-    pair_j,
+def compute_residual_regularizer_losses_from_model_stats(
+    residual_stats,
     gamma,
     axis_name=None,
     *,
     compute_dir,
     compute_ac,
+    debug_finite_checks,
 ):
-    residual_updates = _residual_updates_from_hidden_states(hidden_states)
-    residual_updates_all_finite = _all_finite(residual_updates)
-    normalized_updates = _normalize_residual_updates(residual_updates)
-    normalized_updates_all_finite = _all_finite(normalized_updates)
+    (
+        dir_delta_i,
+        dir_delta_j,
+        ac_local_sum,
+        ac_local_sumsq,
+        ac_local_count,
+        residual_updates_all_finite,
+        normalized_updates_all_finite,
+    ) = residual_stats
 
     if compute_dir:
-        dir_loss, dir_cosine, dir_cosine_sq, dir_inputs_all_finite = compute_direction_loss(
-            normalized_updates,
-            pair_i=pair_i,
-            pair_j=pair_j,
-            axis_name=axis_name,
-        )
+        dir_loss, dir_cosine = compute_direction_loss_from_deltas(dir_delta_i, dir_delta_j)
+        if debug_finite_checks:
+            dir_inputs_all_finite = _all_finite(dir_delta_i) & _all_finite(dir_delta_j)
+        else:
+            dir_inputs_all_finite = jnp.array(True)
     else:
         dir_loss = jnp.array(0.0, dtype=jnp.float32)
         dir_cosine = jnp.array(0.0, dtype=jnp.float32)
-        dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
         dir_inputs_all_finite = jnp.array(True)
 
     if compute_ac:
-        ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac, ac_inputs_all_finite = compute_anti_collapse_loss(
-            normalized_updates,
+        ac_loss, ac_sigma_mean, ac_sigma_min, ac_alive_frac = compute_anti_collapse_loss_from_moments(
+            ac_local_sum,
+            ac_local_sumsq,
+            ac_local_count,
             gamma=gamma,
             axis_name=axis_name,
         )
+        ac_inputs_all_finite = normalized_updates_all_finite if debug_finite_checks else jnp.array(True)
     else:
         ac_loss = jnp.array(0.0, dtype=jnp.float32)
         ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
@@ -692,7 +660,6 @@ def compute_residual_regularizer_losses(
     return (
         dir_loss,
         dir_cosine,
-        dir_cosine_sq,
         ac_loss,
         ac_sigma_mean,
         ac_sigma_min,
@@ -720,8 +687,9 @@ def train_step(
     residual_reg_enabled,
     dir_enabled,
     ac_enabled,
-    residual_reg_capture_layers,
     ac_gamma,
+    debug_finite_checks,
+    log_norm_metrics,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -743,19 +711,23 @@ def train_step(
 
     def loss_fn(params):
         if residual_reg_enabled:
-            pred, hidden_states = state.apply_fn(
+            pred, residual_stats = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=residual_reg_capture_layers,
+                return_residual_regularizer=True,
+                residual_pair_i=dir_pair_i,
+                residual_pair_j=dir_pair_j,
+                residual_compute_dir=dir_enabled,
+                residual_compute_ac=ac_enabled,
+                residual_debug_checks=debug_finite_checks,
             )
             (
                 loss_dir,
                 dir_cosine,
-                dir_cosine_sq,
                 loss_ac,
                 ac_sigma_mean,
                 ac_sigma_min,
@@ -764,14 +736,13 @@ def train_step(
                 normalized_updates_all_finite,
                 dir_inputs_all_finite,
                 ac_inputs_all_finite,
-            ) = compute_residual_regularizer_losses(
-                hidden_states,
-                pair_i=dir_pair_i,
-                pair_j=dir_pair_j,
+            ) = compute_residual_regularizer_losses_from_model_stats(
+                residual_stats,
                 gamma=ac_gamma,
                 axis_name="batch",
                 compute_dir=dir_enabled,
                 compute_ac=ac_enabled,
+                debug_finite_checks=debug_finite_checks,
             )
         else:
             pred = state.apply_fn(
@@ -784,7 +755,6 @@ def train_step(
             )
             loss_dir = jnp.array(0.0, dtype=jnp.float32)
             dir_cosine = jnp.array(0.0, dtype=jnp.float32)
-            dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
             loss_ac = jnp.array(0.0, dtype=jnp.float32)
             ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
             ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
@@ -806,7 +776,6 @@ def train_step(
             loss_reg,
             loss_dir,
             dir_cosine,
-            dir_cosine_sq,
             loss_ac,
             ac_sigma_mean,
             ac_sigma_min,
@@ -829,7 +798,6 @@ def train_step(
             loss_reg,
             loss_dir,
             dir_cosine,
-            dir_cosine_sq,
             loss_ac,
             ac_sigma_mean,
             ac_sigma_min,
@@ -850,36 +818,34 @@ def train_step(
     loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
     loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
     dir_cosine = jax.lax.pmean(dir_cosine, axis_name="batch")
-    dir_cosine_sq = jax.lax.pmean(dir_cosine_sq, axis_name="batch")
     loss_ac = jax.lax.pmean(loss_ac, axis_name="batch")
     ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
     ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
     ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
-    residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
-    normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
-    dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
-    ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+    if debug_finite_checks:
+        residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
+        normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
+        dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+        ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
     dir_pair_i_metric = jax.lax.pmean(dir_pair_i_metric.astype(jnp.float32), axis_name="batch")
     dir_pair_j_metric = jax.lax.pmean(dir_pair_j_metric.astype(jnp.float32), axis_name="batch")
-    dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
-    ac_lambda = jax.lax.pmean(ac_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
-    grads_sanitized = _tree_nan_to_num(grads)
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads_sanitized)))
-    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
     grad_is_finite = _tree_all_finite(grads)
-    update_is_finite = (
-        jnp.isfinite(loss)
-        & jnp.isfinite(loss_gen)
-        & jnp.isfinite(loss_reg)
-        & grad_is_finite
-        & residual_updates_all_finite.astype(bool)
-        & normalized_updates_all_finite.astype(bool)
-        & dir_inputs_all_finite.astype(bool)
-        & ac_inputs_all_finite.astype(bool)
-        & _tree_all_finite(state.params)
-        & _tree_all_finite(ema_params)
-    )
+    update_is_finite = jnp.isfinite(loss) & jnp.isfinite(loss_gen) & jnp.isfinite(loss_reg) & grad_is_finite
+    if debug_finite_checks:
+        update_is_finite = (
+            update_is_finite
+            & residual_updates_all_finite.astype(bool)
+            & normalized_updates_all_finite.astype(bool)
+            & dir_inputs_all_finite.astype(bool)
+            & ac_inputs_all_finite.astype(bool)
+            & _tree_all_finite(state.params)
+            & _tree_all_finite(ema_params)
+        )
+    if log_norm_metrics:
+        grads_sanitized = _tree_nan_to_num(grads)
+        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads_sanitized)))
+        param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
     def _apply_updates(_):
         new_state = state.apply_gradients(grads=grads)
@@ -903,27 +869,25 @@ def train_step(
         "train/loss_reg": loss_reg,
         "train/loss_dir": loss_dir,
         "train/loss_ac": loss_ac,
-        "train/dir_lambda": dir_lambda,
-        "train/ac_lambda": ac_lambda,
         "train/dir_pair_i": (dir_pair_i_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "train/dir_pair_j": (dir_pair_j_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "train/dir_cosine": dir_cosine,
-        "train/dir_cosine_sq": dir_cosine_sq,
         "train/ac_sigma_mean": ac_sigma_mean,
         "train/ac_sigma_min": ac_sigma_min,
         "train/ac_alive_frac": ac_alive_frac,
-        "train/residual_updates_all_finite": residual_updates_all_finite,
-        "train/normalized_updates_all_finite": normalized_updates_all_finite,
-        "train/dir_inputs_all_finite": dir_inputs_all_finite,
-        "train/ac_inputs_all_finite": ac_inputs_all_finite,
-        "train/ema_decay": ema_decay,
-        "train/grad_norm": grad_norm,
-        "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
         "train/grad_all_finite": grad_is_finite.astype(jnp.float32),
         "train/nonfinite_skip": 1.0 - update_is_finite.astype(jnp.float32),
     }
+    if log_norm_metrics:
+        metrics["train/grad_norm"] = grad_norm
+        metrics["train/param_norm"] = param_norm
+    if debug_finite_checks:
+        metrics["train/residual_updates_all_finite"] = residual_updates_all_finite
+        metrics["train/normalized_updates_all_finite"] = normalized_updates_all_finite
+        metrics["train/dir_inputs_all_finite"] = dir_inputs_all_finite
+        metrics["train/ac_inputs_all_finite"] = ac_inputs_all_finite
     return state, ema_params, metrics, rng
 
 
@@ -940,8 +904,8 @@ def eval_step(
     residual_reg_enabled,
     dir_enabled,
     ac_enabled,
-    residual_reg_capture_layers,
     ac_gamma,
+    debug_finite_checks,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -956,18 +920,22 @@ def eval_step(
     target = x0 - x1
 
     if residual_reg_enabled:
-        pred, hidden_states = state.apply_fn(
+        pred, residual_stats = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=residual_reg_capture_layers,
+            return_residual_regularizer=True,
+            residual_pair_i=dir_pair_i,
+            residual_pair_j=dir_pair_j,
+            residual_compute_dir=dir_enabled,
+            residual_compute_ac=ac_enabled,
+            residual_debug_checks=debug_finite_checks,
         )
         (
             loss_dir,
             dir_cosine,
-            dir_cosine_sq,
             loss_ac,
             ac_sigma_mean,
             ac_sigma_min,
@@ -976,14 +944,13 @@ def eval_step(
             normalized_updates_all_finite,
             dir_inputs_all_finite,
             ac_inputs_all_finite,
-        ) = compute_residual_regularizer_losses(
-            hidden_states,
-            pair_i=dir_pair_i,
-            pair_j=dir_pair_j,
+        ) = compute_residual_regularizer_losses_from_model_stats(
+            residual_stats,
             gamma=ac_gamma,
             axis_name="batch",
             compute_dir=dir_enabled,
             compute_ac=ac_enabled,
+            debug_finite_checks=debug_finite_checks,
         )
     else:
         pred = state.apply_fn(
@@ -995,7 +962,6 @@ def eval_step(
         )
         loss_dir = jnp.array(0.0, dtype=jnp.float32)
         dir_cosine = jnp.array(0.0, dtype=jnp.float32)
-        dir_cosine_sq = jnp.array(0.0, dtype=jnp.float32)
         loss_ac = jnp.array(0.0, dtype=jnp.float32)
         ac_sigma_mean = jnp.array(0.0, dtype=jnp.float32)
         ac_sigma_min = jnp.array(0.0, dtype=jnp.float32)
@@ -1016,19 +982,17 @@ def eval_step(
     loss_reg = jax.lax.pmean(loss_reg, axis_name="batch")
     loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
     dir_cosine = jax.lax.pmean(dir_cosine, axis_name="batch")
-    dir_cosine_sq = jax.lax.pmean(dir_cosine_sq, axis_name="batch")
     loss_ac = jax.lax.pmean(loss_ac, axis_name="batch")
     ac_sigma_mean = jax.lax.pmean(ac_sigma_mean, axis_name="batch")
     ac_sigma_min = jax.lax.pmean(ac_sigma_min, axis_name="batch")
     ac_alive_frac = jax.lax.pmean(ac_alive_frac, axis_name="batch")
-    residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
-    normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
-    dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
-    ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+    if debug_finite_checks:
+        residual_updates_all_finite = jax.lax.pmin(residual_updates_all_finite.astype(jnp.float32), axis_name="batch")
+        normalized_updates_all_finite = jax.lax.pmin(normalized_updates_all_finite.astype(jnp.float32), axis_name="batch")
+        dir_inputs_all_finite = jax.lax.pmin(dir_inputs_all_finite.astype(jnp.float32), axis_name="batch")
+        ac_inputs_all_finite = jax.lax.pmin(ac_inputs_all_finite.astype(jnp.float32), axis_name="batch")
     dir_pair_i_metric = jax.lax.pmean(dir_pair_i.astype(jnp.float32), axis_name="batch")
     dir_pair_j_metric = jax.lax.pmean(dir_pair_j.astype(jnp.float32), axis_name="batch")
-    dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
-    ac_lambda = jax.lax.pmean(ac_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -1039,22 +1003,20 @@ def eval_step(
         "val/loss_reg": loss_reg,
         "val/loss_dir": loss_dir,
         "val/loss_ac": loss_ac,
-        "val/dir_lambda": dir_lambda,
-        "val/ac_lambda": ac_lambda,
         "val/dir_pair_i": (dir_pair_i_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "val/dir_pair_j": (dir_pair_j_metric + 1.0) if dir_enabled else jnp.array(0.0, dtype=jnp.float32),
         "val/dir_cosine": dir_cosine,
-        "val/dir_cosine_sq": dir_cosine_sq,
         "val/ac_sigma_mean": ac_sigma_mean,
         "val/ac_sigma_min": ac_sigma_min,
         "val/ac_alive_frac": ac_alive_frac,
-        "val/residual_updates_all_finite": residual_updates_all_finite,
-        "val/normalized_updates_all_finite": normalized_updates_all_finite,
-        "val/dir_inputs_all_finite": dir_inputs_all_finite,
-        "val/ac_inputs_all_finite": ac_inputs_all_finite,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
+    if debug_finite_checks:
+        metrics["val/residual_updates_all_finite"] = residual_updates_all_finite
+        metrics["val/normalized_updates_all_finite"] = normalized_updates_all_finite
+        metrics["val/dir_inputs_all_finite"] = dir_inputs_all_finite
+        metrics["val/ac_inputs_all_finite"] = ac_inputs_all_finite
     return metrics, rng
 
 
@@ -1560,6 +1522,19 @@ def main():
         default=DEFAULT_AC_GAMMA,
         help="Minimum per-channel std target for the anti-collapse hinge loss.",
     )
+    parser.add_argument(
+        "--debug-finite-checks",
+        action="store_true",
+        help=(
+            "Enable expensive finite diagnostics for residual regularizer tensors "
+            "and params/EMA. Loss and gradient finite checks remain enabled regardless."
+        ),
+    )
+    parser.add_argument(
+        "--log-grad-param-norms",
+        action="store_true",
+        help="Compute and log grad_norm/param_norm. Disabled by default because it scans large pytrees each step.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1750,11 +1725,9 @@ def main():
     residual_reg_enabled = (args.dir_lambda > 0.0) or (args.ac_lambda > 0.0)
     dir_enabled = args.dir_lambda > 0.0
     ac_enabled = args.ac_lambda > 0.0
-    residual_reg_capture_layers = None
     dir_pair_choices_i = None
     dir_pair_choices_j = None
     if residual_reg_enabled:
-        residual_reg_capture_layers = tuple(range(0, depth + 1))
         if dir_enabled:
             dir_pair_choices_i, dir_pair_choices_j = build_diversity_pair_indices(
                 depth,
@@ -1772,6 +1745,12 @@ def main():
             )
     else:
         log_stage("Residual regularizer DISABLED: dir_lambda=0.0 ac_lambda=0.0")
+    if args.debug_finite_checks:
+        log_stage("Debug finite checks ENABLED: residual tensors, params, and EMA are scanned each step.")
+    else:
+        log_stage("Debug finite checks DISABLED: only loss and gradients gate non-finite update skips.")
+    if args.log_grad_param_norms:
+        log_stage("Grad/param norm logging ENABLED.")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1839,8 +1818,9 @@ def main():
             residual_reg_enabled=residual_reg_enabled,
             dir_enabled=dir_enabled,
             ac_enabled=ac_enabled,
-            residual_reg_capture_layers=residual_reg_capture_layers,
             ac_gamma=args.ac_gamma,
+            debug_finite_checks=args.debug_finite_checks,
+            log_norm_metrics=args.log_grad_param_norms,
         ),
         axis_name="batch",
     )
@@ -1850,8 +1830,8 @@ def main():
             residual_reg_enabled=residual_reg_enabled,
             dir_enabled=dir_enabled,
             ac_enabled=ac_enabled,
-            residual_reg_capture_layers=residual_reg_capture_layers,
             ac_gamma=args.ac_gamma,
+            debug_finite_checks=args.debug_finite_checks,
         ),
         axis_name="batch",
     )

@@ -17,6 +17,25 @@ from einops import rearrange
 XAVIER_UNIFORM = nn.initializers.xavier_uniform()
 ZERO_INIT = nn.initializers.zeros
 NORMAL_002 = nn.initializers.normal(stddev=0.02)
+RESIDUAL_NORM_EPS = 1e-4
+RESIDUAL_NORM_INV_STD_MAX = 10.0
+RESIDUAL_NORM_CLIP = 10.0
+
+
+def normalize_residual_update(
+    residual_update,
+    eps=RESIDUAL_NORM_EPS,
+    inv_std_max=RESIDUAL_NORM_INV_STD_MAX,
+    clip_value=RESIDUAL_NORM_CLIP,
+):
+    """LayerNorm-style residual normalization used by the depth regularizer."""
+    mean = jnp.mean(residual_update, axis=-1, keepdims=True)
+    centered = residual_update - mean
+    var = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
+    inv_std = jax.lax.rsqrt(jnp.maximum(var, jnp.float32(eps)))
+    inv_std = jnp.minimum(inv_std, jnp.float32(inv_std_max))
+    normalized = centered * jax.lax.stop_gradient(inv_std)
+    return jnp.clip(normalized, -jnp.float32(clip_value), jnp.float32(clip_value))
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -306,10 +325,19 @@ class SelfFlowDiT(nn.Module):
         return_raw_features: bool | int | Sequence[int] = False,
         return_patch_embed: bool = False,
         return_block_summaries: bool = False,
+        return_residual_regularizer: bool = False,
+        residual_pair_i: Optional[jax.Array] = None,
+        residual_pair_j: Optional[jax.Array] = None,
+        residual_compute_dir: bool = True,
+        residual_compute_ac: bool = True,
+        residual_debug_checks: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+        assert not (return_residual_regularizer and return_raw_features)
+        assert not (return_residual_regularizer and return_features)
+        assert not (return_residual_regularizer and return_patch_embed)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
 
@@ -385,13 +413,37 @@ class SelfFlowDiT(nn.Module):
                 for idx in raw_positions[0]:
                     raw_zs[idx] = x
         block_summaries = [] if return_block_summaries else None
+        if return_residual_regularizer:
+            residual_pair_i = jnp.asarray(0 if residual_pair_i is None else residual_pair_i, dtype=jnp.int32)
+            residual_pair_j = jnp.asarray(0 if residual_pair_j is None else residual_pair_j, dtype=jnp.int32)
+            dir_delta_i = jnp.zeros_like(x)
+            dir_delta_j = jnp.zeros_like(x)
+            ac_sums = [] if residual_compute_ac else None
+            ac_sumsq = [] if residual_compute_ac else None
+            ac_count = jnp.asarray(x.shape[0] * x.shape[1], dtype=jnp.float32)
+            residual_updates_all_finite = jnp.array(True)
+            normalized_updates_all_finite = jnp.array(True)
         for i in range(self.depth):
+            prev_x = x if return_residual_regularizer else None
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
+
+            if return_residual_regularizer:
+                residual_update = (x - prev_x).astype(jnp.float32)
+                normalized_update = normalize_residual_update(residual_update)
+                if residual_debug_checks:
+                    residual_updates_all_finite = residual_updates_all_finite & jnp.all(jnp.isfinite(residual_update))
+                    normalized_updates_all_finite = normalized_updates_all_finite & jnp.all(jnp.isfinite(normalized_update))
+                if residual_compute_dir:
+                    dir_delta_i = jnp.where(residual_pair_i == jnp.int32(i), normalized_update, dir_delta_i)
+                    dir_delta_j = jnp.where(residual_pair_j == jnp.int32(i), normalized_update, dir_delta_j)
+                if residual_compute_ac:
+                    ac_sums.append(jnp.sum(normalized_update, axis=(0, 1)))
+                    ac_sumsq.append(jnp.sum(jnp.square(normalized_update), axis=(0, 1)))
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
@@ -420,6 +472,26 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        if return_residual_regularizer:
+            if residual_compute_ac:
+                ac_sum = jnp.stack(ac_sums, axis=0)
+                ac_sumsq = jnp.stack(ac_sumsq, axis=0)
+            else:
+                ac_sum = jnp.zeros((self.depth, self.hidden_size), dtype=jnp.float32)
+                ac_sumsq = jnp.zeros((self.depth, self.hidden_size), dtype=jnp.float32)
+            residual_stats = (
+                dir_delta_i,
+                dir_delta_j,
+                ac_sum,
+                ac_sumsq,
+                ac_count,
+                residual_updates_all_finite,
+                normalized_updates_all_finite,
+            )
+            if return_block_summaries:
+                return x, residual_stats, block_summaries
+            return x, residual_stats
 
         if return_features:
             if return_block_summaries:
