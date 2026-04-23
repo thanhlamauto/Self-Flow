@@ -423,6 +423,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.activation_decomposition import compute_private_activation_loss
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -602,6 +603,9 @@ def _projector_overlap_from_basis(q_a, q_b, rank):
 
 
 def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index):
+    if isinstance(raw_features, (list, tuple)):
+        stacked = jnp.stack(raw_features, axis=0)
+        return jax.lax.dynamic_index_in_dim(stacked, align_layer_index, axis=0, keepdims=False)
     if align_layer_mode == "fixed":
         return raw_features
     if align_layer_mode == "random":
@@ -737,6 +741,42 @@ def extract_layer0_target_tokens(params, x0):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+
+def _zero_private_metrics(dtype):
+    zero = jnp.array(0.0, dtype=dtype)
+    return {
+        "loss_private": zero,
+        "norm_common": zero,
+        "avg_private_norm": zero,
+        "avg_pairwise_private_cosine": zero,
+    }
+
+
+def _scheduled_lambda_private(
+    lambda_private,
+    current_step,
+    start_step=0,
+    warmup_iters=0,
+):
+    """Late-start + linear warmup schedule for the private activation loss."""
+    lambda_private = jnp.asarray(lambda_private, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    start_step = jnp.asarray(start_step, dtype=jnp.int32)
+    warmup_iters = jnp.asarray(warmup_iters, dtype=jnp.int32)
+
+    has_started = current_step >= start_step
+    no_warmup = warmup_iters <= 0
+    warmup_progress = (current_step - start_step + 1).astype(jnp.float32) / jnp.maximum(
+        warmup_iters.astype(jnp.float32), 1.0
+    )
+    warmup_scale = jnp.where(
+        has_started,
+        jnp.where(no_warmup, 1.0, jnp.clip(warmup_progress, 0.0, 1.0)),
+        0.0,
+    )
+    return lambda_private * warmup_scale, warmup_scale
+
+
 def train_step(
     state,
     ema_params,
@@ -745,6 +785,7 @@ def train_step(
     ema_decay,
     align_lambda,
     align_layer_index,
+    current_step,
     *,
     align_enabled,
     align_layer_mode,
@@ -755,6 +796,15 @@ def train_step(
     align_tsvd_dither_scale,
     align_tsvd_solver,
     align_tsvd_power_iters,
+    private_enabled,
+    private_capture_layers,
+    lambda_private,
+    private_max_pairs,
+    private_start_step,
+    private_warmup_iters,
+    common_agg,
+    common_logit_normal_center_layer,
+    common_logit_normal_sigma,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -765,8 +815,22 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    if private_enabled:
+        effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+            lambda_private,
+            current_step,
+            start_step=private_start_step,
+            warmup_iters=private_warmup_iters,
+        )
+    else:
+        effective_lambda_private = jnp.array(0.0, dtype=jnp.float32)
+        private_warmup_scale = jnp.array(0.0, dtype=jnp.float32)
 
-    rng, tau_rng, noise_rng, drop_rng, align_rng = jax.random.split(rng, 5)
+    if private_enabled:
+        rng, tau_rng, noise_rng, drop_rng, align_rng, private_rng = jax.random.split(rng, 6)
+    else:
+        rng, tau_rng, noise_rng, drop_rng, align_rng = jax.random.split(rng, 5)
+        private_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -775,7 +839,8 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if align_enabled:
+        if align_enabled or private_enabled:
+            feature_layers = private_capture_layers if private_enabled else align_capture_layers
             pred, raw_features = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -783,22 +848,39 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=align_capture_layers,
+                return_raw_features=feature_layers,
             )
-            layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
-            target_tokens = extract_layer0_target_tokens(params, x0)
-            loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
-                align_method,
-                layer_tokens=layer_tokens,
-                target_tokens=target_tokens,
-                params=params,
-                rank=align_rank,
-                ortho_lambda=align_ortho_lambda,
-                tsvd_dither_rng=align_rng if align_method == "tsvd" else None,
-                tsvd_dither_scale=align_tsvd_dither_scale,
-                tsvd_solver=align_tsvd_solver,
-                tsvd_power_iters=align_tsvd_power_iters,
-            )
+            if align_enabled:
+                layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
+                target_tokens = extract_layer0_target_tokens(params, x0)
+                loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
+                    align_method,
+                    layer_tokens=layer_tokens,
+                    target_tokens=target_tokens,
+                    params=params,
+                    rank=align_rank,
+                    ortho_lambda=align_ortho_lambda,
+                    tsvd_dither_rng=align_rng if align_method == "tsvd" else None,
+                    tsvd_dither_scale=align_tsvd_dither_scale,
+                    tsvd_solver=align_tsvd_solver,
+                    tsvd_power_iters=align_tsvd_power_iters,
+                )
+            else:
+                loss_align = jnp.array(0.0, dtype=jnp.float32)
+                align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
+                align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
+                align_overlap = jnp.array(0.0, dtype=jnp.float32)
+            if private_enabled:
+                private_metrics = compute_private_activation_loss(
+                    raw_features,
+                    rng=private_rng,
+                    max_pairs=private_max_pairs,
+                    common_agg=common_agg,
+                    common_logit_normal_center_layer=common_logit_normal_center_layer,
+                    common_logit_normal_sigma=common_logit_normal_sigma,
+                )
+            else:
+                private_metrics = _zero_private_metrics(x0.dtype)
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -812,9 +894,11 @@ def train_step(
             align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
             align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
             align_overlap = jnp.array(0.0, dtype=jnp.float32)
+            private_metrics = _zero_private_metrics(x0.dtype)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + align_lambda * loss_align
+        loss_private = private_metrics["loss_private"]
+        loss = loss_gen + align_lambda * loss_align + effective_lambda_private * loss_private
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         return loss, (
@@ -826,21 +910,47 @@ def train_step(
             align_ortho_loss,
             align_overlap,
             align_layer_index,
+            loss_private,
+            private_metrics["norm_common"],
+            private_metrics["avg_private_norm"],
+            private_metrics["avg_pairwise_private_cosine"],
         )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_align, align_spatial_loss, align_ortho_loss, align_overlap, align_layer_index_metric)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_align,
+            align_spatial_loss,
+            align_ortho_loss,
+            align_overlap,
+            align_layer_index_metric,
+            loss_private,
+            private_common_norm,
+            private_avg_norm,
+            private_pairwise_cosine,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     align_spatial_loss = jax.lax.pmean(align_spatial_loss, axis_name="batch")
     align_ortho_loss = jax.lax.pmean(align_ortho_loss, axis_name="batch")
     align_overlap = jax.lax.pmean(align_overlap, axis_name="batch")
     align_layer_index_metric = jax.lax.pmean(align_layer_index_metric.astype(jnp.float32), axis_name="batch")
     align_lambda = jax.lax.pmean(align_lambda, axis_name="batch")
+    effective_lambda_private = jax.lax.pmean(effective_lambda_private, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
+    private_common_norm = jax.lax.pmean(private_common_norm, axis_name="batch")
+    private_avg_norm = jax.lax.pmean(private_avg_norm, axis_name="batch")
+    private_pairwise_cosine = jax.lax.pmean(private_pairwise_cosine, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -854,11 +964,17 @@ def train_step(
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
         "train/loss_align": loss_align,
+        "train/loss_private": loss_private,
         "train/loss_align_spatial": align_spatial_loss,
         "train/loss_align_ortho": align_ortho_loss,
         "train/align_lambda": align_lambda,
         "train/align_overlap": align_overlap,
         "train/align_layer": align_layer_index_metric + 1.0,
+        "train/lambda_private_effective": effective_lambda_private,
+        "train/private_warmup_scale": private_warmup_scale,
+        "train/private_common_norm": private_common_norm,
+        "train/private_avg_norm": private_avg_norm,
+        "train/private_pairwise_cosine": private_pairwise_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -875,6 +991,7 @@ def eval_step(
     rng,
     align_lambda,
     align_layer_index,
+    current_step,
     *,
     align_enabled,
     align_layer_mode,
@@ -885,13 +1002,36 @@ def eval_step(
     align_tsvd_dither_scale,
     align_tsvd_solver,
     align_tsvd_power_iters,
+    private_enabled,
+    private_capture_layers,
+    lambda_private,
+    private_max_pairs,
+    private_start_step,
+    private_warmup_iters,
+    common_agg,
+    common_logit_normal_center_layer,
+    common_logit_normal_sigma,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     del ema_params
     x0, y = batch
     local_batch = x0.shape[0]
+    if private_enabled:
+        effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+            lambda_private,
+            current_step,
+            start_step=private_start_step,
+            warmup_iters=private_warmup_iters,
+        )
+    else:
+        effective_lambda_private = jnp.array(0.0, dtype=jnp.float32)
+        private_warmup_scale = jnp.array(0.0, dtype=jnp.float32)
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    if private_enabled:
+        rng, tau_rng, noise_rng, private_rng = jax.random.split(rng, 4)
+    else:
+        rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+        private_rng = None
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -899,29 +1039,47 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if align_enabled:
+    if align_enabled or private_enabled:
+        feature_layers = private_capture_layers if private_enabled else align_capture_layers
         pred, raw_features = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=align_capture_layers,
+            return_raw_features=feature_layers,
         )
-        layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
-        target_tokens = extract_layer0_target_tokens(state.params, x0)
-        loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
-            align_method,
-            layer_tokens=layer_tokens,
-            target_tokens=target_tokens,
-            params=state.params,
-            rank=align_rank,
-            ortho_lambda=align_ortho_lambda,
-            tsvd_dither_rng=None,
-            tsvd_dither_scale=align_tsvd_dither_scale,
-            tsvd_solver=align_tsvd_solver,
-            tsvd_power_iters=align_tsvd_power_iters,
-        )
+        if align_enabled:
+            layer_tokens = _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_index)
+            target_tokens = extract_layer0_target_tokens(state.params, x0)
+            loss_align, align_spatial_loss, align_ortho_loss, align_overlap = compute_alignment_loss(
+                align_method,
+                layer_tokens=layer_tokens,
+                target_tokens=target_tokens,
+                params=state.params,
+                rank=align_rank,
+                ortho_lambda=align_ortho_lambda,
+                tsvd_dither_rng=None,
+                tsvd_dither_scale=align_tsvd_dither_scale,
+                tsvd_solver=align_tsvd_solver,
+                tsvd_power_iters=align_tsvd_power_iters,
+            )
+        else:
+            loss_align = jnp.array(0.0, dtype=jnp.float32)
+            align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
+            align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
+            align_overlap = jnp.array(0.0, dtype=jnp.float32)
+        if private_enabled:
+            private_metrics = compute_private_activation_loss(
+                raw_features,
+                rng=private_rng,
+                max_pairs=private_max_pairs,
+                common_agg=common_agg,
+                common_logit_normal_center_layer=common_logit_normal_center_layer,
+                common_logit_normal_sigma=common_logit_normal_sigma,
+            )
+        else:
+            private_metrics = _zero_private_metrics(x0.dtype)
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -934,20 +1092,28 @@ def eval_step(
         align_spatial_loss = jnp.array(0.0, dtype=jnp.float32)
         align_ortho_loss = jnp.array(0.0, dtype=jnp.float32)
         align_overlap = jnp.array(0.0, dtype=jnp.float32)
+        private_metrics = _zero_private_metrics(x0.dtype)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + align_lambda * loss_align
+    loss_private = private_metrics["loss_private"]
+    loss = loss_gen + align_lambda * loss_align + effective_lambda_private * loss_private
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     align_spatial_loss = jax.lax.pmean(align_spatial_loss, axis_name="batch")
     align_ortho_loss = jax.lax.pmean(align_ortho_loss, axis_name="batch")
     align_overlap = jax.lax.pmean(align_overlap, axis_name="batch")
     align_layer_index_metric = jax.lax.pmean(align_layer_index.astype(jnp.float32), axis_name="batch")
     align_lambda = jax.lax.pmean(align_lambda, axis_name="batch")
+    effective_lambda_private = jax.lax.pmean(effective_lambda_private, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
+    private_common_norm = jax.lax.pmean(private_metrics["norm_common"], axis_name="batch")
+    private_avg_norm = jax.lax.pmean(private_metrics["avg_private_norm"], axis_name="batch")
+    private_pairwise_cosine = jax.lax.pmean(private_metrics["avg_pairwise_private_cosine"], axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -956,11 +1122,17 @@ def eval_step(
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
         "val/loss_align": loss_align,
+        "val/loss_private": loss_private,
         "val/loss_align_spatial": align_spatial_loss,
         "val/loss_align_ortho": align_ortho_loss,
         "val/align_lambda": align_lambda,
         "val/align_overlap": align_overlap,
         "val/align_layer": align_layer_index_metric + 1.0,
+        "val/lambda_private_effective": effective_lambda_private,
+        "val/private_warmup_scale": private_warmup_scale,
+        "val/private_common_norm": private_common_norm,
+        "val/private_avg_norm": private_avg_norm,
+        "val/private_pairwise_cosine": private_pairwise_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1509,6 +1681,49 @@ def main():
         default=DEFAULT_TSVD_POWER_ITERS,
         help="Number of subspace-iteration steps used by TSVD iter/exact-st solvers. Ignored by exact solver.",
     )
+    parser.add_argument(
+        "--lambda-private",
+        type=float,
+        default=0.0,
+        help="Weight for the common/private activation private diversity loss. 0.0 disables it.",
+    )
+    parser.add_argument(
+        "--private-start-step",
+        type=int,
+        default=0,
+        help="Global step to start applying the private activation loss.",
+    )
+    parser.add_argument(
+        "--private-warmup-iters",
+        type=int,
+        default=0,
+        help="Number of iterations to linearly warm up --lambda-private after --private-start-step.",
+    )
+    parser.add_argument(
+        "--private-max-pairs",
+        type=int,
+        default=0,
+        help="If > 0, randomly sample at most this many layer pairs per step for the private loss.",
+    )
+    parser.add_argument(
+        "--common-agg",
+        type=str,
+        default="mean",
+        choices=["mean", "logit_normal"],
+        help="How to form A_common from per-layer activations for the private loss.",
+    )
+    parser.add_argument(
+        "--common-logit-normal-center-layer",
+        type=float,
+        default=0.0,
+        help="0-based layer index for logit-normal A_common weights. Used only when --common-agg=logit_normal.",
+    )
+    parser.add_argument(
+        "--common-logit-normal-sigma",
+        type=float,
+        default=1.0,
+        help="Std-dev on logit-depth scale for logit-normal A_common weights.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1665,6 +1880,16 @@ def main():
         raise ValueError("--align-tsvd-warmup-steps must be non-negative")
     if args.align_tsvd_power_iters <= 0:
         raise ValueError("--align-tsvd-power-iters must be greater than 0")
+    if args.lambda_private < 0.0:
+        raise ValueError("--lambda-private must be non-negative")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be >= 0")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be >= 0")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be >= 0")
+    if args.common_agg == "logit_normal" and args.common_logit_normal_sigma <= 0:
+        raise ValueError("--common-logit-normal-sigma must be > 0 when --common-agg=logit_normal")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1698,6 +1923,8 @@ def main():
     align_capture_layers = alignment_config["capture_layers"]
     align_rank = alignment_config["rank"]
     align_warmup_steps = int(args.align_tsvd_warmup_steps) if args.align_method == "tsvd" else 0
+    private_capture_layers = tuple(range(1, depth + 1))
+    private_loss_enabled = args.lambda_private > 0.0
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1726,6 +1953,17 @@ def main():
         log_stage(
             f"Alignment DISABLED: lambda=0.0 method={args.align_method} "
             f"layer={alignment_config['display']} rank={align_rank}"
+        )
+    if private_loss_enabled:
+        log_stage(
+            "Private activation loss ENABLED: "
+            f"lambda={args.lambda_private} start_step={args.private_start_step} "
+            f"warmup_iters={args.private_warmup_iters} max_pairs={args.private_max_pairs} "
+            f"common_agg={args.common_agg}"
+        )
+    else:
+        log_stage(
+            "Private activation loss DISABLED: lambda=0.0"
         )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -1776,6 +2014,11 @@ def main():
             f"Alignment warmup ({align_warmup_steps} steps) covers all configured training "
             f"steps ({total_steps}); alignment loss will not be applied in this run."
         )
+    if private_loss_enabled and args.private_start_step >= total_steps:
+        log_stage(
+            f"Private loss start_step ({args.private_start_step}) is after configured training "
+            f"steps ({total_steps}); private loss will not be applied in this run."
+        )
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1794,7 +2037,7 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    def make_pmapped_train_step(enable_alignment):
+    def make_pmapped_train_step(enable_alignment, enable_private):
         return jax.pmap(
             functools.partial(
                 train_step,
@@ -1807,11 +2050,20 @@ def main():
                 align_tsvd_dither_scale=args.align_tsvd_dither_scale,
                 align_tsvd_solver=args.align_tsvd_train_solver,
                 align_tsvd_power_iters=args.align_tsvd_power_iters,
+                private_enabled=enable_private,
+                private_capture_layers=private_capture_layers,
+                lambda_private=args.lambda_private,
+                private_max_pairs=args.private_max_pairs,
+                private_start_step=args.private_start_step,
+                private_warmup_iters=args.private_warmup_iters,
+                common_agg=args.common_agg,
+                common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+                common_logit_normal_sigma=args.common_logit_normal_sigma,
             ),
             axis_name="batch",
         )
 
-    def make_pmapped_eval_step(enable_alignment):
+    def make_pmapped_eval_step(enable_alignment, enable_private):
         return jax.pmap(
             functools.partial(
                 eval_step,
@@ -1824,24 +2076,76 @@ def main():
                 align_tsvd_dither_scale=args.align_tsvd_dither_scale,
                 align_tsvd_solver=args.align_tsvd_eval_solver,
                 align_tsvd_power_iters=args.align_tsvd_power_iters,
+                private_enabled=enable_private,
+                private_capture_layers=private_capture_layers,
+                lambda_private=args.lambda_private,
+                private_max_pairs=args.private_max_pairs,
+                private_start_step=args.private_start_step,
+                private_warmup_iters=args.private_warmup_iters,
+                common_agg=args.common_agg,
+                common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+                common_logit_normal_sigma=args.common_logit_normal_sigma,
             ),
             axis_name="batch",
         )
 
-    pmapped_train_step = make_pmapped_train_step(True)
-    pmapped_eval_step = make_pmapped_eval_step(True)
-    pmapped_train_step_no_align = make_pmapped_train_step(False)
-    pmapped_eval_step_no_align = make_pmapped_eval_step(False)
+    pmapped_train_step = make_pmapped_train_step(True, False)
+    pmapped_eval_step = make_pmapped_eval_step(True, False)
+    pmapped_train_step_no_align = make_pmapped_train_step(False, False)
+    pmapped_eval_step_no_align = make_pmapped_eval_step(False, False)
+    pmapped_train_step_private = make_pmapped_train_step(False, True)
+    pmapped_eval_step_private = make_pmapped_eval_step(False, True)
+    pmapped_train_step_align_private = make_pmapped_train_step(True, True)
+    pmapped_eval_step_align_private = make_pmapped_eval_step(True, True)
+
+    def private_active_at_step(step):
+        return bool(private_loss_enabled and step >= args.private_start_step)
 
     def train_step_call_for_step(step):
-        if alignment_active_at_step(step):
-            return pmapped_train_step, align_lambda_rep, next_align_layer_index_rep(), 1.0
-        return pmapped_train_step_no_align, zero_align_lambda_rep, inactive_align_layer_index_rep, 0.0
+        align_active = alignment_active_at_step(step)
+        private_active = private_active_at_step(step)
+        if align_active and private_active:
+            fn = pmapped_train_step_align_private
+        elif align_active:
+            fn = pmapped_train_step
+        elif private_active:
+            fn = pmapped_train_step_private
+        else:
+            fn = pmapped_train_step_no_align
+        align_lambda_for_step = align_lambda_rep if align_active else zero_align_lambda_rep
+        align_layer_index_for_step = next_align_layer_index_rep() if align_active else inactive_align_layer_index_rep
+        current_step_rep = jax_utils.replicate(jnp.int32(step))
+        return (
+            fn,
+            align_lambda_for_step,
+            align_layer_index_for_step,
+            current_step_rep,
+            float(align_active),
+            float(private_active),
+        )
 
     def eval_step_call_for_step(step):
-        if alignment_active_at_step(step):
-            return pmapped_eval_step, align_lambda_rep, next_align_layer_index_rep(), 1.0
-        return pmapped_eval_step_no_align, zero_align_lambda_rep, inactive_align_layer_index_rep, 0.0
+        align_active = alignment_active_at_step(step)
+        private_active = private_active_at_step(step)
+        if align_active and private_active:
+            fn = pmapped_eval_step_align_private
+        elif align_active:
+            fn = pmapped_eval_step
+        elif private_active:
+            fn = pmapped_eval_step_private
+        else:
+            fn = pmapped_eval_step_no_align
+        align_lambda_for_step = align_lambda_rep if align_active else zero_align_lambda_rep
+        align_layer_index_for_step = next_align_layer_index_rep() if align_active else inactive_align_layer_index_rep
+        current_step_rep = jax_utils.replicate(jnp.int32(step))
+        return (
+            fn,
+            align_lambda_for_step,
+            align_layer_index_for_step,
+            current_step_rep,
+            float(align_active),
+            float(private_active),
+        )
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -2112,9 +2416,17 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        probe_train_step, probe_align_lambda_rep, probe_align_layer_index_rep, _ = train_step_call_for_step(0)
+        (
+            probe_train_step,
+            probe_align_lambda_rep,
+            probe_align_layer_index_rep,
+            probe_current_step_rep,
+            _,
+            _,
+        ) = train_step_call_for_step(0)
         _, _, probe_metrics, _ = probe_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_align_lambda_rep, probe_align_layer_index_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
+            probe_align_lambda_rep, probe_align_layer_index_rep, probe_current_step_rep
         )
         block_pytree(probe_metrics)
 
@@ -2477,9 +2789,17 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            train_step_fn, train_align_lambda_rep, train_align_layer_index_rep, train_align_active = train_step_call_for_step(global_step)
+            (
+                train_step_fn,
+                train_align_lambda_rep,
+                train_align_layer_index_rep,
+                train_current_step_rep,
+                train_align_active,
+                train_private_active,
+            ) = train_step_call_for_step(global_step)
             state, ema_params, metrics, rng = train_step_fn(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, train_align_lambda_rep, train_align_layer_index_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep,
+                train_align_lambda_rep, train_align_layer_index_rep, train_current_step_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2494,6 +2814,7 @@ def main():
                 cpu_metrics["train/step"] = global_step
                 cpu_metrics["train/align_active"] = train_align_active
                 cpu_metrics["train/align_warmup_steps"] = align_warmup_steps
+                cpu_metrics["train/private_active"] = train_private_active
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -2507,9 +2828,17 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    eval_step_fn, eval_align_lambda_rep, eval_align_layer_index_rep, eval_align_active = eval_step_call_for_step(global_step)
+                    (
+                        eval_step_fn,
+                        eval_align_lambda_rep,
+                        eval_align_layer_index_rep,
+                        eval_current_step_rep,
+                        eval_align_active,
+                        eval_private_active,
+                    ) = eval_step_call_for_step(global_step)
                     val_metrics, rng = eval_step_fn(
-                        state, ema_params, (val_x, val_y), rng, eval_align_lambda_rep, eval_align_layer_index_rep
+                        state, ema_params, (val_x, val_y), rng,
+                        eval_align_lambda_rep, eval_align_layer_index_rep, eval_current_step_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
@@ -2519,6 +2848,7 @@ def main():
                 averaged_val_metrics["train/step"] = global_step
                 averaged_val_metrics["val/align_active"] = eval_align_active
                 averaged_val_metrics["val/align_warmup_steps"] = align_warmup_steps
+                averaged_val_metrics["val/private_active"] = eval_private_active
                 logger.log(averaged_val_metrics, step=global_step)
 
             # Synchronous FID (blocks training; see compute_fid docstring)
