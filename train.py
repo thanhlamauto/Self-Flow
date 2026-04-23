@@ -598,8 +598,11 @@ def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_i
 
 
 def _tsvd_basis_single(tokens, rank):
-    u, _, _ = jnp.linalg.svd(tokens, full_matrices=False)
-    return u[:, :rank]
+    # Exact left singular subspace via the Gram matrix XX^T = U Sigma^2 U^T.
+    gram = jnp.matmul(tokens, tokens.T)
+    gram = jnp.float32(0.5) * (gram + gram.T)
+    _, eigvecs = jnp.linalg.eigh(gram)
+    return jnp.flip(eigvecs[:, -rank:], axis=-1)
 
 
 def _tsvd_dithered_tokens_single(tokens, rng, dither_scale):

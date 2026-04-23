@@ -8,120 +8,135 @@
 \begin{document}
 \maketitle
 
-\paragraph{Setup.}
-Each image is first encoded by the VAE and patchified into a token matrix
+\paragraph{Base objective.}
+Training follows the standard SiT velocity objective. We sample
+\[
+\tau \sim \mathcal{U}(0,1), \qquad x_1 \sim \mathcal{N}(0,I),
+\]
+form
+\[
+x_\tau = (1-\tau)x_1 + \tau x_0,
+\qquad
+v^\star = x_0 - x_1,
+\]
+and optimize
+\[
+\mathcal{L}_{\mathrm{gen}} = \left\| v_\theta(x_\tau,\tau,y) - v^\star \right\|_2^2.
+\]
+
+\paragraph{Alignment target.}
+The input latent is first patchified,
 \[
 x_0 \in \mathbb{R}^{N \times d_{\mathrm{in}}},
 \]
-where $N$ is the number of patches and $d_{\mathrm{in}}$ is the raw latent patch dimension.
-The DiT backbone then maps tokens into hidden states of width $D$.
-In model B, for example, $D = 768$.
-
-\paragraph{Main training objective.}
-Training still follows the vanilla SiT velocity objective.
-We sample
-\[
-\tau \sim \mathcal{U}(0,1), \qquad x_1 \sim \mathcal{N}(0, I),
-\]
-build the interpolation
-\[
-x_{\tau} = (1-\tau)x_1 + \tau x_0,
-\]
-and predict the target velocity
-\[
-v^\star = x_0 - x_1.
-\]
-The generative loss is
-\[
-\mathcal{L}_{\mathrm{gen}} = \left\| v_\theta(x_\tau, \tau, y) - v^\star \right\|_2^2.
-\]
-
-\paragraph{What is ``layer 0''?}
-The alignment target is not the raw patchified latent $x_0$.
-Instead, it is the output of the patch embedding layer applied to $x_0$, before positional encoding is added:
+then projected by the model patch embedding layer, before positional encoding:
 \[
 T_0 = \mathrm{PatchEmbed}(x_0) \in \mathbb{R}^{N \times D}.
 \]
-This is the representation that already lives in the model hidden space, but still carries only local patch content, not absolute position bias.
+This is what we call \emph{layer 0}. It already lies in the hidden space of the model, but it has not yet absorbed absolute positional bias.
 
-\paragraph{Which layer is aligned?}
-At each iteration we choose a backbone layer $\ell$ and extract its hidden tokens
+\paragraph{Aligned source layer.}
+For a backbone layer $\ell$, let
 \[
-H_\ell \in \mathbb{R}^{N \times D}.
+H_\ell \in \mathbb{R}^{N \times D}
 \]
-If \texttt{align-layer=random} is used, then $\ell$ is sampled uniformly from the set of backbone layers each iteration.
-So the model is always aligned to the same target $T_0$, but the source layer can vary from step to step.
+denote its token matrix. If \texttt{align-layer=random} is enabled, then $\ell$ is resampled every iteration. The target remains $T_0$, but the aligned source layer changes from step to step.
 
 \paragraph{Centering.}
-Before computing any subspace loss, both token sets are centered across the patch axis:
+Before extracting any subspace, both representations are centered over the patch axis:
 \[
 \bar{H}_\ell = H_\ell - \frac{1}{N}\mathbf{1}\mathbf{1}^\top H_\ell,
 \qquad
 \bar{T}_0 = \mathrm{sg}\!\left(T_0 - \frac{1}{N}\mathbf{1}\mathbf{1}^\top T_0\right).
 \]
-This removes the global mean token and keeps the relative spatial variation across patches.
+This removes the global token bias and keeps only relative spatial variation across patches.
 
-\paragraph{TSVD alignment.}
-For TSVD, we compute
+\paragraph{TSVD by Gram eigendecomposition.}
+The TSVD branch extracts a $k$-dimensional subspace over patches. In principle one may compute
 \[
-\bar{H}_\ell = U_H \Sigma_H V_H^\top,
+\bar{H}_\ell = U_H \Sigma_H V_H^\top
+\]
+and keep the first $k$ columns of $U_H$. In implementation, we use the equivalent Gram formulation
+\[
+G_H = \bar{H}_\ell \bar{H}_\ell^\top = U_H \Sigma_H^2 U_H^\top,
+\]
+and similarly
+\[
+G_T = \bar{T}_0 \bar{T}_0^\top = U_T \Sigma_T^2 U_T^\top.
+\]
+Therefore, the top eigenvectors of $G_H$ and $G_T$ are exactly the left singular subspaces of $\bar{H}_\ell$ and $\bar{T}_0$. We set
+\[
+Q_H = \mathrm{TopEig}_k(G_H), \qquad Q_T = \mathrm{TopEig}_k(G_T),
+\]
+with $Q_H,Q_T \in \mathbb{R}^{N \times k}$ and orthonormal columns.
+
+To reduce the chance of spectral degeneracy during backpropagation through the train-side eigendecomposition, we add a very small Gaussian perturbation before forming $G_H$:
+\[
+\tilde{H}_\ell = \bar{H}_\ell + \alpha \,\mathrm{RMS}(\bar{H}_\ell)\,\varepsilon,
 \qquad
-\bar{T}_0 = U_T \Sigma_T V_T^\top,
+\varepsilon \sim \mathcal{N}(0,I).
 \]
-then keep the first $k$ left singular vectors:
-\[
-Q_H = U_H[:,1\!:\!k], \qquad Q_T = U_T[:,1\!:\!k].
-\]
-These span $k$-dimensional subspaces over the patch axis.
-We compare them through their projectors
-\[
-P_H = Q_H Q_H^\top, \qquad P_T = Q_T Q_T^\top,
-\]
-and define
-\[
-\mathcal{L}_{\mathrm{TSVD}} = \left\| P_H - \mathrm{sg}(P_T) \right\|_F^2.
-\]
-This encourages the chosen layer to match the spatial patch-patch geometry of layer 0, without forcing any one-to-one feature direction match.
+This perturbation is only used on the train side. The target branch stays clean and is stop-gradient.
 
-\paragraph{QBA alignment.}
-For QBA, we replace SVD by a learnable bottleneck
+\paragraph{Projector loss.}
+For either TSVD or QBA, the aligned object is the patch subspace, not the basis vectors themselves. The canonical object is the projector
 \[
-W \in \mathbb{R}^{D \times k}, \qquad Z_H = \bar{H}_\ell W.
+P = QQ^\top.
 \]
-On the target side, we use a fixed orthogonal basis $B \in \mathbb{R}^{D \times k}$ and form
+The raw spatial discrepancy is
+\[
+\mathcal{L}_{\mathrm{spatial}}
+=
+\left\| P_H - P_T \right\|_F^2.
+\]
+Because $Q_H$ and $Q_T$ are orthonormal, this can be evaluated more cheaply as
+\[
+\mathcal{L}_{\mathrm{spatial}}
+=
+2k - 2\,\mathrm{tr}(P_H P_T)
+=
+2k - 2\left\|Q_H^\top Q_T\right\|_F^2.
+\]
+This expression is mathematically identical to the projector Frobenius loss, but avoids explicitly materializing the full $N \times N$ projectors.
+
+\paragraph{QBA.}
+The QBA branch replaces SVD/eigendecomposition on the train side by a learnable bottleneck
+\[
+W \in \mathbb{R}^{D \times k},
+\qquad
+Z_H = \bar{H}_\ell W.
+\]
+On the target side we use a fixed orthogonal basis $B \in \mathbb{R}^{D \times k}$:
 \[
 Z_T = \bar{T}_0 B.
 \]
-Then we orthonormalize both using QR:
+Both are orthonormalized by QR,
 \[
-Z_H = Q_H R_H, \qquad Z_T = Q_T R_T,
+Z_H = Q_H R_H,
+\qquad
+Z_T = Q_T R_T,
 \]
-and again compare the resulting projectors
-\[
-P_H = Q_H Q_H^\top, \qquad P_T = Q_T Q_T^\top.
-\]
-The spatial part of the loss is
-\[
-\mathcal{L}_{\mathrm{spatial}} = \left\| P_H - \mathrm{sg}(P_T) \right\|_F^2.
-\]
-To keep the learned bottleneck well-conditioned, we also add
+and the same spatial loss above is applied to the resulting subspaces. We also regularize the bottleneck:
 \[
 \mathcal{L}_{\mathrm{ortho}} = \left\| W^\top W - I \right\|_F^2.
 \]
-Therefore
+Hence
 \[
-\mathcal{L}_{\mathrm{QBA}} = \mathcal{L}_{\mathrm{spatial}} + \lambda_{\mathrm{ortho}} \mathcal{L}_{\mathrm{ortho}}.
+\mathcal{L}_{\mathrm{QBA}} =
+\mathcal{L}_{\mathrm{spatial}}
++
+\lambda_{\mathrm{ortho}}\mathcal{L}_{\mathrm{ortho}}.
 \]
 
-\paragraph{Final loss.}
+\paragraph{Final objective.}
 The full training loss is
 \[
-\mathcal{L} =
+\mathcal{L}
+=
 \mathcal{L}_{\mathrm{gen}}
 +
-\lambda_{\mathrm{align}} \mathcal{L}_{\mathrm{align}},
+\lambda_{\mathrm{align}}\mathcal{L}_{\mathrm{align}},
 \]
-where $\mathcal{L}_{\mathrm{align}}$ is either $\mathcal{L}_{\mathrm{TSVD}}$ or $\mathcal{L}_{\mathrm{QBA}}$.
-In words, the model still learns to solve the diffusion task, but it is additionally encouraged to preserve the same coarse patch geometry as the patch-embedded input.
+where $\mathcal{L}_{\mathrm{align}}$ is either the TSVD projector loss or the QBA loss above. In words, the model is still trained to solve the diffusion task, but it is additionally encouraged to preserve the same coarse patch geometry as layer 0.
 
 \end{document}
