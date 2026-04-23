@@ -85,13 +85,32 @@ P = Q Q^\top,
 \]
 the optimization target is unchanged even if the basis vectors themselves rotate inside the same subspace.
 
-To reduce the chance of spectral degeneracy during backpropagation through the train-side eigendecomposition, we add a very small Gaussian perturbation before forming $G_H$:
+To reduce the chance of spectral degeneracy in the train-side TSVD, we add a very small Gaussian perturbation before forming $G_H$:
 \[
 \tilde{H}_\ell = \bar{H}_\ell + \alpha \,\mathrm{RMS}(\bar{H}_\ell)\,\varepsilon,
 \qquad
 \varepsilon \sim \mathcal{N}(0,I).
 \]
 This perturbation is only used on the train side. The target branch stays clean and is stop-gradient.
+
+For additional numerical stability, the implementation uses the exact Gram eigenspace in the forward pass, but sends the backward pass through a stabilized subspace-iteration surrogate. This keeps the TSVD projector target unchanged while avoiding undefined eigenvector gradients at repeated or nearly repeated eigenvalues.
+
+\paragraph{TSVD warmup.}
+When TSVD alignment is enabled, the first
+\[
+K_{\mathrm{warm}} = 25{,}000
+\]
+training steps are run with the base SiT objective only. During this warmup, the TSVD branch is skipped entirely:
+\[
+\lambda_{\mathrm{align}}^{\mathrm{eff}}(s) = 0,
+\qquad s < K_{\mathrm{warm}}.
+\]
+After warmup, the configured alignment weight is applied:
+\[
+\lambda_{\mathrm{align}}^{\mathrm{eff}}(s) = \lambda_{\mathrm{align}},
+\qquad s \ge K_{\mathrm{warm}}.
+\]
+This lets the backbone first move away from the highly symmetric initialization regime before TSVD eigenvectors are used in the auxiliary loss.
 
 \paragraph{Projector loss.}
 For either TSVD or QBA, the aligned object is the patch subspace, not the basis vectors themselves. The canonical object is the projector
@@ -115,25 +134,36 @@ Because $Q_H$ and $Q_T$ are orthonormal, this can be evaluated more cheaply as
 This expression is mathematically identical to the projector Frobenius loss, but avoids explicitly materializing the full $N \times N$ projectors.
 
 \paragraph{QBA.}
-The QBA branch replaces SVD/eigendecomposition on the train side by a learnable bottleneck
+The QBA branch replaces SVD/eigendecomposition on both sides by symmetric
+learnable bottlenecks:
 \[
-W \in \mathbb{R}^{D \times k},
+W_H,W_T \in \mathbb{R}^{D \times k},
 \qquad
-Z_H = \bar{H}_\ell W.
+Z_H = \bar{H}_\ell W_H,
+\qquad
+Z_T = \bar{T}_0 W_T.
 \]
-On the target side we use a fixed orthogonal basis $B \in \mathbb{R}^{D \times k}$:
-\[
-Z_T = \bar{T}_0 B.
-\]
-Both are orthonormalized by QR,
+The layer-0 tokens remain stop-gradient through $\bar{T}_0$, but the target
+branch has its own learned bottleneck $W_T$ rather than a fixed basis. Thus both
+branches use the same project-then-orthonormalize mechanism before projector
+matching.
+
+Both bottleneck representations are then orthonormalized by thin QR,
 \[
 Z_H = Q_H R_H,
 \qquad
 Z_T = Q_T R_T,
 \]
-and the same spatial loss above is applied to the resulting subspaces. We also regularize the bottleneck:
+and the same spatial loss above is applied to the resulting subspaces. The QR
+step is the bottleneck whitening/orthonormalization used by QBA: the $R$
+factors are discarded, while $Q_H$ and $Q_T$ provide scale- and
+correlation-normalized bases for projector matching. We regularize both learned
+bottlenecks:
 \[
-\mathcal{L}_{\mathrm{ortho}} = \left\| W^\top W - I \right\|_F^2.
+\mathcal{L}_{\mathrm{ortho}} =
+\left\| W_H^\top W_H - I \right\|_F^2
++
+\left\| W_T^\top W_T - I \right\|_F^2.
 \]
 Hence
 \[

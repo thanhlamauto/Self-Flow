@@ -107,7 +107,7 @@ def load_model(ckpt_path=None, model_size="XL"):
             elif isinstance(raw, collections.abc.Mapping):
                 raw = {
                     k: v for k, v in raw.items()
-                    if k not in {"feature_head", "align_qba_layer_proj"}
+                    if k not in {"feature_head", "align_qba_layer_proj", "align_qba_target_proj"}
                 }
             params = raw
     

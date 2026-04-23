@@ -371,6 +371,7 @@ DIT_VARIANTS = {
 DEFAULT_ALIGNMENT_METHOD = "qba"
 DEFAULT_ALIGNMENT_RANK = 16
 DEFAULT_TSVD_DITHER_SCALE = 1e-5
+DEFAULT_TSVD_ALIGN_WARMUP_STEPS = 25_000
 
 
 def build_model_config(model_size):
@@ -465,7 +466,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEF
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng, align_rng = jax.random.split(rng, 3)
+    rng, drop_rng, layer_align_rng, target_align_rng = jax.random.split(rng, 4)
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
@@ -478,7 +479,16 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEF
     proj_limit = math.sqrt(6.0 / float(config["hidden_size"] + align_rank))
     params["align_qba_layer_proj"] = {
         "kernel": jax.random.uniform(
-            align_rng,
+            layer_align_rng,
+            (config["hidden_size"], align_rank),
+            minval=-proj_limit,
+            maxval=proj_limit,
+            dtype=jnp.float32,
+        ),
+    }
+    params["align_qba_target_proj"] = {
+        "kernel": jax.random.uniform(
+            target_align_rng,
             (config["hidden_size"], align_rank),
             minval=-proj_limit,
             maxval=proj_limit,
@@ -597,12 +607,30 @@ def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_i
     raise ValueError(f"Unsupported align_layer_mode: {align_layer_mode}")
 
 
-def _tsvd_basis_single(tokens, rank):
-    # Exact left singular subspace via the Gram matrix XX^T = U Sigma^2 U^T.
+def _tsvd_exact_basis_single(tokens, rank):
     gram = jnp.matmul(tokens, tokens.T)
     gram = jnp.float32(0.5) * (gram + gram.T)
     _, eigvecs = jnp.linalg.eigh(gram)
     return jnp.flip(eigvecs[:, -rank:], axis=-1)
+
+
+def _tsvd_iter_basis_single(tokens, rank):
+    # Backpropagating through eigenvectors is undefined at repeated eigenvalues.
+    # Subspace iteration gives a stable surrogate gradient for the TSVD projector.
+    q = _dct_feature_basis(tokens.shape[0], rank, dtype=tokens.dtype)
+    gram = jnp.matmul(tokens, tokens.T)
+    gram = jnp.float32(0.5) * (gram + gram.T)
+    for _ in range(4):
+        z = jnp.matmul(gram, q)
+        q, _ = jnp.linalg.qr(_stabilize_tall_matrix(z), mode="reduced")
+        q = q[:, :rank]
+    return q
+
+
+def _tsvd_basis_single(tokens, rank):
+    q_iter = _tsvd_iter_basis_single(tokens, rank)
+    q_exact = _tsvd_exact_basis_single(tokens, rank)
+    return q_iter + jax.lax.stop_gradient(q_exact - q_iter)
 
 
 def _tsvd_dithered_tokens_single(tokens, rng, dither_scale):
@@ -639,7 +667,7 @@ def compute_alignment_loss(
                 tsvd_dither_scale,
             )
         q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
-        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_basis_single, in_axes=(0, None))(target_tokens, rank))
+        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_exact_basis_single, in_axes=(0, None))(target_tokens, rank))
         overlap_trace = _basis_overlap_trace(q_layer, q_target)
         spatial_loss = jnp.mean(jnp.float32(2.0 * rank) - jnp.float32(2.0) * overlap_trace)
         ortho_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -649,20 +677,23 @@ def compute_alignment_loss(
 
     if method == "qba":
         layer_kernel = params["align_qba_layer_proj"]["kernel"].astype(jnp.float32)
-        # Layer-0 tokens are the fixed target, so we use a deterministic
-        # orthogonal bottleneck on the patch feature basis instead of
-        # learning a second projector on the stop-gradient side.
-        target_kernel = jax.lax.stop_gradient(
-            _dct_feature_basis(target_tokens.shape[-1], rank, dtype=jnp.float32)
-        )
+        target_kernel = params["align_qba_target_proj"]["kernel"].astype(jnp.float32)
         z_layer = jnp.einsum("bnd,dk->bnk", layer_tokens, layer_kernel)
         z_target = jnp.einsum("bnd,dk->bnk", target_tokens, target_kernel)
         q_layer = jax.vmap(_qr_basis_single, in_axes=(0, None))(z_layer, rank)
-        q_target = jax.lax.stop_gradient(jax.vmap(_qr_basis_single, in_axes=(0, None))(z_target, rank))
+        # The layer-0 tokens are stop-gradient, but the target-side QBA
+        # projector is learned so both branches use the same bottleneck+QR
+        # mechanism before projector matching.
+        q_target = jax.vmap(_qr_basis_single, in_axes=(0, None))(z_target, rank)
         overlap_trace = _basis_overlap_trace(q_layer, q_target)
         spatial_loss = jnp.mean(jnp.float32(2.0 * rank) - jnp.float32(2.0) * overlap_trace)
-        gram = layer_kernel.T @ layer_kernel
-        ortho_loss = jnp.sum((gram - jnp.eye(rank, dtype=jnp.float32)) ** 2)
+        eye = jnp.eye(rank, dtype=jnp.float32)
+        layer_gram = layer_kernel.T @ layer_kernel
+        target_gram = target_kernel.T @ target_kernel
+        ortho_loss = (
+            jnp.sum((layer_gram - eye) ** 2)
+            + jnp.sum((target_gram - eye) ** 2)
+        )
         total_loss = spatial_loss + jnp.float32(ortho_lambda) * ortho_loss
         overlap = _projector_overlap_from_basis(q_layer, q_target, rank)
         return total_loss, spatial_loss, ortho_loss, overlap
@@ -1425,6 +1456,12 @@ def main():
         default=DEFAULT_TSVD_DITHER_SCALE,
         help="Relative RMS scale of micro-Gaussian dither added before exact TSVD on the train-side. Ignored when --align-method=qba.",
     )
+    parser.add_argument(
+        "--align-tsvd-warmup-steps",
+        type=int,
+        default=DEFAULT_TSVD_ALIGN_WARMUP_STEPS,
+        help="Initial training steps that skip TSVD alignment entirely before applying --align-lambda. Ignored when --align-method=qba.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1577,6 +1614,8 @@ def main():
         raise ValueError("--align-ortho-lambda must be non-negative")
     if args.align_tsvd_dither_scale < 0.0:
         raise ValueError("--align-tsvd-dither-scale must be non-negative")
+    if args.align_tsvd_warmup_steps < 0:
+        raise ValueError("--align-tsvd-warmup-steps must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1609,6 +1648,7 @@ def main():
     align_layer_mode = alignment_config["mode"]
     align_capture_layers = alignment_config["capture_layers"]
     align_rank = alignment_config["rank"]
+    align_warmup_steps = int(args.align_tsvd_warmup_steps) if args.align_method == "tsvd" else 0
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1621,6 +1661,7 @@ def main():
     if align_enabled:
         extra_align_note = (
             f" tsvd_dither_scale={args.align_tsvd_dither_scale}"
+            f" tsvd_warmup_steps={align_warmup_steps}"
             if args.align_method == "tsvd"
             else ""
         )
@@ -1656,6 +1697,8 @@ def main():
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
     align_lambda_rep = jax_utils.replicate(jnp.float32(args.align_lambda))
+    zero_align_lambda_rep = jax_utils.replicate(jnp.float32(0.0))
+    inactive_align_layer_index_rep = jax_utils.replicate(jnp.int32(-1))
     align_layer_rng = jax.random.PRNGKey(123)
     fixed_align_layer_index_rep = None
     if align_layer_mode == "fixed":
@@ -1672,7 +1715,15 @@ def main():
         draw = jax.random.randint(draw_rng, shape=(), minval=0, maxval=depth, dtype=jnp.int32)
         return jax_utils.replicate(draw)
 
+    def alignment_active_at_step(step):
+        return bool(align_enabled and step >= align_warmup_steps)
+
     total_steps = args.epochs * args.steps_per_epoch
+    if align_enabled and align_warmup_steps >= total_steps:
+        log_stage(
+            f"Alignment warmup ({align_warmup_steps} steps) covers all configured training "
+            f"steps ({total_steps}); alignment loss will not be applied in this run."
+        )
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1691,32 +1742,50 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            align_enabled=align_enabled,
-            align_layer_mode=align_layer_mode,
-            align_capture_layers=align_capture_layers,
-            align_method=args.align_method,
-            align_rank=align_rank,
-            align_ortho_lambda=args.align_ortho_lambda,
-            align_tsvd_dither_scale=args.align_tsvd_dither_scale,
-        ),
-        axis_name="batch",
-    )
-    pmapped_eval_step = jax.pmap(
-        functools.partial(
-            eval_step,
-            align_enabled=align_enabled,
-            align_layer_mode=align_layer_mode,
-            align_capture_layers=align_capture_layers,
-            align_method=args.align_method,
-            align_rank=align_rank,
-            align_ortho_lambda=args.align_ortho_lambda,
-            align_tsvd_dither_scale=args.align_tsvd_dither_scale,
-        ),
-        axis_name="batch",
-    )
+    def make_pmapped_train_step(enable_alignment):
+        return jax.pmap(
+            functools.partial(
+                train_step,
+                align_enabled=enable_alignment,
+                align_layer_mode=align_layer_mode,
+                align_capture_layers=align_capture_layers,
+                align_method=args.align_method,
+                align_rank=align_rank,
+                align_ortho_lambda=args.align_ortho_lambda,
+                align_tsvd_dither_scale=args.align_tsvd_dither_scale,
+            ),
+            axis_name="batch",
+        )
+
+    def make_pmapped_eval_step(enable_alignment):
+        return jax.pmap(
+            functools.partial(
+                eval_step,
+                align_enabled=enable_alignment,
+                align_layer_mode=align_layer_mode,
+                align_capture_layers=align_capture_layers,
+                align_method=args.align_method,
+                align_rank=align_rank,
+                align_ortho_lambda=args.align_ortho_lambda,
+                align_tsvd_dither_scale=args.align_tsvd_dither_scale,
+            ),
+            axis_name="batch",
+        )
+
+    pmapped_train_step = make_pmapped_train_step(True)
+    pmapped_eval_step = make_pmapped_eval_step(True)
+    pmapped_train_step_no_align = make_pmapped_train_step(False)
+    pmapped_eval_step_no_align = make_pmapped_eval_step(False)
+
+    def train_step_call_for_step(step):
+        if alignment_active_at_step(step):
+            return pmapped_train_step, align_lambda_rep, next_align_layer_index_rep(), 1.0
+        return pmapped_train_step_no_align, zero_align_lambda_rep, inactive_align_layer_index_rep, 0.0
+
+    def eval_step_call_for_step(step):
+        if alignment_active_at_step(step):
+            return pmapped_eval_step, align_lambda_rep, next_align_layer_index_rep(), 1.0
+        return pmapped_eval_step_no_align, zero_align_lambda_rep, inactive_align_layer_index_rep, 0.0
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1987,9 +2056,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        probe_align_layer_index_rep = next_align_layer_index_rep()
-        _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, align_lambda_rep, probe_align_layer_index_rep
+        probe_train_step, probe_align_lambda_rep, probe_align_layer_index_rep, _ = train_step_call_for_step(0)
+        _, _, probe_metrics, _ = probe_train_step(
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_align_lambda_rep, probe_align_layer_index_rep
         )
         block_pytree(probe_metrics)
 
@@ -2352,9 +2421,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            train_align_layer_index_rep = next_align_layer_index_rep()
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, align_lambda_rep, train_align_layer_index_rep
+            train_step_fn, train_align_lambda_rep, train_align_layer_index_rep, train_align_active = train_step_call_for_step(global_step)
+            state, ema_params, metrics, rng = train_step_fn(
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, train_align_lambda_rep, train_align_layer_index_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2367,6 +2436,8 @@ def main():
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
                 cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
+                cpu_metrics["train/align_active"] = train_align_active
+                cpu_metrics["train/align_warmup_steps"] = align_warmup_steps
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -2380,9 +2451,9 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    eval_align_layer_index_rep = next_align_layer_index_rep()
-                    val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, align_lambda_rep, eval_align_layer_index_rep
+                    eval_step_fn, eval_align_lambda_rep, eval_align_layer_index_rep, eval_align_active = eval_step_call_for_step(global_step)
+                    val_metrics, rng = eval_step_fn(
+                        state, ema_params, (val_x, val_y), rng, eval_align_lambda_rep, eval_align_layer_index_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
@@ -2390,6 +2461,8 @@ def main():
 
                 averaged_val_metrics = {k: v / args.eval_batches for k, v in metric_sums.items()}
                 averaged_val_metrics["train/step"] = global_step
+                averaged_val_metrics["val/align_active"] = eval_align_active
+                averaged_val_metrics["val/align_warmup_steps"] = align_warmup_steps
                 logger.log(averaged_val_metrics, step=global_step)
 
             # Synchronous FID (blocks training; see compute_fid docstring)
