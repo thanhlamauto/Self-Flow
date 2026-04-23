@@ -517,12 +517,13 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def resolve_alignment_config(args, depth, target_feature_dim):
+def resolve_alignment_config(args, depth, target_feature_dim, num_patches):
     align_rank = int(args.align_rank)
-    max_rank = int(target_feature_dim)
+    max_rank = int(min(target_feature_dim, num_patches))
     if not (1 <= align_rank <= max_rank):
         raise ValueError(
-            f"--align-rank must be in [1, {max_rank}] because the alignment target has feature dim {target_feature_dim}"
+            f"--align-rank must be in [1, {max_rank}] because the alignment subspace lives over "
+            f"{num_patches} patches with feature dim {target_feature_dim}"
         )
 
     align_layer_arg = depth if args.align_layer is None else args.align_layer
@@ -591,6 +592,18 @@ def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_i
 
 
 def _tsvd_basis_single(tokens, rank):
+    # Orthogonal iteration converges to the top-k left singular subspace
+    # without backpropagating through singular vectors directly.
+    q = _dct_feature_basis(tokens.shape[0], rank, dtype=tokens.dtype)
+    gram = jnp.matmul(tokens, tokens.T)
+    for _ in range(4):
+        z = jnp.matmul(gram, q)
+        q, _ = jnp.linalg.qr(_stabilize_tall_matrix(z), mode="reduced")
+        q = q[:, :rank]
+    return q
+
+
+def _tsvd_target_basis_single(tokens, rank):
     u, _, _ = jnp.linalg.svd(tokens, full_matrices=False)
     return u[:, :rank]
 
@@ -606,7 +619,7 @@ def compute_alignment_loss(method, layer_tokens, target_tokens, params, rank, or
 
     if method == "tsvd":
         q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
-        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_basis_single, in_axes=(0, None))(target_tokens, rank))
+        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_target_basis_single, in_axes=(0, None))(target_tokens, rank))
         p_layer = _projector_from_basis(q_layer)
         p_target = _projector_from_basis(q_target)
         spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
@@ -1370,7 +1383,7 @@ def main():
         "--align-rank",
         type=int,
         default=DEFAULT_ALIGNMENT_RANK,
-        help="Subspace rank k. Must be <= hidden_size because the target is PatchEmbed(x0) before positional encoding.",
+        help="Subspace rank k. Must be <= min(hidden_size, num_patches) because the alignment projector lives on the patch axis.",
     )
     parser.add_argument(
         "--align-ortho-lambda",
@@ -1554,8 +1567,9 @@ def main():
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
     target_feature_dim = int(config["hidden_size"])
+    num_patches = int((config["input_size"] // config["patch_size"]) ** 2)
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
-    alignment_config = resolve_alignment_config(args, depth, target_feature_dim)
+    alignment_config = resolve_alignment_config(args, depth, target_feature_dim, num_patches)
     align_layer_mode = alignment_config["mode"]
     align_capture_layers = alignment_config["capture_layers"]
     align_rank = alignment_config["rank"]
