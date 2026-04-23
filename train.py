@@ -370,6 +370,7 @@ DIT_VARIANTS = {
 
 DEFAULT_ALIGNMENT_METHOD = "qba"
 DEFAULT_ALIGNMENT_RANK = 16
+DEFAULT_TSVD_DITHER_SCALE = 1e-5
 
 
 def build_model_config(model_size):
@@ -592,20 +593,14 @@ def _select_alignment_layer_tokens(raw_features, align_layer_mode, align_layer_i
 
 
 def _tsvd_basis_single(tokens, rank):
-    # Orthogonal iteration converges to the top-k left singular subspace
-    # without backpropagating through singular vectors directly.
-    q = _dct_feature_basis(tokens.shape[0], rank, dtype=tokens.dtype)
-    gram = jnp.matmul(tokens, tokens.T)
-    for _ in range(4):
-        z = jnp.matmul(gram, q)
-        q, _ = jnp.linalg.qr(_stabilize_tall_matrix(z), mode="reduced")
-        q = q[:, :rank]
-    return q
-
-
-def _tsvd_target_basis_single(tokens, rank):
     u, _, _ = jnp.linalg.svd(tokens, full_matrices=False)
     return u[:, :rank]
+
+
+def _tsvd_dithered_tokens_single(tokens, rng, dither_scale):
+    token_rms = jnp.sqrt(jnp.mean(jnp.square(tokens)) + jnp.asarray(1e-12, dtype=tokens.dtype))
+    noise = jax.random.normal(rng, tokens.shape, dtype=tokens.dtype)
+    return tokens + jnp.asarray(dither_scale, dtype=tokens.dtype) * token_rms * noise
 
 
 def _qr_basis_single(tokens, rank):
@@ -613,13 +608,30 @@ def _qr_basis_single(tokens, rank):
     return q[:, :rank]
 
 
-def compute_alignment_loss(method, layer_tokens, target_tokens, params, rank, ortho_lambda):
+def compute_alignment_loss(
+    method,
+    layer_tokens,
+    target_tokens,
+    params,
+    rank,
+    ortho_lambda,
+    *,
+    tsvd_dither_rng=None,
+    tsvd_dither_scale=0.0,
+):
     layer_tokens = _center_patch_tokens(layer_tokens)
     target_tokens = jax.lax.stop_gradient(_center_patch_tokens(target_tokens))
 
     if method == "tsvd":
+        if tsvd_dither_rng is not None and tsvd_dither_scale > 0.0:
+            batch_keys = jax.random.split(tsvd_dither_rng, layer_tokens.shape[0])
+            layer_tokens = jax.vmap(_tsvd_dithered_tokens_single, in_axes=(0, 0, None))(
+                layer_tokens,
+                batch_keys,
+                tsvd_dither_scale,
+            )
         q_layer = jax.vmap(_tsvd_basis_single, in_axes=(0, None))(layer_tokens, rank)
-        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_target_basis_single, in_axes=(0, None))(target_tokens, rank))
+        q_target = jax.lax.stop_gradient(jax.vmap(_tsvd_basis_single, in_axes=(0, None))(target_tokens, rank))
         p_layer = _projector_from_basis(q_layer)
         p_target = _projector_from_basis(q_target)
         spatial_loss = jnp.mean(jnp.sum((p_layer - p_target) ** 2, axis=(-2, -1)))
@@ -680,6 +692,7 @@ def train_step(
     align_method,
     align_rank,
     align_ortho_lambda,
+    align_tsvd_dither_scale,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -691,7 +704,7 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, align_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -719,6 +732,8 @@ def train_step(
                 params=params,
                 rank=align_rank,
                 ortho_lambda=align_ortho_lambda,
+                tsvd_dither_rng=align_rng if align_method == "tsvd" else None,
+                tsvd_dither_scale=align_tsvd_dither_scale,
             )
         else:
             pred = state.apply_fn(
@@ -803,6 +818,7 @@ def eval_step(
     align_method,
     align_rank,
     align_ortho_lambda,
+    align_tsvd_dither_scale,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     del ema_params
@@ -835,6 +851,8 @@ def eval_step(
             params=state.params,
             rank=align_rank,
             ortho_lambda=align_ortho_lambda,
+            tsvd_dither_rng=None,
+            tsvd_dither_scale=align_tsvd_dither_scale,
         )
     else:
         pred = state.apply_fn(
@@ -1391,6 +1409,12 @@ def main():
         default=0.01,
         help="Orthogonality penalty weight for QBA. Ignored when --align-method=tsvd.",
     )
+    parser.add_argument(
+        "--align-tsvd-dither-scale",
+        type=float,
+        default=DEFAULT_TSVD_DITHER_SCALE,
+        help="Relative RMS scale of micro-Gaussian dither added before exact TSVD on the train-side. Ignored when --align-method=qba.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1541,6 +1565,8 @@ def main():
         raise ValueError("--align-lambda must be non-negative")
     if args.align_ortho_lambda < 0.0:
         raise ValueError("--align-ortho-lambda must be non-negative")
+    if args.align_tsvd_dither_scale < 0.0:
+        raise ValueError("--align-tsvd-dither-scale must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1583,9 +1609,15 @@ def main():
     )
     align_enabled = args.align_lambda > 0.0
     if align_enabled:
+        extra_align_note = (
+            f" tsvd_dither_scale={args.align_tsvd_dither_scale}"
+            if args.align_method == "tsvd"
+            else ""
+        )
         log_stage(
             f"Alignment ENABLED: lambda={args.align_lambda} method={args.align_method} "
             f"layer={alignment_config['display']} rank={align_rank} ortho_lambda={args.align_ortho_lambda}"
+            f"{extra_align_note}"
         )
     else:
         log_stage(
@@ -1658,6 +1690,7 @@ def main():
             align_method=args.align_method,
             align_rank=align_rank,
             align_ortho_lambda=args.align_ortho_lambda,
+            align_tsvd_dither_scale=args.align_tsvd_dither_scale,
         ),
         axis_name="batch",
     )
@@ -1670,6 +1703,7 @@ def main():
             align_method=args.align_method,
             align_rank=align_rank,
             align_ortho_lambda=args.align_ortho_lambda,
+            align_tsvd_dither_scale=args.align_tsvd_dither_scale,
         ),
         axis_name="batch",
     )
