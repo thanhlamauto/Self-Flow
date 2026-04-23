@@ -570,6 +570,24 @@ def _tree_all_finite(tree):
     return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
 
 
+def _tree_nan_to_num(tree):
+    return jax.tree_util.tree_map(
+        lambda x: jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0),
+        tree,
+    )
+
+
+def _safe_l2_norm(x, axis, eps=1e-8, keepdims=False):
+    sq_norm = jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims)
+    return jnp.sqrt(sq_norm + jnp.float32(eps))
+
+
+def _safe_std(x, axis, eps=1e-6, keepdims=False):
+    mean = jnp.mean(x, axis=axis, keepdims=True)
+    var = jnp.mean(jnp.square(x - mean), axis=axis, keepdims=keepdims)
+    return jnp.sqrt(var + jnp.float32(eps))
+
+
 def _pmap_metric_leaf_to_host_scalar(x):
     if isinstance(x, bool):
         return x
@@ -608,9 +626,8 @@ def compute_direction_loss(normalized_updates, pair_i, pair_j, eps=1e-8, axis_na
 
     numer = jnp.sum(delta_i * delta_j, axis=(-2, -1))
     denom = (
-        jnp.linalg.norm(delta_i, axis=(-2, -1))
-        * jnp.linalg.norm(delta_j, axis=(-2, -1))
-        + jnp.float32(eps)
+        _safe_l2_norm(delta_i, axis=(-2, -1), eps=eps, keepdims=False)
+        * _safe_l2_norm(delta_j, axis=(-2, -1), eps=eps, keepdims=False)
     )
     cosine = jnp.nan_to_num(numer / denom, nan=0.0, posinf=0.0, neginf=0.0)
     cosine_sq = jnp.square(cosine)
@@ -626,7 +643,7 @@ def compute_anti_collapse_loss(normalized_updates, gamma, axis_name=None):
             tiled=True,
         )
     sigma = jnp.nan_to_num(
-        jnp.std(normalized_updates, axis=(1, 2)),
+        _safe_std(normalized_updates, axis=(1, 2), eps=1e-6, keepdims=False),
         nan=0.0,
         posinf=jnp.float32(RESIDUAL_NORM_CLIP),
         neginf=0.0,
@@ -826,14 +843,15 @@ def train_step(
     dir_lambda = jax.lax.pmean(dir_lambda, axis_name="batch")
     ac_lambda = jax.lax.pmean(ac_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
-
-    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+    grads_sanitized = _tree_nan_to_num(grads)
+    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads_sanitized)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+    grad_is_finite = _tree_all_finite(grads)
     update_is_finite = (
         jnp.isfinite(loss)
         & jnp.isfinite(loss_gen)
         & jnp.isfinite(loss_reg)
-        & _tree_all_finite(grads)
+        & grad_is_finite
         & _tree_all_finite(state.params)
         & _tree_all_finite(ema_params)
     )
@@ -874,6 +892,7 @@ def train_step(
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
+        "train/grad_all_finite": grad_is_finite.astype(jnp.float32),
         "train/nonfinite_skip": 1.0 - update_is_finite.astype(jnp.float32),
     }
     return state, ema_params, metrics, rng
