@@ -367,6 +367,12 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
+DEFAULT_SELF_ATTN_INIT = "xavier"
+DEFAULT_MIMETIC_QK_ALPHA = 0.7
+DEFAULT_MIMETIC_QK_BETA = 0.7
+DEFAULT_MIMETIC_VO_ALPHA = 0.4
+DEFAULT_MIMETIC_VO_BETA = 0.4
+
 
 def build_model_config(
     model_size,
@@ -375,6 +381,11 @@ def build_model_config(
     common_spatial_projector_width=256,
     common_spatial_projector_depth=2,
     common_spatial_projector_kernel_size=3,
+    self_attn_init=DEFAULT_SELF_ATTN_INIT,
+    mimetic_qk_alpha=DEFAULT_MIMETIC_QK_ALPHA,
+    mimetic_qk_beta=DEFAULT_MIMETIC_QK_BETA,
+    mimetic_vo_alpha=DEFAULT_MIMETIC_VO_ALPHA,
+    mimetic_vo_beta=DEFAULT_MIMETIC_VO_BETA,
 ):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -399,6 +410,11 @@ def build_model_config(
         common_spatial_projector_width=common_spatial_projector_width,
         common_spatial_projector_depth=common_spatial_projector_depth,
         common_spatial_projector_kernel_size=common_spatial_projector_kernel_size,
+        self_attn_init=self_attn_init,
+        mimetic_qk_alpha=mimetic_qk_alpha,
+        mimetic_qk_beta=mimetic_qk_beta,
+        mimetic_vo_alpha=mimetic_vo_alpha,
+        mimetic_vo_beta=mimetic_vo_beta,
     )
 
 
@@ -418,6 +434,7 @@ import optax
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
+from flax.core import freeze, unfreeze
 import numpy as np
 try:
     import grain.python as grain
@@ -451,6 +468,115 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
+def _qkv_kernel_to_heads_first(kernel, num_heads):
+    if kernel.ndim != 3:
+        raise ValueError(f"Expected qkv kernel to have rank 3, got shape {kernel.shape}")
+    if kernel.shape[0] == num_heads:
+        return kernel, lambda x: x
+    if kernel.shape[1] == num_heads:
+        return jnp.transpose(kernel, (1, 0, 2)), lambda x: jnp.transpose(x, (1, 0, 2))
+    raise ValueError(f"Could not locate head axis in qkv kernel shape {kernel.shape} for {num_heads} heads")
+
+
+def _out_kernel_to_heads_first(kernel, num_heads):
+    if kernel.ndim != 3:
+        raise ValueError(f"Expected out kernel to have rank 3, got shape {kernel.shape}")
+    if kernel.shape[0] == num_heads:
+        return kernel, lambda x: x
+    if kernel.shape[1] == num_heads:
+        return jnp.transpose(kernel, (1, 0, 2)), lambda x: jnp.transpose(x, (1, 0, 2))
+    raise ValueError(f"Could not locate head axis in out kernel shape {kernel.shape} for {num_heads} heads")
+
+
+def _mimetic_low_rank_factors(target, rank):
+    u, s, vh = jnp.linalg.svd(target, full_matrices=False)
+    s = jnp.maximum(s[:rank], 0.0)
+    sqrt_s = jnp.sqrt(s)
+    left = u[:, :rank] * sqrt_s[None, :]
+    right = sqrt_s[:, None] * vh[:rank, :]
+    return left, right
+
+
+def _apply_mimetic_self_attention_init(
+    params,
+    rng,
+    *,
+    num_heads,
+    qk_alpha,
+    qk_beta,
+    vo_alpha,
+    vo_beta,
+):
+    params_dict = unfreeze(params)
+    qk_alpha = jnp.float32(qk_alpha)
+    qk_beta = jnp.float32(qk_beta)
+    vo_alpha = jnp.float32(vo_alpha)
+    vo_beta = jnp.float32(vo_beta)
+    module_count = 0
+
+    def init_attention_module(module_params, module_rng):
+        q_kernel = module_params["query"]["kernel"]
+        k_kernel = module_params["key"]["kernel"]
+        v_kernel = module_params["value"]["kernel"]
+        out_kernel = module_params["out"]["kernel"]
+
+        q_heads, q_restore = _qkv_kernel_to_heads_first(q_kernel, num_heads)
+        k_heads, k_restore = _qkv_kernel_to_heads_first(k_kernel, num_heads)
+        v_heads, v_restore = _qkv_kernel_to_heads_first(v_kernel, num_heads)
+        out_heads, out_restore = _out_kernel_to_heads_first(out_kernel, num_heads)
+
+        if q_heads.shape != k_heads.shape or q_heads.shape != v_heads.shape:
+            raise ValueError(
+                "Expected query/key/value kernels to share the same canonical shape, got "
+                f"{q_heads.shape}, {k_heads.shape}, {v_heads.shape}"
+            )
+        if out_heads.shape[0] != num_heads or out_heads.shape[1] != q_heads.shape[2] or out_heads.shape[2] != q_heads.shape[1]:
+            raise ValueError(
+                "Expected out kernel shape to match qkv canonical layout, got "
+                f"qkv={q_heads.shape}, out={out_heads.shape}"
+            )
+
+        model_dim = q_heads.shape[1]
+        head_dim = q_heads.shape[2]
+        eye = jnp.eye(model_dim, dtype=jnp.float32)
+        noise_scale = jnp.sqrt(jnp.float32(model_dim))
+        head_rngs = jax.random.split(module_rng, num_heads * 2).reshape(num_heads, 2, 2)
+
+        def init_head(head_rng_pair):
+            qk_rng, vo_rng = head_rng_pair
+            qk_noise = jax.random.normal(qk_rng, (model_dim, model_dim), dtype=jnp.float32) / noise_scale
+            vo_noise = jax.random.normal(vo_rng, (model_dim, model_dim), dtype=jnp.float32) / noise_scale
+
+            qk_target = qk_alpha * qk_noise + qk_beta * eye
+            vo_target = vo_alpha * vo_noise - vo_beta * eye
+
+            q_new, k_right = _mimetic_low_rank_factors(qk_target, head_dim)
+            v_new, out_new = _mimetic_low_rank_factors(vo_target, head_dim)
+            return q_new, k_right.T, v_new, out_new
+
+        q_new, k_new, v_new, out_new = jax.vmap(init_head)(head_rngs)
+        module_params["query"]["kernel"] = q_restore(q_new.astype(q_kernel.dtype))
+        module_params["key"]["kernel"] = k_restore(k_new.astype(k_kernel.dtype))
+        module_params["value"]["kernel"] = v_restore(v_new.astype(v_kernel.dtype))
+        module_params["out"]["kernel"] = out_restore(out_new.astype(out_kernel.dtype))
+
+    def recurse(node, tree_rng):
+        nonlocal module_count
+        if not isinstance(node, dict):
+            return tree_rng
+        if {"query", "key", "value", "out"}.issubset(node.keys()):
+            tree_rng, module_rng = jax.random.split(tree_rng)
+            init_attention_module(node, module_rng)
+            module_count += 1
+        for child in node.values():
+            if isinstance(child, dict):
+                tree_rng = recurse(child, tree_rng)
+        return tree_rng
+
+    recurse(params_dict, rng)
+    return freeze(params_dict), module_count
+
+
 def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -482,14 +608,33 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    params_rng, drop_rng, attn_init_rng = jax.random.split(rng, 3)
     variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+        {'params': params_rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
     )
+    params = variables['params']
+    if config.get("self_attn_init", DEFAULT_SELF_ATTN_INIT) == "mimetic":
+        params, num_mimetic_modules = _apply_mimetic_self_attention_init(
+            params,
+            attn_init_rng,
+            num_heads=config["num_heads"],
+            qk_alpha=config.get("mimetic_qk_alpha", DEFAULT_MIMETIC_QK_ALPHA),
+            qk_beta=config.get("mimetic_qk_beta", DEFAULT_MIMETIC_QK_BETA),
+            vo_alpha=config.get("mimetic_vo_alpha", DEFAULT_MIMETIC_VO_ALPHA),
+            vo_beta=config.get("mimetic_vo_beta", DEFAULT_MIMETIC_VO_BETA),
+        )
+        log_stage(
+            "Applied mimetic self-attention init "
+            f"to {num_mimetic_modules} attention modules "
+            f"(qk_alpha={config.get('mimetic_qk_alpha', DEFAULT_MIMETIC_QK_ALPHA)}, "
+            f"qk_beta={config.get('mimetic_qk_beta', DEFAULT_MIMETIC_QK_BETA)}, "
+            f"vo_alpha={config.get('mimetic_vo_alpha', DEFAULT_MIMETIC_VO_ALPHA)}, "
+            f"vo_beta={config.get('mimetic_vo_beta', DEFAULT_MIMETIC_VO_BETA)})"
+        )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -499,7 +644,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
         tx=tx,
     )
     # EMA params start as an exact copy of the initial online params
@@ -1471,6 +1616,41 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--self-attn-init",
+        type=str,
+        default=DEFAULT_SELF_ATTN_INIT,
+        choices=["xavier", "mimetic"],
+        help=(
+            "Initialization scheme for self-attention query/key/value/out weights. "
+            "'xavier' keeps the current default; 'mimetic' applies the "
+            "Mimetic Initialization of Self-Attention Layers recipe."
+        ),
+    )
+    parser.add_argument(
+        "--mimetic-qk-alpha",
+        type=float,
+        default=DEFAULT_MIMETIC_QK_ALPHA,
+        help="Noise coefficient alpha for the mimetic QK target: QK^T ~= alpha * Z + beta * I.",
+    )
+    parser.add_argument(
+        "--mimetic-qk-beta",
+        type=float,
+        default=DEFAULT_MIMETIC_QK_BETA,
+        help="Diagonal coefficient beta for the mimetic QK target: QK^T ~= alpha * Z + beta * I.",
+    )
+    parser.add_argument(
+        "--mimetic-vo-alpha",
+        type=float,
+        default=DEFAULT_MIMETIC_VO_ALPHA,
+        help="Noise coefficient alpha for the mimetic VO target: VO ~= alpha * Z - beta * I.",
+    )
+    parser.add_argument(
+        "--mimetic-vo-beta",
+        type=float,
+        default=DEFAULT_MIMETIC_VO_BETA,
+        help="Diagonal coefficient beta for the mimetic VO target: VO ~= alpha * Z - beta * I.",
+    )
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for sliding-window local Gram spatial loss.")
     parser.add_argument(
@@ -1803,6 +1983,15 @@ def main():
         raise ValueError("--spatial-blur-max-sigma must be >= 0")
     if args.spatial_blur_schedule != "linear" and args.spatial_blur_exp_rate <= 0:
         raise ValueError("--spatial-blur-exp-rate must be > 0 for exponential spatial blur schedules")
+    if args.self_attn_init == "mimetic":
+        for value, name in (
+            (args.mimetic_qk_alpha, "--mimetic-qk-alpha"),
+            (args.mimetic_qk_beta, "--mimetic-qk-beta"),
+            (args.mimetic_vo_alpha, "--mimetic-vo-alpha"),
+            (args.mimetic_vo_beta, "--mimetic-vo-beta"),
+        ):
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f"{name} must be in [0, 1] for mimetic self-attention init")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1832,6 +2021,11 @@ def main():
         common_spatial_projector_width=args.common_spatial_projector_width,
         common_spatial_projector_depth=args.common_spatial_projector_depth,
         common_spatial_projector_kernel_size=args.common_spatial_projector_kernel_size,
+        self_attn_init=args.self_attn_init,
+        mimetic_qk_alpha=args.mimetic_qk_alpha,
+        mimetic_qk_beta=args.mimetic_qk_beta,
+        mimetic_vo_alpha=args.mimetic_vo_alpha,
+        mimetic_vo_beta=args.mimetic_vo_beta,
     )
     depth = int(config["depth"])
 
@@ -1842,6 +2036,14 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.self_attn_init == "mimetic":
+        log_stage(
+            "Self-attention init: mimetic "
+            f"(qk_alpha={args.mimetic_qk_alpha} qk_beta={args.mimetic_qk_beta} "
+            f"vo_alpha={args.mimetic_vo_alpha} vo_beta={args.mimetic_vo_beta})"
+        )
+    else:
+        log_stage("Self-attention init: xavier")
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
