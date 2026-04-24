@@ -469,9 +469,10 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEF
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng, layer_align_rng, target_align_rng = jax.random.split(rng, 4)
+    init_rng = rng
+    params_rng, drop_rng = jax.random.split(init_rng)
     variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+        {'params': params_rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
@@ -480,6 +481,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEF
 
     params = unfreeze(variables["params"])
     proj_limit = math.sqrt(6.0 / float(config["hidden_size"] + align_rank))
+    # Keep the shared backbone initialization identical to branches that only
+    # split once for params/dropout, then derive QBA-only heads from separate
+    # fold-ins so auxiliary losses do not perturb common parameter init.
+    layer_align_rng = jax.random.fold_in(init_rng, 1)
+    target_align_rng = jax.random.fold_in(init_rng, 2)
     params["align_qba_layer_proj"] = {
         "kernel": jax.random.uniform(
             layer_align_rng,
