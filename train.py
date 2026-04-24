@@ -367,8 +367,10 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_SCAFFOLD_RANK = 6
+DEFAULT_SCAFFOLD_ETA = 0.1
+DEFAULT_SCAFFOLD_EPS0 = 1e-6
+DEFAULT_SCAFFOLD_LAYERS_B = (4, 6, 8, 10)
 
 
 def build_model_config(model_size):
@@ -502,55 +504,127 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
+def _dedupe_preserve_order(values):
+    out = []
+    seen = set()
+    for value in values:
+        value = int(value)
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return tuple(out)
+
+
+def default_scaffold_layers(depth):
+    return _dedupe_preserve_order(
+        max(2, min(depth, int(round(layer * depth / 12.0))))
+        for layer in DEFAULT_SCAFFOLD_LAYERS_B
     )
 
 
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
+def resolve_scaffold_regularizer_config(args, depth):
+    if args.scaffold_layers is None or str(args.scaffold_layers).strip() == "":
+        scaffold_layers = default_scaffold_layers(depth)
+    else:
+        scaffold_layers = _dedupe_preserve_order(
+            int(token.strip())
+            for token in str(args.scaffold_layers).split(",")
+            if token.strip()
+        )
 
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
+    if not scaffold_layers:
+        raise ValueError("--scaffold-layers must contain at least one layer index")
+    for layer in scaffold_layers:
+        if not (2 <= layer <= depth):
+            raise ValueError(
+                f"--scaffold-layers entries must be in [2, {depth}] so residual updates can use X_(l-1); got {layer}"
+            )
+
+    capture_layers = tuple(sorted(set(scaffold_layers + tuple(layer - 1 for layer in scaffold_layers))))
+    return scaffold_layers, capture_layers
+
+
+def _center_patchwise(tokens):
+    return tokens.astype(jnp.float32) - jnp.mean(tokens.astype(jnp.float32), axis=1, keepdims=True)
+
+
+def _symmetrize(matrix):
+    return jnp.float32(0.5) * (matrix + jnp.swapaxes(matrix, -1, -2))
+
+
+def compute_scaffold_basis(clean_latent, scaffold_rank, scaffold_eps0):
+    centered = _center_patchwise(clean_latent)
+    gram = jnp.einsum("bnd,bmd->bnm", centered, centered)
+    gram = gram / jnp.float32(centered.shape[-1])
+    eye = jnp.eye(centered.shape[1], dtype=gram.dtype)[None, ...]
+    gram = _symmetrize(gram) + jnp.float32(scaffold_eps0) * eye
+    _, eigvecs = jnp.linalg.eigh(gram)
+    basis = jnp.flip(eigvecs[..., -scaffold_rank:], axis=-1)
+    return jax.lax.stop_gradient(basis)
+
+
+def _low_rank_scaffold_score(scaffold_basis, delta, scaffold_eta):
+    proj = jnp.einsum("bnk,bnd->bkd", scaffold_basis, delta)
+    gram_small = jnp.einsum("bkd,bld->bkl", proj, proj) / jnp.float32(delta.shape[-1])
+    gram_small = _symmetrize(gram_small)
+    eigvals = jnp.linalg.eigvalsh(gram_small)
+    eigvals = jnp.maximum(eigvals, jnp.array(0.0, dtype=eigvals.dtype))
+    score = jnp.mean(eigvals / (eigvals + jnp.float32(scaffold_eta)), axis=-1)
+    return jnp.clip(score, 0.0, 1.0)
+
+
+def _full_scaffold_score(scaffold_basis, delta, scaffold_eta):
+    gram = jnp.einsum("bnd,bmd->bnm", delta, delta) / jnp.float32(delta.shape[-1])
+    gram = _symmetrize(gram)
+    eye = jnp.eye(gram.shape[-1], dtype=gram.dtype)[None, ...]
+    y = jnp.linalg.solve(gram + jnp.float32(scaffold_eta) * eye, scaffold_basis)
+    trace_term = jnp.sum(scaffold_basis * y, axis=(-2, -1))
+    score = 1.0 - (jnp.float32(scaffold_eta) / jnp.float32(scaffold_basis.shape[-1])) * trace_term
+    return jnp.clip(score, 0.0, 1.0)
+
+
+def compute_scaffold_regularizer_loss(
+    clean_latent,
+    raw_features,
+    *,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_eta,
+    scaffold_eps0,
+    scaffold_version,
+):
+    scaffold_basis = compute_scaffold_basis(clean_latent, scaffold_rank, scaffold_eps0)
+
+    if not isinstance(raw_features, tuple):
+        raw_features = (raw_features,)
+    feature_map = {
+        int(layer): feature.astype(jnp.float32)
+        for layer, feature in zip(scaffold_capture_layers, raw_features)
+    }
+
+    scores = []
+    update_rms = []
+    for layer in scaffold_target_layers:
+        delta = _center_patchwise(feature_map[int(layer)] - feature_map[int(layer) - 1])
+        if scaffold_version == "low-rank":
+            score = _low_rank_scaffold_score(scaffold_basis, delta, scaffold_eta)
+        elif scaffold_version == "full":
+            score = _full_scaffold_score(scaffold_basis, delta, scaffold_eta)
+        else:
+            raise ValueError(f"Unsupported scaffold version: {scaffold_version}")
+        scores.append(score)
+        update_rms.append(jnp.sqrt(jnp.mean(jnp.square(delta), axis=(-2, -1))))
+
+    scores = jnp.stack(scores, axis=0)
+    update_rms = jnp.stack(update_rms, axis=0)
+    loss_scaffold = jnp.mean(1.0 - scores)
+    return (
+        loss_scaffold,
+        jnp.mean(scores),
+        jnp.min(scores),
+        jnp.mean(update_rms),
     )
-    if uses_default_pair and strong_layer > depth:
-        raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
-        )
-
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
-        )
-
-    return weak_layer, strong_layer
-
-
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
-
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
-
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -561,10 +635,15 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
+    scaffold_lambda,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    scaffold_enabled,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_eta,
+    scaffold_eps0,
+    scaffold_version,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -585,7 +664,7 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
+        if scaffold_enabled:
             pred, raw_features = state.apply_fn(
                 {"params": params},
                 x_tau,
@@ -593,9 +672,23 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_raw_features=scaffold_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            (
+                loss_scaffold,
+                scaffold_score_mean,
+                scaffold_score_min,
+                scaffold_update_rms,
+            ) = compute_scaffold_regularizer_loss(
+                x0,
+                raw_features,
+                scaffold_target_layers=scaffold_target_layers,
+                scaffold_capture_layers=scaffold_capture_layers,
+                scaffold_rank=scaffold_rank,
+                scaffold_eta=scaffold_eta,
+                scaffold_eps0=scaffold_eps0,
+                scaffold_version=scaffold_version,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,25 +698,48 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            loss_scaffold = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_score_mean = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_score_min = jnp.array(0.0, dtype=jnp.float32)
+            scaffold_update_rms = jnp.array(0.0, dtype=jnp.float32)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss = loss_gen + scaffold_lambda * loss_scaffold
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_scaffold,
+            scaffold_score_mean,
+            scaffold_score_min,
+            scaffold_update_rms,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_scaffold,
+            scaffold_score_mean,
+            scaffold_score_min,
+            scaffold_update_rms,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_scaffold = jax.lax.pmean(loss_scaffold, axis_name="batch")
+    scaffold_score_mean = jax.lax.pmean(scaffold_score_mean, axis_name="batch")
+    scaffold_score_min = jax.lax.pmean(scaffold_score_min, axis_name="batch")
+    scaffold_update_rms = jax.lax.pmean(scaffold_update_rms, axis_name="batch")
+    scaffold_lambda = jax.lax.pmean(scaffold_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +752,11 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/loss_scaffold": loss_scaffold,
+        "train/scaffold_lambda": scaffold_lambda,
+        "train/scaffold_score_mean": scaffold_score_mean,
+        "train/scaffold_score_min": scaffold_score_min,
+        "train/scaffold_update_rms": scaffold_update_rms,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -653,10 +771,15 @@ def eval_step(
     ema_params,
     batch,
     rng,
-    layersync_lambda,
+    scaffold_lambda,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    scaffold_enabled,
+    scaffold_target_layers,
+    scaffold_capture_layers,
+    scaffold_rank,
+    scaffold_eta,
+    scaffold_eps0,
+    scaffold_version,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -670,16 +793,30 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
+    if scaffold_enabled:
         pred, raw_features = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_raw_features=scaffold_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        (
+            loss_scaffold,
+            scaffold_score_mean,
+            scaffold_score_min,
+            scaffold_update_rms,
+        ) = compute_scaffold_regularizer_loss(
+            x0,
+            raw_features,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=scaffold_rank,
+            scaffold_eta=scaffold_eta,
+            scaffold_eps0=scaffold_eps0,
+            scaffold_version=scaffold_version,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,19 +825,23 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        loss_scaffold = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_score_mean = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_score_min = jnp.array(0.0, dtype=jnp.float32)
+        scaffold_update_rms = jnp.array(0.0, dtype=jnp.float32)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss = loss_gen + scaffold_lambda * loss_scaffold
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_scaffold = jax.lax.pmean(loss_scaffold, axis_name="batch")
+    scaffold_score_mean = jax.lax.pmean(scaffold_score_mean, axis_name="batch")
+    scaffold_score_min = jax.lax.pmean(scaffold_score_min, axis_name="batch")
+    scaffold_update_rms = jax.lax.pmean(scaffold_update_rms, axis_name="batch")
+    scaffold_lambda = jax.lax.pmean(scaffold_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +849,11 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/loss_scaffold": loss_scaffold,
+        "val/scaffold_lambda": scaffold_lambda,
+        "val/scaffold_score_mean": scaffold_score_mean,
+        "val/scaffold_score_min": scaffold_score_min,
+        "val/scaffold_update_rms": scaffold_update_rms,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1197,22 +1340,41 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
-        "--layersync-lambda",
+        "--scaffold-lambda",
         type=float,
         default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
+        help="Weight for the scaffold regularizer. 0.0 disables the scaffold loss.",
     )
     parser.add_argument(
-        "--layersync-weak-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
+        "--scaffold-version",
+        type=str,
+        default="low-rank",
+        choices=["low-rank", "full"],
+        help="Scaffold score implementation. 'low-rank' is the default cheap 6x6 variant; 'full' solves the N x N patch Gram.",
     )
     parser.add_argument(
-        "--layersync-strong-layer",
+        "--scaffold-layers",
+        type=str,
+        default=None,
+        help="Comma-separated 1-based layers whose residual updates are regularized. Default scales DiT-B's 4,6,8,10 pattern to the chosen depth.",
+    )
+    parser.add_argument(
+        "--scaffold-rank",
         type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
+        default=DEFAULT_SCAFFOLD_RANK,
+        help="Top-k scaffold rank extracted from the clean-latent patch Gram.",
+    )
+    parser.add_argument(
+        "--scaffold-eta",
+        type=float,
+        default=DEFAULT_SCAFFOLD_ETA,
+        help="Soft-projector shrinkage eta used in the scaffold score.",
+    )
+    parser.add_argument(
+        "--scaffold-eps0",
+        type=float,
+        default=DEFAULT_SCAFFOLD_EPS0,
+        help="Small numerical jitter used when extracting the clean-latent scaffold basis.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1360,8 +1522,14 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
+    if args.scaffold_lambda < 0.0:
+        raise ValueError("--scaffold-lambda must be non-negative")
+    if args.scaffold_rank <= 0:
+        raise ValueError("--scaffold-rank must be greater than 0")
+    if args.scaffold_eta <= 0.0:
+        raise ValueError("--scaffold-eta must be greater than 0")
+    if args.scaffold_eps0 < 0.0:
+        raise ValueError("--scaffold-eps0 must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1387,6 +1555,7 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
     depth = int(config["depth"])
+    n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1395,17 +1564,27 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+    if args.scaffold_rank > n_patches:
+        raise ValueError(
+            f"--scaffold-rank must be <= number of patches ({n_patches}), got {args.scaffold_rank}"
+        )
+
+    scaffold_enabled = args.scaffold_lambda > 0.0
+    scaffold_target_layers = ()
+    scaffold_capture_layers = ()
+    if scaffold_enabled:
+        scaffold_target_layers, scaffold_capture_layers = resolve_scaffold_regularizer_config(
+            args,
+            depth,
+        )
         log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"Scaffold ENABLED: lambda={args.scaffold_lambda} "
+            f"version={args.scaffold_version} "
+            f"layers={','.join(str(layer) for layer in scaffold_target_layers)} "
+            f"rank={args.scaffold_rank} eta={args.scaffold_eta} eps0={args.scaffold_eps0}"
         )
     else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
+        log_stage("Scaffold DISABLED: lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1421,10 +1600,9 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
+    scaffold_lambda_rep = jax_utils.replicate(jnp.float32(args.scaffold_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
-    n_patches = (config["input_size"] // config["patch_size"]) ** 2
 
     total_steps = args.epochs * args.steps_per_epoch
 
@@ -1448,16 +1626,26 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            scaffold_enabled=scaffold_enabled,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=args.scaffold_rank,
+            scaffold_eta=args.scaffold_eta,
+            scaffold_eps0=args.scaffold_eps0,
+            scaffold_version=args.scaffold_version,
         ),
         axis_name="batch",
     )
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            scaffold_enabled=scaffold_enabled,
+            scaffold_target_layers=scaffold_target_layers,
+            scaffold_capture_layers=scaffold_capture_layers,
+            scaffold_rank=args.scaffold_rank,
+            scaffold_eta=args.scaffold_eta,
+            scaffold_eps0=args.scaffold_eps0,
+            scaffold_version=args.scaffold_version,
         ),
         axis_name="batch",
     )
@@ -1732,7 +1920,7 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, scaffold_lambda_rep
         )
         block_pytree(probe_metrics)
 
@@ -2096,7 +2284,7 @@ def main():
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, scaffold_lambda_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2123,7 +2311,7 @@ def main():
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state, ema_params, (val_x, val_y), rng, scaffold_lambda_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
