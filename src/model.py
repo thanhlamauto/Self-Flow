@@ -13,6 +13,10 @@ import jax.numpy as jnp
 import flax.linen as nn
 from einops import rearrange
 
+XAVIER_UNIFORM = nn.initializers.xavier_uniform()
+ZERO_INIT = nn.initializers.zeros
+NORMAL_002 = nn.initializers.normal(stddev=0.02)
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
@@ -55,7 +59,13 @@ class PatchedPatchEmbed(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.Dense(self.embed_dim, use_bias=self.bias, name="proj")(x)
+        return nn.Dense(
+            self.embed_dim,
+            use_bias=self.bias,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="proj",
+        )(x)
 
 
 def modulate(x, shift, scale):
@@ -86,9 +96,17 @@ class TimestepEmbedder(nn.Module):
     @nn.compact
     def __call__(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        x = nn.Dense(self.hidden_size)(t_freq)
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=NORMAL_002,
+            bias_init=ZERO_INIT,
+        )(t_freq)
         x = nn.swish(x)
-        x = nn.Dense(self.hidden_size)(x)
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=NORMAL_002,
+            bias_init=ZERO_INIT,
+        )(x)
         return x
 
 
@@ -102,8 +120,9 @@ class LabelEmbedder(nn.Module):
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
         use_cfg_embedding = self.dropout_prob > 0
         embedding_table = nn.Embed(
-            num_embeddings=self.num_classes + use_cfg_embedding, 
-            features=self.hidden_size
+            num_embeddings=self.num_classes + use_cfg_embedding,
+            features=self.hidden_size,
+            embedding_init=NORMAL_002,
         )
 
         use_dropout = self.dropout_prob > 0
@@ -136,7 +155,11 @@ class DiTBlock(nn.Module):
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=ZERO_INIT,
+                    bias_init=ZERO_INIT,
+                ),
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
@@ -144,35 +167,67 @@ class DiTBlock(nn.Module):
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
             # Self Attention
             attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
+                num_heads=self.num_heads,
+                qkv_features=self.hidden_size,
+                out_features=self.hidden_size,
+                kernel_init=XAVIER_UNIFORM,
+                out_kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                out_bias_init=ZERO_INIT,
             )(x_norm, x_norm)
             x = x + gate_msa * attn
             
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
+                nn.Dense(
+                    mlp_hidden_dim,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                ),
                 lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
+                nn.Dense(
+                    self.hidden_size,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                ),
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(6 * self.hidden_size)
+                nn.Dense(
+                    6 * self.hidden_size,
+                    kernel_init=ZERO_INIT,
+                    bias_init=ZERO_INIT,
+                ),
             ])(c)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
+                num_heads=self.num_heads,
+                qkv_features=self.hidden_size,
+                out_features=self.hidden_size,
+                kernel_init=XAVIER_UNIFORM,
+                out_kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                out_bias_init=ZERO_INIT,
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
             
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
+                nn.Dense(
+                    mlp_hidden_dim,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                ),
                 lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
+                nn.Dense(
+                    self.hidden_size,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                ),
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
             
@@ -189,14 +244,22 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
+        linear = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+        )
         
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
             modulation_flat = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=ZERO_INIT,
+                    bias_init=ZERO_INIT,
+                ),
             ])(c_flat)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
@@ -206,7 +269,11 @@ class FinalLayer(nn.Module):
         else:
             modulation = nn.Sequential([
                 nn.swish,
-                nn.Dense(2 * self.hidden_size)
+                nn.Dense(
+                    2 * self.hidden_size,
+                    kernel_init=ZERO_INIT,
+                    bias_init=ZERO_INIT,
+                ),
             ])(c)
             shift, scale = jnp.split(modulation, 2, axis=1)
             
@@ -223,9 +290,17 @@ class SimpleHead(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.in_dim + self.out_dim)(x)
+        x = nn.Dense(
+            self.in_dim + self.out_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+        )(x)
         x = nn.swish(x)
-        x = nn.Dense(self.out_dim)(x)
+        x = nn.Dense(
+            self.out_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+        )(x)
         return x
 
 
@@ -261,6 +336,8 @@ class CommonSpatialCNNProjector(nn.Module):
             features=self.width,
             kernel_size=(1, 1),
             padding="SAME",
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
             name="input_proj",
         )(x)
         x = nn.silu(x)
@@ -271,6 +348,8 @@ class CommonSpatialCNNProjector(nn.Module):
                 features=self.width,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding="SAME",
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
                 name=f"block_{block_idx}_conv1",
             )(x)
             h = nn.silu(h)
@@ -278,6 +357,8 @@ class CommonSpatialCNNProjector(nn.Module):
                 features=self.width,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding="SAME",
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
                 name=f"block_{block_idx}_conv2",
             )(h)
             x = nn.silu(h + residual)
