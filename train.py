@@ -369,6 +369,18 @@ DIT_VARIANTS = {
 
 DEFAULT_LAYERSYNC_WEAK_LAYER = 8
 DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_LAYERSYNC_MODE = 3
+DEFAULT_LAYERSYNC_RANK = 6
+DEFAULT_LAYERSYNC_RESIDUAL_LAMBDA = 1.0
+DEFAULT_LAYERSYNC_NEIGHBOR_WINDOW = 1
+
+LAYERSYNC_MODE_NAMES = {
+    1: "random-clean",
+    2: "fixed-clean",
+    3: "fixed-internal",
+    4: "random-clean-residual",
+    5: "fixed-clean-residual",
+}
 
 
 def build_model_config(model_size):
@@ -410,6 +422,7 @@ import optax
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
+from flax.core import freeze, unfreeze
 import numpy as np
 try:
     import grain.python as grain
@@ -462,7 +475,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, drop_rng, proj_rng = jax.random.split(rng, 3)
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
         x=dummy_x,
@@ -470,6 +483,19 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         vector=dummy_vec,
         deterministic=False,
     )
+    params = unfreeze(variables['params'])
+    proj_limit = jnp.sqrt(jnp.float32(6.0 / float(config["hidden_size"] + patch_dim)))
+    params["layersync_projectors"] = {
+        "kernel": jax.random.uniform(
+            proj_rng,
+            (config["depth"], config["hidden_size"], patch_dim),
+            minval=-proj_limit,
+            maxval=proj_limit,
+            dtype=jnp.float32,
+        ),
+        "bias": jnp.zeros((config["depth"], patch_dim), dtype=jnp.float32),
+    }
+    params = freeze(params)
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -479,7 +505,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        params=params,
         tx=tx,
     )
     # EMA params start as an exact copy of the initial online params
@@ -510,13 +536,24 @@ def _cli_flag_was_set(flag_name):
 
 
 def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
+    mode = int(args.layersync_mode)
+    if mode not in LAYERSYNC_MODE_NAMES:
+        raise ValueError(
+            f"--layersync-mode must be one of {sorted(LAYERSYNC_MODE_NAMES)}, got {mode}"
+        )
+
+    ell0 = int(args.layersync_weak_layer)
+    if _cli_flag_was_set("--layersync-delta"):
+        delta = int(args.layersync_delta)
+    else:
+        delta = int(args.layersync_strong_layer) - ell0
+    strong_layer = ell0 + delta
 
     uses_default_pair = (
         not _cli_flag_was_set("--layersync-weak-layer")
         and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
+        and not _cli_flag_was_set("--layersync-delta")
+        and ell0 == DEFAULT_LAYERSYNC_WEAK_LAYER
         and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
     )
     if uses_default_pair and strong_layer > depth:
@@ -527,30 +564,254 @@ def resolve_layersync_config(args, depth):
             "on smaller backbones."
         )
 
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
+    if not (1 <= ell0 <= depth):
+        raise ValueError(f"--layersync-weak-layer/ell_0 must be in [1, {depth}], got {ell0}")
+    if delta <= 0:
+        raise ValueError(f"--layersync-delta must be positive, got {delta}")
+    if strong_layer > depth:
         raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
+            f"--layersync-weak-layer + --layersync-delta must be <= {depth}, "
+            f"got {ell0} + {delta} = {strong_layer}"
         )
+    if ell0 >= strong_layer:
+        raise ValueError(
+            "--layersync-weak-layer/ell_0 must be strictly less than ell_0 + delta "
+            f"(got {ell0} and {strong_layer})"
+        )
+    if int(args.layersync_rank) <= 0:
+        raise ValueError("--layersync-rank must be positive")
+    max_rank = 16 if mode in (1, 2, 4, 5) else 256
+    if int(args.layersync_rank) > max_rank:
+        raise ValueError(
+            f"--layersync-rank must be <= {max_rank} for mode {mode}:{LAYERSYNC_MODE_NAMES[mode]}, "
+            f"got {args.layersync_rank}"
+        )
+    if int(args.layersync_neighbor_window) <= 0:
+        raise ValueError("--layersync-neighbor-window must be positive")
+    if float(args.layersync_residual_lambda) < 0.0:
+        raise ValueError("--layersync-residual-lambda must be non-negative")
 
-    return weak_layer, strong_layer
+    capture_layers = tuple(range(1, depth + 1)) if mode in (1, 4) else (ell0, strong_layer)
+    return {
+        "mode": mode,
+        "mode_name": LAYERSYNC_MODE_NAMES[mode],
+        "ell0": ell0,
+        "delta": delta,
+        "strong_layer": strong_layer,
+        "capture_layers": capture_layers,
+        "rank": int(args.layersync_rank),
+        "residual_lambda": float(args.layersync_residual_lambda),
+        "neighbor_window": int(args.layersync_neighbor_window),
+    }
 
 
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
+def spatial_norm_tokens(x, eps=1e-6):
+    x = x.astype(jnp.float32)
+    mean = jnp.mean(x, axis=1, keepdims=True)
+    variance = jnp.mean(jnp.square(x - mean), axis=1, keepdims=True)
+    return (x - mean) * jax.lax.rsqrt(variance + jnp.asarray(eps, dtype=jnp.float32))
 
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
 
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+def tsvd_components(z, rank=DEFAULT_LAYERSYNC_RANK):
+    z = z.astype(jnp.float32)
+    _, _, vh = jnp.linalg.svd(jax.lax.stop_gradient(z), full_matrices=False)
+    v = jnp.swapaxes(vh[:, :rank, :], -2, -1)
+    v = jax.lax.stop_gradient(v)
+    z_low = jnp.matmul(z, v)
+    z_recon = jnp.matmul(z_low, jnp.swapaxes(v, 1, 2))
+    z_res = z - z_recon
+    return z_low, v, z_res
+
+
+def directed_local_distance_loss(
+    pred_low,
+    target_low,
+    *,
+    H,
+    W,
+    neighbor_window=DEFAULT_LAYERSYNC_NEIGHBOR_WINDOW,
+    eps=1e-6,
+):
+    pred_grid = pred_low.reshape(pred_low.shape[0], H, W, pred_low.shape[-1])
+    target_grid = target_low.reshape(target_low.shape[0], H, W, target_low.shape[-1])
+    losses = []
+    for dy in range(-neighbor_window, neighbor_window + 1):
+        for dx in range(-neighbor_window, neighbor_window + 1):
+            if dy == 0 and dx == 0:
+                continue
+            y0 = max(0, -dy)
+            y1 = min(H, H - dy)
+            x0 = max(0, -dx)
+            x1 = min(W, W - dx)
+            pred_a = pred_grid[:, y0:y1, x0:x1, :]
+            pred_b = pred_grid[:, y0 + dy:y1 + dy, x0 + dx:x1 + dx, :]
+            target_a = target_grid[:, y0:y1, x0:x1, :]
+            target_b = target_grid[:, y0 + dy:y1 + dy, x0 + dx:x1 + dx, :]
+            pred_dist = jnp.sqrt(jnp.sum(jnp.square(pred_a - pred_b), axis=-1) + eps)
+            target_dist = jnp.sqrt(jnp.sum(jnp.square(target_a - target_b), axis=-1) + eps)
+            losses.append(jnp.mean(jnp.square(pred_dist - target_dist)))
+    return sum(losses) / float(len(losses))
+
+
+def clg_loss(
+    pred,
+    target,
+    *,
+    H,
+    W,
+    rank=DEFAULT_LAYERSYNC_RANK,
+    neighbor_window=DEFAULT_LAYERSYNC_NEIGHBOR_WINDOW,
+    eps=1e-6,
+    detach_target=True,
+    return_components=False,
+):
+    pred_low, pred_v, pred_res = tsvd_components(pred, rank=rank)
+    target_low, target_v, target_res = tsvd_components(target, rank=rank)
+    if detach_target:
+        target_low = jax.lax.stop_gradient(target_low)
+    loss = directed_local_distance_loss(
+        pred_low,
+        target_low,
+        H=H,
+        W=W,
+        neighbor_window=neighbor_window,
+        eps=eps,
+    )
+    if return_components:
+        return {
+            "loss": loss,
+            "pred_low": pred_low,
+            "target_low": target_low,
+            "pred_V": pred_v,
+            "target_V": target_v,
+            "pred_res": pred_res,
+            "target_res": target_res,
+        }
+    return loss
+
+
+def residual_orthogonality_loss(r_a, r_b, *, detach_b=False, eps=1e-6):
+    a = r_a.reshape((-1,)).astype(jnp.float32)
+    b = r_b.reshape((-1,)).astype(jnp.float32)
+    if detach_b:
+        b = jax.lax.stop_gradient(b)
+    denom = jnp.linalg.norm(a, ord=2) * jnp.linalg.norm(b, ord=2) + jnp.asarray(eps, dtype=jnp.float32)
+    cos = jnp.vdot(a, b) / denom
+    return jnp.square(cos)
+
+
+def _select_feature(raw_features, layer_index, *, random_mode):
+    if random_mode:
+        stacked = jnp.stack(raw_features, axis=0)
+        return jax.lax.dynamic_index_in_dim(stacked, layer_index, axis=0, keepdims=False)
+    return raw_features[layer_index]
+
+
+def _project_clean_layer(projector_params, h, layer_index):
+    kernel = jax.lax.dynamic_index_in_dim(projector_params["kernel"], layer_index, axis=0, keepdims=False)
+    bias = jax.lax.dynamic_index_in_dim(projector_params["bias"], layer_index, axis=0, keepdims=False)
+    return jnp.einsum("bnd,dc->bnc", h.astype(jnp.float32), kernel.astype(jnp.float32)) + bias.astype(jnp.float32)
+
+
+def _clean_latent_target(x0):
+    return jax.lax.stop_gradient(spatial_norm_tokens(x0))
+
+
+def _zero_layersync_metrics(dtype=jnp.float32):
+    zero = jnp.array(0.0, dtype=dtype)
+    return {
+        "loss": zero,
+        "clg_a": zero,
+        "clg_b": zero,
+        "residual": zero,
+        "cosine": zero,
+    }
+
+
+def compute_layersync_loss(
+    params,
+    raw_features,
+    clean_latent_tokens,
+    rng,
+    *,
+    mode,
+    ell0,
+    delta,
+    rank,
+    residual_lambda,
+    neighbor_window,
+):
+    random_mode = mode in (1, 4)
+    clean_mode = mode in (1, 2, 4, 5)
+    residual_mode = mode in (4, 5)
+    max_start = len(raw_features) - delta if random_mode else 1
+    start_zero = (
+        jax.random.randint(rng, (), minval=0, maxval=max_start)
+        if random_mode
+        else jnp.array(0, dtype=jnp.int32)
+    )
+    layer_a_index = start_zero if random_mode else jnp.array(ell0 - 1, dtype=jnp.int32)
+    layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
+    raw_a = _select_feature(raw_features, layer_a_index if random_mode else 0, random_mode=random_mode)
+    raw_b = _select_feature(raw_features, layer_b_index if random_mode else 1, random_mode=random_mode)
+    H = W = int(round(clean_latent_tokens.shape[1] ** 0.5))
+
+    if clean_mode:
+        target = _clean_latent_target(clean_latent_tokens)
+        y_a = _project_clean_layer(params["layersync_projectors"], raw_a, layer_a_index)
+        y_b = _project_clean_layer(params["layersync_projectors"], raw_b, layer_b_index)
+        result_a = clg_loss(
+            y_a,
+            target,
+            H=H,
+            W=W,
+            rank=rank,
+            neighbor_window=neighbor_window,
+            detach_target=True,
+            return_components=True,
+        )
+        result_b = clg_loss(
+            y_b,
+            target,
+            H=H,
+            W=W,
+            rank=rank,
+            neighbor_window=neighbor_window,
+            detach_target=True,
+            return_components=True,
+        )
+        clg_a = result_a["loss"]
+        clg_b = result_b["loss"]
+        residual = (
+            residual_orthogonality_loss(result_a["pred_res"], result_b["pred_res"])
+            if residual_mode
+            else jnp.array(0.0, dtype=jnp.float32)
+        )
+        align = jnp.float32(0.5) * (clg_a + clg_b) + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
+    else:
+        raw_b_ref = jax.lax.stop_gradient(raw_b)
+        result = clg_loss(
+            raw_a,
+            raw_b_ref,
+            H=H,
+            W=W,
+            rank=rank,
+            neighbor_window=neighbor_window,
+            detach_target=True,
+            return_components=True,
+        )
+        clg_a = result["loss"]
+        clg_b = jnp.array(0.0, dtype=jnp.float32)
+        residual = jnp.array(0.0, dtype=jnp.float32)
+        align = clg_a
+
+    return {
+        "loss": align,
+        "clg_a": clg_a,
+        "clg_b": clg_b,
+        "residual": residual,
+        "cosine": jnp.array(0.0, dtype=jnp.float32),
+    }
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -565,6 +826,12 @@ def train_step(
     *,
     layersync_enabled,
     layersync_capture_layers,
+    layersync_mode,
+    layersync_ell0,
+    layersync_delta,
+    layersync_rank,
+    layersync_residual_lambda,
+    layersync_neighbor_window,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -576,7 +843,7 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, align_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -595,7 +862,18 @@ def train_step(
                 rngs={"dropout": drop_rng},
                 return_raw_features=layersync_capture_layers,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            layersync_metrics = compute_layersync_loss(
+                params,
+                raw_features,
+                x0,
+                align_rng,
+                mode=layersync_mode,
+                ell0=layersync_ell0,
+                delta=layersync_delta,
+                rank=layersync_rank,
+                residual_lambda=layersync_residual_lambda,
+                neighbor_window=layersync_neighbor_window,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,24 +883,26 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            layersync_metrics = _zero_layersync_metrics()
 
+        loss_layersync = layersync_metrics["loss"]
         loss_gen = jnp.mean((pred - target) ** 2)
         loss = loss_gen + layersync_lambda * loss_layersync
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, layersync_metrics)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, layersync_metrics)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
+    layersync_metrics = jax.tree_util.tree_map(
+        lambda x: jax.lax.pmean(x, axis_name="batch"),
+        layersync_metrics,
+    )
     layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
@@ -636,9 +916,12 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
+        "train/loss_layersync": layersync_metrics["loss"],
+        "train/layersync_clg_a": layersync_metrics["clg_a"],
+        "train/layersync_clg_b": layersync_metrics["clg_b"],
+        "train/layersync_residual_orth": layersync_metrics["residual"],
         "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/layersync_cosine": layersync_metrics["cosine"],
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -657,12 +940,18 @@ def eval_step(
     *,
     layersync_enabled,
     layersync_capture_layers,
+    layersync_mode,
+    layersync_ell0,
+    layersync_delta,
+    layersync_rank,
+    layersync_residual_lambda,
+    layersync_neighbor_window,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, noise_rng, align_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -679,7 +968,18 @@ def eval_step(
             deterministic=True,
             return_raw_features=layersync_capture_layers,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        layersync_metrics = compute_layersync_loss(
+            state.params,
+            raw_features,
+            x0,
+            align_rng,
+            mode=layersync_mode,
+            ell0=layersync_ell0,
+            delta=layersync_delta,
+            rank=layersync_rank,
+            residual_lambda=layersync_residual_lambda,
+            neighbor_window=layersync_neighbor_window,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,9 +988,9 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        layersync_metrics = _zero_layersync_metrics()
 
+    loss_layersync = layersync_metrics["loss"]
     loss_gen = jnp.mean((pred - target) ** 2)
     loss = loss_gen + layersync_lambda * loss_layersync
     v_abs_mean = jnp.mean(jnp.abs(target))
@@ -698,8 +998,10 @@ def eval_step(
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
+    layersync_metrics = jax.tree_util.tree_map(
+        lambda x: jax.lax.pmean(x, axis_name="batch"),
+        layersync_metrics,
+    )
     layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
@@ -708,9 +1010,12 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
+        "val/loss_layersync": layersync_metrics["loss"],
+        "val/layersync_clg_a": layersync_metrics["clg_a"],
+        "val/layersync_clg_b": layersync_metrics["clg_b"],
+        "val/layersync_residual_orth": layersync_metrics["residual"],
         "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/layersync_cosine": layersync_metrics["cosine"],
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1214,6 +1519,44 @@ def main():
         default=DEFAULT_LAYERSYNC_STRONG_LAYER,
         help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
     )
+    parser.add_argument(
+        "--layersync-mode",
+        type=int,
+        default=DEFAULT_LAYERSYNC_MODE,
+        choices=sorted(LAYERSYNC_MODE_NAMES),
+        help=(
+            "Alignment mode: 1=random clean-latent pair, 2=fixed clean-latent pair, "
+            "3=fixed internal pair, 4=random clean-latent pair + residual orthogonality, "
+            "5=fixed clean-latent pair + residual orthogonality."
+        ),
+    )
+    parser.add_argument(
+        "--layersync-delta",
+        type=int,
+        default=DEFAULT_LAYERSYNC_STRONG_LAYER - DEFAULT_LAYERSYNC_WEAK_LAYER,
+        help=(
+            "Layer gap delta. If omitted, defaults to strong_layer - weak_layer for "
+            "backward-compatible 8:16 behavior."
+        ),
+    )
+    parser.add_argument(
+        "--layersync-rank",
+        type=int,
+        default=DEFAULT_LAYERSYNC_RANK,
+        help="TSVD rank for CLG low-rank coordinates and residual reconstruction.",
+    )
+    parser.add_argument(
+        "--layersync-residual-lambda",
+        type=float,
+        default=DEFAULT_LAYERSYNC_RESIDUAL_LAMBDA,
+        help="Weight of residual orthogonality inside residual modes 4 and 5.",
+    )
+    parser.add_argument(
+        "--layersync-neighbor-window",
+        type=int,
+        default=DEFAULT_LAYERSYNC_NEIGHBOR_WINDOW,
+        help="Local CLG neighbor radius on the 16x16 latent token grid.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1397,12 +1740,28 @@ def main():
     )
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
+    layersync_config = {
+        "mode": int(args.layersync_mode),
+        "mode_name": LAYERSYNC_MODE_NAMES[int(args.layersync_mode)],
+        "ell0": int(args.layersync_weak_layer),
+        "delta": int(args.layersync_delta),
+        "strong_layer": int(args.layersync_weak_layer) + int(args.layersync_delta),
+        "capture_layers": (),
+        "rank": int(args.layersync_rank),
+        "residual_lambda": float(args.layersync_residual_lambda),
+        "neighbor_window": int(args.layersync_neighbor_window),
+    }
     if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+        layersync_config = resolve_layersync_config(args, config["depth"])
+        layersync_capture_layers = layersync_config["capture_layers"]
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
+            f"ell0={layersync_config['ell0']} delta={layersync_config['delta']} "
+            f"pair=({layersync_config['ell0']}, {layersync_config['strong_layer']}) "
+            f"rank={layersync_config['rank']} "
+            f"residual_lambda={layersync_config['residual_lambda']} "
+            f"neighbor_window={layersync_config['neighbor_window']}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
@@ -1450,6 +1809,12 @@ def main():
             train_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            layersync_mode=layersync_config["mode"],
+            layersync_ell0=layersync_config["ell0"],
+            layersync_delta=layersync_config["delta"],
+            layersync_rank=layersync_config["rank"],
+            layersync_residual_lambda=layersync_config["residual_lambda"],
+            layersync_neighbor_window=layersync_config["neighbor_window"],
         ),
         axis_name="batch",
     )
@@ -1458,6 +1823,12 @@ def main():
             eval_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            layersync_mode=layersync_config["mode"],
+            layersync_ell0=layersync_config["ell0"],
+            layersync_delta=layersync_config["delta"],
+            layersync_rank=layersync_config["rank"],
+            layersync_residual_lambda=layersync_config["residual_lambda"],
+            layersync_neighbor_window=layersync_config["neighbor_window"],
         ),
         axis_name="batch",
     )
