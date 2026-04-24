@@ -542,41 +542,54 @@ def resolve_layersync_config(args, depth):
             f"--layersync-mode must be one of {sorted(LAYERSYNC_MODE_NAMES)}, got {mode}"
         )
 
-    ell0 = int(args.layersync_weak_layer)
-    if _cli_flag_was_set("--layersync-delta"):
-        delta = int(args.layersync_delta)
+    random_mode = mode in (1, 4)
+    if random_mode:
+        if _cli_flag_was_set("--layersync-delta"):
+            delta = int(args.layersync_delta)
+        else:
+            delta = int(args.layersync_strong_layer) - int(args.layersync_weak_layer)
+        ell0 = None
+        strong_layer = None
     else:
-        delta = int(args.layersync_strong_layer) - ell0
-    strong_layer = ell0 + delta
+        ell0 = int(args.layersync_weak_layer)
+        if _cli_flag_was_set("--layersync-delta"):
+            delta = int(args.layersync_delta)
+        else:
+            delta = int(args.layersync_strong_layer) - ell0
+        strong_layer = ell0 + delta
 
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and not _cli_flag_was_set("--layersync-delta")
-        and ell0 == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
-    )
-    if uses_default_pair and strong_layer > depth:
-        raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
+        uses_default_pair = (
+            not _cli_flag_was_set("--layersync-weak-layer")
+            and not _cli_flag_was_set("--layersync-strong-layer")
+            and not _cli_flag_was_set("--layersync-delta")
+            and ell0 == DEFAULT_LAYERSYNC_WEAK_LAYER
+            and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
         )
+        if uses_default_pair and strong_layer > depth:
+            raise ValueError(
+                "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
+                f"Current --model-size {args.model_size.upper()} has depth {depth}. "
+                "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
+                "on smaller backbones."
+            )
+        if not (1 <= ell0 <= depth):
+            raise ValueError(f"--layersync-weak-layer/ell_0 must be in [1, {depth}], got {ell0}")
+        if strong_layer > depth:
+            raise ValueError(
+                f"--layersync-weak-layer + --layersync-delta must be <= {depth}, "
+                f"got {ell0} + {delta} = {strong_layer}"
+            )
+        if ell0 >= strong_layer:
+            raise ValueError(
+                "--layersync-weak-layer/ell_0 must be strictly less than ell_0 + delta "
+                f"(got {ell0} and {strong_layer})"
+            )
 
-    if not (1 <= ell0 <= depth):
-        raise ValueError(f"--layersync-weak-layer/ell_0 must be in [1, {depth}], got {ell0}")
     if delta <= 0:
         raise ValueError(f"--layersync-delta must be positive, got {delta}")
-    if strong_layer > depth:
+    if random_mode and delta >= depth:
         raise ValueError(
-            f"--layersync-weak-layer + --layersync-delta must be <= {depth}, "
-            f"got {ell0} + {delta} = {strong_layer}"
-        )
-    if ell0 >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer/ell_0 must be strictly less than ell_0 + delta "
-            f"(got {ell0} and {strong_layer})"
+            f"--layersync-delta must be in [1, {depth - 1}] for random modes, got {delta}"
         )
     if int(args.layersync_rank) <= 0:
         raise ValueError("--layersync-rank must be positive")
@@ -591,7 +604,7 @@ def resolve_layersync_config(args, depth):
     if float(args.layersync_residual_lambda) < 0.0:
         raise ValueError("--layersync-residual-lambda must be non-negative")
 
-    capture_layers = tuple(range(1, depth + 1)) if mode in (1, 4) else (ell0, strong_layer)
+    capture_layers = tuple(range(1, depth + 1)) if random_mode else (ell0, strong_layer)
     return {
         "mode": mode,
         "mode_name": LAYERSYNC_MODE_NAMES[mode],
@@ -1740,12 +1753,13 @@ def main():
     )
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
+    default_random_mode = int(args.layersync_mode) in (1, 4)
     layersync_config = {
         "mode": int(args.layersync_mode),
         "mode_name": LAYERSYNC_MODE_NAMES[int(args.layersync_mode)],
-        "ell0": int(args.layersync_weak_layer),
+        "ell0": None if default_random_mode else int(args.layersync_weak_layer),
         "delta": int(args.layersync_delta),
-        "strong_layer": int(args.layersync_weak_layer) + int(args.layersync_delta),
+        "strong_layer": None if default_random_mode else int(args.layersync_weak_layer) + int(args.layersync_delta),
         "capture_layers": (),
         "rank": int(args.layersync_rank),
         "residual_lambda": float(args.layersync_residual_lambda),
@@ -1754,15 +1768,25 @@ def main():
     if layersync_enabled:
         layersync_config = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = layersync_config["capture_layers"]
-        log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
-            f"ell0={layersync_config['ell0']} delta={layersync_config['delta']} "
-            f"pair=({layersync_config['ell0']}, {layersync_config['strong_layer']}) "
-            f"rank={layersync_config['rank']} "
-            f"residual_lambda={layersync_config['residual_lambda']} "
-            f"neighbor_window={layersync_config['neighbor_window']}"
-        )
+        if layersync_config["mode"] in (1, 4):
+            log_stage(
+                f"LayerSync ENABLED: lambda={args.layersync_lambda} "
+                f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
+                f"random_delta={layersync_config['delta']} "
+                f"rank={layersync_config['rank']} "
+                f"residual_lambda={layersync_config['residual_lambda']} "
+                f"neighbor_window={layersync_config['neighbor_window']}"
+            )
+        else:
+            log_stage(
+                f"LayerSync ENABLED: lambda={args.layersync_lambda} "
+                f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
+                f"ell0={layersync_config['ell0']} delta={layersync_config['delta']} "
+                f"pair=({layersync_config['ell0']}, {layersync_config['strong_layer']}) "
+                f"rank={layersync_config['rank']} "
+                f"residual_lambda={layersync_config['residual_lambda']} "
+                f"neighbor_window={layersync_config['neighbor_window']}"
+            )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
 

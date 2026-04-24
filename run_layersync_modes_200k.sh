@@ -36,8 +36,6 @@ COMMON_ARGS=(
   --wandb-project selfflow-jax
   --ema-decay 0.9999
   --layersync-lambda 0.2
-  --layersync-weak-layer 4
-  --layersync-strong-layer 8
 )
 
 MODE_NAMES=(
@@ -56,6 +54,8 @@ for MODE in 1 2 3 4 5; do
   MODE_ARGS=(--layersync-mode "${MODE}")
   if [[ "${MODE}" == "1" || "${MODE}" == "4" ]]; then
     MODE_ARGS+=(--layersync-delta 6)
+  else
+    MODE_ARGS+=(--layersync-weak-layer 4 --layersync-strong-layer 8)
   fi
 
   echo "[$(date -Is)] Starting ${RUN_NAME}"
