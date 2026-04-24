@@ -367,10 +367,6 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
-
-
 def build_model_config(model_size):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -416,6 +412,7 @@ try:
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.activation_decomposition import compute_private_loss
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -502,55 +499,34 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
+def _zero_private_metrics(dtype=jnp.float32):
+    zero = jnp.array(0.0, dtype=dtype)
+    return {
+        "loss_private": zero,
+        "norm_common": zero,
+        "avg_private_norm": zero,
+        "avg_pairwise_private_cosine": zero,
+    }
+
+
+def _scheduled_lambda_private(lambda_private, current_step, start_step=0, warmup_iters=0):
+    """Late-start + linear warmup schedule for private diversity loss."""
+    lambda_private = jnp.asarray(lambda_private, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    start_step = jnp.asarray(start_step, dtype=jnp.int32)
+    warmup_iters = jnp.asarray(warmup_iters, dtype=jnp.int32)
+
+    has_started = current_step >= start_step
+    no_warmup = warmup_iters <= 0
+    warmup_progress = (current_step - start_step + 1).astype(jnp.float32) / jnp.maximum(
+        warmup_iters.astype(jnp.float32), 1.0
     )
-
-
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
-
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
+    warmup_scale = jnp.where(
+        has_started,
+        jnp.where(no_warmup, 1.0, jnp.clip(warmup_progress, 0.0, 1.0)),
+        0.0,
     )
-    if uses_default_pair and strong_layer > depth:
-        raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
-        )
-
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
-        )
-
-    return weak_layer, strong_layer
-
-
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
-
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
-
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
+    return lambda_private * warmup_scale, warmup_scale
 
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
@@ -561,10 +537,15 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
+    current_step,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    lambda_private=0.0,
+    private_start_step=0,
+    private_warmup_iters=0,
+    private_max_pairs=0,
+    common_agg="mean",
+    common_logit_normal_center_layer=0.0,
+    common_logit_normal_sigma=1.0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -575,8 +556,15 @@ def train_step(
     """
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    private_enabled = lambda_private != 0.0
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -585,17 +573,24 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
-            pred, raw_features = state.apply_fn(
+        if private_enabled:
+            pred, activations = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_activations=True,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            private_metrics = compute_private_loss(
+                activations,
+                private_pair_rng=private_pair_rng,
+                private_max_pairs=private_max_pairs,
+                common_agg=common_agg,
+                common_logit_normal_center_layer=common_logit_normal_center_layer,
+                common_logit_normal_sigma=common_logit_normal_sigma,
+            )
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -605,25 +600,28 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+            private_metrics = _zero_private_metrics()
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss_private = private_metrics["loss_private"]
+        loss = loss_gen + effective_lambda_private * loss_private
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, private_metrics)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, private_metrics)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    private_metrics = jax.tree_util.tree_map(
+        lambda value: jax.lax.pmean(value, axis_name="batch"),
+        private_metrics,
+    )
+    effective_lambda_private = jax.lax.pmean(effective_lambda_private, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +634,13 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
+        "train/loss_private": private_metrics["loss_private"],
+        "train/lambda_private": jnp.asarray(lambda_private, dtype=jnp.float32),
+        "train/lambda_private_effective": effective_lambda_private,
+        "train/private_warmup_scale": private_warmup_scale,
+        "train/private_norm_common": private_metrics["norm_common"],
+        "train/private_norm": private_metrics["avg_private_norm"],
+        "train/private_pairwise_cosine": private_metrics["avg_pairwise_private_cosine"],
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -653,16 +655,28 @@ def eval_step(
     ema_params,
     batch,
     rng,
-    layersync_lambda,
+    current_step,
     *,
-    layersync_enabled,
-    layersync_capture_layers,
+    lambda_private=0.0,
+    private_start_step=0,
+    private_warmup_iters=0,
+    private_max_pairs=0,
+    common_agg="mean",
+    common_logit_normal_center_layer=0.0,
+    common_logit_normal_sigma=1.0,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
+    effective_lambda_private, private_warmup_scale = _scheduled_lambda_private(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
+    private_enabled = lambda_private != 0.0
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -670,16 +684,23 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
-        pred, raw_features = state.apply_fn(
+    if private_enabled:
+        pred, activations = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_activations=True,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        private_metrics = compute_private_loss(
+            activations,
+            private_pair_rng=private_pair_rng,
+            private_max_pairs=private_max_pairs,
+            common_agg=common_agg,
+            common_logit_normal_center_layer=common_logit_normal_center_layer,
+            common_logit_normal_sigma=common_logit_normal_sigma,
+        )
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -688,19 +709,21 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        private_metrics = _zero_private_metrics()
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss = loss_gen + effective_lambda_private * private_metrics["loss_private"]
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    private_metrics = jax.tree_util.tree_map(
+        lambda value: jax.lax.pmean(value, axis_name="batch"),
+        private_metrics,
+    )
+    effective_lambda_private = jax.lax.pmean(effective_lambda_private, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +731,13 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
+        "val/loss_private": private_metrics["loss_private"],
+        "val/lambda_private": jnp.asarray(lambda_private, dtype=jnp.float32),
+        "val/lambda_private_effective": effective_lambda_private,
+        "val/private_warmup_scale": private_warmup_scale,
+        "val/private_norm_common": private_metrics["norm_common"],
+        "val/private_norm": private_metrics["avg_private_norm"],
+        "val/private_pairwise_cosine": private_metrics["avg_pairwise_private_cosine"],
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1197,22 +1224,47 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
-        "--layersync-lambda",
+        "--lambda-private",
         type=float,
         default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
+        help="Weight for the private activation diversity loss. 0.0 disables it.",
     )
     parser.add_argument(
-        "--layersync-weak-layer",
+        "--private-start-step",
         type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
+        default=0,
+        help="Training step at which private activation loss starts.",
     )
     parser.add_argument(
-        "--layersync-strong-layer",
+        "--private-warmup-iters",
         type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
+        default=0,
+        help="Linear warmup length for private activation loss after --private-start-step.",
+    )
+    parser.add_argument(
+        "--private-max-pairs",
+        type=int,
+        default=0,
+        help="Maximum number of private layer pairs to sample per step; 0 uses all pairs.",
+    )
+    parser.add_argument(
+        "--common-agg",
+        type=str,
+        default="mean",
+        choices=["mean", "logit_normal"],
+        help="Aggregation used to form A_common before private residuals.",
+    )
+    parser.add_argument(
+        "--common-logit-normal-center-layer",
+        type=float,
+        default=0.0,
+        help="0-based center layer for --common-agg=logit_normal.",
+    )
+    parser.add_argument(
+        "--common-logit-normal-sigma",
+        type=float,
+        default=1.0,
+        help="Logit-space sigma for --common-agg=logit_normal.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1360,8 +1412,16 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
+    if args.lambda_private < 0.0:
+        raise ValueError("--lambda-private must be non-negative")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be >= 0")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be >= 0")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be >= 0")
+    if args.common_logit_normal_sigma <= 0.0:
+        raise ValueError("--common-logit-normal-sigma must be > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1395,17 +1455,14 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
+    if args.lambda_private > 0.0:
         log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"Private activation loss ENABLED: lambda={args.lambda_private} "
+            f"start_step={args.private_start_step} warmup_iters={args.private_warmup_iters} "
+            f"max_pairs={args.private_max_pairs} common_agg={args.common_agg}"
         )
     else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
+        log_stage("Private activation loss DISABLED: lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1421,7 +1478,6 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1448,16 +1504,26 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
+            private_max_pairs=args.private_max_pairs,
+            common_agg=args.common_agg,
+            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+            common_logit_normal_sigma=args.common_logit_normal_sigma,
         ),
         axis_name="batch",
     )
     pmapped_eval_step = jax.pmap(
         functools.partial(
             eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
+            lambda_private=args.lambda_private,
+            private_start_step=args.private_start_step,
+            private_warmup_iters=args.private_warmup_iters,
+            private_max_pairs=args.private_max_pairs,
+            common_agg=args.common_agg,
+            common_logit_normal_center_layer=args.common_logit_normal_center_layer,
+            common_logit_normal_sigma=args.common_logit_normal_sigma,
         ),
         axis_name="batch",
     )
@@ -1731,8 +1797,9 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        probe_step = jnp.zeros((num_devices,), dtype=jnp.int32)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, probe_step
         )
         block_pytree(probe_metrics)
 
@@ -2095,8 +2162,9 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2122,8 +2190,9 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    eval_step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state, ema_params, (val_x, val_y), rng, eval_step_devices
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():

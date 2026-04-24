@@ -305,6 +305,7 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
+        return_activations: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -376,6 +377,7 @@ class SelfFlowDiT(nn.Module):
         zs = None
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
+        activations = [] if return_activations else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -387,6 +389,8 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
+            if return_activations:
+                activations.append(x)
             
             if (i + 1) == return_features:
                 zs = x
@@ -411,22 +415,40 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+        if return_activations:
+            activations = jnp.stack(activations, axis=0)  # (depth, B, N, D)
 
         if return_features:
+            if return_block_summaries and return_activations:
+                return x, zs, block_summaries, activations
+            if return_activations:
+                return x, zs, activations
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
         if raw_layers:
             raw_out = zs if raw_single else tuple(raw_zs)
+            if return_block_summaries and return_activations:
+                return x, raw_out, block_summaries, activations
+            if return_activations:
+                return x, raw_out, activations
             if return_block_summaries:
                 return x, raw_out, block_summaries
             return x, raw_out
         if return_raw_features:
+            if return_block_summaries and return_activations:
+                return x, zs, block_summaries, activations
+            if return_activations:
+                return x, zs, activations
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
+        if return_block_summaries and return_activations:
+            return x, block_summaries, activations
         if return_block_summaries:
             return x, block_summaries
+        if return_activations:
+            return x, activations
         return x
 
     def _shufflechannel(self, x):
