@@ -394,7 +394,7 @@ def build_model_config(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1000,
+        num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
     )
@@ -442,7 +442,14 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEFAULT_ALIGNMENT_RANK):
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    align_rank=DEFAULT_ALIGNMENT_RANK,
+    init_qba_heads=False,
+):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -479,32 +486,34 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0, align_rank=DEF
         deterministic=False,
     )
 
-    params = unfreeze(variables["params"])
-    proj_limit = math.sqrt(6.0 / float(config["hidden_size"] + align_rank))
-    # Keep the shared backbone initialization identical to branches that only
-    # split once for params/dropout, then derive QBA-only heads from separate
-    # fold-ins so auxiliary losses do not perturb common parameter init.
-    layer_align_rng = jax.random.fold_in(init_rng, 1)
-    target_align_rng = jax.random.fold_in(init_rng, 2)
-    params["align_qba_layer_proj"] = {
-        "kernel": jax.random.uniform(
-            layer_align_rng,
-            (config["hidden_size"], align_rank),
-            minval=-proj_limit,
-            maxval=proj_limit,
-            dtype=jnp.float32,
-        ),
-    }
-    params["align_qba_target_proj"] = {
-        "kernel": jax.random.uniform(
-            target_align_rng,
-            (config["hidden_size"], align_rank),
-            minval=-proj_limit,
-            maxval=proj_limit,
-            dtype=jnp.float32,
-        ),
-    }
-    params = freeze(params)
+    params = variables["params"]
+    if init_qba_heads:
+        params = unfreeze(params)
+        proj_limit = math.sqrt(6.0 / float(config["hidden_size"] + align_rank))
+        # Keep the shared backbone initialization identical to branches that only
+        # split once for params/dropout, then derive QBA-only heads from separate
+        # fold-ins so auxiliary losses do not perturb common parameter init.
+        layer_align_rng = jax.random.fold_in(init_rng, 1)
+        target_align_rng = jax.random.fold_in(init_rng, 2)
+        params["align_qba_layer_proj"] = {
+            "kernel": jax.random.uniform(
+                layer_align_rng,
+                (config["hidden_size"], align_rank),
+                minval=-proj_limit,
+                maxval=proj_limit,
+                dtype=jnp.float32,
+            ),
+        }
+        params["align_qba_target_proj"] = {
+            "kernel": jax.random.uniform(
+                target_align_rng,
+                (config["hidden_size"], align_rank),
+                minval=-proj_limit,
+                maxval=proj_limit,
+                dtype=jnp.float32,
+            ),
+        }
+        params = freeze(params)
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
     tx = optax.chain(
@@ -1749,6 +1758,7 @@ def main():
         args.learning_rate,
         args.grad_clip,
         align_rank=align_rank,
+        init_qba_heads=align_enabled and args.align_method == "qba",
     )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)

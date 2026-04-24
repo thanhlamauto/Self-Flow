@@ -48,7 +48,7 @@ def _model_config_for_size(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1000,
+        num_classes=1001,
         learn_sigma=True,
         compatibility_mode=True,
     )
