@@ -53,11 +53,15 @@ for MODE in 1 2 3 4 5; do
   MODE_NAME="${MODE_NAMES[$MODE]}"
   RUN_NAME="layersync-mode-${MODE}-${MODE_NAME}-200k"
   CKPT_DIR="./checkpoints/${RUN_NAME}"
+  MODE_ARGS=(--layersync-mode "${MODE}")
+  if [[ "${MODE}" == "1" || "${MODE}" == "4" ]]; then
+    MODE_ARGS+=(--layersync-delta 6)
+  fi
 
   echo "[$(date -Is)] Starting ${RUN_NAME}"
   WANDB_NAME="${RUN_NAME}" python train.py \
     "${COMMON_ARGS[@]}" \
-    --layersync-mode "${MODE}" \
+    "${MODE_ARGS[@]}" \
     --ckpt-dir "${CKPT_DIR}"
   echo "[$(date -Is)] Finished ${RUN_NAME}"
 done
