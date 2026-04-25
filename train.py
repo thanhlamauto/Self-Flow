@@ -380,6 +380,7 @@ LAYERSYNC_MODE_NAMES = {
     3: "fixed-internal",
     4: "random-clean-residual",
     5: "fixed-clean-residual",
+    6: "random-residual-only",
 }
 
 
@@ -484,11 +485,11 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         deterministic=False,
     )
     params = unfreeze(variables['params'])
-    proj_limit = jnp.sqrt(jnp.float32(6.0 / float(config["hidden_size"] + patch_dim)))
+    proj_limit = jnp.sqrt(jnp.float32(6.0 / float(9 * config["hidden_size"] + patch_dim)))
     params["layersync_projectors"] = {
         "kernel": jax.random.uniform(
             proj_rng,
-            (config["depth"], config["hidden_size"], patch_dim),
+            (config["depth"], 3, 3, config["hidden_size"], patch_dim),
             minval=-proj_limit,
             maxval=proj_limit,
             dtype=jnp.float32,
@@ -542,7 +543,7 @@ def resolve_layersync_config(args, depth):
             f"--layersync-mode must be one of {sorted(LAYERSYNC_MODE_NAMES)}, got {mode}"
         )
 
-    random_mode = mode in (1, 4)
+    random_mode = mode in (1, 4, 6)
     if random_mode:
         if _cli_flag_was_set("--layersync-delta"):
             delta = int(args.layersync_delta)
@@ -593,7 +594,7 @@ def resolve_layersync_config(args, depth):
         )
     if int(args.layersync_rank) <= 0:
         raise ValueError("--layersync-rank must be positive")
-    max_rank = 16 if mode in (1, 2, 4, 5) else 256
+    max_rank = 16 if mode in (1, 2, 4, 5, 6) else 256
     if int(args.layersync_rank) > max_rank:
         raise ValueError(
             f"--layersync-rank must be <= {max_rank} for mode {mode}:{LAYERSYNC_MODE_NAMES[mode]}, "
@@ -604,7 +605,7 @@ def resolve_layersync_config(args, depth):
     if float(args.layersync_residual_lambda) < 0.0:
         raise ValueError("--layersync-residual-lambda must be non-negative")
 
-    capture_layers = tuple(range(1, depth + 1)) if random_mode else (ell0, strong_layer)
+    capture_layers = () if random_mode else (ell0, strong_layer)
     return {
         "mode": mode,
         "mode_name": LAYERSYNC_MODE_NAMES[mode],
@@ -618,11 +619,14 @@ def resolve_layersync_config(args, depth):
     }
 
 
-def spatial_norm_tokens(x, eps=1e-6):
+def spatial_norm_tokens(x, eps=1e-6, gamma=0.8):
     x = x.astype(jnp.float32)
     mean = jnp.mean(x, axis=1, keepdims=True)
     variance = jnp.mean(jnp.square(x - mean), axis=1, keepdims=True)
-    return (x - mean) * jax.lax.rsqrt(variance + jnp.asarray(eps, dtype=jnp.float32))
+    std = jnp.sqrt(variance + jnp.asarray(eps, dtype=jnp.float32))
+    return (
+        x - jnp.asarray(gamma, dtype=jnp.float32) * jax.lax.stop_gradient(mean)
+    ) / (jax.lax.stop_gradient(std) + jnp.asarray(eps, dtype=jnp.float32))
 
 
 def tsvd_components(z, rank=DEFAULT_LAYERSYNC_RANK):
@@ -662,7 +666,10 @@ def directed_local_distance_loss(
             target_b = target_grid[:, y0 + dy:y1 + dy, x0 + dx:x1 + dx, :]
             pred_dist = jnp.sqrt(jnp.sum(jnp.square(pred_a - pred_b), axis=-1) + eps)
             target_dist = jnp.sqrt(jnp.sum(jnp.square(target_a - target_b), axis=-1) + eps)
-            losses.append(jnp.mean(jnp.square(pred_dist - target_dist)))
+            diff = pred_dist - target_dist
+            abs_diff = jnp.abs(diff)
+            smooth_l1 = jnp.where(abs_diff < 1.0, 0.5 * jnp.square(diff), abs_diff - 0.5)
+            losses.append(jnp.mean(smooth_l1))
     return sum(losses) / float(len(losses))
 
 
@@ -723,7 +730,17 @@ def _select_feature(raw_features, layer_index, *, random_mode):
 def _project_clean_layer(projector_params, h, layer_index):
     kernel = jax.lax.dynamic_index_in_dim(projector_params["kernel"], layer_index, axis=0, keepdims=False)
     bias = jax.lax.dynamic_index_in_dim(projector_params["bias"], layer_index, axis=0, keepdims=False)
-    return jnp.einsum("bnd,dc->bnc", h.astype(jnp.float32), kernel.astype(jnp.float32)) + bias.astype(jnp.float32)
+    h = h.astype(jnp.float32)
+    H = W = int(round(h.shape[1] ** 0.5))
+    h_grid = h.reshape(h.shape[0], H, W, h.shape[-1])
+    y_grid = jax.lax.conv_general_dilated(
+        h_grid,
+        kernel.astype(jnp.float32),
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+    )
+    return (y_grid + bias.astype(jnp.float32)).reshape(h.shape[0], h.shape[1], -1)
 
 
 def _clean_latent_target(x0):
@@ -754,54 +771,58 @@ def compute_layersync_loss(
     residual_lambda,
     neighbor_window,
 ):
-    random_mode = mode in (1, 4)
+    del rng
     clean_mode = mode in (1, 2, 4, 5)
-    residual_mode = mode in (4, 5)
-    max_start = len(raw_features) - delta if random_mode else 1
-    start_zero = (
-        jax.random.randint(rng, (), minval=0, maxval=max_start)
-        if random_mode
-        else jnp.array(0, dtype=jnp.int32)
-    )
-    layer_a_index = start_zero if random_mode else jnp.array(ell0 - 1, dtype=jnp.int32)
+    internal_mode = mode == 3
+    residual_mode = mode in (4, 5, 6)
+    residual_only_mode = mode == 6
+    layer_a_index = jnp.array(ell0 - 1, dtype=jnp.int32)
     layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
-    raw_a = _select_feature(raw_features, layer_a_index if random_mode else 0, random_mode=random_mode)
-    raw_b = _select_feature(raw_features, layer_b_index if random_mode else 1, random_mode=random_mode)
+    raw_a = raw_features[0]
+    raw_b = raw_features[1]
     H = W = int(round(clean_latent_tokens.shape[1] ** 0.5))
 
-    if clean_mode:
+    if clean_mode or residual_only_mode:
         target = _clean_latent_target(clean_latent_tokens)
         y_a = _project_clean_layer(params["layersync_projectors"], raw_a, layer_a_index)
         y_b = _project_clean_layer(params["layersync_projectors"], raw_b, layer_b_index)
-        result_a = clg_loss(
-            y_a,
-            target,
-            H=H,
-            W=W,
-            rank=rank,
-            neighbor_window=neighbor_window,
-            detach_target=True,
-            return_components=True,
-        )
-        result_b = clg_loss(
-            y_b,
-            target,
-            H=H,
-            W=W,
-            rank=rank,
-            neighbor_window=neighbor_window,
-            detach_target=True,
-            return_components=True,
-        )
-        clg_a = result_a["loss"]
-        clg_b = result_b["loss"]
-        residual = (
-            residual_orthogonality_loss(result_a["pred_res"], result_b["pred_res"])
-            if residual_mode
-            else jnp.array(0.0, dtype=jnp.float32)
-        )
-        align = jnp.float32(0.5) * (clg_a + clg_b) + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
-    else:
+        if residual_only_mode:
+            _, _, res_a = tsvd_components(y_a, rank=rank)
+            _, _, res_b = tsvd_components(y_b, rank=rank)
+            clg_a = jnp.array(0.0, dtype=jnp.float32)
+            clg_b = jnp.array(0.0, dtype=jnp.float32)
+            residual = residual_orthogonality_loss(res_a, res_b)
+            align = residual
+        else:
+            result_a = clg_loss(
+                y_a,
+                target,
+                H=H,
+                W=W,
+                rank=rank,
+                neighbor_window=neighbor_window,
+                detach_target=True,
+                return_components=True,
+            )
+            result_b = clg_loss(
+                y_b,
+                target,
+                H=H,
+                W=W,
+                rank=rank,
+                neighbor_window=neighbor_window,
+                detach_target=True,
+                return_components=True,
+            )
+            clg_a = result_a["loss"]
+            clg_b = result_b["loss"]
+            residual = (
+                residual_orthogonality_loss(result_a["pred_res"], result_b["pred_res"])
+                if residual_mode
+                else jnp.array(0.0, dtype=jnp.float32)
+            )
+            align = jnp.float32(0.5) * (clg_a + clg_b) + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
+    elif internal_mode:
         raw_b_ref = jax.lax.stop_gradient(raw_b)
         result = clg_loss(
             raw_a,
@@ -815,8 +836,14 @@ def compute_layersync_loss(
         )
         clg_a = result["loss"]
         clg_b = jnp.array(0.0, dtype=jnp.float32)
-        residual = jnp.array(0.0, dtype=jnp.float32)
-        align = clg_a
+        residual = (
+            residual_orthogonality_loss(result["pred_res"], jax.lax.stop_gradient(result["target_res"]))
+            if residual_mode
+            else jnp.array(0.0, dtype=jnp.float32)
+        )
+        align = clg_a + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
+    else:
+        raise ValueError(f"Unsupported LayerSync mode {mode}")
 
     return {
         "loss": align,
@@ -1540,7 +1567,8 @@ def main():
         help=(
             "Alignment mode: 1=random clean-latent pair, 2=fixed clean-latent pair, "
             "3=fixed internal pair, 4=random clean-latent pair + residual orthogonality, "
-            "5=fixed clean-latent pair + residual orthogonality."
+            "5=fixed clean-latent pair + residual orthogonality, "
+            "6=random projected residual orthogonality only."
         ),
     )
     parser.add_argument(
@@ -1753,7 +1781,7 @@ def main():
     )
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
-    default_random_mode = int(args.layersync_mode) in (1, 4)
+    default_random_mode = int(args.layersync_mode) in (1, 4, 6)
     layersync_config = {
         "mode": int(args.layersync_mode),
         "mode_name": LAYERSYNC_MODE_NAMES[int(args.layersync_mode)],
@@ -1768,7 +1796,7 @@ def main():
     if layersync_enabled:
         layersync_config = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = layersync_config["capture_layers"]
-        if layersync_config["mode"] in (1, 4):
+        if layersync_config["mode"] in (1, 4, 6):
             log_stage(
                 f"LayerSync ENABLED: lambda={args.layersync_lambda} "
                 f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
@@ -1828,34 +1856,82 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-            layersync_mode=layersync_config["mode"],
-            layersync_ell0=layersync_config["ell0"],
-            layersync_delta=layersync_config["delta"],
-            layersync_rank=layersync_config["rank"],
-            layersync_residual_lambda=layersync_config["residual_lambda"],
-            layersync_neighbor_window=layersync_config["neighbor_window"],
-        ),
-        axis_name="batch",
-    )
-    pmapped_eval_step = jax.pmap(
-        functools.partial(
-            eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-            layersync_mode=layersync_config["mode"],
-            layersync_ell0=layersync_config["ell0"],
-            layersync_delta=layersync_config["delta"],
-            layersync_rank=layersync_config["rank"],
-            layersync_residual_lambda=layersync_config["residual_lambda"],
-            layersync_neighbor_window=layersync_config["neighbor_window"],
-        ),
-        axis_name="batch",
-    )
+    random_layersync_mode = layersync_enabled and layersync_config["mode"] in (1, 4, 6)
+
+    def layersync_pair_for_step(step):
+        max_start = depth - int(layersync_config["delta"])
+        if max_start <= 0:
+            raise ValueError(
+                f"LayerSync random delta must be < depth, got delta={layersync_config['delta']} depth={depth}"
+            )
+        hashed = (int(step) * 1103515245 + 12345) & 0x7FFFFFFF
+        ell0 = (hashed % max_start) + 1
+        return ell0, ell0 + int(layersync_config["delta"])
+
+    def layersync_pair_config(ell0, strong_layer):
+        cfg = dict(layersync_config)
+        cfg["ell0"] = int(ell0)
+        cfg["strong_layer"] = int(strong_layer)
+        cfg["capture_layers"] = (int(ell0), int(strong_layer))
+        return cfg
+
+    def make_pmapped_train_step(step_cfg):
+        return jax.pmap(
+            functools.partial(
+                train_step,
+                layersync_enabled=layersync_enabled,
+                layersync_capture_layers=step_cfg["capture_layers"] if layersync_enabled else layersync_capture_layers,
+                layersync_mode=step_cfg["mode"],
+                layersync_ell0=step_cfg["ell0"],
+                layersync_delta=step_cfg["delta"],
+                layersync_rank=step_cfg["rank"],
+                layersync_residual_lambda=step_cfg["residual_lambda"],
+                layersync_neighbor_window=step_cfg["neighbor_window"],
+            ),
+            axis_name="batch",
+        )
+
+    def make_pmapped_eval_step(step_cfg):
+        return jax.pmap(
+            functools.partial(
+                eval_step,
+                layersync_enabled=layersync_enabled,
+                layersync_capture_layers=step_cfg["capture_layers"] if layersync_enabled else layersync_capture_layers,
+                layersync_mode=step_cfg["mode"],
+                layersync_ell0=step_cfg["ell0"],
+                layersync_delta=step_cfg["delta"],
+                layersync_rank=step_cfg["rank"],
+                layersync_residual_lambda=step_cfg["residual_lambda"],
+                layersync_neighbor_window=step_cfg["neighbor_window"],
+            ),
+            axis_name="batch",
+        )
+
+    pmapped_train_step = None
+    pmapped_eval_step = None
+    train_step_cache = {}
+    eval_step_cache = {}
+    if random_layersync_mode:
+        log_stage("LayerSync random scheduling: host-selected deterministic layer pairs; each compiled step captures only two layers.")
+    else:
+        pmapped_train_step = make_pmapped_train_step(layersync_config)
+        pmapped_eval_step = make_pmapped_eval_step(layersync_config)
+
+    def get_pmapped_train_step(step):
+        if not random_layersync_mode:
+            return pmapped_train_step, None
+        pair = layersync_pair_for_step(step)
+        if pair not in train_step_cache:
+            train_step_cache[pair] = make_pmapped_train_step(layersync_pair_config(*pair))
+        return train_step_cache[pair], pair
+
+    def get_pmapped_eval_step(step):
+        if not random_layersync_mode:
+            return pmapped_eval_step, None
+        pair = layersync_pair_for_step(step)
+        if pair not in eval_step_cache:
+            eval_step_cache[pair] = make_pmapped_eval_step(layersync_pair_config(*pair))
+        return eval_step_cache[pair], pair
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -2126,7 +2202,8 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(
+        probe_train_step, _ = get_pmapped_train_step(0)
+        _, _, probe_metrics, _ = probe_train_step(
             state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
         )
         block_pytree(probe_metrics)
@@ -2490,7 +2567,8 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
+            train_step_fn, train_pair = get_pmapped_train_step(global_step)
+            state, ema_params, metrics, rng = train_step_fn(
                 state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
             )
             global_step += 1
@@ -2504,6 +2582,9 @@ def main():
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
                 cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
+                if train_pair is not None:
+                    cpu_metrics["train/layersync_layer_a"] = train_pair[0]
+                    cpu_metrics["train/layersync_layer_b"] = train_pair[1]
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -2511,16 +2592,20 @@ def main():
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
-                for _ in range(args.eval_batches):
+                for eval_idx in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
                         val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(
+                    eval_step_fn, eval_pair = get_pmapped_eval_step(global_step + eval_idx)
+                    val_metrics, rng = eval_step_fn(
                         state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
+                    if eval_pair is not None:
+                        host_val_metrics["val/layersync_layer_a"] = float(eval_pair[0])
+                        host_val_metrics["val/layersync_layer_b"] = float(eval_pair[1])
                     for key, value in host_val_metrics.items():
                         metric_sums[key] = metric_sums.get(key, 0.0) + value
 

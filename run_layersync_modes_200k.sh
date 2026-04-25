@@ -45,14 +45,15 @@ MODE_NAMES=(
   "fixed-internal"
   "random-clean-residual"
   "fixed-clean-residual"
+  "random-residual-only"
 )
 
-for MODE in 1 2 3 4 5; do
+for MODE in 1 2 3 4 5 6; do
   MODE_NAME="${MODE_NAMES[$MODE]}"
   RUN_NAME="layersync-mode-${MODE}-${MODE_NAME}-200k"
   CKPT_DIR="./checkpoints/${RUN_NAME}"
   MODE_ARGS=(--layersync-mode "${MODE}")
-  if [[ "${MODE}" == "1" || "${MODE}" == "4" ]]; then
+  if [[ "${MODE}" == "1" || "${MODE}" == "4" || "${MODE}" == "6" ]]; then
     MODE_ARGS+=(--layersync-delta 6)
   else
     MODE_ARGS+=(--layersync-weak-layer 4 --layersync-strong-layer 8)
