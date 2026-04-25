@@ -380,6 +380,7 @@ LAYERSYNC_MODE_NAMES = {
     3: "fixed-internal",
     4: "random-clean-residual",
     5: "fixed-clean-residual",
+    6: "random-residual-only",
 }
 
 
@@ -542,7 +543,7 @@ def resolve_layersync_config(args, depth):
             f"--layersync-mode must be one of {sorted(LAYERSYNC_MODE_NAMES)}, got {mode}"
         )
 
-    random_mode = mode in (1, 4)
+    random_mode = mode in (1, 4, 6)
     if random_mode:
         if _cli_flag_was_set("--layersync-delta"):
             delta = int(args.layersync_delta)
@@ -774,9 +775,10 @@ def compute_layersync_loss(
     neighbor_window,
     axis_name=None,
 ):
-    random_mode = mode in (1, 4)
+    random_mode = mode in (1, 4, 6)
     clean_mode = mode in (1, 2, 4, 5)
     residual_mode = mode in (4, 5)
+    residual_only_mode = mode == 6
     max_start = len(raw_features) - delta if random_mode else 1
     start_zero = (
         jax.random.randint(rng, (), minval=0, maxval=max_start)
@@ -787,10 +789,22 @@ def compute_layersync_loss(
     layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
     raw_a = _select_feature(raw_features, layer_a_index if random_mode else 0, random_mode=random_mode)
     raw_b = _select_feature(raw_features, layer_b_index if random_mode else 1, random_mode=random_mode)
-    target_tokens = patchify_clean_latent(clean_latent)
-    H = W = int(round(target_tokens.shape[1] ** 0.5))
+
+    if residual_only_mode:
+        _, _, raw_a_res = tsvd_components(raw_a, rank=rank)
+        _, _, raw_b_res = tsvd_components(raw_b, rank=rank)
+        residual = residual_orthogonality_loss(raw_a_res, raw_b_res, axis_name=axis_name)
+        zero = jnp.array(0.0, dtype=jnp.float32)
+        return {
+            "loss": residual,
+            "clg_a": zero,
+            "clg_b": zero,
+            "residual": residual,
+        }
 
     if clean_mode:
+        target_tokens = patchify_clean_latent(clean_latent)
+        H = W = int(round(target_tokens.shape[1] ** 0.5))
         target = jax.lax.stop_gradient(spatial_norm_tokens(target_tokens))
         y_a = _project_clean_layer(params["layersync_projectors"], raw_a, layer_a_index)
         y_b = _project_clean_layer(params["layersync_projectors"], raw_b, layer_b_index)
@@ -823,6 +837,8 @@ def compute_layersync_loss(
         )
         align = jnp.float32(0.5) * (clg_a + clg_b) + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
     else:
+        target_tokens = patchify_clean_latent(clean_latent)
+        H = W = int(round(target_tokens.shape[1] ** 0.5))
         raw_b_ref = jax.lax.stop_gradient(raw_b)
         result = clg_loss(
             raw_a,
@@ -1560,7 +1576,8 @@ def main():
         help=(
             "Alignment mode: 1=random clean-latent pair, 2=fixed clean-latent pair, "
             "3=fixed internal pair, 4=random clean-latent pair + residual orthogonality, "
-            "5=fixed clean-latent pair + residual orthogonality."
+            "5=fixed clean-latent pair + residual orthogonality, "
+            "6=random internal residual orthogonality only."
         ),
     )
     parser.add_argument(
@@ -1774,7 +1791,7 @@ def main():
     )
     layersync_enabled = args.layersync_lambda > 0.0
     layersync_capture_layers = None
-    default_random_mode = int(args.layersync_mode) in (1, 4)
+    default_random_mode = int(args.layersync_mode) in (1, 4, 6)
     layersync_config = {
         "mode": int(args.layersync_mode),
         "mode_name": LAYERSYNC_MODE_NAMES[int(args.layersync_mode)],
@@ -1789,7 +1806,7 @@ def main():
     if layersync_enabled:
         layersync_config = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = layersync_config["capture_layers"]
-        if layersync_config["mode"] in (1, 4):
+        if layersync_config["mode"] in (1, 4, 6):
             log_stage(
                 f"LayerSync ENABLED: lambda={args.layersync_lambda} "
                 f"mode={layersync_config['mode']}:{layersync_config['mode_name']} "
