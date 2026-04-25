@@ -389,6 +389,7 @@ def _select_private_pair_indices(
     rng: jax.Array | None = None,
     max_pairs: int = 0,
     pair_mode: str = "first_pairs",
+    min_pair_delta: int = 1,
     fixed_pair_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return selected private-layer pair indices in lexicographic pair order."""
@@ -401,6 +402,7 @@ def _select_private_pair_indices(
         empty = jnp.asarray((), dtype=jnp.int32)
         return empty, empty
 
+    min_pair_delta = max(1, int(min_pair_delta))
     if pair_mode == "fixed_random_pairs":
         if fixed_pair_indices is None:
             raise ValueError("fixed_random_pairs requires fixed_pair_indices.")
@@ -410,6 +412,9 @@ def _select_private_pair_indices(
         return pair_a, pair_b
 
     pair_a, pair_b = jnp.triu_indices(num_layers, k=1)
+    valid = (pair_b - pair_a) >= min_pair_delta
+    pair_a = pair_a[valid]
+    pair_b = pair_b[valid]
     total_pairs = pair_a.shape[0]
     if max_pairs and max_pairs > 0 and total_pairs > max_pairs:
         if pair_mode == "random_pairs":
@@ -445,6 +450,7 @@ def _private_pairwise_loss_and_metric(
     rng: jax.Array | None = None,
     max_pairs: int = 0,
     pair_mode: str = "first_pairs",
+    min_pair_delta: int = 1,
     fixed_pair_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Average squared cosine loss and mean cosine over selected private-layer pairs."""
@@ -453,6 +459,7 @@ def _private_pairwise_loss_and_metric(
         rng=rng,
         max_pairs=max_pairs,
         pair_mode=pair_mode,
+        min_pair_delta=min_pair_delta,
         fixed_pair_indices=fixed_pair_indices,
     )
     pairwise_cosines = _private_pairwise_cosines_for_indices(private, pair_a, pair_b, eps=eps)
@@ -515,6 +522,7 @@ def compute_aux_losses(
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
     private_pair_mode: str = "first_pairs",
+    private_min_pair_delta: int = 1,
     private_fixed_pair_indices: jax.Array | None = None,
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
@@ -618,6 +626,7 @@ def compute_aux_losses(
             rng=private_pair_rng,
             max_pairs=private_max_pairs,
             pair_mode=private_pair_mode,
+            min_pair_delta=private_min_pair_delta,
             fixed_pair_indices=private_fixed_pair_indices,
         )
     else:

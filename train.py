@@ -600,12 +600,17 @@ def _scheduled_lambda_spatial(
     return lambda_spatial * stop_scale, stop_scale
 
 
-def resolve_private_fixed_pair_schedule(depth, max_pairs, seed, num_steps):
-    total_pairs = int(depth) * (int(depth) - 1) // 2
+def resolve_private_fixed_pair_schedule(depth, max_pairs, seed, num_steps, min_pair_delta=1):
+    min_pair_delta = max(1, int(min_pair_delta))
+    all_pairs = [
+        (i, j)
+        for i in range(int(depth))
+        for j in range(i + min_pair_delta, int(depth))
+    ]
+    total_pairs = len(all_pairs)
     max_pairs = total_pairs if int(max_pairs) <= 0 else min(int(max_pairs), total_pairs)
     if max_pairs <= 0 or int(num_steps) <= 0:
         return None
-    all_pairs = [(i, j) for i in range(int(depth)) for j in range(i + 1, int(depth))]
     rng = random.Random(int(seed))
     schedule = []
     for _ in range(int(num_steps)):
@@ -620,6 +625,7 @@ def train_step(
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
+    private_min_pair_delta=1,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -708,6 +714,7 @@ def train_step(
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
                 private_pair_mode=private_pair_mode,
+                private_min_pair_delta=private_min_pair_delta,
                 private_fixed_pair_indices=private_fixed_pair_indices,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
@@ -857,6 +864,7 @@ def eval_step(
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
+    private_min_pair_delta=1,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -939,6 +947,7 @@ def eval_step(
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
             private_pair_mode=private_pair_mode,
+            private_min_pair_delta=private_min_pair_delta,
             private_fixed_pair_indices=private_fixed_pair_indices,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
@@ -1538,6 +1547,12 @@ def main():
     parser.add_argument("--private-max-pairs", type=int, default=0,
                         help="If > 0, use at most this many layer pairs for L_private.")
     parser.add_argument(
+        "--private-min-pair-delta",
+        type=int,
+        default=1,
+        help="Minimum block-index gap j - i for private layer pairs. Default 1 preserves all i < j pairs.",
+    )
+    parser.add_argument(
         "--private-pair-mode",
         type=str,
         default="first_pairs",
@@ -1817,6 +1832,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be >= 0")
+    if args.private_min_pair_delta <= 0:
+        raise ValueError("--private-min-pair-delta must be > 0")
     if args.common_private_max_layers < 0:
         raise ValueError("--common-private-max-layers must be >= 0")
     if args.spatial_stop_step < -1:
@@ -1898,6 +1915,7 @@ def main():
             args.private_max_pairs,
             args.private_pair_seed,
             total_steps,
+            min_pair_delta=args.private_min_pair_delta,
         )
     log_stage(
         "Activation decomposition: "
@@ -1909,6 +1927,7 @@ def main():
         f"private_start_step={args.private_start_step} "
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
+        f"private_min_pair_delta={args.private_min_pair_delta} "
         f"private_pair_mode={args.private_pair_mode} "
         f"private_pair_seed={args.private_pair_seed} "
         f"common_private_max_layers={args.common_private_max_layers} "
@@ -1999,6 +2018,7 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
+            private_min_pair_delta=args.private_min_pair_delta,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -2026,6 +2046,7 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
+            private_min_pair_delta=args.private_min_pair_delta,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
