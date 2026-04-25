@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from collections.abc import Sequence
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -501,12 +502,66 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+def _smooth_patch_tokens_3x3(tokens, grid_size):
+    """Average-pool patch tokens over a 3x3 local window on the token grid."""
+    b, _, d = tokens.shape
+    x = tokens.reshape(b, grid_size, grid_size, d)
+    x = jnp.pad(x, ((0, 0), (1, 1), (1, 1), (0, 0)), mode="edge")
+    acc = jnp.zeros((b, grid_size, grid_size, d), dtype=tokens.dtype)
+    for dh in range(3):
+        for dw in range(3):
+            acc = acc + x[:, dh:dh + grid_size, dw:dw + grid_size, :]
+    return (acc / 9.0).reshape(b, grid_size * grid_size, d)
+
+
+def _local_similarity_vector(tokens, grid_size, eps=1e-6):
+    """Return 3x3-neighborhood cosine similarities as one vector per sample."""
+    b, _, d = tokens.shape
+    x = tokens.reshape(b, grid_size, grid_size, d)
+    x = x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    sims = []
+    for dh in (-1, 0, 1):
+        for dw in (-1, 0, 1):
+            if dh == 0 and dw == 0:
+                continue
+            h_src = slice(max(0, -dh), grid_size - max(0, dh))
+            w_src = slice(max(0, -dw), grid_size - max(0, dw))
+            h_dst = slice(max(0, dh), grid_size - max(0, -dh))
+            w_dst = slice(max(0, dw), grid_size - max(0, -dw))
+            sim = jnp.sum(x[:, h_src, w_src, :] * x[:, h_dst, w_dst, :], axis=-1)
+            sims.append(sim.reshape(b, -1))
+    return jnp.concatenate(sims, axis=1)
+
+
+def local_pairwise_similarity_loss(hidden_tokens, target_tokens, grid_size):
+    hidden_rel = _local_similarity_vector(hidden_tokens, grid_size)
+    target_rel = jax.lax.stop_gradient(_local_similarity_vector(target_tokens, grid_size))
+    hidden_rel = hidden_rel / jnp.maximum(jnp.linalg.norm(hidden_rel, axis=1, keepdims=True), 1e-6)
+    target_rel = target_rel / jnp.maximum(jnp.linalg.norm(target_rel, axis=1, keepdims=True), 1e-6)
+    return jnp.mean(1.0 - jnp.sum(hidden_rel * target_rel, axis=1))
+
+
+def parse_align_layers(value):
+    if value is None:
+        return ()
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        return tuple(int(layer) for layer in value)
+    value = value.strip()
+    if not value:
+        return ()
+    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+
 def train_step(
     state,
     ema_params,
     batch,
     rng,
     ema_decay,
+    global_step,
+    align_lambda_max,
+    align_warmup_steps,
+    align_layers,
+    align_sample_one_layer,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -518,35 +573,74 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, align_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    grid_size = int(round(x0.shape[1] ** 0.5))
+    align_layers_1based = tuple(layer + 1 for layer in align_layers)
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
+        if align_lambda_max > 0.0 and align_layers_1based:
+            pred, raw_features = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                return_raw_features=align_layers_1based,
+                rngs={"dropout": drop_rng},
+            )
+            if len(align_layers_1based) == 1:
+                raw_features = (raw_features,)
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            raw_features = ()
+
         loss_gen = jnp.mean((pred - target) ** 2)
+        loss_align = jnp.asarray(0.0, dtype=loss_gen.dtype)
+        lambda_align = jnp.asarray(0.0, dtype=loss_gen.dtype)
+        if raw_features:
+            target_tokens = _smooth_patch_tokens_3x3(x0, grid_size)
+            per_layer_losses = jnp.stack([
+                local_pairwise_similarity_loss(hidden, target_tokens, grid_size)
+                for hidden in raw_features
+            ])
+            if align_sample_one_layer and len(raw_features) > 1:
+                layer_idx = jax.random.randint(align_rng, (), 0, len(raw_features))
+                loss_align = per_layer_losses[layer_idx]
+            else:
+                loss_align = jnp.mean(per_layer_losses)
+
+            if align_warmup_steps > 0:
+                warmup = jnp.minimum(1.0, global_step.astype(jnp.float32) / float(align_warmup_steps))
+            else:
+                warmup = jnp.asarray(1.0, dtype=loss_gen.dtype)
+            lambda_align = jnp.asarray(align_lambda_max, dtype=loss_gen.dtype) * warmup
+        loss_total = loss_gen + lambda_align * loss_align
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss_gen, (v_abs_mean, v_pred_abs_mean, loss_gen)
+        return loss_total, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_align, lambda_align)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, loss_align, lambda_align)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    lambda_align = jax.lax.pmean(lambda_align, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -559,6 +653,8 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
+        "train/loss_align": loss_align,
+        "train/lambda_align": lambda_align,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -1113,6 +1209,35 @@ def main():
             "Set to 0 to train without CFG dropout/unconditional label embedding."
         ),
     )
+    parser.add_argument(
+        "--align-layers",
+        type=str,
+        default="5,8",
+        help=(
+            "Comma-separated 0-based transformer block indices for local pairwise "
+            "similarity alignment. Default 5,8 maps original XL layers 14,21 "
+            "to SiT-B depth 12 human layers 6,9. Empty string disables alignment."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-align",
+        type=float,
+        default=0.005,
+        help="Maximum weight for local pairwise similarity alignment loss.",
+    )
+    parser.add_argument(
+        "--align-warmup-steps",
+        type=int,
+        default=10000,
+        help="Linear warmup steps for --lambda-align. Set 0 to disable warmup.",
+    )
+    parser.add_argument(
+        "--align-sample-one-layer",
+        dest="align_sample_one_layer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample one configured align layer per train step; otherwise average all configured layers.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1261,6 +1386,10 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not 0.0 <= args.cfg_dropout_rate <= 1.0:
         raise ValueError("--cfg-dropout-rate must be between 0 and 1")
+    if args.lambda_align < 0.0:
+        raise ValueError("--lambda-align must be >= 0")
+    if args.align_warmup_steps < 0:
+        raise ValueError("--align-warmup-steps must be >= 0")
     if args.cfg_dropout_rate == 0.0:
         if args.sample_cfg_scale > 1.0:
             raise ValueError("--sample-cfg-scale > 1 requires --cfg-dropout-rate > 0")
@@ -1291,6 +1420,11 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
     depth = int(config["depth"])
+    align_layers = parse_align_layers(args.align_layers)
+    if any(layer < 0 or layer >= depth for layer in align_layers):
+        raise ValueError(
+            f"--align-layers must contain 0-based indices in [0, {depth - 1}], got {align_layers}"
+        )
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1300,6 +1434,20 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"cfg_dropout_rate={args.cfg_dropout_rate}"
     )
+    if args.lambda_align > 0.0 and align_layers:
+        if args.model_size.upper() != "B" and align_layers == (5, 8):
+            log_stage(
+                "Local pairwise alignment uses default SiT-B-mapped layers [5, 8] "
+                f"while --model-size={args.model_size.upper()}."
+            )
+        log_stage(
+            "Local pairwise alignment: "
+            f"layers_0based={align_layers} lambda_max={args.lambda_align} "
+            f"warmup_steps={args.align_warmup_steps} "
+            f"sample_one_layer={args.align_sample_one_layer}"
+        )
+    else:
+        log_stage("Local pairwise alignment disabled.")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1338,7 +1486,12 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        train_step,
+        axis_name="batch",
+        in_axes=(0, 0, 0, 0, 0, None, None, None, None, None),
+        static_broadcasted_argnums=(6, 7, 8, 9),
+    )
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -1611,7 +1764,16 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+            state,
+            ema_params,
+            (probe_x, probe_y),
+            rng,
+            ema_decay_rep,
+            jnp.asarray(0, dtype=jnp.int32),
+            float(args.lambda_align),
+            int(args.align_warmup_steps),
+            align_layers,
+            bool(args.align_sample_one_layer),
         )
         block_pytree(probe_metrics)
 
@@ -1975,7 +2137,16 @@ def main():
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                jnp.asarray(global_step, dtype=jnp.int32),
+                float(args.lambda_align),
+                int(args.align_warmup_steps),
+                align_layers,
+                bool(args.align_sample_one_layer),
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
