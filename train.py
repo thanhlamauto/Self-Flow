@@ -605,7 +605,7 @@ def resolve_layersync_config(args, depth):
     if float(args.layersync_residual_lambda) < 0.0:
         raise ValueError("--layersync-residual-lambda must be non-negative")
 
-    capture_layers = tuple(range(1, depth + 1)) if random_mode else (ell0, strong_layer)
+    capture_layers = None if random_mode else (ell0, strong_layer)
     return {
         "mode": mode,
         "mode_name": LAYERSYNC_MODE_NAMES[mode],
@@ -617,6 +617,21 @@ def resolve_layersync_config(args, depth):
         "residual_lambda": float(args.layersync_residual_lambda),
         "neighbor_window": int(args.layersync_neighbor_window),
     }
+
+
+def pseudo_random_layersync_start(step, depth, delta, seed=0x5EED):
+    max_start = int(depth) - int(delta)
+    if max_start <= 0:
+        raise ValueError(f"Cannot sample LayerSync pair with depth={depth}, delta={delta}")
+    # Host-side SplitMix-style hash: deterministic, cheap, and keeps random
+    # layer choice out of XLA without the short cycles simple LCGs get modulo
+    # small numbers like depth-delta.
+    mask = (1 << 64) - 1
+    x = (int(step) + int(seed)) & mask
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+    x = (x ^ (x >> 31)) & mask
+    return int(x % max_start) + 1
 
 
 def spatial_norm_tokens(x, eps=1e-6):
@@ -779,16 +794,22 @@ def compute_layersync_loss(
     clean_mode = mode in (1, 2, 4, 5)
     residual_mode = mode in (4, 5)
     residual_only_mode = mode == 6
-    max_start = len(raw_features) - delta if random_mode else 1
-    start_zero = (
-        jax.random.randint(rng, (), minval=0, maxval=max_start)
-        if random_mode
-        else jnp.array(0, dtype=jnp.int32)
-    )
-    layer_a_index = start_zero if random_mode else jnp.array(ell0 - 1, dtype=jnp.int32)
-    layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
-    raw_a = _select_feature(raw_features, layer_a_index if random_mode else 0, random_mode=random_mode)
-    raw_b = _select_feature(raw_features, layer_b_index if random_mode else 1, random_mode=random_mode)
+    host_selected_random_pair = random_mode and ell0 is not None and len(raw_features) == 2
+    if host_selected_random_pair:
+        layer_a_index = jnp.array(ell0 - 1, dtype=jnp.int32)
+        layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
+        raw_a, raw_b = raw_features
+    else:
+        max_start = len(raw_features) - delta if random_mode else 1
+        start_zero = (
+            jax.random.randint(rng, (), minval=0, maxval=max_start)
+            if random_mode
+            else jnp.array(0, dtype=jnp.int32)
+        )
+        layer_a_index = start_zero if random_mode else jnp.array(ell0 - 1, dtype=jnp.int32)
+        layer_b_index = layer_a_index + jnp.array(delta, dtype=jnp.int32)
+        raw_a = _select_feature(raw_features, layer_a_index if random_mode else 0, random_mode=random_mode)
+        raw_b = _select_feature(raw_features, layer_b_index if random_mode else 1, random_mode=random_mode)
 
     if residual_only_mode:
         _, _, raw_a_res = tsvd_components(raw_a, rank=rank)
@@ -1866,34 +1887,71 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-            layersync_mode=layersync_config["mode"],
-            layersync_ell0=layersync_config["ell0"],
-            layersync_delta=layersync_config["delta"],
-            layersync_rank=layersync_config["rank"],
-            layersync_residual_lambda=layersync_config["residual_lambda"],
-            layersync_neighbor_window=layersync_config["neighbor_window"],
-        ),
-        axis_name="batch",
-    )
-    pmapped_eval_step = jax.pmap(
-        functools.partial(
-            eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-            layersync_mode=layersync_config["mode"],
-            layersync_ell0=layersync_config["ell0"],
-            layersync_delta=layersync_config["delta"],
-            layersync_rank=layersync_config["rank"],
-            layersync_residual_lambda=layersync_config["residual_lambda"],
-            layersync_neighbor_window=layersync_config["neighbor_window"],
-        ),
-        axis_name="batch",
-    )
+    layersync_random_host_mode = layersync_enabled and layersync_config["mode"] in (1, 4, 6)
+
+    def make_pmapped_train_step(capture_layers, ell0):
+        return jax.pmap(
+            functools.partial(
+                train_step,
+                layersync_enabled=layersync_enabled,
+                layersync_capture_layers=capture_layers,
+                layersync_mode=layersync_config["mode"],
+                layersync_ell0=ell0,
+                layersync_delta=layersync_config["delta"],
+                layersync_rank=layersync_config["rank"],
+                layersync_residual_lambda=layersync_config["residual_lambda"],
+                layersync_neighbor_window=layersync_config["neighbor_window"],
+            ),
+            axis_name="batch",
+        )
+
+    def make_pmapped_eval_step(capture_layers, ell0):
+        return jax.pmap(
+            functools.partial(
+                eval_step,
+                layersync_enabled=layersync_enabled,
+                layersync_capture_layers=capture_layers,
+                layersync_mode=layersync_config["mode"],
+                layersync_ell0=ell0,
+                layersync_delta=layersync_config["delta"],
+                layersync_rank=layersync_config["rank"],
+                layersync_residual_lambda=layersync_config["residual_lambda"],
+                layersync_neighbor_window=layersync_config["neighbor_window"],
+            ),
+            axis_name="batch",
+        )
+
+    if layersync_random_host_mode:
+        random_starts = tuple(range(1, depth - layersync_config["delta"] + 1))
+        pmapped_train_steps = {
+            start: make_pmapped_train_step((start, start + layersync_config["delta"]), start)
+            for start in random_starts
+        }
+        pmapped_eval_steps = {
+            start: make_pmapped_eval_step((start, start + layersync_config["delta"]), start)
+            for start in random_starts
+        }
+        log_stage(
+            "LayerSync pseudo-random host schedule: "
+            f"{len(random_starts)} compiled layer-pair choices, delta={layersync_config['delta']}"
+        )
+
+        def train_step_for_global_step(step):
+            start = pseudo_random_layersync_start(step, depth, layersync_config["delta"])
+            return pmapped_train_steps[start], start
+
+        def eval_step_for_global_step(step):
+            start = pseudo_random_layersync_start(step, depth, layersync_config["delta"], seed=0xE0A1)
+            return pmapped_eval_steps[start], start
+    else:
+        pmapped_train_step = make_pmapped_train_step(layersync_capture_layers, layersync_config["ell0"])
+        pmapped_eval_step = make_pmapped_eval_step(layersync_capture_layers, layersync_config["ell0"])
+
+        def train_step_for_global_step(step):
+            return pmapped_train_step, layersync_config["ell0"]
+
+        def eval_step_for_global_step(step):
+            return pmapped_eval_step, layersync_config["ell0"]
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -2165,7 +2223,8 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(
+        probe_train_step, _ = train_step_for_global_step(0)
+        _, _, probe_metrics, _ = probe_train_step(
             state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
         )
         block_pytree(probe_metrics)
@@ -2529,7 +2588,8 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
+            train_step_fn, train_layersync_start = train_step_for_global_step(global_step)
+            state, ema_params, metrics, rng = train_step_fn(
                 state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
             )
             global_step += 1
@@ -2543,6 +2603,8 @@ def main():
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
                 cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
+                if layersync_random_host_mode:
+                    cpu_metrics["train/layersync_start_layer"] = train_layersync_start
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -2550,13 +2612,14 @@ def main():
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
-                for _ in range(args.eval_batches):
+                for eval_idx in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
                         val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(
+                    eval_step_fn, _ = eval_step_for_global_step(global_step + eval_idx)
+                    val_metrics, rng = eval_step_fn(
                         state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
