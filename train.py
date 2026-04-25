@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+import random
 from functools import partial
 
 os.environ.setdefault("USE_TF", "0")
@@ -599,11 +600,27 @@ def _scheduled_lambda_spatial(
     return lambda_spatial * stop_scale, stop_scale
 
 
+def resolve_private_fixed_pair_schedule(depth, max_pairs, seed, num_steps):
+    total_pairs = int(depth) * (int(depth) - 1) // 2
+    max_pairs = total_pairs if int(max_pairs) <= 0 else min(int(max_pairs), total_pairs)
+    if max_pairs <= 0 or int(num_steps) <= 0:
+        return None
+    all_pairs = [(i, j) for i in range(int(depth)) for j in range(i + 1, int(depth))]
+    rng = random.Random(int(seed))
+    schedule = []
+    for _ in range(int(num_steps)):
+        pairs = list(all_pairs)
+        rng.shuffle(pairs)
+        schedule.append(pairs[:max_pairs])
+    return jnp.asarray(schedule, dtype=jnp.int32)
+
+
 def train_step(
     state, ema_params, batch, rng, ema_decay, current_step,
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
+    private_fixed_pair_schedule=None,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -692,6 +709,8 @@ def train_step(
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
                 private_pair_mode=private_pair_mode,
+                private_fixed_pair_schedule=private_fixed_pair_schedule,
+                private_pair_schedule_step=current_step,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
                 compute_spatial_loss=compute_spatial_loss,
@@ -840,6 +859,7 @@ def eval_step(
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
+    private_fixed_pair_schedule=None,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -922,6 +942,8 @@ def eval_step(
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
             private_pair_mode=private_pair_mode,
+            private_fixed_pair_schedule=private_fixed_pair_schedule,
+            private_pair_schedule_step=current_step,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
             compute_spatial_loss=compute_spatial_loss,
@@ -1523,12 +1545,19 @@ def main():
         "--private-pair-mode",
         type=str,
         default="first_pairs",
-        choices=["first_pairs", "random_pairs"],
+        choices=["first_pairs", "random_pairs", "fixed_random_pairs"],
         help=(
             "Private loss pair selection. 'first_pairs' takes pairs in increasing block-index order "
             "(0,1), (0,2), ... up to --private-max-pairs. 'random_pairs' samples pairs directly "
-            "from all layer pairs each iteration."
+            "from all layer pairs each iteration. 'fixed_random_pairs' precomputes the per-step "
+            "random pair schedule on the host with --private-pair-seed and reuses that schedule."
         ),
+    )
+    parser.add_argument(
+        "--private-pair-seed",
+        type=int,
+        default=42,
+        help="Host RNG seed used only when --private-pair-mode=fixed_random_pairs.",
     )
     parser.add_argument(
         "--common-private-max-layers",
@@ -1865,6 +1894,15 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    total_steps = args.epochs * args.steps_per_epoch
+    private_fixed_pair_schedule = None
+    if args.private_pair_mode == "fixed_random_pairs":
+        private_fixed_pair_schedule = resolve_private_fixed_pair_schedule(
+            depth,
+            args.private_max_pairs,
+            args.private_pair_seed,
+            total_steps,
+        )
     log_stage(
         "Activation decomposition: "
         f"lambda_spatial={args.lambda_spatial} "
@@ -1876,6 +1914,7 @@ def main():
         f"private_warmup_iters={args.private_warmup_iters} "
         f"private_max_pairs={args.private_max_pairs} "
         f"private_pair_mode={args.private_pair_mode} "
+        f"private_pair_seed={args.private_pair_seed} "
         f"common_private_max_layers={args.common_private_max_layers} "
         f"spatial_window_size={args.spatial_window_size} "
         f"spatial_window_stride={args.spatial_window_stride} "
@@ -1896,6 +1935,15 @@ def main():
             f"depth={args.common_spatial_projector_depth} "
             f"kernel={args.common_spatial_projector_kernel_size}"
         )
+    if private_fixed_pair_schedule is not None:
+        preview_steps = min(3, int(private_fixed_pair_schedule.shape[0]))
+        log_stage(
+            "Private fixed random pair schedule: "
+            f"steps={private_fixed_pair_schedule.shape[0]} "
+            f"pairs_per_step={private_fixed_pair_schedule.shape[1]} "
+            f"seed={args.private_pair_seed} "
+            f"preview={np.asarray(private_fixed_pair_schedule[:preview_steps]).tolist()}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1914,8 +1962,6 @@ def main():
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
-
-    total_steps = args.epochs * args.steps_per_epoch
 
     # ── FLOPs estimate (cached once; used for TFLOPs logging) ─────────────────
     # This is a rough throughput metric for monitoring. It intentionally avoids
@@ -1946,6 +1992,7 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
+            private_fixed_pair_schedule=private_fixed_pair_schedule,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -1973,6 +2020,7 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
+            private_fixed_pair_schedule=private_fixed_pair_schedule,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,

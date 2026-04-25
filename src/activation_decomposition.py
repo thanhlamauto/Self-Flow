@@ -383,33 +383,91 @@ def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     return cosine_matrix[upper_indices]
 
 
-def _mean_pairwise_cosine_squared(
+def _select_private_pair_indices(
+    num_layers: int,
+    *,
+    rng: jax.Array | None = None,
+    max_pairs: int = 0,
+    pair_mode: str = "first_pairs",
+    fixed_pair_schedule: jax.Array | None = None,
+    pair_schedule_step: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Return selected private-layer pair indices in lexicographic pair order."""
+    if pair_mode not in ("first_pairs", "random_pairs", "fixed_random_pairs"):
+        raise ValueError(
+            f"Unknown private pair mode {pair_mode!r}; expected 'first_pairs', 'random_pairs', "
+            "or 'fixed_random_pairs'."
+        )
+    if num_layers < 2:
+        empty = jnp.asarray((), dtype=jnp.int32)
+        return empty, empty
+
+    if pair_mode == "fixed_random_pairs":
+        if fixed_pair_schedule is None or pair_schedule_step is None:
+            raise ValueError("fixed_random_pairs requires fixed_pair_schedule and pair_schedule_step.")
+        schedule_step = jnp.mod(pair_schedule_step, fixed_pair_schedule.shape[0])
+        pairs = jax.lax.dynamic_index_in_dim(
+            fixed_pair_schedule,
+            schedule_step,
+            axis=0,
+            keepdims=False,
+        ).astype(jnp.int32)
+        pair_a = pairs[:, 0]
+        pair_b = pairs[:, 1]
+        return pair_a, pair_b
+
+    pair_a, pair_b = jnp.triu_indices(num_layers, k=1)
+    total_pairs = pair_a.shape[0]
+    if max_pairs and max_pairs > 0 and total_pairs > max_pairs:
+        if pair_mode == "random_pairs":
+            if rng is None:
+                raise ValueError("An RNG key is required when sampling private-layer pairs.")
+            selected = jax.random.permutation(rng, total_pairs)[:max_pairs]
+            return pair_a[selected], pair_b[selected]
+        return pair_a[:max_pairs], pair_b[:max_pairs]
+    return pair_a, pair_b
+
+
+def _private_pairwise_cosines_for_indices(
+    private: jax.Array,
+    pair_a: jax.Array,
+    pair_b: jax.Array,
+    eps: float = 1e-8,
+) -> jax.Array:
+    """Return cosine similarities for preselected private-layer pairs."""
+    if pair_a.shape[0] == 0:
+        return jnp.array(0.0, dtype=private.dtype)
+
+    flattened = private.reshape(private.shape[0], -1)
+    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
+    normalized = flattened / jnp.maximum(norms, eps)
+    selected_a = normalized[pair_a]
+    selected_b = normalized[pair_b]
+    return jnp.sum(selected_a * selected_b, axis=-1)
+
+
+def _private_pairwise_loss_and_metric(
     private: jax.Array,
     eps: float = 1e-8,
     rng: jax.Array | None = None,
     max_pairs: int = 0,
     pair_mode: str = "first_pairs",
-) -> jax.Array:
-    """Average squared cosine similarity over all or sampled layer pairs."""
-    if pair_mode not in ("first_pairs", "random_pairs"):
-        raise ValueError(
-            f"Unknown private pair mode {pair_mode!r}; expected 'first_pairs' or 'random_pairs'."
-        )
-
-    pairwise_cosines = _pairwise_cosines(private, eps=eps)
+    fixed_pair_schedule: jax.Array | None = None,
+    pair_schedule_step: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Average squared cosine loss and mean cosine over selected private-layer pairs."""
+    pair_a, pair_b = _select_private_pair_indices(
+        private.shape[0],
+        rng=rng,
+        max_pairs=max_pairs,
+        pair_mode=pair_mode,
+        fixed_pair_schedule=fixed_pair_schedule,
+        pair_schedule_step=pair_schedule_step,
+    )
+    pairwise_cosines = _private_pairwise_cosines_for_indices(private, pair_a, pair_b, eps=eps)
     if pairwise_cosines.ndim == 0:
-        return pairwise_cosines
-
-    if max_pairs and max_pairs > 0 and pairwise_cosines.shape[0] > max_pairs:
-        if pair_mode == "random_pairs":
-            if rng is None:
-                raise ValueError("An RNG key is required when sampling private-layer pairs.")
-            indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
-            pairwise_cosines = pairwise_cosines[indices]
-        else:
-            pairwise_cosines = pairwise_cosines[:max_pairs]
-
-    return jnp.mean(jnp.square(pairwise_cosines))
+        return pairwise_cosines, pairwise_cosines
+    return jnp.mean(jnp.square(pairwise_cosines)), jnp.mean(pairwise_cosines)
 
 
 def _common_private_cosines(
@@ -466,6 +524,8 @@ def compute_aux_losses(
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
     private_pair_mode: str = "first_pairs",
+    private_fixed_pair_schedule: jax.Array | None = None,
+    private_pair_schedule_step: jax.Array | None = None,
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
     compute_spatial_loss: bool = True,
@@ -563,14 +623,17 @@ def compute_aux_losses(
     if compute_private_loss:
         if private is None:
             raise ValueError("Private activations are required when computing private loss.")
-        private_loss = _mean_pairwise_cosine_squared(
+        private_loss, avg_pairwise_cosine = _private_pairwise_loss_and_metric(
             private,
             rng=private_pair_rng,
             max_pairs=private_max_pairs,
             pair_mode=private_pair_mode,
+            fixed_pair_schedule=private_fixed_pair_schedule,
+            pair_schedule_step=private_pair_schedule_step,
         )
     else:
         private_loss = jnp.array(0.0, dtype=common.dtype)
+        avg_pairwise_cosine = jnp.array(0.0, dtype=common.dtype)
     if compute_common_private_loss:
         if private is None:
             raise ValueError("Private activations are required when computing common/private loss.")
@@ -597,15 +660,6 @@ def compute_aux_losses(
         avg_private_norm = jnp.mean(private_norms)
     else:
         avg_private_norm = jnp.array(0.0, dtype=common.dtype)
-
-    if compute_private_loss:
-        pairwise_cosines = _pairwise_cosines(private)
-        if pairwise_cosines.ndim == 0:
-            avg_pairwise_cosine = pairwise_cosines
-        else:
-            avg_pairwise_cosine = jnp.mean(pairwise_cosines)
-    else:
-        avg_pairwise_cosine = jnp.array(0.0, dtype=common.dtype)
 
     return {
         "common_activation": common,
