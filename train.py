@@ -6,7 +6,6 @@ import pickle
 import time
 import threading
 import queue
-import functools
 import logging
 import zipfile
 
@@ -367,10 +366,6 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-DEFAULT_LAYERSYNC_WEAK_LAYER = 8
-DEFAULT_LAYERSYNC_STRONG_LAYER = 16
-
-
 def build_model_config(model_size):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -502,57 +497,6 @@ def ema_update(ema_params, new_params, decay):
     )
 
 
-def _cli_flag_was_set(flag_name):
-    return any(
-        arg == flag_name or arg.startswith(f"{flag_name}=")
-        for arg in sys.argv[1:]
-    )
-
-
-def resolve_layersync_config(args, depth):
-    weak_layer = int(args.layersync_weak_layer)
-    strong_layer = int(args.layersync_strong_layer)
-
-    uses_default_pair = (
-        not _cli_flag_was_set("--layersync-weak-layer")
-        and not _cli_flag_was_set("--layersync-strong-layer")
-        and weak_layer == DEFAULT_LAYERSYNC_WEAK_LAYER
-        and strong_layer == DEFAULT_LAYERSYNC_STRONG_LAYER
-    )
-    if uses_default_pair and strong_layer > depth:
-        raise ValueError(
-            "LayerSync default pair 8:16 is only valid for models with depth >= 16. "
-            f"Current --model-size {args.model_size.upper()} has depth {depth}. "
-            "Override --layersync-weak-layer and --layersync-strong-layer when enabling LayerSync "
-            "on smaller backbones."
-        )
-
-    if not (1 <= weak_layer <= depth):
-        raise ValueError(f"--layersync-weak-layer must be in [1, {depth}], got {weak_layer}")
-    if not (1 <= strong_layer <= depth):
-        raise ValueError(f"--layersync-strong-layer must be in [1, {depth}], got {strong_layer}")
-    if weak_layer >= strong_layer:
-        raise ValueError(
-            "--layersync-weak-layer must be strictly less than --layersync-strong-layer "
-            f"(got {weak_layer} and {strong_layer})"
-        )
-
-    return weak_layer, strong_layer
-
-
-def compute_layersync_loss(raw_features):
-    z_weak, z_strong = raw_features
-    eps = jnp.float32(1e-8)
-
-    z_strong = jax.lax.stop_gradient(z_strong)
-    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
-    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
-
-    cosine = jnp.sum(z_weak * z_strong, axis=-1)
-    mean_cosine = jnp.mean(cosine)
-    return -mean_cosine, mean_cosine
-
-
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
@@ -561,10 +505,6 @@ def train_step(
     batch,
     rng,
     ema_decay,
-    layersync_lambda,
-    *,
-    layersync_enabled,
-    layersync_capture_layers,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -585,45 +525,26 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
-            pred, raw_features = state.apply_fn(
-                {"params": params},
-                x_tau,
-                timesteps=tau,
-                vector=y,
-                deterministic=False,
-                rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
-            )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
-        else:
-            pred = state.apply_fn(
-                {"params": params},
-                x_tau,
-                timesteps=tau,
-                vector=y,
-                deterministic=False,
-                rngs={"dropout": drop_rng},
-            )
-            loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-            layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
-
+        pred = state.apply_fn(
+            {"params": params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+        )
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss_gen, (v_abs_mean, v_pred_abs_mean, loss_gen)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -636,9 +557,6 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
-        "train/loss_layersync": loss_layersync,
-        "train/layersync_lambda": layersync_lambda,
-        "train/layersync_cosine": layersync_cosine,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -650,13 +568,8 @@ def train_step(
 
 def eval_step(
     state,
-    ema_params,
     batch,
     rng,
-    layersync_lambda,
-    *,
-    layersync_enabled,
-    layersync_capture_layers,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
@@ -670,37 +583,19 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
-        pred, raw_features = state.apply_fn(
-            {"params": state.params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=True,
-            return_raw_features=layersync_capture_layers,
-        )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
-    else:
-        pred = state.apply_fn(
-            {"params": state.params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=True,
-        )
-        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
-        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
-
+    pred = state.apply_fn(
+        {"params": state.params},
+        x_tau,
+        timesteps=tau,
+        vector=y,
+        deterministic=True,
+    )
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
+    loss = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
-    loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
-    layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
-    layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -708,9 +603,6 @@ def eval_step(
         "val/loss": loss,
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
-        "val/loss_layersync": loss_layersync,
-        "val/layersync_lambda": layersync_lambda,
-        "val/layersync_cosine": layersync_cosine,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1196,24 +1088,6 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
-    parser.add_argument(
-        "--layersync-lambda",
-        type=float,
-        default=0.0,
-        help="Weight for the LayerSync regularizer. 0.0 disables LayerSync.",
-    )
-    parser.add_argument(
-        "--layersync-weak-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_WEAK_LAYER,
-        help="1-based index of the shallower layer aligned by LayerSync (paper default: 8).",
-    )
-    parser.add_argument(
-        "--layersync-strong-layer",
-        type=int,
-        default=DEFAULT_LAYERSYNC_STRONG_LAYER,
-        help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
-    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1360,8 +1234,6 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
-    if args.layersync_lambda < 0.0:
-        raise ValueError("--layersync-lambda must be non-negative")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1395,17 +1267,6 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
-    layersync_enabled = args.layersync_lambda > 0.0
-    layersync_capture_layers = None
-    if layersync_enabled:
-        weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
-        layersync_capture_layers = (weak_layer, strong_layer)
-        log_stage(
-            f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
-        )
-    else:
-        log_stage("LayerSync DISABLED: lambda=0.0")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1421,7 +1282,6 @@ def main():
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
-    layersync_lambda_rep = jax_utils.replicate(jnp.float32(args.layersync_lambda))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1445,22 +1305,8 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(
-        functools.partial(
-            train_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-        ),
-        axis_name="batch",
-    )
-    pmapped_eval_step = jax.pmap(
-        functools.partial(
-            eval_step,
-            layersync_enabled=layersync_enabled,
-            layersync_capture_layers=layersync_capture_layers,
-        ),
-        axis_name="batch",
-    )
+    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
@@ -1732,7 +1578,7 @@ def main():
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
         )
         block_pytree(probe_metrics)
 
@@ -2096,7 +1942,7 @@ def main():
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2123,7 +1969,7 @@ def main():
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state, (val_x, val_y), rng
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
