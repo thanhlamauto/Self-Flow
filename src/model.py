@@ -272,6 +272,76 @@ class FinalLayer(nn.Module):
         return x
 
 
+class LayerConditionedSpatialProbe(nn.Module):
+    """Shared phase projector with one-hot layer conditioning."""
+    hidden_size: int
+    depth: int
+    grid_size: int
+    num_frequencies: int = 8
+    max_frequency: float = 8.0
+
+    @nn.compact
+    def __call__(self, hidden_layers, layer_ids, pair_indices):
+        # hidden_layers: (S, B, N, D), layer_ids are 1-indexed block numbers.
+        hidden_layers = jnp.asarray(hidden_layers)
+        layer_ids = jnp.asarray(layer_ids, dtype=jnp.int32)
+        pair_indices = jnp.asarray(pair_indices, dtype=jnp.int32)
+
+        normed = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)(hidden_layers)
+        cond = nn.Embed(
+            num_embeddings=self.depth,
+            features=2 * self.hidden_size,
+            embedding_init=ZERO_INIT,
+            name="layer_condition",
+        )(layer_ids - 1)
+        gamma, beta = jnp.split(cond, 2, axis=-1)
+        conditioned = normed * (1.0 + gamma[:, None, None, :]) + beta[:, None, None, :]
+
+        phases = nn.Dense(
+            4 * self.num_frequencies,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="shared_projector",
+        )(conditioned)
+        phases = phases.reshape(
+            phases.shape[0],
+            phases.shape[1],
+            phases.shape[2],
+            2,
+            self.num_frequencies,
+            2,
+        )
+        phases = phases / (jnp.linalg.norm(phases, axis=-1, keepdims=True) + 1e-6)
+
+        i_idx = pair_indices[:, 0]
+        j_idx = pair_indices[:, 1]
+        qi = jnp.take(phases, i_idx, axis=2)  # (S, B, M, axis, K, cos/sin)
+        qj = jnp.take(phases, j_idx, axis=2)
+
+        qi = qi[:, None, ...]
+        qj = qj[None, :, ...]
+        pred_cos = qi[..., 0] * qj[..., 0] + qi[..., 1] * qj[..., 1]
+        pred_sin = qi[..., 1] * qj[..., 0] - qi[..., 0] * qj[..., 1]
+        pred = jnp.stack([pred_cos, pred_sin], axis=-1)
+
+        coords_1d = jnp.linspace(0.0, 1.0, self.grid_size, dtype=jnp.float32)
+        yy, xx = jnp.meshgrid(coords_1d, coords_1d, indexing="ij")
+        coords = jnp.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1)
+        delta = jnp.take(coords, i_idx, axis=0) - jnp.take(coords, j_idx, axis=0)
+        freqs = jnp.linspace(
+            1.0,
+            float(self.max_frequency),
+            self.num_frequencies,
+            dtype=jnp.float32,
+        ) * (2.0 * jnp.pi)
+        target_angles = delta[:, :, None] * freqs[None, None, :]
+        target = jnp.stack([jnp.cos(target_angles), jnp.sin(target_angles)], axis=-1)
+        target = target[None, None, None, ...]
+
+        loss = jnp.mean(jnp.square(pred - target))
+        return loss
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -305,6 +375,11 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
+        return_spatial_probe_loss: bool = False,
+        spatial_probe_layers: Optional[Sequence[int]] = None,
+        spatial_probe_pair_indices: Optional[jax.Array] = None,
+        spatial_probe_num_frequencies: int = 8,
+        spatial_probe_max_frequency: float = 8.0,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -333,6 +408,25 @@ class SelfFlowDiT(nn.Module):
                 raw_positions = {}
                 for idx, layer in enumerate(raw_layers):
                     raw_positions.setdefault(layer, []).append(idx)
+
+        spatial_layers = ()
+        spatial_positions = None
+        if return_spatial_probe_loss:
+            if spatial_probe_layers is None:
+                spatial_layers = tuple(range(1, self.depth + 1))
+            else:
+                spatial_layers = tuple(int(layer) for layer in spatial_probe_layers)
+            if any(layer <= 0 for layer in spatial_layers):
+                raise ValueError(f"spatial_probe_layers must be >= 1, got {spatial_layers}")
+            if any(layer > self.depth for layer in spatial_layers):
+                raise ValueError(
+                    f"spatial_probe_layers must be <= model depth ({self.depth}), got {spatial_layers}"
+                )
+            if spatial_probe_pair_indices is None:
+                raise ValueError("spatial_probe_pair_indices is required when return_spatial_probe_loss=True")
+            spatial_positions = {}
+            for idx, layer in enumerate(spatial_layers):
+                spatial_positions.setdefault(layer, []).append(idx)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -376,6 +470,7 @@ class SelfFlowDiT(nn.Module):
         zs = None
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
+        spatial_zs = [None] * len(spatial_layers) if return_spatial_probe_loss else None
         for i in range(self.depth):
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
@@ -396,6 +491,9 @@ class SelfFlowDiT(nn.Module):
                 else:
                     for idx in raw_positions[i + 1]:
                         raw_zs[idx] = x
+            if return_spatial_probe_loss and (i + 1) in spatial_positions:
+                for idx in spatial_positions[i + 1]:
+                    spatial_zs[idx] = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -411,6 +509,21 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        if return_spatial_probe_loss:
+            spatial_probe_loss = LayerConditionedSpatialProbe(
+                hidden_size=self.hidden_size,
+                depth=self.depth,
+                grid_size=self.grid_size,
+                num_frequencies=int(spatial_probe_num_frequencies),
+                max_frequency=float(spatial_probe_max_frequency),
+                name="layer_conditioned_spatial_probe",
+            )(
+                jnp.stack(spatial_zs, axis=0),
+                jnp.asarray(spatial_layers, dtype=jnp.int32),
+                spatial_probe_pair_indices,
+            )
+            return x, spatial_probe_loss
 
         if return_features:
             if return_block_summaries:

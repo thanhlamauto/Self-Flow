@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from functools import partial
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -431,7 +432,28 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def parse_layer_list(spec, depth):
+    """Parse comma-separated 1-indexed layer ids; 'all' expands to every block."""
+    if spec is None or str(spec).strip().lower() == "all":
+        return tuple(range(1, int(depth) + 1))
+    layers = tuple(int(part.strip()) for part in str(spec).split(",") if part.strip())
+    if not layers:
+        raise ValueError("--spatial-probe-layers must be 'all' or a comma-separated list")
+    if any(layer <= 0 or layer > depth for layer in layers):
+        raise ValueError(f"--spatial-probe-layers must be in [1, {depth}], got {layers}")
+    return layers
+
+
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    spatial_probe_enabled=False,
+    spatial_probe_layers=(),
+    spatial_probe_num_frequencies=8,
+    spatial_probe_max_frequency=8.0,
+):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -460,12 +482,24 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
-    variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+    init_kwargs = dict(
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
+    )
+    if spatial_probe_enabled:
+        init_kwargs.update(
+            return_spatial_probe_loss=True,
+            spatial_probe_layers=tuple(spatial_probe_layers),
+            spatial_probe_pair_indices=jnp.asarray([[0, min(1, n_patches - 1)]], dtype=jnp.int32),
+            spatial_probe_num_frequencies=int(spatial_probe_num_frequencies),
+            spatial_probe_max_frequency=float(spatial_probe_max_frequency),
+        )
+
+    variables = model.init(
+        {'params': rng, 'dropout': drop_rng},
+        **init_kwargs,
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
@@ -507,6 +541,11 @@ def train_step(
     batch,
     rng,
     ema_decay,
+    spatial_probe_weight=0.0,
+    spatial_probe_layers=(),
+    spatial_probe_num_frequencies=8,
+    spatial_probe_max_frequency=8.0,
+    spatial_probe_num_pairs=1024,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -518,7 +557,7 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, pair_rng = jax.random.split(rng, 5)
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -527,26 +566,51 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
-            {"params": params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-        )
+        if spatial_probe_weight > 0.0:
+            pair_indices = jax.random.randint(
+                pair_rng,
+                shape=(int(spatial_probe_num_pairs), 2),
+                minval=0,
+                maxval=x0.shape[1],
+                dtype=jnp.int32,
+            )
+            pred, loss_spatial = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                return_spatial_probe_loss=True,
+                spatial_probe_layers=tuple(spatial_probe_layers),
+                spatial_probe_pair_indices=pair_indices,
+                spatial_probe_num_frequencies=int(spatial_probe_num_frequencies),
+                spatial_probe_max_frequency=float(spatial_probe_max_frequency),
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+        else:
+            pred = state.apply_fn(
+                {"params": params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+            )
+            loss_spatial = jnp.asarray(0.0, dtype=jnp.float32)
         loss_gen = jnp.mean((pred - target) ** 2)
+        loss_total = loss_gen + jnp.asarray(spatial_probe_weight, dtype=jnp.float32) * loss_spatial
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss_gen, (v_abs_mean, v_pred_abs_mean, loss_gen)
+        return loss_total, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_spatial)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, loss_gen, loss_spatial)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_spatial = jax.lax.pmean(loss_spatial, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -559,6 +623,8 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
+        "train/loss_spatial": loss_spatial,
+        "train/spatial_probe_weight": jnp.asarray(spatial_probe_weight, dtype=jnp.float32),
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -1113,6 +1179,37 @@ def main():
             "Set to 0 to train without CFG dropout/unconditional label embedding."
         ),
     )
+    # ── Layer-conditioned shared spatial probe regularizer ───────────────────
+    parser.add_argument(
+        "--spatial-probe-weight",
+        type=float,
+        default=0.0,
+        help="Lambda for the layer-conditioned shared spatial phase probe regularizer. 0 disables it.",
+    )
+    parser.add_argument(
+        "--spatial-probe-layers",
+        type=str,
+        default="all",
+        help="1-indexed backbone layers for the spatial probe, e.g. 'all' or '3,6,9,12'.",
+    )
+    parser.add_argument(
+        "--spatial-probe-num-frequencies",
+        type=int,
+        default=8,
+        help="Number of sinusoidal frequencies per x/y axis for the spatial phase target.",
+    )
+    parser.add_argument(
+        "--spatial-probe-max-frequency",
+        type=float,
+        default=8.0,
+        help="Maximum cycles over normalized token coordinates; frequencies are linearly spaced from 1 to this value.",
+    )
+    parser.add_argument(
+        "--spatial-probe-num-pairs",
+        type=int,
+        default=1024,
+        help="Number of random token pairs sampled per local train step for the spatial regularizer.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1261,6 +1358,14 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if not 0.0 <= args.cfg_dropout_rate <= 1.0:
         raise ValueError("--cfg-dropout-rate must be between 0 and 1")
+    if args.spatial_probe_weight < 0.0:
+        raise ValueError("--spatial-probe-weight must be >= 0")
+    if args.spatial_probe_num_frequencies <= 0:
+        raise ValueError("--spatial-probe-num-frequencies must be > 0")
+    if args.spatial_probe_max_frequency <= 0.0:
+        raise ValueError("--spatial-probe-max-frequency must be > 0")
+    if args.spatial_probe_num_pairs <= 0:
+        raise ValueError("--spatial-probe-num-pairs must be > 0")
     if args.cfg_dropout_rate == 0.0:
         if args.sample_cfg_scale > 1.0:
             raise ValueError("--sample-cfg-scale > 1 requires --cfg-dropout-rate > 0")
@@ -1291,6 +1396,8 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
     depth = int(config["depth"])
+    spatial_probe_enabled = args.spatial_probe_weight > 0.0
+    spatial_probe_layers = parse_layer_list(args.spatial_probe_layers, depth)
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1300,6 +1407,13 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"cfg_dropout_rate={args.cfg_dropout_rate}"
     )
+    if spatial_probe_enabled:
+        log_stage(
+            "Spatial probe regularizer: "
+            f"lambda={args.spatial_probe_weight} layers={spatial_probe_layers} "
+            f"freqs={args.spatial_probe_num_frequencies} "
+            f"max_freq={args.spatial_probe_max_frequency} pairs={args.spatial_probe_num_pairs}"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1310,7 +1424,16 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        spatial_probe_enabled=spatial_probe_enabled,
+        spatial_probe_layers=spatial_probe_layers,
+        spatial_probe_num_frequencies=args.spatial_probe_num_frequencies,
+        spatial_probe_max_frequency=args.spatial_probe_max_frequency,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1338,7 +1461,15 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    train_step_fn = partial(
+        train_step,
+        spatial_probe_weight=float(args.spatial_probe_weight),
+        spatial_probe_layers=spatial_probe_layers,
+        spatial_probe_num_frequencies=int(args.spatial_probe_num_frequencies),
+        spatial_probe_max_frequency=float(args.spatial_probe_max_frequency),
+        spatial_probe_num_pairs=int(args.spatial_probe_num_pairs),
+    )
+    pmapped_train_step = jax.pmap(train_step_fn, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
