@@ -37,7 +37,7 @@ DIT_VARIANTS = {
 }
 
 
-def _model_config_for_size(model_size):
+def _model_config_for_size(model_size, class_dropout_prob=0.1):
     """Return the full model-init config dict for a DiT variant name (S/B/L/XL)."""
     variant = DIT_VARIANTS[model_size.upper()]
     return dict(
@@ -51,6 +51,7 @@ def _model_config_for_size(model_size):
         num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=float(class_dropout_prob),
     )
 
 
@@ -75,7 +76,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL"):
+def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
     """Load the DiT backbone from a flax.training.checkpoints checkpoint.
 
     This SiT baseline expects flat parameter trees (both online and EMA).
@@ -83,7 +84,7 @@ def load_model(ckpt_path=None, model_size="XL"):
       - Nested {"backbone": ...} checkpoints: extract "backbone".
       - Flat checkpoints that include a legacy "feature_head": drop that key.
     """
-    config = _model_config_for_size(model_size)
+    config = _model_config_for_size(model_size, class_dropout_prob=class_dropout_prob)
     model = SelfFlowDiT(**config, per_token=False)
 
     # Initialize parameters with random key
@@ -218,9 +219,20 @@ def main():
                         choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
                         help="HuggingFace VAE model ID")
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="CFG scale (1.0 = no guidance)")
+    parser.add_argument(
+        "--cfg-dropout-rate",
+        type=float,
+        default=0.1,
+        help="CFG dropout rate used when training the checkpoint. Use 0 for checkpoints trained with --cfg-dropout-rate 0.",
+    )
     parser.add_argument("--guidance-low", type=float, default=0.0, help="Lower guidance bound")
     parser.add_argument("--guidance-high", type=float, default=0.7, help="Upper guidance bound")
     args = parser.parse_args()
+
+    if not 0.0 <= args.cfg_dropout_rate <= 1.0:
+        raise ValueError("--cfg-dropout-rate must be between 0 and 1")
+    if args.cfg_dropout_rate == 0.0 and args.cfg_scale > 1.0:
+        raise ValueError("--cfg-scale > 1 requires a checkpoint trained with --cfg-dropout-rate > 0")
     
     print(f"Generating {args.num_fid_samples} samples")
     print(f"Mode: {args.mode}, Steps: {args.num_steps}, CFG: {args.cfg_scale}")
@@ -233,7 +245,11 @@ def main():
     if args.save_images:
         (output_dir / "images").mkdir(exist_ok=True)
         
-    model, params = load_model(args.ckpt, model_size=args.model_size)
+    model, params = load_model(
+        args.ckpt,
+        model_size=args.model_size,
+        class_dropout_prob=args.cfg_dropout_rate,
+    )
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
     sample_step_fn = build_sample_step(model, vae, scale_factor, shift_factor)

@@ -366,7 +366,7 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-def build_model_config(model_size):
+def build_model_config(model_size, class_dropout_prob=0.1):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -386,6 +386,7 @@ def build_model_config(model_size):
         num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=float(class_dropout_prob),
     )
 
 
@@ -447,6 +448,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -741,6 +743,12 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         - Paper-like eval: num_steps=250, cfg_scale=1.0
         (paper eval keeps cfg_scale=1.0; higher CFG remains a deviation)
     """
+    if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires an unconditional label embedding. "
+            "Use --cfg-dropout-rate > 0 for training, or keep cfg scale at 1.0."
+        )
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -752,6 +760,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -840,6 +849,12 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
+    if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires an unconditional label embedding. "
+            "Use --cfg-dropout-rate > 0 for training, or keep cfg scale at 1.0."
+        )
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -851,6 +866,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -1088,6 +1104,15 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    parser.add_argument(
+        "--cfg-dropout-rate",
+        type=float,
+        default=0.1,
+        help=(
+            "Classifier-free label dropout rate during training. "
+            "Set to 0 to train without CFG dropout/unconditional label embedding."
+        ),
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1234,6 +1259,13 @@ def main():
         raise ValueError("--block-corr-batches must be > 0")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
+    if not 0.0 <= args.cfg_dropout_rate <= 1.0:
+        raise ValueError("--cfg-dropout-rate must be between 0 and 1")
+    if args.cfg_dropout_rate == 0.0:
+        if args.sample_cfg_scale > 1.0:
+            raise ValueError("--sample-cfg-scale > 1 requires --cfg-dropout-rate > 0")
+        if args.fid_cfg_scale > 1.0:
+            raise ValueError("--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1257,7 +1289,7 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size)
+    config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
     depth = int(config["depth"])
 
     log_stage(
@@ -1265,7 +1297,8 @@ def main():
         f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
+        f"cfg_dropout_rate={args.cfg_dropout_rate}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
