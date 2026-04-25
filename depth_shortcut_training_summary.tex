@@ -1,0 +1,258 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs}
+
+\title{Depth Shortcut Predictor for DiT: Training Summary}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Setup}
+Let a DiT backbone have depth $L=12$, $P=256$ patch tokens, hidden size
+$D=768$, and $T=50$ discrete training timesteps. For a noised latent
+$x_t$ at timestep index $q\in\{0,\ldots,49\}$, a full DiT forward returns
+\[
+    \hat v,\quad Z_0,Z_1,\ldots,Z_L,\quad e_t^{\mathrm{DiT}},
+\]
+where $Z_0$ is the post-patch-embedding state and $Z_l\in\mathbb{R}^{B\times P\times D}$
+is the state after block $l$.
+
+All shortcut supervision is done in tokenwise direction space:
+\[
+    U_l=\operatorname{dir}(Z_l)
+    =\frac{Z_l}{\|Z_l\|_2+\epsilon},
+    \qquad U_l\in\mathbb{R}^{B\times P\times D}.
+\]
+The shortcut predictor receives a source direction, source layer, target
+layer, and DiT timestep embedding:
+\[
+    Y_{a\rightarrow b}=P_\theta(U_a,a,b,t_q),\qquad
+    \hat U_{a\rightarrow b}=\operatorname{dir}(Y_{a\rightarrow b}).
+\]
+
+\section{Conditioning}
+For $0\leq a<b\leq L$, let $\Delta=b-a$. The predictor uses learned layer
+embeddings of dimension $16$:
+\[
+    h_a=W_{\mathrm{state}}o_a,\quad
+    h_b=W_{\mathrm{state}}o_b,\quad
+    h_\Delta=W_\Delta o_\Delta .
+\]
+The depth condition is
+\[
+    h_{\mathrm{depth}}=[h_a,h_b,h_b-h_a,h_\Delta],
+\]
+and the predictor condition is produced by an MLP from
+\[
+    c_{\mathrm{in}}=
+    [h_{\mathrm{depth}},\operatorname{sg}(e_t^{\mathrm{DiT}})].
+\]
+The stop-gradient prevents shortcut training from directly perturbing the
+backbone timestep embedding through the condition path.
+
+\section{Predictor Architecture}
+The source direction is reshaped from $B\times256\times768$ to
+$B\times16\times16\times768$. A ConvNeXt-style residual block is
+\[
+    h\leftarrow h+
+    \mathrm{PW}_2\!\left(
+    \mathrm{GELU}\!\left(
+    \mathrm{PW}_1\!\left(
+    \mathrm{DWConv}_{3\times3}(\mathrm{AdaLN}(h,c))
+    \right)\right)\right),
+\]
+where
+\[
+    \mathrm{AdaLN}(h,c)=(1+\gamma(c))\mathrm{LN}(h)+\beta(c).
+\]
+The output projection predicts a residual direction update with a learnable
+scalar output gate initialized at $\gamma_{\mathrm{out}}=0.05$:
+\[
+    Y_{a\rightarrow b}=U_a+\gamma_{\mathrm{out}}\Delta Y.
+\]
+
+\begin{center}
+\begin{tabular}{lrrrrl}
+\toprule
+Version & Width & Blocks & Expansion & Params & Use case \\
+\midrule
+P-Tiny  & 256 & 2 & 2 & 1.3--1.8M & fast debug \\
+P-Small & 384 & 4 & 2 & 3.5--4.2M & lightweight runs \\
+P-Base  & 768 & 4 & 2 & 10--11M & main balanced model \\
+P-Large & 768 & 6 & 2 & 15--17M & long skips / ceiling runs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Direct Shortcut Loss}
+Sample a direct pair by first sampling a gap $d\sim\mathrm{Uniform}\{1,\ldots,L\}$
+and then $a\sim\mathrm{Uniform}\{0,\ldots,L-d\}$, with $b=a+d$.
+The direct loss is cosine distance to the stop-gradient target direction:
+\[
+    \mathcal{L}_{\mathrm{dir}}
+    =
+    1-
+    \frac{1}{BP}\sum_{n=1}^{B}\sum_{i=1}^{P}
+    \hat U_{a\rightarrow b}^{(n)}(i)^\top
+    \operatorname{sg}(U_b^{(n)}(i)).
+\]
+
+\section{Bootstrap Depth Consistency}
+Sample a triplet $0\leq a<b<c\leq L$ by sampling positive gaps
+$d_1=b-a$ and $d_2=c-b$ uniformly and resampling if $d_1+d_2>L$.
+Two short shortcuts are composed:
+\[
+    \hat U_{a\rightarrow b}
+    =
+    \operatorname{dir}(P_\theta(U_a,a,b,t_q)),
+\]
+\[
+    \hat U_{a\rightarrow b\rightarrow c}
+    =
+    \operatorname{dir}(P_\theta(\hat U_{a\rightarrow b},b,c,t_q)).
+\]
+The target is the EMA teacher's long shortcut:
+\[
+    \hat U_{a\rightarrow c}^{\mathrm{ema}}
+    =
+    \operatorname{sg}\!\left[
+    \operatorname{dir}(P_{\bar\theta}(U_a,a,c,t_q))
+    \right].
+\]
+The bootstrap loss is
+\[
+    \mathcal{L}_{\mathrm{boot}}
+    =
+    1-
+    \frac{1}{BP}\sum_{n,i}
+    \hat U_{a\rightarrow b\rightarrow c}^{(n)}(i)^\top
+    \hat U_{a\rightarrow c}^{\mathrm{ema},(n)}(i).
+\]
+The predictor teacher is updated after each optimizer step:
+\[
+    \bar\theta\leftarrow0.999\,\bar\theta+0.001\,\theta.
+\]
+
+\section{Total Objective}
+The backbone is still trained by the original flow matching loss:
+\[
+    \mathcal{L}_{\mathrm{FM}}
+    =
+    \mathbb{E}\|\hat v-(x_0-x_1)\|_2^2 .
+\]
+The joint objective is
+\[
+    \boxed{
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{FM}}
+    +0.5\,\mathcal{L}_{\mathrm{dir}}
+    +0.25\,\mathcal{L}_{\mathrm{boot}}
+    }.
+\]
+Targets $U_b$ and $P_{\bar\theta}$ are stop-gradient. Gradients from the
+shortcut losses can flow through the source state $U_a$ into the DiT backbone.
+
+\section{EMA Magnitude Calibration}
+Magnitude is not used in the shortcut training losses. For skip inference
+ablation only, maintain
+\[
+    R_{\mathrm{EMA}}\in\mathbb{R}^{(L+1)\times5\times P}.
+\]
+The timestep bin is $\tau(q)=\lfloor q/10\rfloor$. For each layer, bin, and
+token:
+\[
+    R_{\mathrm{EMA}}[l,\tau,i]
+    \leftarrow
+    0.99\,R_{\mathrm{EMA}}[l,\tau,i]
+    +0.01\,
+    \mathbb{E}_{n:\tau(q_n)=\tau}\|Z_l^{(n)}(i)\|_2 .
+\]
+At skip inference from layer $a$ to $b$:
+\[
+    \tilde Z_b(i)=
+    R_{\mathrm{EMA}}[b,\tau(q),i]\,
+    \operatorname{dir}(P_\theta(\operatorname{dir}(Z_a),a,b,t_q))(i).
+\]
+The DiT then resumes from block $b+1$.
+
+\section{Optimization and Metrics}
+The DiT uses AdamW with backbone learning rate from the main config and
+weight decay $0.01$, excluding biases, normalization parameters, and
+embedding tables. The predictor uses AdamW with learning rate $10^{-4}$,
+weight decay $0.1$, betas $(0.9,0.999)$, and gradient clipping at $1.0$.
+
+Log the training losses and cosine similarities:
+\[
+    \cos_{\mathrm{dir}}=
+    \frac{1}{BP}\sum_{n,i}
+    \hat U_{a\rightarrow b}^{(n)}(i)^\top U_b^{(n)}(i),
+\]
+\[
+    \cos_{\mathrm{boot}}=
+    \frac{1}{BP}\sum_{n,i}
+    \hat U_{a\rightarrow b\rightarrow c}^{(n)}(i)^\top
+    \hat U_{a\rightarrow c}^{\mathrm{ema},(n)}(i).
+\]
+For inference ablations, also report restored-state relative error, output
+deviation, FID, wall-clock speedup, and the FID--speed curve.
+
+\section{Skip-FID Evaluation}
+In addition to full-backbone FID, evaluate a skip sampler that repeatedly
+jumps by two state indices:
+\[
+    1\rightarrow3,\quad 3\rightarrow5,\quad 5\rightarrow7,\quad \ldots
+\]
+At each source layer $a$, the predictor estimates only direction:
+\[
+    \hat U_{a\rightarrow a+2}
+    =
+    \operatorname{dir}(P_{\bar\theta}(\operatorname{dir}(Z_a),a,a+2,t_q)).
+\]
+Before continuing the DiT, restore the target-layer magnitude with the L2 EMA:
+\[
+    \tilde Z_{a+2}(i)=
+    R_{\mathrm{EMA}}[a+2,\tau(q),i]\,
+    \hat U_{a\rightarrow a+2}(i).
+\]
+The sampler then skips the true intervening blocks and resumes from the block
+after the restored target state. Report these metrics separately, e.g.
+$\mathrm{FID}_{\mathrm{skip}}$ and $\mathrm{sFID}_{\mathrm{skip}}$, so the
+quality--speed tradeoff is visible next to full-backbone FID.
+
+\section{Experimental Plan}
+Run the method in four stages so implementation bugs, capacity limits, and
+skip-quality tradeoffs are separated.
+
+\paragraph{Stage 1: Pipeline debug.}
+Train with P-Tiny for short runs. The goal is only to verify that the joint
+loss is numerically stable, EMA teacher updates, $R_{\mathrm{EMA}}$ fills all
+five timestep bins, and the raw predictor norm remains reasonable:
+\[
+    \mathbb{E}_{n,i}\|Y_{a\rightarrow b}^{(n)}(i)\|_2,\qquad
+    \min_{n,i}\|Y_{a\rightarrow b}^{(n)}(i)\|_2,\qquad
+    \max_{n,i}\|Y_{a\rightarrow b}^{(n)}(i)\|_2 .
+\]
+Since $\|U_a(i)\|_2=1$, these values should not collapse near zero or grow to
+large magnitudes before direction normalization.
+
+\paragraph{Stage 2: Main model.}
+Train P-Base as the balanced setting for the primary result. Track
+$\mathcal{L}_{\mathrm{FM}}$, $\mathcal{L}_{\mathrm{dir}}$,
+$\mathcal{L}_{\mathrm{boot}}$, $\cos_{\mathrm{dir}}$, and
+$\cos_{\mathrm{boot}}$. Evaluate both full-backbone FID and skip-FID at the
+same checkpoint cadence.
+
+\paragraph{Stage 3: Capacity sweep.}
+If P-Base underfits long gaps, run P-Large with the same optimizer settings.
+Compare long-gap direct cosine and skip-FID against P-Base for skips such as
+$1\rightarrow3$, $3\rightarrow5$, and longer diagnostic pairs like
+$0\rightarrow6$ or $0\rightarrow12$.
+
+\paragraph{Stage 4: Quality--speed curve.}
+For selected checkpoints, report full FID/sFID and skip FID/sFID together
+with wall-clock sampling time. The useful operating point is the largest
+speedup whose FID degradation remains acceptable.
+
+\end{document}

@@ -13,6 +13,12 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from einops import rearrange
+from src.depth_shortcut import (
+    DepthShortcutPredictor,
+    l2_normalize_tokens,
+    predictor_config_from_name,
+    restore_l2_ema_magnitude,
+)
 
 XAVIER_UNIFORM = nn.initializers.xavier_uniform()
 ZERO_INIT = nn.initializers.zeros
@@ -305,6 +311,12 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
+        return_hidden_states: bool = False,
+        depth_shortcut_predictor_params: Optional[dict] = None,
+        depth_shortcut_l2_ema: Optional[jax.Array] = None,
+        depth_shortcut_variant: str = "tiny",
+        depth_shortcut_skip_every_other: bool = False,
+        depth_shortcut_timesteps: int = 50,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -334,6 +346,7 @@ class SelfFlowDiT(nn.Module):
                 for idx, layer in enumerate(raw_layers):
                     raw_positions.setdefault(layer, []).append(idx)
 
+        original_timesteps = timesteps
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
@@ -373,16 +386,64 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
+        shortcut_enabled = (
+            depth_shortcut_skip_every_other
+            and depth_shortcut_predictor_params is not None
+            and depth_shortcut_l2_ema is not None
+        )
+        shortcut_sources = tuple(range(1, self.depth, 2))
+        shortcut_skip_until = 0
+        shortcut_q = None
+        shortcut_predictor = None
+        if shortcut_enabled:
+            predictor_cfg = predictor_config_from_name(depth_shortcut_variant, self.hidden_size)
+            shortcut_predictor = DepthShortcutPredictor(
+                hidden_size=self.hidden_size,
+                depth=self.depth,
+                num_tokens=self.num_patches,
+                **predictor_cfg,
+            )
+            # Training discretizes tau as q / (T - 1). Sampling uses continuous tau,
+            # so round back to the nearest discrete index for EMA magnitude bins.
+            shortcut_q = jnp.rint(original_timesteps * max(int(depth_shortcut_timesteps) - 1, 1)).astype(jnp.int32)
+            shortcut_q = jnp.clip(shortcut_q, 0, int(depth_shortcut_timesteps) - 1)
+
         zs = None
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
+        hidden_states = [x] if return_hidden_states else None
         for i in range(self.depth):
+            layer_idx = i + 1
+            if shortcut_enabled and layer_idx <= shortcut_skip_until:
+                continue
+
             x = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
+
+            if shortcut_enabled and layer_idx in shortcut_sources and (layer_idx + 2) <= self.depth:
+                target_layer = layer_idx + 2
+                y_short = shortcut_predictor.apply(
+                    {"params": depth_shortcut_predictor_params},
+                    l2_normalize_tokens(x),
+                    jnp.asarray(layer_idx, dtype=jnp.int32),
+                    jnp.asarray(target_layer, dtype=jnp.int32),
+                    t_emb,
+                )
+                u_short = l2_normalize_tokens(y_short)
+                x = restore_l2_ema_magnitude(
+                    u_short,
+                    depth_shortcut_l2_ema,
+                    jnp.asarray(target_layer, dtype=jnp.int32),
+                    shortcut_q,
+                )
+                shortcut_skip_until = target_layer
+
+            if return_hidden_states:
+                hidden_states.append(x)
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
@@ -412,6 +473,11 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
+        if return_hidden_states:
+            hidden_states = tuple(hidden_states)
+            if return_block_summaries:
+                return x, hidden_states, t_emb, block_summaries
+            return x, hidden_states, t_emb
         if return_features:
             if return_block_summaries:
                 return x, zs, block_summaries

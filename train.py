@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -406,12 +407,19 @@ import optax
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
+from flax import struct
+from flax import traverse_util
 import numpy as np
 try:
     import grain.python as grain
 except ImportError:
     grain = None
 from src.model import SelfFlowDiT
+from src.depth_shortcut import (
+    DepthShortcutPredictor,
+    l2_normalize_tokens,
+    predictor_config_from_name,
+)
 from src.sampling import denoise_loop
 from src.metrics import (
     ReservoirSampler,
@@ -431,7 +439,37 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+class ShortcutTrainState(train_state.TrainState):
+    predictor_apply_fn: Callable = struct.field(pytree_node=False)
+
+
+def make_adamw_decay_mask(params):
+    """Apply AdamW decay to matrix/conv kernels, excluding bias/norm/embeddings."""
+    flat = traverse_util.flatten_dict(params)
+    mask = {}
+    for path, _ in flat.items():
+        path_str = "/".join(str(part).lower() for part in path)
+        leaf = str(path[-1]).lower()
+        excluded = (
+            leaf in {"bias", "scale"}
+            or "norm" in path_str
+            or "embed" in path_str
+            or "embedding" in path_str
+        )
+        mask[path] = not excluded
+    return traverse_util.unflatten_dict(mask)
+
+
+def create_train_state(
+    rng,
+    config,
+    learning_rate,
+    grad_clip=1.0,
+    predictor_variant="tiny",
+    predictor_lr=1e-4,
+    predictor_weight_decay=0.1,
+    predictor_grad_clip=1.0,
+):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
@@ -454,34 +492,78 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
+    predictor_cfg = predictor_config_from_name(predictor_variant, config["hidden_size"])
+    predictor = DepthShortcutPredictor(
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_tokens=n_patches,
+        **predictor_cfg,
+    )
 
     dummy_x = jnp.ones((1, n_patches, patch_dim))
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, drop_rng = jax.random.split(rng)
+    rng, backbone_rng, predictor_rng, drop_rng = jax.random.split(rng, 4)
     variables = model.init(
-        {'params': rng, 'dropout': drop_rng},
+        {'params': backbone_rng, 'dropout': drop_rng},
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
     )
-
-    # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
-    tx = optax.chain(
-        optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate, weight_decay=0),
+    dummy_u = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
+    dummy_t_embed = jnp.ones((1, config["hidden_size"]), dtype=jnp.float32)
+    predictor_variables = predictor.init(
+        {"params": predictor_rng},
+        dummy_u,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+        dummy_t_embed,
     )
 
-    state = train_state.TrainState.create(
+    params = {
+        "backbone": variables["params"],
+        "predictor": predictor_variables["params"],
+    }
+
+    tx = optax.multi_transform(
+        {
+            "backbone": optax.chain(
+                optax.clip_by_global_norm(grad_clip),
+                optax.adamw(
+                    learning_rate,
+                    weight_decay=0.01,
+                    mask=make_adamw_decay_mask(params),
+                ),
+            ),
+            "predictor": optax.chain(
+                optax.clip_by_global_norm(predictor_grad_clip),
+                optax.adamw(
+                    predictor_lr,
+                    b1=0.9,
+                    b2=0.999,
+                    weight_decay=predictor_weight_decay,
+                ),
+            ),
+        },
+        {
+            "backbone": jax.tree_util.tree_map(lambda _: "backbone", params["backbone"]),
+            "predictor": jax.tree_util.tree_map(lambda _: "predictor", params["predictor"]),
+        },
+    )
+
+    state = ShortcutTrainState.create(
         apply_fn=model.apply,
-        params=variables['params'],
+        predictor_apply_fn=predictor.apply,
+        params=params,
         tx=tx,
     )
-    # EMA params start as an exact copy of the initial online params
-    ema_params = jax.tree_util.tree_map(lambda x: x, state.params)
-    return state, ema_params
+    # Backbone EMA is used for evaluation; predictor EMA is the bootstrap teacher.
+    ema_params = jax.tree_util.tree_map(lambda x: x, state.params["backbone"])
+    predictor_ema_params = jax.tree_util.tree_map(lambda x: x, state.params["predictor"])
+    l2_ema = jnp.zeros((config["depth"] + 1, 5, n_patches), dtype=jnp.float32)
+    return state, ema_params, predictor_ema_params, l2_ema
 
 
 # ── Self-Flow core helpers ────────────────────────────────────────────────────
@@ -501,12 +583,65 @@ def ema_update(ema_params, new_params, decay):
 
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
+def sample_pair_uniform_gap(rng, depth):
+    gap_rng, source_rng = jax.random.split(rng)
+    gap = jax.random.randint(gap_rng, (), 1, depth + 1, dtype=jnp.int32)
+    source = jax.random.randint(source_rng, (), 0, depth - gap + 1, dtype=jnp.int32)
+    return source, source + gap
+
+
+def sample_triplet_uniform(rng, depth):
+    def draw(key):
+        key, d1_rng, d2_rng = jax.random.split(key, 3)
+        d1 = jax.random.randint(d1_rng, (), 1, depth + 1, dtype=jnp.int32)
+        d2 = jax.random.randint(d2_rng, (), 1, depth + 1, dtype=jnp.int32)
+        return key, d1, d2
+
+    key, d1, d2 = draw(rng)
+
+    def cond_fn(carry):
+        _, cur_d1, cur_d2 = carry
+        return (cur_d1 + cur_d2) > depth
+
+    def body_fn(carry):
+        cur_key, _, _ = carry
+        return draw(cur_key)
+
+    key, d1, d2 = jax.lax.while_loop(cond_fn, body_fn, (key, d1, d2))
+    source_rng, = jax.random.split(key, 1)
+    a = jax.random.randint(source_rng, (), 0, depth - d1 - d2 + 1, dtype=jnp.int32)
+    b = a + d1
+    c = b + d2
+    return a, b, c
+
+
+def update_l2_ema_5bins(l2_ema, hidden_states, timestep_indices, alpha=0.01):
+    """Update per-layer/token L2 magnitude EMA across five 10-step bins."""
+    norms = jnp.linalg.norm(hidden_states, axis=-1)  # [L+1, B, P]
+    bins = jnp.clip(timestep_indices // 10, 0, 4)
+    bin_mask = jax.nn.one_hot(bins, 5, dtype=norms.dtype)  # [B, 5]
+    sums = jnp.einsum("bt,lbp->ltp", bin_mask, norms)
+    counts = jnp.sum(bin_mask, axis=0)  # [5]
+    sums = jax.lax.psum(sums, axis_name="batch")
+    counts = jax.lax.psum(counts, axis_name="batch")
+    means = sums / jnp.maximum(counts[None, :, None], 1.0)
+    updated = (1.0 - alpha) * l2_ema + alpha * means
+    return jnp.where((counts[None, :, None] > 0), updated, l2_ema)
+
+
 def train_step(
     state,
     ema_params,
+    predictor_ema_params,
+    l2_ema,
     batch,
     rng,
     ema_decay,
+    predictor_ema_decay,
+    shortcut_timesteps,
+    lambda_dir,
+    lambda_boot,
+    l2_ema_alpha,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -518,9 +653,10 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng = jax.random.split(rng, 6)
 
-    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
+    q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
+    tau = q.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
@@ -528,44 +664,141 @@ def train_step(
 
     def loss_fn(params):
         pred = state.apply_fn(
-            {"params": params},
+            {"params": params["backbone"]},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=False,
             rngs={"dropout": drop_rng},
+            return_hidden_states=True,
         )
+        pred, hidden_tuple, dit_time_emb = pred
         loss_gen = jnp.mean((pred - target) ** 2)
+        hidden_stack = jnp.stack(hidden_tuple, axis=0)
+        directions = l2_normalize_tokens(hidden_stack)
+
+        direct_a, direct_b = sample_pair_uniform_gap(pair_rng, directions.shape[0] - 1)
+        y_ab = state.predictor_apply_fn(
+            {"params": params["predictor"]},
+            directions[direct_a],
+            direct_a,
+            direct_b,
+            dit_time_emb,
+        )
+        u_ab = l2_normalize_tokens(y_ab)
+        y_ab_norm = jnp.linalg.norm(y_ab, axis=-1)
+        y_ab_norm_mean = jnp.mean(y_ab_norm)
+        y_ab_norm_min = jnp.min(y_ab_norm)
+        y_ab_norm_max = jnp.max(y_ab_norm)
+        target_u_b = jax.lax.stop_gradient(directions[direct_b])
+        cos_dir = jnp.sum(u_ab * target_u_b, axis=-1).mean()
+        loss_dir = 1.0 - cos_dir
+
+        boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
+        y_boot_ab = state.predictor_apply_fn(
+            {"params": params["predictor"]},
+            directions[boot_a],
+            boot_a,
+            boot_b,
+            dit_time_emb,
+        )
+        u_boot_ab = l2_normalize_tokens(y_boot_ab)
+        y_abc = state.predictor_apply_fn(
+            {"params": params["predictor"]},
+            u_boot_ab,
+            boot_b,
+            boot_c,
+            dit_time_emb,
+        )
+        u_abc = l2_normalize_tokens(y_abc)
+        y_ac_ema = state.predictor_apply_fn(
+            {"params": predictor_ema_params},
+            directions[boot_a],
+            boot_a,
+            boot_c,
+            dit_time_emb,
+        )
+        u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
+        cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
+        loss_boot = 1.0 - cos_boot
+        loss_total = loss_gen + lambda_dir * loss_dir + lambda_boot * loss_boot
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss_gen, (v_abs_mean, v_pred_abs_mean, loss_gen)
+        aux = (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_dir,
+            loss_boot,
+            cos_dir,
+            cos_boot,
+            y_ab_norm_mean,
+            y_ab_norm_min,
+            y_ab_norm_max,
+            hidden_stack,
+        )
+        return loss_total, aux
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen)), grads = grad_fn(state.params)
+    (loss, aux), grads = grad_fn(state.params)
+    (
+        v_abs,
+        v_pred,
+        loss_gen,
+        loss_dir,
+        loss_boot,
+        cos_dir,
+        cos_boot,
+        y_ab_norm_mean,
+        y_ab_norm_min,
+        y_ab_norm_max,
+        hidden_stack,
+    ) = aux
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
     v_pred = jax.lax.pmean(v_pred, axis_name="batch")
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
+    loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
+    loss_boot = jax.lax.pmean(loss_boot, axis_name="batch")
+    cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
+    cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
+    y_ab_norm_mean = jax.lax.pmean(y_ab_norm_mean, axis_name="batch")
+    y_ab_norm_min = jax.lax.pmin(y_ab_norm_min, axis_name="batch")
+    y_ab_norm_max = jax.lax.pmax(y_ab_norm_max, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
+    l2_ema = update_l2_ema_5bins(l2_ema, jax.lax.stop_gradient(hidden_stack), q, alpha=l2_ema_alpha)
     state = state.apply_gradients(grads=grads)
-    ema_params = ema_update(ema_params, state.params, ema_decay)
+    ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
+    predictor_ema_params = ema_update(
+        predictor_ema_params,
+        state.params["predictor"],
+        predictor_ema_decay,
+    )
 
     metrics = {
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
+        "train/loss_dir": loss_dir,
+        "train/loss_boot": loss_boot,
+        "train/cos_dir": cos_dir,
+        "train/cos_boot": cos_boot,
+        "train/y_ab_norm_mean": y_ab_norm_mean,
+        "train/y_ab_norm_min": y_ab_norm_min,
+        "train/y_ab_norm_max": y_ab_norm_max,
         "train/ema_decay": ema_decay,
+        "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
-    return state, ema_params, metrics, rng
+    return state, ema_params, predictor_ema_params, l2_ema, metrics, rng
 
 
 def eval_step(
@@ -586,7 +819,7 @@ def eval_step(
     target = x0 - x1
 
     pred = state.apply_fn(
-        {"params": state.params},
+        {"params": state.params["backbone"]},
         x_tau,
         timesteps=tau,
         vector=y,
@@ -839,7 +1072,14 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    depth_shortcut_skip=False,
+    shortcut_predictor_variant="tiny",
+    shortcut_timesteps=50,
+):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -937,6 +1177,80 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         )
         return samples.astype(jnp.float32)
 
+    def _sample_latents_shortcut_local(
+        ema_params_local,
+        predictor_params_local,
+        l2_ema_local,
+        class_labels_local,
+        rng_local,
+    ):
+        batch_size = class_labels_local.shape[0]
+        rng_local, noise_rng = jax.random.split(rng_local)
+        noise = jax.random.normal(
+            noise_rng,
+            (batch_size, latent_channels, latent_size, latent_size),
+            dtype=jnp.float32,
+        )
+
+        from einops import rearrange
+        x = rearrange(
+            noise,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=patch_size,
+            p2=patch_size,
+        ).astype(jnp.float32)
+
+        use_cfg = cfg_scale > 1.0
+        if use_cfg:
+            x = jnp.concatenate([x, x], axis=0)
+            class_labels_local = jnp.concatenate(
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
+                axis=0,
+            )
+
+        def model_fn(z_x, t):
+            return model.apply(
+                {"params": ema_params_local},
+                z_x,
+                timesteps=t,
+                vector=class_labels_local,
+                deterministic=True,
+                depth_shortcut_predictor_params=predictor_params_local,
+                depth_shortcut_l2_ema=l2_ema_local,
+                depth_shortcut_variant=shortcut_predictor_variant,
+                depth_shortcut_skip_every_other=True,
+                depth_shortcut_timesteps=int(shortcut_timesteps),
+            )
+
+        rng_local, denoise_rng = jax.random.split(rng_local)
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+            reverse=False,
+        )
+
+        if use_cfg:
+            samples = samples[batch_size:]
+
+        samples = rearrange(
+            samples,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h,
+            w=token_w,
+            p1=patch_size,
+            p2=patch_size,
+            c=latent_channels,
+        )
+        return samples.astype(jnp.float32)
+
+    if depth_shortcut_skip:
+        return jax.pmap(_sample_latents_shortcut_local, axis_name="batch")
     return jax.pmap(_sample_latents_local, axis_name="batch")
 
 
@@ -1104,6 +1418,19 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    # ── Depth Shortcut Predictor args ────────────────────────────────────────
+    parser.add_argument("--shortcut-predictor", type=str, default="tiny",
+                        choices=["tiny", "small", "base", "large",
+                                 "p-tiny", "p-small", "p-base", "p-large"],
+                        help="Depth shortcut predictor size.")
+    parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
+    parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
+    parser.add_argument("--shortcut-timesteps", type=int, default=50)
+    parser.add_argument("--shortcut-predictor-lr", type=float, default=1e-4)
+    parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
+    parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
+    parser.add_argument("--shortcut-predictor-ema-decay", type=float, default=0.999)
+    parser.add_argument("--shortcut-l2-ema-alpha", type=float, default=0.01)
     parser.add_argument(
         "--cfg-dropout-rate",
         type=float,
@@ -1214,6 +1541,13 @@ def main():
                              "TPU default: 50 (monitoring). Paper: 250.")
     parser.add_argument("--fid-cfg-scale", type=float, default=1.0,
                         help="CFG scale for FID generation. Default 1.0 (paper uses 1.0).")
+    parser.add_argument(
+        "--fid-skip-eval",
+        dest="fid_skip_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also compute FID/sFID with depth shortcuts 1->3, 3->5, ... using predictor EMA and L2 EMA magnitudes.",
+    )
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
@@ -1266,6 +1600,10 @@ def main():
             raise ValueError("--sample-cfg-scale > 1 requires --cfg-dropout-rate > 0")
         if args.fid_cfg_scale > 1.0:
             raise ValueError("--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
+    if args.shortcut_timesteps <= 0:
+        raise ValueError("--shortcut-timesteps must be greater than 0")
+    if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
+        raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1300,6 +1638,11 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"cfg_dropout_rate={args.cfg_dropout_rate}"
     )
+    log_stage(
+        f"DepthShortcut: predictor={args.shortcut_predictor} "
+        f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
+        f"pred_lr={args.shortcut_predictor_lr} pred_wd={args.shortcut_predictor_weight_decay}"
+    )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1310,11 +1653,27 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params, predictor_ema_params, l2_ema = create_train_state(
+        rng,
+        config,
+        args.learning_rate,
+        args.grad_clip,
+        predictor_variant=args.shortcut_predictor,
+        predictor_lr=args.shortcut_predictor_lr,
+        predictor_weight_decay=args.shortcut_predictor_weight_decay,
+        predictor_grad_clip=args.shortcut_predictor_grad_clip,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
+    predictor_ema_params = jax_utils.replicate(predictor_ema_params)
+    l2_ema = jax_utils.replicate(l2_ema)
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
+    predictor_ema_decay_rep = jax_utils.replicate(jnp.float32(args.shortcut_predictor_ema_decay))
+    shortcut_timesteps_rep = jax_utils.replicate(jnp.int32(args.shortcut_timesteps))
+    shortcut_lambda_dir_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_dir))
+    shortcut_lambda_boot_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_boot))
+    shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1359,6 +1718,16 @@ def main():
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
         config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
     )
+    fid_sample_latents_skip_pmapped = None
+    if args.fid_skip_eval:
+        fid_sample_latents_skip_pmapped = make_sample_latents_pmap_fn(
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            depth_shortcut_skip=True,
+            shortcut_predictor_variant=args.shortcut_predictor,
+            shortcut_timesteps=args.shortcut_timesteps,
+        )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
@@ -1610,8 +1979,19 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
+        _, _, _, _, probe_metrics, _ = pmapped_train_step(
+            state,
+            ema_params,
+            predictor_ema_params,
+            l2_ema,
+            (probe_x, probe_y),
+            rng,
+            ema_decay_rep,
+            predictor_ema_decay_rep,
+            shortcut_timesteps_rep,
+            shortcut_lambda_dir_rep,
+            shortcut_lambda_boot_rep,
+            shortcut_l2_ema_alpha_rep,
         )
         block_pytree(probe_metrics)
 
@@ -1815,6 +2195,50 @@ def main():
         sfid_val = fid_from_stats(mu_real_s, cov_real_s, mu_fs, cov_fs)
 
         metrics = {"val/FID": fid_val, "val/sFID": sfid_val, "train/step": step}
+        if args.fid_skip_eval and fid_sample_latents_skip_pmapped is not None:
+            log_stage(
+                f"[EVAL] generating skip fake pool: {need} samples @ step {step} "
+                f"(1->3, 3->5, ...; L2 EMA magnitude restore)…"
+            )
+            acc_skip_pooled = init_gaussian_sums(2048)
+            acc_skip_spatial = init_gaussian_sums(2048)
+            produced_skip = 0
+            chunk_idx_skip = 0
+            skip_rng = jax.vmap(
+                lambda key: jax.random.fold_in(key, jnp.uint32((step + 0x51F) & 0xFFFFFFFF))
+            )(rng)
+            while produced_skip < need:
+                valid = min(global_b, need - produced_skip)
+                class_rng, sample_rng = make_eval_chunk_rngs(skip_rng, chunk_idx_skip)
+                classes = jax.vmap(
+                    lambda key: jax.random.randint(key, (local_b,), 0, 1000),
+                    in_axes=0,
+                )(class_rng)
+                latents_sharded = fid_sample_latents_skip_pmapped(
+                    ema_params,
+                    predictor_ema_params,
+                    l2_ema,
+                    classes,
+                    sample_rng,
+                )
+                imgs_sharded = decode_latents_sharded(latents_sharded)
+                pooled, spatial, valid_mask = apply_inception_to_decoded_sharded(
+                    imgs_sharded,
+                    inception_fn,
+                    mode="pooled+spatial",
+                    valid_global=valid,
+                )
+                acc_skip_pooled, acc_skip_spatial = _update_accumulators(
+                    acc_skip_pooled, acc_skip_spatial, pooled, spatial, valid_mask
+                )
+                produced_skip += valid
+                chunk_idx_skip += 1
+
+            mu_skip, cov_skip, _ = finalize_gaussian_sums(acc_skip_pooled)
+            mu_skip_s, cov_skip_s, _ = finalize_gaussian_sums(acc_skip_spatial)
+            metrics["val/FID_skip_1to3_3to5"] = fid_from_stats(mu_real, cov_real, mu_skip, cov_skip)
+            metrics["val/sFID_skip_1to3_3to5"] = fid_from_stats(mu_real_s, cov_real_s, mu_skip_s, cov_skip_s)
+
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)
             pr_real = real.get("pr", {}).get("real_feats", None)
@@ -1863,6 +2287,9 @@ def main():
             current_val_iter = probe_iter
 
         summary_parts = [f"[EVAL] step {step}:", f"FID={fid_val:.2f}", f"sFID={sfid_val:.2f}"]
+        if "val/FID_skip_1to3_3to5" in metrics:
+            summary_parts.append(f"FIDskip={metrics['val/FID_skip_1to3_3to5']:.2f}")
+            summary_parts.append(f"sFIDskip={metrics['val/sFID_skip_1to3_3to5']:.2f}")
         if is_enabled and "val/InceptionScore" in metrics:
             summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
         if "val/Precision" in metrics and "val/Recall" in metrics:
@@ -1974,8 +2401,19 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+            state, ema_params, predictor_ema_params, l2_ema, metrics, rng = pmapped_train_step(
+                state,
+                ema_params,
+                predictor_ema_params,
+                l2_ema,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                predictor_ema_decay_rep,
+                shortcut_timesteps_rep,
+                shortcut_lambda_dir_rep,
+                shortcut_lambda_boot_rep,
+                shortcut_l2_ema_alpha_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2054,6 +2492,8 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
     unreplicated_params = jax_utils.unreplicate(state.params)
     unreplicated_ema    = jax_utils.unreplicate(ema_params)
+    unreplicated_predictor_ema = jax_utils.unreplicate(predictor_ema_params)
+    unreplicated_l2_ema = jax_utils.unreplicate(l2_ema)
     checkpoints.save_checkpoint(
         ckpt_dir=args.ckpt_dir,
         target=unreplicated_params,
@@ -2062,6 +2502,16 @@ def main():
     checkpoints.save_checkpoint(
         ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
         target=unreplicated_ema,
+        step=global_step,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(args.ckpt_dir, "predictor_ema"),
+        target=unreplicated_predictor_ema,
+        step=global_step,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(args.ckpt_dir, "l2_ema"),
+        target=unreplicated_l2_ema,
         step=global_step,
     )
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
