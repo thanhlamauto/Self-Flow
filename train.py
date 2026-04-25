@@ -649,6 +649,8 @@ def train_step(
         warmup_iters=private_warmup_iters,
     )
     compute_common_private_loss = lambda_common_private != 0.0
+    compute_spatial_loss = lambda_spatial != 0.0
+    compute_private_loss = lambda_private != 0.0
     use_aux_losses = any(
         weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
     )
@@ -692,6 +694,8 @@ def train_step(
                 private_pair_mode=private_pair_mode,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
+                compute_spatial_loss=compute_spatial_loss,
+                compute_private_loss=compute_private_loss,
                 compute_common_private_loss=compute_common_private_loss,
                 spatial_window_size=spatial_window_size,
                 spatial_window_stride=spatial_window_stride,
@@ -875,6 +879,8 @@ def eval_step(
         warmup_iters=private_warmup_iters,
     )
     compute_common_private_loss = lambda_common_private != 0.0
+    compute_spatial_loss = lambda_spatial != 0.0
+    compute_private_loss = lambda_private != 0.0
     use_aux_losses = any(
         weight != 0.0 for weight in (lambda_spatial, lambda_private, lambda_common_private)
     )
@@ -918,6 +924,8 @@ def eval_step(
             private_pair_mode=private_pair_mode,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
+            compute_spatial_loss=compute_spatial_loss,
+            compute_private_loss=compute_private_loss,
             compute_common_private_loss=compute_common_private_loss,
             spatial_window_size=spatial_window_size,
             spatial_window_stride=spatial_window_stride,

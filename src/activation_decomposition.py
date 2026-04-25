@@ -68,6 +68,28 @@ def collect_activations(activations: Any) -> jax.Array:
     raise TypeError(f"Unsupported activation container type: {type(activations)!r}")
 
 
+def _compute_common_from_normalized(
+    activations: Any,
+    *,
+    agg: str = "mean",
+    logit_normal_center_layer: float = 0.0,
+    logit_normal_sigma: float = 1.0,
+) -> jax.Array:
+    num_layers = activations.shape[0]
+    if agg == "mean":
+        return jnp.mean(activations, axis=0)
+    elif agg == "logit_normal":
+        w = _layer_logit_normal_weights(
+            num_layers,
+            logit_normal_center_layer,
+            logit_normal_sigma,
+            activations.dtype,
+        )
+        return jnp.tensordot(w, activations, axes=(0, 0))
+    else:
+        raise ValueError(f"Unknown common aggregation {agg!r}; expected 'mean' or 'logit_normal'.")
+
+
 def compute_common_private(
     activations: Any,
     *,
@@ -85,22 +107,34 @@ def compute_common_private(
     """
     activations = collect_activations(activations)
     activations = _normalize_channels(activations)
-    num_layers = activations.shape[0]
-    if agg == "mean":
-        common = jnp.mean(activations, axis=0)
-    elif agg == "logit_normal":
-        w = _layer_logit_normal_weights(
-            num_layers,
-            logit_normal_center_layer,
-            logit_normal_sigma,
-            activations.dtype,
-        )
-        common = jnp.tensordot(w, activations, axes=(0, 0))
-    else:
-        raise ValueError(f"Unknown common aggregation {agg!r}; expected 'mean' or 'logit_normal'.")
+    common = _compute_common_from_normalized(
+        activations,
+        agg=agg,
+        logit_normal_center_layer=logit_normal_center_layer,
+        logit_normal_sigma=logit_normal_sigma,
+    )
     common_anchor = jax.lax.stop_gradient(common)
     private = activations - common_anchor[None, ...]
     return common, common_anchor, private
+
+
+def compute_common(
+    activations: Any,
+    *,
+    agg: str = "mean",
+    logit_normal_center_layer: float = 0.0,
+    logit_normal_sigma: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute common activation without materializing private residuals."""
+    activations = collect_activations(activations)
+    activations = _normalize_channels(activations)
+    common = _compute_common_from_normalized(
+        activations,
+        agg=agg,
+        logit_normal_center_layer=logit_normal_center_layer,
+        logit_normal_sigma=logit_normal_sigma,
+    )
+    return common, jax.lax.stop_gradient(common)
 
 
 def gram_matrix(x: jax.Array) -> jax.Array:
@@ -434,6 +468,8 @@ def compute_aux_losses(
     private_pair_mode: str = "first_pairs",
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
+    compute_spatial_loss: bool = True,
+    compute_private_loss: bool = True,
     compute_common_private_loss: bool = True,
     spatial_window_size: int = DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride: int = DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -451,7 +487,9 @@ def compute_aux_losses(
     activations = collect_activations(activations)
     if spatial_target.ndim != 3:
         raise ValueError(f"Expected spatial target with rank 3, got shape {spatial_target.shape}")
-    needs_timesteps = spatial_blur_by_timestep or spatial_timestep_range is not None
+    needs_timesteps = compute_spatial_loss and (
+        spatial_blur_by_timestep or spatial_timestep_range is not None
+    )
     if needs_timesteps:
         if timesteps is None:
             raise ValueError(
@@ -464,7 +502,7 @@ def compute_aux_losses(
                 "Timesteps batch size and spatial target batch size must match, "
                 f"got {timesteps.shape[0]} vs {spatial_target.shape[0]}"
             )
-    if spatial_blur_by_timestep:
+    if compute_spatial_loss and spatial_blur_by_timestep:
         blur_sigmas = _timestep_dependent_blur_sigmas(
             timesteps,
             max_sigma=spatial_blur_max_sigma,
@@ -473,7 +511,7 @@ def compute_aux_losses(
         )
     else:
         blur_sigmas = None
-    if spatial_timestep_range is not None:
+    if compute_spatial_loss and spatial_timestep_range is not None:
         spatial_tau_min, spatial_tau_max = spatial_timestep_range
         spatial_tau_min = jnp.asarray(spatial_tau_min, dtype=timesteps.dtype)
         spatial_tau_max = jnp.asarray(spatial_tau_max, dtype=timesteps.dtype)
@@ -481,35 +519,61 @@ def compute_aux_losses(
     else:
         spatial_sample_mask = None
 
-    common, common_anchor, private = compute_common_private(
-        activations,
-        agg=common_agg,
-        logit_normal_center_layer=common_logit_normal_center_layer,
-        logit_normal_sigma=common_logit_normal_sigma,
-    )
-    spatial_common = (
-        common_spatial_project_fn(common)
-        if common_spatial_project_fn is not None
-        else common
-    )
+    needs_private = compute_private_loss or compute_common_private_loss
+    if needs_private:
+        common, common_anchor, private = compute_common_private(
+            activations,
+            agg=common_agg,
+            logit_normal_center_layer=common_logit_normal_center_layer,
+            logit_normal_sigma=common_logit_normal_sigma,
+        )
+    else:
+        common, common_anchor = compute_common(
+            activations,
+            agg=common_agg,
+            logit_normal_center_layer=common_logit_normal_center_layer,
+            logit_normal_sigma=common_logit_normal_sigma,
+        )
+        private = None
+    if compute_spatial_loss:
+        spatial_common = (
+            common_spatial_project_fn(common)
+            if common_spatial_project_fn is not None
+            else common
+        )
+        spatial_loss, spatial_metrics = local_window_gram_loss(
+            spatial_common,
+            spatial_target,
+            window_size=spatial_window_size,
+            stride=spatial_window_stride,
+            sample_mask=spatial_sample_mask,
+            target_blur_sigmas=blur_sigmas,
+            target_blur_max_sigma=spatial_blur_max_sigma,
+        )
+    else:
+        zero = jnp.array(0.0, dtype=common.dtype)
+        spatial_loss = zero
+        spatial_metrics = {
+            "spatial_num_windows": zero,
+            "spatial_window_area": zero,
+            "spatial_active_fraction": zero,
+            "spatial_blur_sigma_mean": zero,
+        }
 
-    spatial_loss, spatial_metrics = local_window_gram_loss(
-        spatial_common,
-        spatial_target,
-        window_size=spatial_window_size,
-        stride=spatial_window_stride,
-        sample_mask=spatial_sample_mask,
-        target_blur_sigmas=blur_sigmas,
-        target_blur_max_sigma=spatial_blur_max_sigma,
-    )
-
-    private_loss = _mean_pairwise_cosine_squared(
-        private,
-        rng=private_pair_rng,
-        max_pairs=private_max_pairs,
-        pair_mode=private_pair_mode,
-    )
+    if compute_private_loss:
+        if private is None:
+            raise ValueError("Private activations are required when computing private loss.")
+        private_loss = _mean_pairwise_cosine_squared(
+            private,
+            rng=private_pair_rng,
+            max_pairs=private_max_pairs,
+            pair_mode=private_pair_mode,
+        )
+    else:
+        private_loss = jnp.array(0.0, dtype=common.dtype)
     if compute_common_private_loss:
+        if private is None:
+            raise ValueError("Private activations are required when computing common/private loss.")
         common_private_loss = _mean_common_private_cosine_squared(
             common,
             private,
@@ -526,18 +590,26 @@ def compute_aux_losses(
         avg_common_private_cosine = jnp.array(0.0, dtype=common.dtype)
 
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
-    private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
-    avg_private_norm = jnp.mean(private_norms)
-
-    pairwise_cosines = _pairwise_cosines(private)
-    if pairwise_cosines.ndim == 0:
-        avg_pairwise_cosine = pairwise_cosines
+    if needs_private:
+        if private is None:
+            raise ValueError("Private activations are required when logging private norms.")
+        private_norms = jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
+        avg_private_norm = jnp.mean(private_norms)
     else:
-        avg_pairwise_cosine = jnp.mean(pairwise_cosines)
+        avg_private_norm = jnp.array(0.0, dtype=common.dtype)
+
+    if compute_private_loss:
+        pairwise_cosines = _pairwise_cosines(private)
+        if pairwise_cosines.ndim == 0:
+            avg_pairwise_cosine = pairwise_cosines
+        else:
+            avg_pairwise_cosine = jnp.mean(pairwise_cosines)
+    else:
+        avg_pairwise_cosine = jnp.array(0.0, dtype=common.dtype)
 
     return {
         "common_activation": common,
-        "private_activations": private,
+        "private_activations": private if private is not None else jnp.array(0.0, dtype=common.dtype),
         "loss_spatial": spatial_loss,
         "loss_private": private_loss,
         "loss_common_private": common_private_loss,
