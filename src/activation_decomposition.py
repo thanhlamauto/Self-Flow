@@ -387,7 +387,12 @@ def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     return cosine_matrix[upper_indices]
 
 
-def _select_private_pair_indices(
+def _private_pair_flat_index(i: jax.Array, j: jax.Array, num_layers: int) -> jax.Array:
+    """Map an upper-triangle pair ``(i, j)`` to _pairwise_cosines flat order."""
+    return i * num_layers - (i * (i + 1)) // 2 + (j - i - 1)
+
+
+def _select_private_pair_flat_indices(
     num_layers: int,
     *,
     rng: jax.Array | None = None,
@@ -395,59 +400,40 @@ def _select_private_pair_indices(
     pair_mode: str = "first_pairs",
     min_pair_delta: int = 1,
     fixed_pair_indices: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    """Return selected private-layer pair indices in lexicographic pair order."""
+) -> jax.Array:
+    """Return selected private-layer pair flat indices in _pairwise_cosines order."""
     if pair_mode not in ("first_pairs", "random_pairs", "fixed_random_pairs"):
         raise ValueError(
             f"Unknown private pair mode {pair_mode!r}; expected 'first_pairs', 'random_pairs', "
             "or 'fixed_random_pairs'."
         )
     if num_layers < 2:
-        empty = jnp.asarray((), dtype=jnp.int32)
-        return empty, empty
+        return jnp.asarray((), dtype=jnp.int32)
 
     min_pair_delta = max(1, int(min_pair_delta))
     if pair_mode == "fixed_random_pairs":
         if fixed_pair_indices is None:
             raise ValueError("fixed_random_pairs requires fixed_pair_indices.")
         pairs = fixed_pair_indices.astype(jnp.int32)
-        pair_a = pairs[:, 0]
-        pair_b = pairs[:, 1]
-        return pair_a, pair_b
+        return _private_pair_flat_index(pairs[:, 0], pairs[:, 1], num_layers).astype(jnp.int32)
 
-    pairs = tuple(
-        (i, j)
+    pair_indices = tuple(
+        int(_private_pair_flat_index(i, j, int(num_layers)))
         for i in range(int(num_layers))
         for j in range(i + min_pair_delta, int(num_layers))
     )
-    if not pairs:
-        empty = jnp.asarray((), dtype=jnp.int32)
-        return empty, empty
-    pair_a = jnp.asarray([pair[0] for pair in pairs], dtype=jnp.int32)
-    pair_b = jnp.asarray([pair[1] for pair in pairs], dtype=jnp.int32)
-    total_pairs = pair_a.shape[0]
+    if not pair_indices:
+        return jnp.asarray((), dtype=jnp.int32)
+    pair_indices = jnp.asarray(pair_indices, dtype=jnp.int32)
+    total_pairs = pair_indices.shape[0]
     if max_pairs and max_pairs > 0 and total_pairs > max_pairs:
         if pair_mode == "random_pairs":
             if rng is None:
                 raise ValueError("An RNG key is required when sampling private-layer pairs.")
             selected = jax.random.permutation(rng, total_pairs)[:max_pairs]
-            return pair_a[selected], pair_b[selected]
-        return pair_a[:max_pairs], pair_b[:max_pairs]
-    return pair_a, pair_b
-
-
-def _private_pairwise_cosines_for_indices(
-    private: jax.Array,
-    pair_a: jax.Array,
-    pair_b: jax.Array,
-    eps: float = 1e-8,
-) -> jax.Array:
-    """Return cosine similarities for preselected private-layer pairs."""
-    if pair_a.shape[0] == 0:
-        return jnp.array(0.0, dtype=private.dtype)
-
-    cosine_matrix = _private_cosine_matrix(private, eps=eps)
-    return cosine_matrix[pair_a, pair_b]
+            return pair_indices[selected]
+        return pair_indices[:max_pairs]
+    return pair_indices
 
 
 def _private_pairwise_loss_and_metric(
@@ -460,7 +446,7 @@ def _private_pairwise_loss_and_metric(
     fixed_pair_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Average squared cosine loss and mean cosine over selected private-layer pairs."""
-    pair_a, pair_b = _select_private_pair_indices(
+    pair_indices = _select_private_pair_flat_indices(
         private.shape[0],
         rng=rng,
         max_pairs=max_pairs,
@@ -468,10 +454,13 @@ def _private_pairwise_loss_and_metric(
         min_pair_delta=min_pair_delta,
         fixed_pair_indices=fixed_pair_indices,
     )
-    pairwise_cosines = _private_pairwise_cosines_for_indices(private, pair_a, pair_b, eps=eps)
-    if pairwise_cosines.ndim == 0:
-        return pairwise_cosines, pairwise_cosines
-    return jnp.mean(jnp.square(pairwise_cosines)), jnp.mean(pairwise_cosines)
+    if pair_indices.shape[0] == 0:
+        zero = jnp.array(0.0, dtype=private.dtype)
+        return zero, zero
+
+    pairwise_cosines = _pairwise_cosines(private, eps=eps)
+    selected_cosines = pairwise_cosines[pair_indices]
+    return jnp.mean(jnp.square(selected_cosines)), jnp.mean(selected_cosines)
 
 
 def _common_private_cosines(
