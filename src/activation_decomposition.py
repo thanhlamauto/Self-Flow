@@ -354,17 +354,26 @@ def _mean_pairwise_cosine_squared(
     eps: float = 1e-8,
     rng: jax.Array | None = None,
     max_pairs: int = 0,
+    pair_mode: str = "first_pairs",
 ) -> jax.Array:
     """Average squared cosine similarity over all or sampled layer pairs."""
+    if pair_mode not in ("first_pairs", "random_pairs"):
+        raise ValueError(
+            f"Unknown private pair mode {pair_mode!r}; expected 'first_pairs' or 'random_pairs'."
+        )
+
     pairwise_cosines = _pairwise_cosines(private, eps=eps)
     if pairwise_cosines.ndim == 0:
         return pairwise_cosines
 
     if max_pairs and max_pairs > 0 and pairwise_cosines.shape[0] > max_pairs:
-        if rng is None:
-            raise ValueError("An RNG key is required when sampling private-layer pairs.")
-        indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
-        pairwise_cosines = pairwise_cosines[indices]
+        if pair_mode == "random_pairs":
+            if rng is None:
+                raise ValueError("An RNG key is required when sampling private-layer pairs.")
+            indices = jax.random.permutation(rng, pairwise_cosines.shape[0])[:max_pairs]
+            pairwise_cosines = pairwise_cosines[indices]
+        else:
+            pairwise_cosines = pairwise_cosines[:max_pairs]
 
     return jnp.mean(jnp.square(pairwise_cosines))
 
@@ -422,6 +431,7 @@ def compute_aux_losses(
     timesteps: jax.Array | None = None,
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
+    private_pair_mode: str = "first_pairs",
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
     compute_common_private_loss: bool = True,
@@ -497,6 +507,7 @@ def compute_aux_losses(
         private,
         rng=private_pair_rng,
         max_pairs=private_max_pairs,
+        pair_mode=private_pair_mode,
     )
     if compute_common_private_loss:
         common_private_loss = _mean_common_private_cosine_squared(
