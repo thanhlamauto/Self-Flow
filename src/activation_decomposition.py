@@ -389,8 +389,7 @@ def _select_private_pair_indices(
     rng: jax.Array | None = None,
     max_pairs: int = 0,
     pair_mode: str = "first_pairs",
-    fixed_pair_schedule: jax.Array | None = None,
-    pair_schedule_step: jax.Array | None = None,
+    fixed_pair_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return selected private-layer pair indices in lexicographic pair order."""
     if pair_mode not in ("first_pairs", "random_pairs", "fixed_random_pairs"):
@@ -403,15 +402,9 @@ def _select_private_pair_indices(
         return empty, empty
 
     if pair_mode == "fixed_random_pairs":
-        if fixed_pair_schedule is None or pair_schedule_step is None:
-            raise ValueError("fixed_random_pairs requires fixed_pair_schedule and pair_schedule_step.")
-        schedule_step = jnp.mod(pair_schedule_step, fixed_pair_schedule.shape[0])
-        pairs = jax.lax.dynamic_index_in_dim(
-            fixed_pair_schedule,
-            schedule_step,
-            axis=0,
-            keepdims=False,
-        ).astype(jnp.int32)
+        if fixed_pair_indices is None:
+            raise ValueError("fixed_random_pairs requires fixed_pair_indices.")
+        pairs = fixed_pair_indices.astype(jnp.int32)
         pair_a = pairs[:, 0]
         pair_b = pairs[:, 1]
         return pair_a, pair_b
@@ -452,8 +445,7 @@ def _private_pairwise_loss_and_metric(
     rng: jax.Array | None = None,
     max_pairs: int = 0,
     pair_mode: str = "first_pairs",
-    fixed_pair_schedule: jax.Array | None = None,
-    pair_schedule_step: jax.Array | None = None,
+    fixed_pair_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Average squared cosine loss and mean cosine over selected private-layer pairs."""
     pair_a, pair_b = _select_private_pair_indices(
@@ -461,8 +453,7 @@ def _private_pairwise_loss_and_metric(
         rng=rng,
         max_pairs=max_pairs,
         pair_mode=pair_mode,
-        fixed_pair_schedule=fixed_pair_schedule,
-        pair_schedule_step=pair_schedule_step,
+        fixed_pair_indices=fixed_pair_indices,
     )
     pairwise_cosines = _private_pairwise_cosines_for_indices(private, pair_a, pair_b, eps=eps)
     if pairwise_cosines.ndim == 0:
@@ -524,8 +515,7 @@ def compute_aux_losses(
     private_pair_rng: jax.Array | None = None,
     private_max_pairs: int = 0,
     private_pair_mode: str = "first_pairs",
-    private_fixed_pair_schedule: jax.Array | None = None,
-    private_pair_schedule_step: jax.Array | None = None,
+    private_fixed_pair_indices: jax.Array | None = None,
     common_private_rng: jax.Array | None = None,
     common_private_max_layers: int = 0,
     compute_spatial_loss: bool = True,
@@ -628,8 +618,7 @@ def compute_aux_losses(
             rng=private_pair_rng,
             max_pairs=private_max_pairs,
             pair_mode=private_pair_mode,
-            fixed_pair_schedule=private_fixed_pair_schedule,
-            pair_schedule_step=private_pair_schedule_step,
+            fixed_pair_indices=private_fixed_pair_indices,
         )
     else:
         private_loss = jnp.array(0.0, dtype=common.dtype)

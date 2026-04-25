@@ -612,15 +612,14 @@ def resolve_private_fixed_pair_schedule(depth, max_pairs, seed, num_steps):
         pairs = list(all_pairs)
         rng.shuffle(pairs)
         schedule.append(pairs[:max_pairs])
-    return jnp.asarray(schedule, dtype=jnp.int32)
+    return np.asarray(schedule, dtype=np.int32)
 
 
 def train_step(
-    state, ema_params, batch, rng, ema_decay, current_step,
+    state, ema_params, batch, rng, ema_decay, current_step, private_fixed_pair_indices,
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
-    private_fixed_pair_schedule=None,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -709,8 +708,7 @@ def train_step(
                 private_pair_rng=private_pair_rng,
                 private_max_pairs=private_max_pairs,
                 private_pair_mode=private_pair_mode,
-                private_fixed_pair_schedule=private_fixed_pair_schedule,
-                private_pair_schedule_step=current_step,
+                private_fixed_pair_indices=private_fixed_pair_indices,
                 common_private_rng=common_private_rng,
                 common_private_max_layers=common_private_max_layers,
                 compute_spatial_loss=compute_spatial_loss,
@@ -855,11 +853,10 @@ def train_step(
 
 
 def eval_step(
-    state, ema_params, batch, rng, current_step,
+    state, ema_params, batch, rng, current_step, private_fixed_pair_indices,
     lambda_spatial=0.0, lambda_private=0.0, lambda_common_private=0.0,
     private_max_pairs=0,
     private_pair_mode="first_pairs",
-    private_fixed_pair_schedule=None,
     common_private_max_layers=0,
     spatial_window_size=DEFAULT_SPATIAL_WINDOW_SIZE,
     spatial_window_stride=DEFAULT_SPATIAL_WINDOW_STRIDE,
@@ -942,8 +939,7 @@ def eval_step(
             private_pair_rng=private_pair_rng,
             private_max_pairs=private_max_pairs,
             private_pair_mode=private_pair_mode,
-            private_fixed_pair_schedule=private_fixed_pair_schedule,
-            private_pair_schedule_step=current_step,
+            private_fixed_pair_indices=private_fixed_pair_indices,
             common_private_rng=common_private_rng,
             common_private_max_layers=common_private_max_layers,
             compute_spatial_loss=compute_spatial_loss,
@@ -1945,6 +1941,17 @@ def main():
             f"preview={np.asarray(private_fixed_pair_schedule[:preview_steps]).tolist()}"
         )
 
+    private_dummy_pair_indices = jnp.zeros((num_devices, 1, 2), dtype=jnp.int32)
+
+    def private_pair_indices_for_step(step):
+        if private_fixed_pair_schedule is None:
+            return private_dummy_pair_indices
+        pair_indices = private_fixed_pair_schedule[int(step) % private_fixed_pair_schedule.shape[0]]
+        return jnp.asarray(
+            np.broadcast_to(pair_indices, (num_devices,) + pair_indices.shape),
+            dtype=jnp.int32,
+        )
+
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
         wandb.init(project=args.wandb_project, config=vars(args))
@@ -1992,7 +1999,6 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
-            private_fixed_pair_schedule=private_fixed_pair_schedule,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -2020,7 +2026,6 @@ def main():
             private_warmup_iters=args.private_warmup_iters,
             private_max_pairs=args.private_max_pairs,
             private_pair_mode=args.private_pair_mode,
-            private_fixed_pair_schedule=private_fixed_pair_schedule,
             common_private_max_layers=args.common_private_max_layers,
             spatial_window_size=args.spatial_window_size,
             spatial_window_stride=args.spatial_window_stride,
@@ -2309,7 +2314,8 @@ def main():
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
             state, ema_params, (probe_x, probe_y), rng, ema_decay_rep,
-            jnp.zeros((num_devices,), dtype=jnp.int32)
+            jnp.zeros((num_devices,), dtype=jnp.int32),
+            private_pair_indices_for_step(0),
         )
         block_pytree(probe_metrics)
 
@@ -2673,8 +2679,9 @@ def main():
 
             # Vanilla SiT training step (returns updated EMA params)
             step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+            private_pair_indices = private_pair_indices_for_step(global_step)
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices
+                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, step_devices, private_pair_indices
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2701,8 +2708,9 @@ def main():
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     eval_step_devices = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+                    eval_private_pair_indices = private_pair_indices_for_step(global_step)
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, eval_step_devices
+                        state, ema_params, (val_x, val_y), rng, eval_step_devices, eval_private_pair_indices
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
