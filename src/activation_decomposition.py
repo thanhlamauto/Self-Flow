@@ -415,10 +415,16 @@ def _select_private_pair_indices(
         pair_b = pairs[:, 1]
         return pair_a, pair_b
 
-    pair_a, pair_b = jnp.triu_indices(num_layers, k=1)
-    valid = (pair_b - pair_a) >= min_pair_delta
-    pair_a = pair_a[valid]
-    pair_b = pair_b[valid]
+    pairs = tuple(
+        (i, j)
+        for i in range(int(num_layers))
+        for j in range(i + min_pair_delta, int(num_layers))
+    )
+    if not pairs:
+        empty = jnp.asarray((), dtype=jnp.int32)
+        return empty, empty
+    pair_a = jnp.asarray([pair[0] for pair in pairs], dtype=jnp.int32)
+    pair_b = jnp.asarray([pair[1] for pair in pairs], dtype=jnp.int32)
     total_pairs = pair_a.shape[0]
     if max_pairs and max_pairs > 0 and total_pairs > max_pairs:
         if pair_mode == "random_pairs":
