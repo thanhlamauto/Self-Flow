@@ -368,6 +368,7 @@ DIT_VARIANTS = {
 
 DEFAULT_LAYERSYNC_WEAK_LAYER = 8
 DEFAULT_LAYERSYNC_STRONG_LAYER = 16
+DEFAULT_CFG_DROPOUT_RATE = 0.1
 
 
 def build_model_config(model_size):
@@ -390,6 +391,7 @@ def build_model_config(model_size):
         num_classes=1000,
         learn_sigma=True,
         compatibility_mode=True,
+        class_dropout_prob=DEFAULT_CFG_DROPOUT_RATE,
     )
 
 
@@ -451,6 +453,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -848,6 +851,9 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         - Paper-like eval: num_steps=250, cfg_scale=1.0
         (paper eval keeps cfg_scale=1.0; higher CFG remains a deviation)
     """
+    if cfg_scale > 1.0 and config["class_dropout_prob"] <= 0.0:
+        raise ValueError("cfg_scale > 1 requires --cfg-dropout-rate > 0 during model init.")
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -859,6 +865,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -947,6 +954,9 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
+    if cfg_scale > 1.0 and config["class_dropout_prob"] <= 0.0:
+        raise ValueError("cfg_scale > 1 requires --cfg-dropout-rate > 0 during model init.")
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -958,6 +968,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         num_classes=config["num_classes"],
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
         per_token=False,
     )
 
@@ -1196,6 +1207,19 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     parser.add_argument(
+        "--cfg-dropout-rate",
+        type=float,
+        default=DEFAULT_CFG_DROPOUT_RATE,
+        help="Classifier-free guidance class dropout rate during training/model init. Use 0.0 for no-CFG-dropout training.",
+    )
+    parser.add_argument(
+        "--no-cfg-dropout",
+        dest="cfg_dropout_rate",
+        action="store_const",
+        const=0.0,
+        help="Shortcut for --cfg-dropout-rate 0.0.",
+    )
+    parser.add_argument(
         "--layersync-lambda",
         type=float,
         default=0.0,
@@ -1361,6 +1385,10 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.layersync_lambda < 0.0:
         raise ValueError("--layersync-lambda must be non-negative")
+    if not 0.0 <= args.cfg_dropout_rate < 1.0:
+        raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
+    if args.cfg_dropout_rate <= 0.0 and (args.sample_cfg_scale > 1.0 or args.fid_cfg_scale > 1.0):
+        raise ValueError("--sample-cfg-scale/--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -1385,11 +1413,12 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    config["class_dropout_prob"] = float(args.cfg_dropout_rate)
     depth = int(config["depth"])
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
-        f"depth={depth} heads={config['num_heads']}"
+        f"depth={depth} heads={config['num_heads']} cfg_dropout={config['class_dropout_prob']}"
     )
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
