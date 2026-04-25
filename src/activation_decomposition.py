@@ -369,16 +369,20 @@ def local_window_gram_loss(
     return spatial_loss, spatial_metrics
 
 
+def _private_cosine_matrix(private: jax.Array, eps: float = 1e-8) -> jax.Array:
+    flattened = private.reshape(private.shape[0], -1)
+    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
+    normalized = flattened / jnp.maximum(norms, eps)
+    return normalized @ normalized.T
+
+
 def _pairwise_cosines(private: jax.Array, eps: float = 1e-8) -> jax.Array:
     """Return cosine similarities for all layer pairs `i < j`."""
     num_layers = private.shape[0]
     if num_layers < 2:
         return jnp.array(0.0, dtype=private.dtype)
 
-    flattened = private.reshape(num_layers, -1)
-    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
-    normalized = flattened / jnp.maximum(norms, eps)
-    cosine_matrix = normalized @ normalized.T
+    cosine_matrix = _private_cosine_matrix(private, eps=eps)
     upper_indices = jnp.triu_indices(num_layers, k=1)
     return cosine_matrix[upper_indices]
 
@@ -436,12 +440,8 @@ def _private_pairwise_cosines_for_indices(
     if pair_a.shape[0] == 0:
         return jnp.array(0.0, dtype=private.dtype)
 
-    flattened = private.reshape(private.shape[0], -1)
-    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
-    normalized = flattened / jnp.maximum(norms, eps)
-    selected_a = normalized[pair_a]
-    selected_b = normalized[pair_b]
-    return jnp.sum(selected_a * selected_b, axis=-1)
+    cosine_matrix = _private_cosine_matrix(private, eps=eps)
+    return cosine_matrix[pair_a, pair_b]
 
 
 def _private_pairwise_loss_and_metric(
