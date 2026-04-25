@@ -731,21 +731,18 @@ def clg_loss(
     return loss
 
 
-def residual_orthogonality_loss(r_a, r_b, *, detach_b=False, eps=1e-6, axis_name=None):
-    a = r_a.reshape((-1,)).astype(jnp.float32)
-    b = r_b.reshape((-1,)).astype(jnp.float32)
+def residual_orthogonality_loss(r_a, r_b, *, detach_b=False, eps=1e-8, axis_name=None):
+    del axis_name  # Match common/private cosine: local flatten, scalar is pmapped-reduced later.
+    a = r_a.astype(jnp.float32)
+    b = r_b.astype(jnp.float32)
     if detach_b:
         b = jax.lax.stop_gradient(b)
-    dot = jnp.vdot(a, b)
-    norm_a_sq = jnp.vdot(a, a)
-    norm_b_sq = jnp.vdot(b, b)
-    if axis_name is not None:
-        dot = jax.lax.psum(dot, axis_name=axis_name)
-        norm_a_sq = jax.lax.psum(norm_a_sq, axis_name=axis_name)
-        norm_b_sq = jax.lax.psum(norm_b_sq, axis_name=axis_name)
-    denom = jnp.sqrt(norm_a_sq) * jnp.sqrt(norm_b_sq) + jnp.asarray(eps, dtype=jnp.float32)
-    cos = dot / denom
-    return jnp.square(cos)
+    pair = jnp.stack([a, b], axis=0)
+    flattened = pair.reshape((2, -1))
+    norms = jnp.linalg.norm(flattened, axis=-1, keepdims=True)
+    normalized = flattened / jnp.maximum(norms, jnp.asarray(eps, dtype=jnp.float32))
+    cosine = normalized[0] @ normalized[1]
+    return jnp.square(cosine)
 
 
 def _select_feature(raw_features, layer_index, *, random_mode):
