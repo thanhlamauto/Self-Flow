@@ -6,6 +6,7 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 """
 
 import math
+from collections.abc import Sequence
 from typing import Optional
 
 import jax
@@ -260,7 +261,7 @@ class SelfFlowDiT(nn.Module):
         vector: jax.Array,
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
-        return_raw_features: bool = False,
+        return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
@@ -268,6 +269,28 @@ class SelfFlowDiT(nn.Module):
         assert not (return_raw_features and return_features)
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
+
+        raw_layers = ()
+        raw_single = False
+        raw_positions = None
+        if isinstance(return_raw_features, Sequence) and not isinstance(return_raw_features, (str, bytes)):
+            raw_layers = tuple(int(layer) for layer in return_raw_features)
+            raw_single = len(raw_layers) == 1
+        elif isinstance(return_raw_features, int) and not isinstance(return_raw_features, bool):
+            raw_layers = (int(return_raw_features),)
+            raw_single = True
+
+        if raw_layers:
+            if any(layer <= 0 for layer in raw_layers):
+                raise ValueError(f"return_raw_features layers must be >= 1, got {raw_layers}")
+            if any(layer > self.depth for layer in raw_layers):
+                raise ValueError(
+                    f"return_raw_features layers must be <= model depth ({self.depth}), got {raw_layers}"
+                )
+            if not raw_single:
+                raw_positions = {}
+                for idx, layer in enumerate(raw_layers):
+                    raw_positions.setdefault(layer, []).append(idx)
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -305,6 +328,7 @@ class SelfFlowDiT(nn.Module):
         c = t_emb + y_emb
 
         zs = None
+        raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
             x = DiTBlock(
@@ -320,8 +344,12 @@ class SelfFlowDiT(nn.Module):
             
             if (i + 1) == return_features:
                 zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+            if raw_layers and ((i + 1) in raw_positions if raw_positions is not None else (i + 1) in raw_layers):
+                if raw_single:
+                    zs = x
+                else:
+                    for idx in raw_positions[i + 1]:
+                        raw_zs[idx] = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -338,7 +366,16 @@ class SelfFlowDiT(nn.Module):
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
 
-        if return_features or return_raw_features:
+        if return_features:
+            if return_block_summaries:
+                return x, zs, block_summaries
+            return x, zs
+        if raw_layers:
+            raw_out = zs if raw_single else tuple(raw_zs)
+            if return_block_summaries:
+                return x, raw_out, block_summaries
+            return x, raw_out
+        if return_raw_features:
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
