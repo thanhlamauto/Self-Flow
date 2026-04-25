@@ -754,8 +754,17 @@ def _zero_layersync_metrics(dtype=jnp.float32):
         "clg_a": zero,
         "clg_b": zero,
         "residual": zero,
+        "dispersion": zero,
         "cosine": zero,
     }
+
+
+def feature_dispersion_loss(feature_usage):
+    usage = feature_usage.astype(jnp.float32)
+    mean_usage = jnp.mean(usage)
+    variance = jnp.mean(jnp.square(usage - mean_usage))
+    normalized_variance = variance / jnp.float32(0.25)
+    return -jnp.clip(normalized_variance, 0.0, 1.0)
 
 
 def compute_layersync_loss(
@@ -770,6 +779,7 @@ def compute_layersync_loss(
     rank,
     residual_lambda,
     neighbor_window,
+    feature_usage=None,
 ):
     del rng
     clean_mode = mode in (1, 2, 4, 5)
@@ -792,7 +802,12 @@ def compute_layersync_loss(
             clg_a = jnp.array(0.0, dtype=jnp.float32)
             clg_b = jnp.array(0.0, dtype=jnp.float32)
             residual = residual_orthogonality_loss(res_a, res_b)
-            align = residual
+            dispersion = (
+                feature_dispersion_loss(feature_usage)
+                if feature_usage is not None
+                else jnp.array(0.0, dtype=jnp.float32)
+            )
+            align = residual + dispersion
         else:
             result_a = clg_loss(
                 y_a,
@@ -821,6 +836,7 @@ def compute_layersync_loss(
                 if residual_mode
                 else jnp.array(0.0, dtype=jnp.float32)
             )
+            dispersion = jnp.array(0.0, dtype=jnp.float32)
             align = jnp.float32(0.5) * (clg_a + clg_b) + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
     elif internal_mode:
         raw_b_ref = jax.lax.stop_gradient(raw_b)
@@ -841,6 +857,7 @@ def compute_layersync_loss(
             if residual_mode
             else jnp.array(0.0, dtype=jnp.float32)
         )
+        dispersion = jnp.array(0.0, dtype=jnp.float32)
         align = clg_a + jnp.asarray(residual_lambda, dtype=jnp.float32) * residual
     else:
         raise ValueError(f"Unsupported LayerSync mode {mode}")
@@ -850,6 +867,7 @@ def compute_layersync_loss(
         "clg_a": clg_a,
         "clg_b": clg_b,
         "residual": residual,
+        "dispersion": dispersion,
         "cosine": jnp.array(0.0, dtype=jnp.float32),
     }
 
@@ -893,15 +911,29 @@ def train_step(
 
     def loss_fn(params):
         if layersync_enabled:
-            pred, raw_features = state.apply_fn(
-                {"params": params},
-                x_tau,
-                timesteps=tau,
-                vector=y,
-                deterministic=False,
-                rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
-            )
+            return_feature_usage = layersync_mode == 6
+            if return_feature_usage:
+                pred, raw_features, feature_usage = state.apply_fn(
+                    {"params": params},
+                    x_tau,
+                    timesteps=tau,
+                    vector=y,
+                    deterministic=False,
+                    rngs={"dropout": drop_rng},
+                    return_raw_features=layersync_capture_layers,
+                    return_feature_usage=True,
+                )
+            else:
+                pred, raw_features = state.apply_fn(
+                    {"params": params},
+                    x_tau,
+                    timesteps=tau,
+                    vector=y,
+                    deterministic=False,
+                    rngs={"dropout": drop_rng},
+                    return_raw_features=layersync_capture_layers,
+                )
+                feature_usage = None
             layersync_metrics = compute_layersync_loss(
                 params,
                 raw_features,
@@ -913,6 +945,7 @@ def train_step(
                 rank=layersync_rank,
                 residual_lambda=layersync_residual_lambda,
                 neighbor_window=layersync_neighbor_window,
+                feature_usage=feature_usage,
             )
         else:
             pred = state.apply_fn(
@@ -960,6 +993,7 @@ def train_step(
         "train/layersync_clg_a": layersync_metrics["clg_a"],
         "train/layersync_clg_b": layersync_metrics["clg_b"],
         "train/layersync_residual_orth": layersync_metrics["residual"],
+        "train/layersync_dispersion": layersync_metrics["dispersion"],
         "train/layersync_lambda": layersync_lambda,
         "train/layersync_cosine": layersync_metrics["cosine"],
         "train/ema_decay": ema_decay,
@@ -1000,14 +1034,27 @@ def eval_step(
     target = x0 - x1
 
     if layersync_enabled:
-        pred, raw_features = state.apply_fn(
-            {"params": state.params},
-            x_tau,
-            timesteps=tau,
-            vector=y,
-            deterministic=True,
-            return_raw_features=layersync_capture_layers,
-        )
+        return_feature_usage = layersync_mode == 6
+        if return_feature_usage:
+            pred, raw_features, feature_usage = state.apply_fn(
+                {"params": state.params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=True,
+                return_raw_features=layersync_capture_layers,
+                return_feature_usage=True,
+            )
+        else:
+            pred, raw_features = state.apply_fn(
+                {"params": state.params},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=True,
+                return_raw_features=layersync_capture_layers,
+            )
+            feature_usage = None
         layersync_metrics = compute_layersync_loss(
             state.params,
             raw_features,
@@ -1019,6 +1066,7 @@ def eval_step(
             rank=layersync_rank,
             residual_lambda=layersync_residual_lambda,
             neighbor_window=layersync_neighbor_window,
+            feature_usage=feature_usage,
         )
     else:
         pred = state.apply_fn(
@@ -1054,6 +1102,7 @@ def eval_step(
         "val/layersync_clg_a": layersync_metrics["clg_a"],
         "val/layersync_clg_b": layersync_metrics["clg_b"],
         "val/layersync_residual_orth": layersync_metrics["residual"],
+        "val/layersync_dispersion": layersync_metrics["dispersion"],
         "val/layersync_lambda": layersync_lambda,
         "val/layersync_cosine": layersync_metrics["cosine"],
         "val/v_abs_mean": v_abs_mean,
