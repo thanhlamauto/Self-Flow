@@ -313,6 +313,8 @@ class SelfFlowDiT(nn.Module):
         return_raw_features: bool | int | Sequence[int] = False,
         return_block_summaries: bool = False,
         return_hidden_states: bool = False,
+        resume_hidden: Optional[jax.Array] = None,
+        resume_start_layer: int | jax.Array = 1,
         depth_shortcut_predictor_params: Optional[dict] = None,
         depth_shortcut_l2_ema: Optional[jax.Array] = None,
         depth_shortcut_variant: str = "tiny",
@@ -357,14 +359,17 @@ class SelfFlowDiT(nn.Module):
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
-        # Patch Embedding
-        x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
-        )(x)
-        x = x + self.pos_embed_val
+        if resume_hidden is None:
+            # Patch Embedding
+            x = PatchedPatchEmbed(
+                img_size=self.input_size,
+                patch_size=self.patch_size,
+                in_channels=self.in_channels,
+                embed_dim=self.hidden_size,
+            )(x)
+            x = x + self.pos_embed_val
+        else:
+            x = resume_hidden
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
         y_embedder = LabelEmbedder(
@@ -421,17 +426,24 @@ class SelfFlowDiT(nn.Module):
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
         hidden_states = [x] if return_hidden_states else None
+        resume_start_block = jnp.asarray(resume_start_layer, dtype=jnp.int32) - 1
         for i in range(self.depth):
             layer_idx = i + 1
             if shortcut_enabled and layer_idx <= shortcut_skip_until:
                 continue
 
-            x = DiTBlock(
+            block_out = DiTBlock(
                 hidden_size=self.hidden_size, 
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
+                per_token=self.per_token,
+                name=f"DiTBlock_{i}",
             )(x, c)
+            if resume_hidden is None:
+                x = block_out
+            else:
+                should_apply_block = jnp.asarray(i, dtype=jnp.int32) >= resume_start_block
+                x = jnp.where(should_apply_block, block_out, x)
 
             if shortcut_enabled and layer_idx in shortcut_sources and (layer_idx + 2) <= self.depth:
                 target_layer = layer_idx + 2
@@ -466,7 +478,7 @@ class SelfFlowDiT(nn.Module):
                     )
                 shortcut_skip_until = target_layer
 
-            if return_hidden_states:
+            if hidden_states is not None:
                 hidden_states.append(x)
 
             if return_block_summaries:
@@ -486,7 +498,8 @@ class SelfFlowDiT(nn.Module):
             hidden_size=self.hidden_size,
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
-            per_token=self.per_token
+            per_token=self.per_token,
+            name="FinalLayer_0",
         )(x, c)
 
         x = self._shufflechannel(x)

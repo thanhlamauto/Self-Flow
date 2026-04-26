@@ -645,6 +645,7 @@ def train_step(
     l2_ema,
     batch,
     rng,
+    global_step,
     ema_decay,
     predictor_ema_decay,
     shortcut_timesteps,
@@ -652,6 +653,11 @@ def train_step(
     lambda_boot,
     lambda_mag,
     lambda_boot_mag,
+    lambda_skip_fm,
+    skip_in_loop_prob,
+    skip_in_loop_gap,
+    skip_in_loop_warmup_steps,
+    skip_in_loop_detach_source,
     mag_scale,
     l2_ema_alpha,
 ):
@@ -665,7 +671,7 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng = jax.random.split(rng, 6)
+    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng, skip_rng, skip_pair_rng, skip_drop_rng = jax.random.split(rng, 9)
 
     q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
     tau = q.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
@@ -754,12 +760,71 @@ def train_step(
         target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
         pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
         loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+
+        def compute_skip_fm_loss(_):
+            max_source = directions.shape[0] - 1 - skip_in_loop_gap
+            skip_a = jax.random.randint(skip_pair_rng, (), 0, max_source + 1, dtype=jnp.int32)
+            skip_b = skip_a + skip_in_loop_gap
+            u_skip_source = directions[skip_a]
+            m_skip_source = log_magnitudes[skip_a]
+            u_skip_source = jax.lax.cond(
+                skip_in_loop_detach_source,
+                jax.lax.stop_gradient,
+                lambda z: z,
+                u_skip_source,
+            )
+            m_skip_source = jax.lax.cond(
+                skip_in_loop_detach_source,
+                jax.lax.stop_gradient,
+                lambda z: z,
+                m_skip_source,
+            )
+            y_skip, delta_m_skip = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                u_skip_source,
+                skip_a,
+                skip_b,
+                dit_time_emb,
+                m_skip_source,
+            )
+            u_skip = l2_normalize_tokens(y_skip)
+            m_skip = jnp.clip(m_skip_source + mag_scale * delta_m_skip, 3.0, 8.0)
+            z_skip = jnp.exp(m_skip) * u_skip
+            pred_skip = state.apply_fn(
+                {"params": params["backbone"]},
+                x_tau,
+                timesteps=tau,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": skip_drop_rng},
+                resume_hidden=z_skip,
+                resume_start_layer=skip_b + 1,
+            )
+            return (
+                jnp.mean((pred_skip - target) ** 2),
+                skip_a.astype(jnp.float32),
+                skip_b.astype(jnp.float32),
+            )
+
+        skip_prob_eff = jnp.where(
+            global_step >= skip_in_loop_warmup_steps,
+            skip_in_loop_prob,
+            jnp.float32(0.0),
+        )
+        skip_do = jax.random.uniform(skip_rng, ()) < skip_prob_eff
+        loss_skip_fm, skip_a_metric, skip_b_metric = jax.lax.cond(
+            skip_do,
+            compute_skip_fm_loss,
+            lambda _: (jnp.float32(0.0), jnp.float32(-1.0), jnp.float32(-1.0)),
+            operand=None,
+        )
         loss_total = (
             loss_gen
             + lambda_dir * loss_dir
             + lambda_boot * loss_boot
             + lambda_mag * loss_mag
             + lambda_boot_mag * loss_boot_mag
+            + lambda_skip_fm * loss_skip_fm
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -771,6 +836,7 @@ def train_step(
             loss_boot,
             loss_mag,
             loss_boot_mag,
+            loss_skip_fm,
             cos_dir,
             cos_boot,
             y_ab_norm_mean,
@@ -781,6 +847,10 @@ def train_step(
             delta_m_ratio_error,
             delta_m_clip_rate,
             direct_gap,
+            skip_do.astype(jnp.float32),
+            skip_prob_eff,
+            skip_a_metric,
+            skip_b_metric,
             hidden_stack,
         )
         return loss_total, aux
@@ -795,6 +865,7 @@ def train_step(
         loss_boot,
         loss_mag,
         loss_boot_mag,
+        loss_skip_fm,
         cos_dir,
         cos_boot,
         y_ab_norm_mean,
@@ -805,6 +876,10 @@ def train_step(
         delta_m_ratio_error,
         delta_m_clip_rate,
         direct_gap,
+        skip_do_metric,
+        skip_prob_eff,
+        skip_a_metric,
+        skip_b_metric,
         hidden_stack,
     ) = aux
 
@@ -816,6 +891,7 @@ def train_step(
     loss_boot = jax.lax.pmean(loss_boot, axis_name="batch")
     loss_mag = jax.lax.pmean(loss_mag, axis_name="batch")
     loss_boot_mag = jax.lax.pmean(loss_boot_mag, axis_name="batch")
+    loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
     cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
     y_ab_norm_mean = jax.lax.pmean(y_ab_norm_mean, axis_name="batch")
@@ -826,6 +902,10 @@ def train_step(
     delta_m_ratio_error = jax.lax.pmean(delta_m_ratio_error, axis_name="batch")
     delta_m_clip_rate = jax.lax.pmean(delta_m_clip_rate, axis_name="batch")
     direct_gap = jax.lax.pmean(direct_gap.astype(jnp.float32), axis_name="batch")
+    skip_do_metric = jax.lax.pmean(skip_do_metric, axis_name="batch")
+    skip_prob_eff = jax.lax.pmean(skip_prob_eff, axis_name="batch")
+    skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
+    skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -848,6 +928,7 @@ def train_step(
         "train/loss_boot": loss_boot,
         "train/loss_mag": loss_mag,
         "train/loss_boot_mag": loss_boot_mag,
+        "train/loss_skip_fm": loss_skip_fm,
         "train/cos_dir": cos_dir,
         "train/cos_boot": cos_boot,
         "train/y_ab_norm_mean": y_ab_norm_mean,
@@ -858,6 +939,10 @@ def train_step(
         "train/delta_m_ratio_error": delta_m_ratio_error,
         "train/delta_m_clip_rate": delta_m_clip_rate,
         "train/direct_gap": direct_gap,
+        "train/skip_in_loop_do": skip_do_metric,
+        "train/skip_in_loop_prob": skip_prob_eff,
+        "train/skip_in_loop_source": skip_a_metric,
+        "train/skip_in_loop_target": skip_b_metric,
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -1506,13 +1591,24 @@ def main():
         "--shortcut-training-mode",
         type=str,
         default="direction",
-        choices=["direction", "direction-magnitude"],
-        help="direction keeps EMA-L2 skip calibration; direction-magnitude trains an extra log-magnitude head and uses it for skip sampling.",
+        choices=["direction", "direction-magnitude", "direction-magnitude-skip"],
+        help="direction keeps EMA-L2 skip calibration; direction-magnitude trains an extra log-magnitude head; direction-magnitude-skip also adds stochastic skip-in-the-loop FM loss.",
     )
     parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
     parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
+    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.1)
+    parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
+    parser.add_argument("--shortcut-skip-in-loop-gap", type=int, default=2)
+    parser.add_argument("--shortcut-skip-in-loop-warmup-steps", type=int, default=5000)
+    parser.add_argument(
+        "--shortcut-skip-in-loop-detach-source",
+        dest="shortcut_skip_in_loop_detach_source",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detach U_a and m_a in the skip-FM branch so skip loss updates predictor and downstream blocks, not upstream source blocks.",
+    )
     parser.add_argument("--shortcut-mag-scale", type=float, default=3.0)
     parser.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
     parser.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
@@ -1701,6 +1797,12 @@ def main():
         raise ValueError("--shortcut-mag-abs-scale must be greater than 0")
     if args.shortcut_mag_clip_min >= args.shortcut_mag_clip_max:
         raise ValueError("--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max")
+    if not 0.0 <= args.shortcut_skip_in_loop_prob <= 1.0:
+        raise ValueError("--shortcut-skip-in-loop-prob must be between 0 and 1")
+    if args.shortcut_skip_in_loop_gap <= 0:
+        raise ValueError("--shortcut-skip-in-loop-gap must be greater than 0")
+    if args.shortcut_skip_in_loop_warmup_steps < 0:
+        raise ValueError("--shortcut-skip-in-loop-warmup-steps must be >= 0")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
 
@@ -1728,6 +1830,8 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
     depth = int(config["depth"])
+    if args.shortcut_skip_in_loop_gap > depth:
+        raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1742,6 +1846,10 @@ def main():
         f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
+        f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
+        f"skip_p={args.shortcut_skip_in_loop_prob} skip_gap={args.shortcut_skip_in_loop_gap} "
+        f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
+        f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
@@ -1780,10 +1888,19 @@ def main():
     shortcut_timesteps_rep = jax_utils.replicate(jnp.int32(args.shortcut_timesteps))
     shortcut_lambda_dir_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_dir))
     shortcut_lambda_boot_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_boot))
-    effective_lambda_mag = args.shortcut_lambda_mag if args.shortcut_training_mode == "direction-magnitude" else 0.0
-    effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if args.shortcut_training_mode == "direction-magnitude" else 0.0
+    uses_magnitude_losses = args.shortcut_training_mode in {"direction-magnitude", "direction-magnitude-skip"}
+    uses_skip_in_loop = args.shortcut_training_mode == "direction-magnitude-skip"
+    effective_lambda_mag = args.shortcut_lambda_mag if uses_magnitude_losses else 0.0
+    effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if uses_magnitude_losses else 0.0
+    effective_lambda_skip_fm = args.shortcut_lambda_skip_fm if uses_skip_in_loop else 0.0
+    effective_skip_prob = args.shortcut_skip_in_loop_prob if uses_skip_in_loop else 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
+    shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
+    shortcut_skip_in_loop_prob_rep = jax_utils.replicate(jnp.float32(effective_skip_prob))
+    shortcut_skip_in_loop_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_gap))
+    shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
+    shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
     shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
 
@@ -1837,7 +1954,7 @@ def main():
             num_steps=args.fid_num_steps,
             cfg_scale=args.fid_cfg_scale,
             depth_shortcut_skip=True,
-            depth_shortcut_predict_magnitude=args.shortcut_training_mode == "direction-magnitude",
+            depth_shortcut_predict_magnitude=uses_magnitude_losses,
             depth_shortcut_mag_scale=args.shortcut_mag_scale,
             depth_shortcut_mag_abs_center=args.shortcut_mag_abs_center,
             depth_shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
@@ -2104,6 +2221,7 @@ def main():
             l2_ema,
             (probe_x, probe_y),
             rng,
+            jax_utils.replicate(jnp.int32(0)),
             ema_decay_rep,
             predictor_ema_decay_rep,
             shortcut_timesteps_rep,
@@ -2111,6 +2229,11 @@ def main():
             shortcut_lambda_boot_rep,
             shortcut_lambda_mag_rep,
             shortcut_lambda_boot_mag_rep,
+            shortcut_lambda_skip_fm_rep,
+            shortcut_skip_in_loop_prob_rep,
+            shortcut_skip_in_loop_gap_rep,
+            shortcut_skip_in_loop_warmup_steps_rep,
+            shortcut_skip_in_loop_detach_source_rep,
             shortcut_mag_scale_rep,
             shortcut_l2_ema_alpha_rep,
         )
@@ -2529,6 +2652,7 @@ def main():
                 l2_ema,
                 (batch_x, batch_y),
                 rng,
+                jax_utils.replicate(jnp.int32(global_step)),
                 ema_decay_rep,
                 predictor_ema_decay_rep,
                 shortcut_timesteps_rep,
@@ -2536,6 +2660,11 @@ def main():
                 shortcut_lambda_boot_rep,
                 shortcut_lambda_mag_rep,
                 shortcut_lambda_boot_mag_rep,
+                shortcut_lambda_skip_fm_rep,
+                shortcut_skip_in_loop_prob_rep,
+                shortcut_skip_in_loop_gap_rep,
+                shortcut_skip_in_loop_warmup_steps_rep,
+                shortcut_skip_in_loop_detach_source_rep,
                 shortcut_mag_scale_rep,
                 shortcut_l2_ema_alpha_rep,
             )

@@ -274,6 +274,67 @@ In \texttt{direction-magnitude} mode, the objective becomes
 Targets $U_b$ and $P_{\bar\theta}$ are stop-gradient. Gradients from the
 shortcut losses can flow through the source state $U_a$ into the DiT backbone.
 
+\section{Stochastic Skip-in-the-Loop Mode}
+The optional \texttt{direction-magnitude-skip} mode reduces train--test
+mismatch by occasionally feeding a predicted shortcut state into the remaining
+backbone during training. First run the normal full forward to obtain
+$Z_0,\ldots,Z_L$ and $\mathcal{L}_{\mathrm{FM}}$. Then, with probability
+$p_{\mathrm{skip}}$, sample a short skip pair
+\[
+    b=a+d_{\mathrm{skip}},\qquad d_{\mathrm{skip}}=2
+\]
+by default. Build the source using detached hidden statistics for stability:
+\[
+    U_a^{\mathrm{skip}}=\operatorname{sg}(\operatorname{dir}(Z_a)),\qquad
+    m_a^{\mathrm{skip}}=\operatorname{sg}(\ln(\|Z_a\|_2+10^{-6})).
+\]
+The predictor restores the skipped hidden state using its magnitude head:
+\[
+    (\hat U_b,\hat{\delta m}_{a\rightarrow b})
+    =
+    P_\theta(U_a^{\mathrm{skip}},m_a^{\mathrm{skip}},a,b,t),
+\]
+\[
+    \tilde Z_b
+    =
+    \exp\!\left(\operatorname{clip}\left(
+    m_a^{\mathrm{skip}}+s_m\hat{\delta m}_{a\rightarrow b}^{\mathrm{norm}},
+    3,8\right)\right)\hat U_b .
+\]
+The backbone then resumes from layer $b+1$ and predicts
+$\hat v_{\mathrm{skip}}$. The auxiliary task-aware loss is
+\[
+    \mathcal{L}_{\mathrm{skip-FM}}
+    =
+    \|\hat v_{\mathrm{skip}}-(x_0-x_1)\|_2^2.
+\]
+The recommended initial setting for SiT-B/2 with P-Small is
+\[
+\begin{array}{ll}
+p_{\mathrm{skip}} & 0.10 \\
+\lambda_{\mathrm{skip}} & 0.10 \\
+d_{\mathrm{skip}} & 2 \\
+\text{warmup} & 5000\ \text{steps} \\
+\text{source detach} & \text{enabled}
+\end{array}
+\]
+The full objective in this mode is
+\[
+    \boxed{
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{FM}}
+    +0.5\,\mathcal{L}_{\mathrm{dir}}
+    +0.25\,\mathcal{L}_{\mathrm{boot}}
+    +0.375\,\mathcal{L}_{\mathrm{mag}}
+    +0.1875\,\mathcal{L}_{\mathrm{boot-mag}}
+    +0.1\,\mathcal{L}_{\mathrm{skip-FM}}
+    }.
+\]
+Log $\mathcal{L}_{\mathrm{skip-FM}}$, the effective skip probability, and the
+sampled source/target layers. If full-backbone FID degrades, reduce
+$p_{\mathrm{skip}}$ or $\lambda_{\mathrm{skip}}$ before increasing skip gap.
+
 \section{EMA Magnitude Calibration}
 In the default \texttt{direction} mode, magnitude is not predicted by the
 shortcut model. For skip inference ablation in that mode only, maintain
