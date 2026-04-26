@@ -196,6 +196,16 @@ The bootstrap loss is
     \hat U_{a\rightarrow b\rightarrow c}^{(n)}(i)^\top
     \hat U_{a\rightarrow c}^{\mathrm{ema},(n)}(i).
 \]
+By default, bootstrap gradients can flow through the source state $U_a$ into
+the DiT backbone. The CLI option
+\texttt{--shortcut-bootstrap-detach-source} changes only this path:
+\[
+    U_a^{\mathrm{boot}}=\operatorname{sg}(U_a),\qquad
+    m_a^{\mathrm{boot}}=\operatorname{sg}(m_a).
+\]
+Then $\mathcal{L}_{\mathrm{boot}}$ and $\mathcal{L}_{\mathrm{boot-mag}}$
+update the predictor but do not update the DiT backbone through the bootstrap
+source state. Direct shortcut loss and skip-FM behavior are unchanged.
 The predictor teacher is updated after each optimizer step:
 \[
     \bar\theta\leftarrow0.999\,\bar\theta+0.001\,\theta.
