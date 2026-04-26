@@ -655,7 +655,11 @@ def train_step(
     lambda_boot_mag,
     lambda_skip_fm,
     skip_in_loop_prob,
+    skip_in_loop_gap_mode,
     skip_in_loop_gap,
+    skip_in_loop_max_gap,
+    skip_in_loop_gap_loc,
+    skip_in_loop_gap_sigma,
     skip_in_loop_warmup_steps,
     skip_in_loop_detach_source,
     mag_scale,
@@ -762,9 +766,23 @@ def train_step(
         loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
 
         def compute_skip_fm_loss(_):
-            max_source = directions.shape[0] - 1 - skip_in_loop_gap
-            skip_a = jax.random.randint(skip_pair_rng, (), 0, max_source + 1, dtype=jnp.int32)
-            skip_b = skip_a + skip_in_loop_gap
+            gap_rng, source_rng = jax.random.split(skip_pair_rng)
+            max_gap = jnp.minimum(skip_in_loop_max_gap, directions.shape[0] - 1)
+            fixed_gap = jnp.clip(skip_in_loop_gap, 1, max_gap)
+            gap_candidates = jnp.arange(1, directions.shape[0], dtype=jnp.int32)
+            gap_offsets = (gap_candidates.astype(jnp.float32) - skip_in_loop_gap_loc) / skip_in_loop_gap_sigma
+            gap_logits = -0.5 * jnp.square(gap_offsets)
+            gap_logits = jnp.where(gap_candidates <= max_gap, gap_logits, -jnp.inf)
+            sampled_gap = jax.random.categorical(gap_rng, gap_logits).astype(jnp.int32) + 1
+            skip_gap = jax.lax.cond(
+                skip_in_loop_gap_mode == 0,
+                lambda _: fixed_gap,
+                lambda _: sampled_gap,
+                operand=None,
+            )
+            max_source = directions.shape[0] - 1 - skip_gap
+            skip_a = jax.random.randint(source_rng, (), 0, max_source + 1, dtype=jnp.int32)
+            skip_b = skip_a + skip_gap
             u_skip_source = directions[skip_a]
             m_skip_source = log_magnitudes[skip_a]
             u_skip_source = jax.lax.cond(
@@ -804,6 +822,7 @@ def train_step(
                 jnp.mean((pred_skip - target) ** 2),
                 skip_a.astype(jnp.float32),
                 skip_b.astype(jnp.float32),
+                skip_gap.astype(jnp.float32),
             )
 
         skip_prob_eff = jnp.where(
@@ -812,10 +831,10 @@ def train_step(
             jnp.float32(0.0),
         )
         skip_do = jax.random.uniform(skip_rng, ()) < skip_prob_eff
-        loss_skip_fm, skip_a_metric, skip_b_metric = jax.lax.cond(
+        loss_skip_fm, skip_a_metric, skip_b_metric, skip_gap_metric = jax.lax.cond(
             skip_do,
             compute_skip_fm_loss,
-            lambda _: (jnp.float32(0.0), jnp.float32(-1.0), jnp.float32(-1.0)),
+            lambda _: (jnp.float32(0.0), jnp.float32(-1.0), jnp.float32(-1.0), jnp.float32(0.0)),
             operand=None,
         )
         loss_total = (
@@ -851,6 +870,7 @@ def train_step(
             skip_prob_eff,
             skip_a_metric,
             skip_b_metric,
+            skip_gap_metric,
             hidden_stack,
         )
         return loss_total, aux
@@ -880,6 +900,7 @@ def train_step(
         skip_prob_eff,
         skip_a_metric,
         skip_b_metric,
+        skip_gap_metric,
         hidden_stack,
     ) = aux
 
@@ -906,6 +927,7 @@ def train_step(
     skip_prob_eff = jax.lax.pmean(skip_prob_eff, axis_name="batch")
     skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
     skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
+    skip_gap_metric = jax.lax.pmean(skip_gap_metric, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -943,6 +965,7 @@ def train_step(
         "train/skip_in_loop_prob": skip_prob_eff,
         "train/skip_in_loop_source": skip_a_metric,
         "train/skip_in_loop_target": skip_b_metric,
+        "train/skip_in_loop_gap": skip_gap_metric,
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -1600,7 +1623,17 @@ def main():
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
     parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.1)
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
+    parser.add_argument(
+        "--shortcut-skip-in-loop-gap-mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "truncated-normal"],
+        help="How to sample skip-in-loop gaps. truncated-normal samples discrete gaps on [1, max_gap] with a right tail.",
+    )
     parser.add_argument("--shortcut-skip-in-loop-gap", type=int, default=2)
+    parser.add_argument("--shortcut-skip-in-loop-max-gap", type=int, default=10)
+    parser.add_argument("--shortcut-skip-in-loop-gap-loc", type=float, default=3.0)
+    parser.add_argument("--shortcut-skip-in-loop-gap-sigma", type=float, default=2.0)
     parser.add_argument("--shortcut-skip-in-loop-warmup-steps", type=int, default=5000)
     parser.add_argument(
         "--shortcut-skip-in-loop-detach-source",
@@ -1801,6 +1834,10 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-prob must be between 0 and 1")
     if args.shortcut_skip_in_loop_gap <= 0:
         raise ValueError("--shortcut-skip-in-loop-gap must be greater than 0")
+    if args.shortcut_skip_in_loop_max_gap <= 0:
+        raise ValueError("--shortcut-skip-in-loop-max-gap must be greater than 0")
+    if args.shortcut_skip_in_loop_gap_sigma <= 0:
+        raise ValueError("--shortcut-skip-in-loop-gap-sigma must be greater than 0")
     if args.shortcut_skip_in_loop_warmup_steps < 0:
         raise ValueError("--shortcut-skip-in-loop-warmup-steps must be >= 0")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
@@ -1832,6 +1869,8 @@ def main():
     depth = int(config["depth"])
     if args.shortcut_skip_in_loop_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
+    if args.shortcut_skip_in_loop_max_gap > depth:
+        raise ValueError("--shortcut-skip-in-loop-max-gap must be <= model depth")
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -1847,7 +1886,12 @@ def main():
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
-        f"skip_p={args.shortcut_skip_in_loop_prob} skip_gap={args.shortcut_skip_in_loop_gap} "
+        f"skip_p={args.shortcut_skip_in_loop_prob} "
+        f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
+        f"skip_gap={args.shortcut_skip_in_loop_gap} "
+        f"skip_max_gap={args.shortcut_skip_in_loop_max_gap} "
+        f"skip_gap_loc={args.shortcut_skip_in_loop_gap_loc} "
+        f"skip_gap_sigma={args.shortcut_skip_in_loop_gap_sigma} "
         f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
         f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
         f"mag_scale={args.shortcut_mag_scale} "
@@ -1898,7 +1942,13 @@ def main():
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
     shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
     shortcut_skip_in_loop_prob_rep = jax_utils.replicate(jnp.float32(effective_skip_prob))
+    shortcut_skip_in_loop_gap_mode_rep = jax_utils.replicate(
+        jnp.int32(0 if args.shortcut_skip_in_loop_gap_mode == "fixed" else 1)
+    )
     shortcut_skip_in_loop_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_gap))
+    shortcut_skip_in_loop_max_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_max_gap))
+    shortcut_skip_in_loop_gap_loc_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_loc))
+    shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
     shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
     shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
     shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
@@ -2231,7 +2281,11 @@ def main():
             shortcut_lambda_boot_mag_rep,
             shortcut_lambda_skip_fm_rep,
             shortcut_skip_in_loop_prob_rep,
+            shortcut_skip_in_loop_gap_mode_rep,
             shortcut_skip_in_loop_gap_rep,
+            shortcut_skip_in_loop_max_gap_rep,
+            shortcut_skip_in_loop_gap_loc_rep,
+            shortcut_skip_in_loop_gap_sigma_rep,
             shortcut_skip_in_loop_warmup_steps_rep,
             shortcut_skip_in_loop_detach_source_rep,
             shortcut_mag_scale_rep,
@@ -2662,7 +2716,11 @@ def main():
                 shortcut_lambda_boot_mag_rep,
                 shortcut_lambda_skip_fm_rep,
                 shortcut_skip_in_loop_prob_rep,
+                shortcut_skip_in_loop_gap_mode_rep,
                 shortcut_skip_in_loop_gap_rep,
+                shortcut_skip_in_loop_max_gap_rep,
+                shortcut_skip_in_loop_gap_loc_rep,
+                shortcut_skip_in_loop_gap_sigma_rep,
                 shortcut_skip_in_loop_warmup_steps_rep,
                 shortcut_skip_in_loop_detach_source_rep,
                 shortcut_mag_scale_rep,

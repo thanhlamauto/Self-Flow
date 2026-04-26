@@ -56,6 +56,10 @@ DIRECTION_MAG_SKIP_ARGS=(
   --shortcut-mag-abs-scale 1.5
   --shortcut-mag-clip-min 3.0
   --shortcut-mag-clip-max 8.0
+  --shortcut-skip-in-loop-gap-mode truncated-normal
+  --shortcut-skip-in-loop-max-gap 10
+  --shortcut-skip-in-loop-gap-loc 3.0
+  --shortcut-skip-in-loop-gap-sigma 2.0
   --shortcut-skip-in-loop-warmup-steps 5000
   --shortcut-skip-in-loop-detach-source
 )
@@ -64,28 +68,25 @@ run_ablation() {
   local name="$1"
   local skip_prob="$2"
   local lambda_skip="$3"
-  local skip_gap="$4"
 
   python train.py \
     "${COMMON_ARGS[@]}" \
     "${DIRECTION_MAG_SKIP_ARGS[@]}" \
     --ckpt-dir "./checkpoints-depth-shortcut-small-skiploop-${name}" \
     --shortcut-skip-in-loop-prob "${skip_prob}" \
-    --shortcut-lambda-skip-fm "${lambda_skip}" \
-    --shortcut-skip-in-loop-gap "${skip_gap}"
+    --shortcut-lambda-skip-fm "${lambda_skip}"
 }
 
 case "${1:-main}" in
   main)
-    run_ablation p010_l010_g2 0.10 0.10 2
+    run_ablation p010_l010_tn10 0.10 0.10
     ;;
   all)
-    run_ablation p005_l010_g2 0.05 0.10 2
-    run_ablation p010_l010_g2 0.10 0.10 2
-    run_ablation p020_l010_g2 0.20 0.10 2
-    run_ablation p010_l005_g2 0.10 0.05 2
-    run_ablation p010_l020_g2 0.10 0.20 2
-    run_ablation p010_l010_g3 0.10 0.10 3
+    run_ablation p005_l010_tn10 0.05 0.10
+    run_ablation p010_l010_tn10 0.10 0.10
+    run_ablation p020_l010_tn10 0.20 0.10
+    run_ablation p010_l005_tn10 0.10 0.05
+    run_ablation p010_l020_tn10 0.10 0.20
     ;;
   *)
     echo "Usage: $0 [main|all]" >&2

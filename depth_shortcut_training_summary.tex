@@ -279,11 +279,16 @@ The optional \texttt{direction-magnitude-skip} mode reduces train--test
 mismatch by occasionally feeding a predicted shortcut state into the remaining
 backbone during training. First run the normal full forward to obtain
 $Z_0,\ldots,Z_L$ and $\mathcal{L}_{\mathrm{FM}}$. Then, with probability
-$p_{\mathrm{skip}}$, sample a short skip pair
+$p_{\mathrm{skip}}$, sample a skip gap from a left-truncated discrete normal:
 \[
-    b=a+d_{\mathrm{skip}},\qquad d_{\mathrm{skip}}=2
+    d_{\mathrm{skip}}\in\{1,\ldots,10\},\qquad
+    p(d)\propto
+    \exp\left[-\frac{1}{2}\left(\frac{d-3}{2}\right)^2\right].
 \]
-by default. Build the source using detached hidden statistics for stability:
+This keeps $d=1,2,3$ likely, gives median near $3$, and leaves a low-probability
+right tail for longer skips up to $10$. Then $b=a+d_{\mathrm{skip}}$ and
+$a$ is sampled uniformly from valid source layers. Build the source using
+detached hidden statistics for stability:
 \[
     U_a^{\mathrm{skip}}=\operatorname{sg}(\operatorname{dir}(Z_a)),\qquad
     m_a^{\mathrm{skip}}=\operatorname{sg}(\ln(\|Z_a\|_2+10^{-6})).
@@ -313,7 +318,7 @@ The recommended initial setting for SiT-B/2 with P-Small is
 \begin{array}{ll}
 p_{\mathrm{skip}} & 0.10 \\
 \lambda_{\mathrm{skip}} & 0.10 \\
-d_{\mathrm{skip}} & 2 \\
+d_{\mathrm{skip}} & \text{truncated-normal on }[1,10]\text{ with loc }3\text{ and sigma }2 \\
 \text{warmup} & 5000\ \text{steps} \\
 \text{source detach} & \text{enabled}
 \end{array}
@@ -331,9 +336,10 @@ The full objective in this mode is
     +0.1\,\mathcal{L}_{\mathrm{skip-FM}}
     }.
 \]
-Log $\mathcal{L}_{\mathrm{skip-FM}}$, the effective skip probability, and the
-sampled source/target layers. If full-backbone FID degrades, reduce
-$p_{\mathrm{skip}}$ or $\lambda_{\mathrm{skip}}$ before increasing skip gap.
+Log $\mathcal{L}_{\mathrm{skip-FM}}$, the effective skip probability, sampled
+gap, and sampled source/target layers. If full-backbone FID degrades, reduce
+$p_{\mathrm{skip}}$ or $\lambda_{\mathrm{skip}}$ before shifting probability
+mass toward longer gaps.
 
 \section{EMA Magnitude Calibration}
 In the default \texttt{direction} mode, magnitude is not predicted by the
