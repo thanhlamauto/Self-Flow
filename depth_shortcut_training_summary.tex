@@ -466,6 +466,16 @@ $3.5$.
     -\delta m_{a\rightarrow b}^{\mathrm{tgt},(n)}(i)\right|
     \right).
 \]
+For diagnosis, \texttt{--shortcut-debug-gap-logs} evaluates predictor losses on
+fixed representative pairs every train step, independent of the randomly
+sampled training pair. The logged pairs are
+\[
+    1\!\rightarrow\!3,\quad 3\!\rightarrow\!5,\quad 5\!\rightarrow\!7,\quad
+    10\!\rightarrow\!12,\quad 1\!\rightarrow\!5,\quad 3\!\rightarrow\!7,\quad
+    6\!\rightarrow\!12,\quad 1\!\rightarrow\!10,\quad 3\!\rightarrow\!12.
+\]
+For each pair the debug metrics are direction loss, magnitude loss, direction
+cosine, and log-magnitude MAE.
 
 \section{Skip-FID Evaluation}
 In addition to full-backbone FID, evaluate a skip sampler that repeatedly

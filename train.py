@@ -638,6 +638,20 @@ def update_l2_ema_5bins(l2_ema, hidden_states, timestep_indices, alpha=0.01):
     return jnp.where((counts[None, :, None] > 0), updated, l2_ema)
 
 
+PREDICTOR_DEBUG_PAIRS = (
+    (1, 3),
+    (3, 5),
+    (5, 7),
+    (10, 12),
+    (1, 5),
+    (3, 7),
+    (6, 12),
+    (1, 10),
+    (3, 12),
+)
+PREDICTOR_DEBUG_METRIC_NAMES = ("loss_dir", "loss_mag", "cos_dir", "delta_m_mae")
+
+
 def train_step(
     state,
     ema_params,
@@ -662,6 +676,7 @@ def train_step(
     skip_in_loop_gap_sigma,
     skip_in_loop_warmup_steps,
     skip_in_loop_detach_source,
+    debug_gap_logs,
     mag_scale,
     l2_ema_alpha,
 ):
@@ -764,6 +779,53 @@ def train_step(
         target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
         pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
         loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+
+        def compute_debug_pair_metrics(_):
+            values = []
+            for pair_a, pair_b in PREDICTOR_DEBUG_PAIRS:
+                safe_pair_a = min(pair_a, directions.shape[0] - 1)
+                safe_pair_b = min(pair_b, directions.shape[0] - 1)
+
+                def compute_one_pair(_):
+                    pair_a_arr = jnp.asarray(pair_a, dtype=jnp.int32)
+                    pair_b_arr = jnp.asarray(pair_b, dtype=jnp.int32)
+                    y_pair, delta_m_pair = state.predictor_apply_fn(
+                        {"params": params["predictor"]},
+                        directions[safe_pair_a],
+                        pair_a_arr,
+                        pair_b_arr,
+                        dit_time_emb,
+                        log_magnitudes[safe_pair_a],
+                    )
+                    u_pair = l2_normalize_tokens(y_pair)
+                    target_u_pair = jax.lax.stop_gradient(directions[safe_pair_b])
+                    pair_cos = jnp.sum(u_pair * target_u_pair, axis=-1).mean()
+                    pair_loss_dir = 1.0 - pair_cos
+                    pair_target_delta_raw = jax.lax.stop_gradient(
+                        log_magnitudes[safe_pair_b] - log_magnitudes[safe_pair_a]
+                    )
+                    pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
+                    pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
+                    pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair - pair_target_delta_raw))
+                    return pair_loss_dir, pair_loss_mag, pair_cos, pair_delta_m_mae
+
+                pair_is_valid = pair_b < directions.shape[0]
+                values.extend(
+                    jax.lax.cond(
+                        pair_is_valid,
+                        compute_one_pair,
+                        lambda _: (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
+                        operand=None,
+                    )
+                )
+            return tuple(values)
+
+        debug_pair_metrics = jax.lax.cond(
+            debug_gap_logs,
+            compute_debug_pair_metrics,
+            lambda _: tuple(jnp.float32(0.0) for _ in range(len(PREDICTOR_DEBUG_PAIRS) * len(PREDICTOR_DEBUG_METRIC_NAMES))),
+            operand=None,
+        )
 
         def compute_skip_fm_loss(_):
             gap_rng, source_rng = jax.random.split(skip_pair_rng)
@@ -871,6 +933,7 @@ def train_step(
             skip_a_metric,
             skip_b_metric,
             skip_gap_metric,
+            debug_pair_metrics,
             hidden_stack,
         )
         return loss_total, aux
@@ -901,6 +964,7 @@ def train_step(
         skip_a_metric,
         skip_b_metric,
         skip_gap_metric,
+        debug_pair_metrics,
         hidden_stack,
     ) = aux
 
@@ -928,6 +992,7 @@ def train_step(
     skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
     skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
     skip_gap_metric = jax.lax.pmean(skip_gap_metric, axis_name="batch")
+    debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -973,6 +1038,11 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
+    for pair_idx, (pair_a, pair_b) in enumerate(PREDICTOR_DEBUG_PAIRS):
+        for metric_idx, metric_name in enumerate(PREDICTOR_DEBUG_METRIC_NAMES):
+            metrics[f"train/debug_pair_{pair_a}_{pair_b}/{metric_name}"] = debug_pair_metrics[
+                pair_idx * len(PREDICTOR_DEBUG_METRIC_NAMES) + metric_idx
+            ]
     return state, ema_params, predictor_ema_params, l2_ema, metrics, rng
 
 
@@ -1621,6 +1691,12 @@ def main():
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
     parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
+    parser.add_argument(
+        "--shortcut-debug-gap-logs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log fixed-pair predictor debug losses for representative layer gaps.",
+    )
     parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.1)
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
     parser.add_argument(
@@ -1885,6 +1961,7 @@ def main():
         f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
+        f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
         f"skip_p={args.shortcut_skip_in_loop_prob} "
         f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
@@ -1951,6 +2028,7 @@ def main():
     shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
     shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
     shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
+    shortcut_debug_gap_logs_rep = jax_utils.replicate(jnp.asarray(args.shortcut_debug_gap_logs, dtype=jnp.bool_))
     shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
 
@@ -2288,6 +2366,7 @@ def main():
             shortcut_skip_in_loop_gap_sigma_rep,
             shortcut_skip_in_loop_warmup_steps_rep,
             shortcut_skip_in_loop_detach_source_rep,
+            shortcut_debug_gap_logs_rep,
             shortcut_mag_scale_rep,
             shortcut_l2_ema_alpha_rep,
         )
@@ -2723,6 +2802,7 @@ def main():
                 shortcut_skip_in_loop_gap_sigma_rep,
                 shortcut_skip_in_loop_warmup_steps_rep,
                 shortcut_skip_in_loop_detach_source_rep,
+                shortcut_debug_gap_logs_rep,
                 shortcut_mag_scale_rep,
                 shortcut_l2_ema_alpha_rep,
             )
