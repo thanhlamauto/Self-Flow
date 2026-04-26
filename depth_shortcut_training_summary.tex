@@ -476,6 +476,9 @@ sampled training pair. The logged pairs are
 \]
 For each pair the debug metrics are direction loss, magnitude loss, direction
 cosine, and log-magnitude MAE.
+The same flag also logs the average of those four metrics over all valid
+source--target pairs for each gap $d\in\{1,\ldots,10\}$, e.g.
+\texttt{train/debug\_gap\_3/loss\_dir}.
 
 \section{Skip-FID Evaluation}
 In addition to full-backbone FID, evaluate a skip sampler that repeatedly

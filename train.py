@@ -650,6 +650,7 @@ PREDICTOR_DEBUG_PAIRS = (
     (3, 12),
 )
 PREDICTOR_DEBUG_METRIC_NAMES = ("loss_dir", "loss_mag", "cos_dir", "delta_m_mae")
+PREDICTOR_DEBUG_MAX_GAP = 10
 
 
 def train_step(
@@ -781,33 +782,34 @@ def train_step(
         loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
 
         def compute_debug_pair_metrics(_):
+            def compute_pair_metrics(source_layer, target_layer):
+                y_pair, delta_m_pair = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    directions[source_layer],
+                    jnp.asarray(source_layer, dtype=jnp.int32),
+                    jnp.asarray(target_layer, dtype=jnp.int32),
+                    dit_time_emb,
+                    log_magnitudes[source_layer],
+                )
+                u_pair = l2_normalize_tokens(y_pair)
+                target_u_pair = jax.lax.stop_gradient(directions[target_layer])
+                pair_cos = jnp.sum(u_pair * target_u_pair, axis=-1).mean()
+                pair_loss_dir = 1.0 - pair_cos
+                pair_target_delta_raw = jax.lax.stop_gradient(
+                    log_magnitudes[target_layer] - log_magnitudes[source_layer]
+                )
+                pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
+                pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
+                pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair - pair_target_delta_raw))
+                return pair_loss_dir, pair_loss_mag, pair_cos, pair_delta_m_mae
+
             values = []
             for pair_a, pair_b in PREDICTOR_DEBUG_PAIRS:
                 safe_pair_a = min(pair_a, directions.shape[0] - 1)
                 safe_pair_b = min(pair_b, directions.shape[0] - 1)
 
                 def compute_one_pair(_):
-                    pair_a_arr = jnp.asarray(pair_a, dtype=jnp.int32)
-                    pair_b_arr = jnp.asarray(pair_b, dtype=jnp.int32)
-                    y_pair, delta_m_pair = state.predictor_apply_fn(
-                        {"params": params["predictor"]},
-                        directions[safe_pair_a],
-                        pair_a_arr,
-                        pair_b_arr,
-                        dit_time_emb,
-                        log_magnitudes[safe_pair_a],
-                    )
-                    u_pair = l2_normalize_tokens(y_pair)
-                    target_u_pair = jax.lax.stop_gradient(directions[safe_pair_b])
-                    pair_cos = jnp.sum(u_pair * target_u_pair, axis=-1).mean()
-                    pair_loss_dir = 1.0 - pair_cos
-                    pair_target_delta_raw = jax.lax.stop_gradient(
-                        log_magnitudes[safe_pair_b] - log_magnitudes[safe_pair_a]
-                    )
-                    pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
-                    pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
-                    pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair - pair_target_delta_raw))
-                    return pair_loss_dir, pair_loss_mag, pair_cos, pair_delta_m_mae
+                    return compute_pair_metrics(safe_pair_a, safe_pair_b)
 
                 pair_is_valid = pair_b < directions.shape[0]
                 values.extend(
@@ -818,12 +820,37 @@ def train_step(
                         operand=None,
                     )
                 )
+            for gap in range(1, PREDICTOR_DEBUG_MAX_GAP + 1):
+                gap_values = []
+                gap_count = jnp.asarray(max(directions.shape[0] - gap, 0), dtype=jnp.float32)
+                for source_layer in range(0, 13 - gap):
+                    target_layer = source_layer + gap
+                    safe_source_layer = min(source_layer, directions.shape[0] - 1)
+                    safe_target_layer = min(target_layer, directions.shape[0] - 1)
+
+                    def compute_one_gap_pair(_):
+                        return compute_pair_metrics(safe_source_layer, safe_target_layer)
+
+                    pair_values = jax.lax.cond(
+                        target_layer < directions.shape[0],
+                        compute_one_gap_pair,
+                        lambda _: (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
+                        operand=None,
+                    )
+                    gap_values.append(pair_values)
+                for metric_idx in range(len(PREDICTOR_DEBUG_METRIC_NAMES)):
+                    metric_sum = sum(pair_values[metric_idx] for pair_values in gap_values)
+                    values.append(metric_sum / jnp.maximum(gap_count, 1.0))
             return tuple(values)
 
+        debug_metric_count = (
+            (len(PREDICTOR_DEBUG_PAIRS) + PREDICTOR_DEBUG_MAX_GAP)
+            * len(PREDICTOR_DEBUG_METRIC_NAMES)
+        )
         debug_pair_metrics = jax.lax.cond(
             debug_gap_logs,
             compute_debug_pair_metrics,
-            lambda _: tuple(jnp.float32(0.0) for _ in range(len(PREDICTOR_DEBUG_PAIRS) * len(PREDICTOR_DEBUG_METRIC_NAMES))),
+            lambda _: tuple(jnp.float32(0.0) for _ in range(debug_metric_count)),
             operand=None,
         )
 
@@ -1042,6 +1069,12 @@ def train_step(
         for metric_idx, metric_name in enumerate(PREDICTOR_DEBUG_METRIC_NAMES):
             metrics[f"train/debug_pair_{pair_a}_{pair_b}/{metric_name}"] = debug_pair_metrics[
                 pair_idx * len(PREDICTOR_DEBUG_METRIC_NAMES) + metric_idx
+            ]
+    gap_offset = len(PREDICTOR_DEBUG_PAIRS) * len(PREDICTOR_DEBUG_METRIC_NAMES)
+    for gap in range(1, PREDICTOR_DEBUG_MAX_GAP + 1):
+        for metric_idx, metric_name in enumerate(PREDICTOR_DEBUG_METRIC_NAMES):
+            metrics[f"train/debug_gap_{gap}/{metric_name}"] = debug_pair_metrics[
+                gap_offset + (gap - 1) * len(PREDICTOR_DEBUG_METRIC_NAMES) + metric_idx
             ]
     return state, ema_params, predictor_ema_params, l2_ema, metrics, rng
 
