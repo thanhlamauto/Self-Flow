@@ -668,6 +668,51 @@ PREDICTOR_DEBUG_METRIC_NAMES = ("loss_dir", "loss_mag", "cos_dir", "delta_m_mae"
 PREDICTOR_DEBUG_MAX_GAP = 10
 
 
+def _scheduled_lambda(lambda_value, global_step, start_step, warmup_iters):
+    """Return scheduled lambda and warmup scale for optional auxiliary losses."""
+    step = global_step.astype(jnp.float32)
+    start = start_step.astype(jnp.float32)
+    warmup = warmup_iters.astype(jnp.float32)
+    active = step >= start
+    warmup_scale = jnp.where(
+        warmup > 0.0,
+        jnp.clip((step - start + 1.0) / jnp.maximum(warmup, 1.0), 0.0, 1.0),
+        jnp.float32(1.0),
+    )
+    warmup_scale = jnp.where(active, warmup_scale, jnp.float32(0.0))
+    return lambda_value * warmup_scale, warmup_scale
+
+
+def private_activation_loss(activations, eps=1e-8):
+    """Common/private activation loss from feat/common-private-activations.
+
+    `activations` is `[L, B, P, D]`, normally post-block states `Z_1..Z_L`.
+    The loss penalizes squared cosine similarity between private residuals
+    from all layer pairs, after subtracting a stop-gradient common activation.
+    """
+    activations = activations.astype(jnp.float32)
+    activations = activations / jnp.maximum(
+        jnp.linalg.norm(activations, axis=-1, keepdims=True),
+        eps,
+    )
+    common = jnp.mean(activations, axis=0)
+    private = activations - jax.lax.stop_gradient(common)[None, ...]
+    private_flat = private.reshape(private.shape[0], -1)
+    private_norm = private_flat / jnp.maximum(
+        jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+        eps,
+    )
+    cosine_matrix = private_norm @ private_norm.T
+    pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
+    loss_private = jnp.mean(jnp.square(pair_cosines))
+    common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
+    private_avg_norm = jnp.mean(
+        jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
+    )
+    private_pairwise_cosine = jnp.mean(pair_cosines)
+    return loss_private, common_norm, private_avg_norm, private_pairwise_cosine
+
+
 def train_step(
     state,
     ema_params,
@@ -693,6 +738,10 @@ def train_step(
     skip_in_loop_gap_sigma,
     skip_in_loop_warmup_steps,
     skip_in_loop_detach_source,
+    private_loss_enabled,
+    lambda_private,
+    private_start_step,
+    private_warmup_iters,
     debug_gap_logs,
     mag_scale,
     l2_ema_alpha,
@@ -708,6 +757,12 @@ def train_step(
     local_batch = x0.shape[0]
 
     rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng, skip_rng, skip_pair_rng, skip_drop_rng = jax.random.split(rng, 9)
+    lambda_private_eff, private_warmup_scale = _scheduled_lambda(
+        lambda_private,
+        global_step,
+        private_start_step,
+        private_warmup_iters,
+    )
 
     q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
     tau = q.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
@@ -958,6 +1013,21 @@ def train_step(
             lambda _: (jnp.float32(0.0), jnp.float32(-1.0), jnp.float32(-1.0), jnp.float32(0.0)),
             operand=None,
         )
+
+        def compute_private_metrics(_):
+            return private_activation_loss(hidden_stack[1:])
+
+        loss_private, common_norm, private_avg_norm, private_pairwise_cosine = jax.lax.cond(
+            private_loss_enabled & (lambda_private_eff > 0.0),
+            compute_private_metrics,
+            lambda _: (
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+            ),
+            operand=None,
+        )
         loss_total = (
             loss_gen
             + lambda_dir * loss_dir
@@ -965,6 +1035,7 @@ def train_step(
             + lambda_mag * loss_mag
             + lambda_boot_mag * loss_boot_mag
             + lambda_skip_fm * loss_skip_fm
+            + lambda_private_eff * loss_private
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -977,8 +1048,14 @@ def train_step(
             loss_mag,
             loss_boot_mag,
             loss_skip_fm,
+            loss_private,
             cos_dir,
             cos_boot,
+            common_norm,
+            private_avg_norm,
+            private_pairwise_cosine,
+            lambda_private_eff,
+            private_warmup_scale,
             y_ab_norm_mean,
             y_ab_norm_min,
             y_ab_norm_max,
@@ -1008,8 +1085,14 @@ def train_step(
         loss_mag,
         loss_boot_mag,
         loss_skip_fm,
+        loss_private,
         cos_dir,
         cos_boot,
+        common_norm,
+        private_avg_norm,
+        private_pairwise_cosine,
+        lambda_private_eff,
+        private_warmup_scale,
         y_ab_norm_mean,
         y_ab_norm_min,
         y_ab_norm_max,
@@ -1036,8 +1119,14 @@ def train_step(
     loss_mag = jax.lax.pmean(loss_mag, axis_name="batch")
     loss_boot_mag = jax.lax.pmean(loss_boot_mag, axis_name="batch")
     loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
+    loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
     cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
+    common_norm = jax.lax.pmean(common_norm, axis_name="batch")
+    private_avg_norm = jax.lax.pmean(private_avg_norm, axis_name="batch")
+    private_pairwise_cosine = jax.lax.pmean(private_pairwise_cosine, axis_name="batch")
+    lambda_private_eff = jax.lax.pmean(lambda_private_eff, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
     y_ab_norm_mean = jax.lax.pmean(y_ab_norm_mean, axis_name="batch")
     y_ab_norm_min = jax.lax.pmin(y_ab_norm_min, axis_name="batch")
     y_ab_norm_max = jax.lax.pmax(y_ab_norm_max, axis_name="batch")
@@ -1075,8 +1164,14 @@ def train_step(
         "train/loss_mag": loss_mag,
         "train/loss_boot_mag": loss_boot_mag,
         "train/loss_skip_fm": loss_skip_fm,
+        "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
         "train/cos_boot": cos_boot,
+        "train/lambda_private_effective": lambda_private_eff,
+        "train/private_warmup_scale": private_warmup_scale,
+        "train/common_norm": common_norm,
+        "train/private_avg_norm": private_avg_norm,
+        "train/private_pairwise_cosine": private_pairwise_cosine,
         "train/y_ab_norm_mean": y_ab_norm_mean,
         "train/y_ab_norm_min": y_ab_norm_min,
         "train/y_ab_norm_max": y_ab_norm_max,
@@ -1230,6 +1325,20 @@ def replicated_metrics_to_host(metrics):
         lambda value: float(value[0]) if getattr(value, "shape", ()) else float(value),
         metrics_cpu,
     )
+
+
+PRIVATE_TRAIN_METRIC_KEYS = {
+    "train/l_private",
+    "train/lambda_private_effective",
+    "train/private_warmup_scale",
+    "train/common_norm",
+    "train/private_avg_norm",
+    "train/private_pairwise_cosine",
+}
+
+
+def filter_private_metrics(metrics):
+    return {key: value for key, value in metrics.items() if key not in PRIVATE_TRAIN_METRIC_KEYS}
 
 
 class AsyncWandbLogger:
@@ -1812,6 +1921,30 @@ def main():
     parser.add_argument("--shortcut-predictor-ema-decay", type=float, default=0.999)
     parser.add_argument("--shortcut-l2-ema-alpha", type=float, default=0.01)
     parser.add_argument(
+        "--private-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable common/private activation loss and its training logs. Default false.",
+    )
+    parser.add_argument(
+        "--lambda-private",
+        type=float,
+        default=0.0,
+        help="Auxiliary common/private activation loss weight. Default 0 disables it.",
+    )
+    parser.add_argument(
+        "--private-start-step",
+        type=int,
+        default=0,
+        help="Global step where private activation loss starts contributing.",
+    )
+    parser.add_argument(
+        "--private-warmup-iters",
+        type=int,
+        default=0,
+        help="Linear warmup steps for --lambda-private after --private-start-step.",
+    )
+    parser.add_argument(
         "--cfg-dropout-rate",
         type=float,
         default=0.1,
@@ -2029,6 +2162,14 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
     if args.shortcut_skip_in_loop_max_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-max-gap must be <= model depth")
+    if args.private_loss and args.lambda_private <= 0.0:
+        raise ValueError("--private-loss requires --lambda-private > 0")
+    if args.lambda_private < 0.0:
+        raise ValueError("--lambda-private must be non-negative")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be non-negative")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be non-negative")
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
@@ -2058,6 +2199,11 @@ def main():
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
         f"pred_lr={args.shortcut_predictor_lr} pred_wd={args.shortcut_predictor_weight_decay}"
+    )
+    log_stage(
+        f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
+        f"start_step={args.private_start_step} warmup_iters={args.private_warmup_iters} "
+        "pairing=all_post_block_pairs"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -2129,6 +2275,11 @@ def main():
     shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
     shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
     shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
+    private_loss_enabled_rep = jax_utils.replicate(jnp.asarray(args.private_loss, dtype=jnp.bool_))
+    effective_lambda_private = args.lambda_private if args.private_loss else 0.0
+    lambda_private_rep = jax_utils.replicate(jnp.float32(effective_lambda_private))
+    private_start_step_rep = jax_utils.replicate(jnp.int32(args.private_start_step))
+    private_warmup_iters_rep = jax_utils.replicate(jnp.int32(args.private_warmup_iters))
     shortcut_debug_gap_logs_rep = jax_utils.replicate(jnp.asarray(args.shortcut_debug_gap_logs, dtype=jnp.bool_))
     shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
@@ -2470,6 +2621,10 @@ def main():
             shortcut_skip_in_loop_gap_sigma_rep,
             shortcut_skip_in_loop_warmup_steps_rep,
             shortcut_skip_in_loop_detach_source_rep,
+            private_loss_enabled_rep,
+            lambda_private_rep,
+            private_start_step_rep,
+            private_warmup_iters_rep,
             shortcut_debug_gap_logs_rep,
             shortcut_mag_scale_rep,
             shortcut_l2_ema_alpha_rep,
@@ -2907,6 +3062,10 @@ def main():
                 shortcut_skip_in_loop_gap_sigma_rep,
                 shortcut_skip_in_loop_warmup_steps_rep,
                 shortcut_skip_in_loop_detach_source_rep,
+                private_loss_enabled_rep,
+                lambda_private_rep,
+                private_start_step_rep,
+                private_warmup_iters_rep,
                 shortcut_debug_gap_logs_rep,
                 shortcut_mag_scale_rep,
                 shortcut_l2_ema_alpha_rep,
@@ -2922,6 +3081,8 @@ def main():
                 cpu_metrics["perf/train_step_tflops"] = (flops_per_train_step / 1e12) / max(cpu_metrics["perf/train_step_time"], 1e-12)
                 cpu_metrics["perf/accumulated_train_tflops"] = accumulated_train_tflops
                 cpu_metrics["train/step"] = global_step
+                if not args.private_loss:
+                    cpu_metrics = filter_private_metrics(cpu_metrics)
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
