@@ -683,7 +683,7 @@ def _scheduled_lambda(lambda_value, global_step, start_step, warmup_iters):
     return lambda_value * warmup_scale, warmup_scale
 
 
-def private_activation_loss(activations, eps=1e-8):
+def private_activation_loss(activations, max_pairs=0, eps=1e-8):
     """Common/private activation loss from feat/common-private-activations.
 
     `activations` is `[L, B, P, D]`, normally post-block states `Z_1..Z_L`.
@@ -704,12 +704,16 @@ def private_activation_loss(activations, eps=1e-8):
     )
     cosine_matrix = private_norm @ private_norm.T
     pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
-    loss_private = jnp.mean(jnp.square(pair_cosines))
+    pair_ids = jnp.arange(pair_cosines.shape[0], dtype=max_pairs.dtype)
+    pair_mask = (max_pairs <= 0) | (pair_ids < max_pairs)
+    pair_mask = pair_mask.astype(pair_cosines.dtype)
+    pair_count = jnp.maximum(jnp.sum(pair_mask), jnp.asarray(1.0, dtype=pair_cosines.dtype))
+    loss_private = jnp.sum(jnp.square(pair_cosines) * pair_mask) / pair_count
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
     private_avg_norm = jnp.mean(
         jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
     )
-    private_pairwise_cosine = jnp.mean(pair_cosines)
+    private_pairwise_cosine = jnp.sum(pair_cosines * pair_mask) / pair_count
     return loss_private, common_norm, private_avg_norm, private_pairwise_cosine
 
 
@@ -740,6 +744,7 @@ def train_step(
     skip_in_loop_detach_source,
     private_loss_enabled,
     lambda_private,
+    private_max_pairs,
     private_start_step,
     private_warmup_iters,
     debug_gap_logs,
@@ -1015,7 +1020,7 @@ def train_step(
         )
 
         def compute_private_metrics(_):
-            return private_activation_loss(hidden_stack[1:])
+            return private_activation_loss(hidden_stack[1:], max_pairs=private_max_pairs)
 
         loss_private, common_norm, private_avg_norm, private_pairwise_cosine = jax.lax.cond(
             private_loss_enabled & (lambda_private_eff > 0.0),
@@ -1933,6 +1938,12 @@ def main():
         help="Auxiliary common/private activation loss weight. Default 0 disables it.",
     )
     parser.add_argument(
+        "--private-max-pairs",
+        type=int,
+        default=0,
+        help="Maximum number of post-block layer pairs for private loss. 0 means all pairs.",
+    )
+    parser.add_argument(
         "--private-start-step",
         type=int,
         default=0,
@@ -2166,6 +2177,8 @@ def main():
         raise ValueError("--private-loss requires --lambda-private > 0")
     if args.lambda_private < 0.0:
         raise ValueError("--lambda-private must be non-negative")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be non-negative")
     if args.private_start_step < 0:
         raise ValueError("--private-start-step must be non-negative")
     if args.private_warmup_iters < 0:
@@ -2202,8 +2215,8 @@ def main():
     )
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
-        f"start_step={args.private_start_step} warmup_iters={args.private_warmup_iters} "
-        "pairing=all_post_block_pairs"
+        f"max_pairs={args.private_max_pairs} start_step={args.private_start_step} "
+        f"warmup_iters={args.private_warmup_iters} pairing=first_post_block_pairs"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -2278,6 +2291,7 @@ def main():
     private_loss_enabled_rep = jax_utils.replicate(jnp.asarray(args.private_loss, dtype=jnp.bool_))
     effective_lambda_private = args.lambda_private if args.private_loss else 0.0
     lambda_private_rep = jax_utils.replicate(jnp.float32(effective_lambda_private))
+    private_max_pairs_rep = jax_utils.replicate(jnp.int32(args.private_max_pairs))
     private_start_step_rep = jax_utils.replicate(jnp.int32(args.private_start_step))
     private_warmup_iters_rep = jax_utils.replicate(jnp.int32(args.private_warmup_iters))
     shortcut_debug_gap_logs_rep = jax_utils.replicate(jnp.asarray(args.shortcut_debug_gap_logs, dtype=jnp.bool_))
@@ -2623,6 +2637,7 @@ def main():
             shortcut_skip_in_loop_detach_source_rep,
             private_loss_enabled_rep,
             lambda_private_rep,
+            private_max_pairs_rep,
             private_start_step_rep,
             private_warmup_iters_rep,
             shortcut_debug_gap_logs_rep,
@@ -3064,6 +3079,7 @@ def main():
                 shortcut_skip_in_loop_detach_source_rep,
                 private_loss_enabled_rep,
                 lambda_private_rep,
+                private_max_pairs_rep,
                 private_start_step_rep,
                 private_warmup_iters_rep,
                 shortcut_debug_gap_logs_rep,
