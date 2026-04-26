@@ -448,7 +448,7 @@ class SelfFlowDiT(nn.Module):
             if shortcut_enabled and layer_idx in shortcut_sources and (layer_idx + 2) <= self.depth:
                 target_layer = layer_idx + 2
                 u_source_short = l2_normalize_tokens(x)
-                m_source_short = log_token_magnitudes(x) if depth_shortcut_predict_magnitude else None
+                m_source_short = log_token_magnitudes(x)
                 pred_short = shortcut_predictor.apply(
                     {"params": depth_shortcut_predictor_params},
                     u_source_short,
@@ -456,6 +456,7 @@ class SelfFlowDiT(nn.Module):
                     jnp.asarray(target_layer, dtype=jnp.int32),
                     t_emb,
                     m_source_short,
+                    return_magnitude=depth_shortcut_predict_magnitude,
                 )
                 if depth_shortcut_predict_magnitude:
                     y_short, delta_m_short = pred_short

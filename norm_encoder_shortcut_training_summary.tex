@@ -1,0 +1,202 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs}
+
+\title{Depth Shortcut Predictor with NormEncoder Input: Training Summary}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+This branch keeps the predictor in direction-normalized space while giving it
+explicit source-layer magnitude context. The shortcut predictor now receives
+both the token direction \(U_a\) and a small encoded log-norm map \(E_m\):
+\[
+    P_\theta(U_a,m_a,a,b,t)
+    \rightarrow
+    (Y_{a\rightarrow b}, \hat{\delta m}_{a\rightarrow b}^{\mathrm{norm}}).
+\]
+
+\section{Source State Inputs}
+For a source hidden state
+\[
+    Z_a\in\mathbb{R}^{B\times256\times768},
+\]
+compute tokenwise magnitude, direction, and log magnitude:
+\[
+    r_a(i)=\|Z_a(i)\|_2,
+    \qquad
+    U_a(i)=\frac{Z_a(i)}{r_a(i)+10^{-6}},
+\]
+\[
+    m_a(i)=\ln(r_a(i)+10^{-6}).
+\]
+The direction \(U_a\) remains the main representation input.
+
+\section{Norm Map}
+For SiT-B/2, build two log-norm channels:
+\[
+    M_a^{\mathrm{abs}}(i)=\frac{m_a(i)-5.5}{1.5},
+\]
+\[
+    M_a^{\mathrm{rel}}(i)=
+    \frac{m_a(i)-\operatorname{mean}_{j}m_a(j)}
+    {\operatorname{std}_{j}m_a(j)+10^{-6}}.
+\]
+Concatenate and reshape:
+\[
+    M_a=[M_a^{\mathrm{abs}},M_a^{\mathrm{rel}}]
+    \in\mathbb{R}^{B\times16\times16\times2}.
+\]
+The map is stop-gradient before entering the predictor:
+\[
+    M_a^{\mathrm{in}}=\operatorname{sg}(M_a).
+\]
+
+\section{NormEncoder}
+The norm map is encoded by a small local encoder:
+\[
+    E_m=\mathrm{NormEncoder}(M_a^{\mathrm{in}}),
+    \qquad
+    E_m\in\mathbb{R}^{B\times16\times16\times32}.
+\]
+The current implementation is
+\[
+    \mathrm{Conv}_{1\times1}(2\to32)
+    \rightarrow
+    \mathrm{GELU}
+    \rightarrow
+    \mathrm{DWConv}_{3\times3}(32)
+    \rightarrow
+    \mathrm{GELU}.
+\]
+
+\section{Predictor Input}
+Reshape the direction into a grid:
+\[
+    U_a^{\mathrm{grid}}\in\mathbb{R}^{B\times16\times16\times768}.
+\]
+Concatenate the direction grid and norm encoding:
+\[
+    X_a=[U_a^{\mathrm{grid}},E_m]
+    \in\mathbb{R}^{B\times16\times16\times800}.
+\]
+Then project to predictor width \(C\):
+\[
+    h_0=\mathrm{Linear}(800\to C)(X_a).
+\]
+Examples:
+\[
+    C=256\ \text{for Tiny},\qquad
+    C=384\ \text{for Small},\qquad
+    C=768\ \text{for Base/Large}.
+\]
+
+\section{Conditioning}
+The depth and timestep condition is unchanged:
+\[
+    h_{\mathrm{depth}}=[h_a,h_b,h_b-h_a,h_\Delta],
+\]
+\[
+    c=\mathrm{MLP}\left(
+    [h_{\mathrm{depth}},\operatorname{sg}(e_t^{\mathrm{DiT}})]
+    \right).
+\]
+This condition modulates the predictor backbone through AdaLN/FiLM.
+
+\section{Backbone and Heads}
+The projected input \(h_0\) is processed by the configured predictor backbone:
+\[
+    h=\mathrm{Backbone}(h_0,c).
+\]
+The branch supports the existing ConvNeXt family and the architecture
+ablations:
+\[
+    \texttt{convnext\_*},\qquad
+    \texttt{dilated\_*},\qquad
+    \texttt{attn\_hybrid\_*}.
+\]
+
+The direction head predicts a residual update:
+\[
+    Y_{a\rightarrow b}=U_a+\gamma_{\mathrm{out}}\Delta Y.
+\]
+The direction used for loss or skip inference is
+\[
+    \hat U_{a\rightarrow b}=\operatorname{dir}(Y_{a\rightarrow b}).
+\]
+
+In direction--magnitude modes, the magnitude head receives \([h,M_a]\) and
+predicts a bounded normalized log-magnitude delta:
+\[
+    \hat{\delta m}_{a\rightarrow b}^{\mathrm{norm}}=\tanh(o_m).
+\]
+With SiT-B/2 scale \(s_m=3\),
+\[
+    \hat{\delta m}_{a\rightarrow b}
+    =
+    3\,\hat{\delta m}_{a\rightarrow b}^{\mathrm{norm}}.
+\]
+
+\section{Training Loss}
+Each iteration still runs a full DiT forward to obtain
+\[
+    Z_0,\ldots,Z_L,\qquad \hat v.
+\]
+The total loss in direction--magnitude mode is
+\[
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{FM}}
+    +\lambda_{\mathrm{dir}}\mathcal{L}_{\mathrm{dir}}
+    +\lambda_{\mathrm{boot}}\mathcal{L}_{\mathrm{boot}}
+    +\lambda_{\mathrm{mag}}\mathcal{L}_{\mathrm{mag}}
+    +\lambda_{\mathrm{boot-mag}}\mathcal{L}_{\mathrm{boot-mag}}.
+\]
+Default weights:
+\[
+    \lambda_{\mathrm{dir}}=0.5,\quad
+    \lambda_{\mathrm{boot}}=0.25,\quad
+    \lambda_{\mathrm{mag}}=0.375,\quad
+    \lambda_{\mathrm{boot-mag}}=0.1875.
+\]
+
+\section{Skip-in-the-Loop Mode}
+In \texttt{direction-magnitude-skip} mode, a stochastic skip-FM branch is added
+after warmup:
+\[
+    z_{\mathrm{skip}}\sim\mathrm{Bernoulli}(p_{\mathrm{skip}}).
+\]
+When active, sample \(a<b\), restore
+\[
+    \tilde Z_b
+    =
+    \exp\left(
+    \operatorname{clip}
+    (m_a+3\hat{\delta m}_{a\rightarrow b}^{\mathrm{norm}},3,8)
+    \right)
+    \hat U_{a\rightarrow b},
+\]
+resume the DiT from layer \(b+1\), and compute
+\[
+    \mathcal{L}_{\mathrm{skip-FM}}
+    =
+    \|\hat v_{\mathrm{skip}}-(x_0-x_1)\|_2^2.
+\]
+The total loss becomes
+\[
+    \mathcal{L}
+    \leftarrow
+    \mathcal{L}
+    +\lambda_{\mathrm{skip-FM}}\mathcal{L}_{\mathrm{skip-FM}}.
+\]
+
+\section{Direction-Only Compatibility}
+For direction-only skip inference or skip-FID, the predictor still receives
+the real source log magnitude \(m_a\), so NormEncoder is active. The caller
+sets \texttt{return\_magnitude=False}, and only \(Y_{a\rightarrow b}\) is
+returned. In direction-only mode, target magnitudes are still restored by the
+stored L2 EMA calibration rather than by the magnitude head.
+
+\end{document}

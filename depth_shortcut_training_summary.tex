@@ -52,8 +52,51 @@ The stop-gradient prevents shortcut training from directly perturbing the
 backbone timestep embedding through the condition path.
 
 \section{Predictor Architecture}
+The source direction is still the main input, but the predictor also receives
+a stop-gradient log-norm context map. For source state $Z_a$, define
+\[
+    r_a(i)=\|Z_a(i)\|_2,\qquad
+    U_a(i)=\frac{Z_a(i)}{r_a(i)+10^{-6}},\qquad
+    m_a(i)=\ln(r_a(i)+10^{-6}).
+\]
+For SiT-B/2, two norm-map channels are formed:
+\[
+    M_a^{\mathrm{abs}}(i)=\frac{m_a(i)-5.5}{1.5},
+\]
+\[
+    M_a^{\mathrm{rel}}(i)=
+    \frac{m_a(i)-\operatorname{mean}_j m_a(j)}
+    {\operatorname{std}_j m_a(j)+10^{-6}}.
+\]
+The map
+\[
+    M_a=[M_a^{\mathrm{abs}},M_a^{\mathrm{rel}}]
+    \in\mathbb{R}^{B\times16\times16\times2}
+\]
+is stop-gradient before entering the shortcut predictor. A small norm encoder
+produces
+\[
+    E_m=\mathrm{NormEncoder}(\operatorname{sg}(M_a))
+    \in\mathbb{R}^{B\times16\times16\times32},
+\]
+with
+\[
+    \mathrm{NormEncoder}:
+    \mathrm{Conv}_{1\times1}(2\to32)\rightarrow
+    \mathrm{GELU}\rightarrow
+    \mathrm{DWConv}_{3\times3}(32)\rightarrow
+    \mathrm{GELU}.
+\]
 The source direction is reshaped from $B\times256\times768$ to
-$B\times16\times16\times768$. A ConvNeXt-style residual block is
+$B\times16\times16\times768$ and concatenated with the norm encoding:
+\[
+    X_a=[U_a^{\mathrm{grid}},E_m]\in\mathbb{R}^{B\times16\times16\times800}.
+\]
+The predictor input projection is therefore
+\[
+    X_a\rightarrow \mathrm{Linear}(800\to C),
+\]
+where $C$ is the predictor width. A ConvNeXt-style residual block is
 \[
     h\leftarrow h+
     \mathrm{PW}_2\!\left(
@@ -71,6 +114,15 @@ scalar output gate initialized at $\gamma_{\mathrm{out}}=0.05$:
 \[
     Y_{a\rightarrow b}=U_a+\gamma_{\mathrm{out}}\Delta Y.
 \]
+
+\paragraph{Direction-only compatibility.}
+In direction-only training and skip-FID, the predictor still receives
+\[
+    m_a=\ln(\|Z_a\|_2+10^{-6})
+\]
+so the shared backbone uses the same NormEncoder scale context. The caller can
+set \texttt{return\_magnitude=False}; in that case the magnitude head is not
+evaluated and only the direction output \(Y_{a\rightarrow b}\) is returned.
 
 \begin{center}
 \begin{tabular}{lrrrrl}

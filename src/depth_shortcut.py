@@ -39,6 +39,34 @@ def magnitude_input_features(
     return jnp.concatenate([m_abs, m_spatial], axis=-1)
 
 
+class NormEncoder(nn.Module):
+    """Encodes absolute and relative log-norm maps for predictor input."""
+
+    channels: int = 32
+
+    @nn.compact
+    def __call__(self, m_features_grid: jax.Array) -> jax.Array:
+        x = nn.Conv(
+            features=self.channels,
+            kernel_size=(1, 1),
+            padding="SAME",
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="conv1x1",
+        )(m_features_grid)
+        x = nn.gelu(x, approximate=True)
+        x = nn.Conv(
+            features=self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            feature_group_count=self.channels,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="dwconv",
+        )(x)
+        return nn.gelu(x, approximate=True)
+
+
 class AdaLNConvNeXtBlock(nn.Module):
     """Small ConvNeXt-style block conditioned by AdaLN shift/scale."""
 
@@ -188,6 +216,7 @@ class MagnitudeHead(nn.Module):
     cond_dim: int
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    stop_gradient_input: bool = True
 
     @nn.compact
     def __call__(self, h: jax.Array, m_source: jax.Array, c: jax.Array) -> jax.Array:
@@ -197,6 +226,8 @@ class MagnitudeHead(nn.Module):
             abs_center=self.mag_abs_center,
             abs_scale=self.mag_abs_scale,
         )
+        if self.stop_gradient_input:
+            m_features = jax.lax.stop_gradient(m_features)
         m_grid = m_features.reshape(batch_size, height, width, 2)
         x = jnp.concatenate([h, m_grid], axis=-1)
         mag_channels = channels + 2
@@ -256,6 +287,8 @@ class DepthShortcutPredictor(nn.Module):
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    norm_encoder_dim: int = 32
+    norm_input_stop_gradient: bool = True
 
     @property
     def grid_size(self) -> int:
@@ -269,9 +302,13 @@ class DepthShortcutPredictor(nn.Module):
         target_layer: jax.Array,
         timestep_embed: jax.Array,
         m_source: jax.Array | None = None,
+        return_magnitude: bool | None = None,
     ) -> jax.Array:
         batch_size = u_source.shape[0]
         cond_dim = int(self.cond_dim or self.width)
+        should_return_magnitude = (m_source is not None) if return_magnitude is None else bool(return_magnitude)
+        if should_return_magnitude and m_source is None:
+            raise ValueError("m_source is required when return_magnitude=True")
         source_layer = jnp.asarray(source_layer, dtype=jnp.int32)
         target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
         delta = target_layer - source_layer
@@ -311,13 +348,33 @@ class DepthShortcutPredictor(nn.Module):
             name="cond_mlp_1",
         )(c)
 
+        u_grid = u_source.reshape(batch_size, self.grid_size, self.grid_size, self.hidden_size)
+        if m_source is None:
+            # Compatibility path for direction-only callers that have no hidden norm.
+            # Training and skip sampling pass real log magnitudes so scale context is used.
+            m_source_for_input = jnp.zeros((batch_size, self.num_tokens, 1), dtype=u_source.dtype)
+        else:
+            m_source_for_input = m_source
+        m_features = magnitude_input_features(
+            m_source_for_input,
+            abs_center=self.mag_abs_center,
+            abs_scale=self.mag_abs_scale,
+        )
+        if self.norm_input_stop_gradient:
+            m_features = jax.lax.stop_gradient(m_features)
+        m_grid = m_features.reshape(batch_size, self.grid_size, self.grid_size, 2)
+        e_m = NormEncoder(
+            channels=self.norm_encoder_dim,
+            name="norm_encoder",
+        )(m_grid)
+        x_in = jnp.concatenate([u_grid, e_m], axis=-1)
+
         h = nn.Dense(
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
             name="in_proj",
-        )(u_source)
-        h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+        )(x_in)
         dilation_schedule = self.dilation_schedule or tuple([1] * self.num_blocks)
         if len(dilation_schedule) != self.num_blocks:
             raise ValueError("dilation_schedule length must match num_blocks")
@@ -360,13 +417,14 @@ class DepthShortcutPredictor(nn.Module):
             (),
         )
         y = u_source + gamma_out * delta_y
-        if m_source is None:
+        if not should_return_magnitude:
             return y
         delta_m = MagnitudeHead(
             width=self.width,
             cond_dim=cond_dim,
             mag_abs_center=self.mag_abs_center,
             mag_abs_scale=self.mag_abs_scale,
+            stop_gradient_input=self.norm_input_stop_gradient,
             name="mag_head",
         )(h_grid, m_source, c)
         return y, delta_m
