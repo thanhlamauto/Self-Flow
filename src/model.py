@@ -15,6 +15,7 @@ import flax.linen as nn
 from einops import rearrange
 from src.depth_shortcut import (
     DepthShortcutPredictor,
+    log_token_magnitudes,
     l2_normalize_tokens,
     predictor_config_from_name,
     restore_l2_ema_magnitude,
@@ -316,6 +317,12 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_l2_ema: Optional[jax.Array] = None,
         depth_shortcut_variant: str = "tiny",
         depth_shortcut_skip_every_other: bool = False,
+        depth_shortcut_predict_magnitude: bool = False,
+        depth_shortcut_mag_scale: float = 3.0,
+        depth_shortcut_mag_abs_center: float = 5.5,
+        depth_shortcut_mag_abs_scale: float = 1.5,
+        depth_shortcut_mag_clip_min: float = 3.0,
+        depth_shortcut_mag_clip_max: float = 8.0,
         depth_shortcut_timesteps: int = 50,
         deterministic: bool = True,
     ):
@@ -389,7 +396,7 @@ class SelfFlowDiT(nn.Module):
         shortcut_enabled = (
             depth_shortcut_skip_every_other
             and depth_shortcut_predictor_params is not None
-            and depth_shortcut_l2_ema is not None
+            and (depth_shortcut_predict_magnitude or depth_shortcut_l2_ema is not None)
         )
         shortcut_sources = tuple(range(1, self.depth, 2))
         shortcut_skip_until = 0
@@ -401,6 +408,8 @@ class SelfFlowDiT(nn.Module):
                 hidden_size=self.hidden_size,
                 depth=self.depth,
                 num_tokens=self.num_patches,
+                mag_abs_center=depth_shortcut_mag_abs_center,
+                mag_abs_scale=depth_shortcut_mag_abs_scale,
                 **predictor_cfg,
             )
             # Training discretizes tau as q / (T - 1). Sampling uses continuous tau,
@@ -426,20 +435,35 @@ class SelfFlowDiT(nn.Module):
 
             if shortcut_enabled and layer_idx in shortcut_sources and (layer_idx + 2) <= self.depth:
                 target_layer = layer_idx + 2
-                y_short = shortcut_predictor.apply(
+                u_source_short = l2_normalize_tokens(x)
+                m_source_short = log_token_magnitudes(x) if depth_shortcut_predict_magnitude else None
+                pred_short = shortcut_predictor.apply(
                     {"params": depth_shortcut_predictor_params},
-                    l2_normalize_tokens(x),
+                    u_source_short,
                     jnp.asarray(layer_idx, dtype=jnp.int32),
                     jnp.asarray(target_layer, dtype=jnp.int32),
                     t_emb,
+                    m_source_short,
                 )
+                if depth_shortcut_predict_magnitude:
+                    y_short, delta_m_short = pred_short
+                else:
+                    y_short = pred_short
                 u_short = l2_normalize_tokens(y_short)
-                x = restore_l2_ema_magnitude(
-                    u_short,
-                    depth_shortcut_l2_ema,
-                    jnp.asarray(target_layer, dtype=jnp.int32),
-                    shortcut_q,
-                )
+                if depth_shortcut_predict_magnitude:
+                    m_target_short = jnp.clip(
+                        m_source_short + float(depth_shortcut_mag_scale) * delta_m_short,
+                        float(depth_shortcut_mag_clip_min),
+                        float(depth_shortcut_mag_clip_max),
+                    )
+                    x = jnp.exp(m_target_short) * u_short
+                else:
+                    x = restore_l2_ema_magnitude(
+                        u_short,
+                        depth_shortcut_l2_ema,
+                        jnp.asarray(target_layer, dtype=jnp.int32),
+                        shortcut_q,
+                    )
                 shortcut_skip_until = target_layer
 
             if return_hidden_states:

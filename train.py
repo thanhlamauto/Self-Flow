@@ -417,6 +417,7 @@ except ImportError:
 from src.model import SelfFlowDiT
 from src.depth_shortcut import (
     DepthShortcutPredictor,
+    log_token_magnitudes,
     l2_normalize_tokens,
     predictor_config_from_name,
 )
@@ -469,6 +470,9 @@ def create_train_state(
     predictor_lr=1e-4,
     predictor_weight_decay=0.1,
     predictor_grad_clip=1.0,
+    shortcut_training_mode="direction",
+    shortcut_mag_abs_center=5.5,
+    shortcut_mag_abs_scale=1.5,
 ):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -497,6 +501,9 @@ def create_train_state(
         hidden_size=config["hidden_size"],
         depth=config["depth"],
         num_tokens=n_patches,
+        gamma_out_init=0.001 if shortcut_training_mode == "direction-magnitude" else 0.05,
+        mag_abs_center=shortcut_mag_abs_center,
+        mag_abs_scale=shortcut_mag_abs_scale,
         **predictor_cfg,
     )
 
@@ -514,12 +521,14 @@ def create_train_state(
     )
     dummy_u = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
     dummy_t_embed = jnp.ones((1, config["hidden_size"]), dtype=jnp.float32)
+    dummy_m = jnp.zeros((1, n_patches, 1), dtype=jnp.float32)
     predictor_variables = predictor.init(
         {"params": predictor_rng},
         dummy_u,
         jnp.asarray(0, dtype=jnp.int32),
         jnp.asarray(1, dtype=jnp.int32),
         dummy_t_embed,
+        dummy_m,
     )
 
     params = {
@@ -641,6 +650,9 @@ def train_step(
     shortcut_timesteps,
     lambda_dir,
     lambda_boot,
+    lambda_mag,
+    lambda_boot_mag,
+    mag_scale,
     l2_ema_alpha,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
@@ -676,14 +688,16 @@ def train_step(
         loss_gen = jnp.mean((pred - target) ** 2)
         hidden_stack = jnp.stack(hidden_tuple, axis=0)
         directions = l2_normalize_tokens(hidden_stack)
+        log_magnitudes = log_token_magnitudes(hidden_stack)
 
         direct_a, direct_b = sample_pair_uniform_gap(pair_rng, directions.shape[0] - 1)
-        y_ab = state.predictor_apply_fn(
+        y_ab, delta_m_ab = state.predictor_apply_fn(
             {"params": params["predictor"]},
             directions[direct_a],
             direct_a,
             direct_b,
             dit_time_emb,
+            log_magnitudes[direct_a],
         )
         u_ab = l2_normalize_tokens(y_ab)
         y_ab_norm = jnp.linalg.norm(y_ab, axis=-1)
@@ -693,35 +707,60 @@ def train_step(
         target_u_b = jax.lax.stop_gradient(directions[direct_b])
         cos_dir = jnp.sum(u_ab * target_u_b, axis=-1).mean()
         loss_dir = 1.0 - cos_dir
+        target_delta_m_raw = jax.lax.stop_gradient(log_magnitudes[direct_b] - log_magnitudes[direct_a])
+        delta_m_clip_rate = jnp.mean((jnp.abs(target_delta_m_raw) > mag_scale).astype(jnp.float32))
+        target_delta_m_ab = jax.lax.stop_gradient(
+            jnp.clip(target_delta_m_raw / mag_scale, -1.0, 1.0)
+        )
+        loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_ab - target_delta_m_ab))
+        delta_m_raw_error = mag_scale * delta_m_ab - target_delta_m_raw
+        delta_m_abs_error = jnp.abs(delta_m_raw_error)
+        delta_m_mae = jnp.mean(delta_m_abs_error)
+        delta_m_rmse = jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error)))
+        delta_m_ratio_error = jnp.mean(jnp.exp(delta_m_abs_error))
+        direct_gap = direct_b - direct_a
 
         boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
-        y_boot_ab = state.predictor_apply_fn(
+        y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
             {"params": params["predictor"]},
             directions[boot_a],
             boot_a,
             boot_b,
             dit_time_emb,
+            log_magnitudes[boot_a],
         )
         u_boot_ab = l2_normalize_tokens(y_boot_ab)
-        y_abc = state.predictor_apply_fn(
+        m_boot_ab = log_magnitudes[boot_a] + mag_scale * delta_m_boot_ab
+        y_abc, delta_m_abc = state.predictor_apply_fn(
             {"params": params["predictor"]},
             u_boot_ab,
             boot_b,
             boot_c,
             dit_time_emb,
+            m_boot_ab,
         )
         u_abc = l2_normalize_tokens(y_abc)
-        y_ac_ema = state.predictor_apply_fn(
+        y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
             {"params": predictor_ema_params},
             directions[boot_a],
             boot_a,
             boot_c,
             dit_time_emb,
+            log_magnitudes[boot_a],
         )
         u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
         cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
         loss_boot = 1.0 - cos_boot
-        loss_total = loss_gen + lambda_dir * loss_dir + lambda_boot * loss_boot
+        target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
+        pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+        loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+        loss_total = (
+            loss_gen
+            + lambda_dir * loss_dir
+            + lambda_boot * loss_boot
+            + lambda_mag * loss_mag
+            + lambda_boot_mag * loss_boot_mag
+        )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         aux = (
@@ -730,11 +769,18 @@ def train_step(
             loss_gen,
             loss_dir,
             loss_boot,
+            loss_mag,
+            loss_boot_mag,
             cos_dir,
             cos_boot,
             y_ab_norm_mean,
             y_ab_norm_min,
             y_ab_norm_max,
+            delta_m_mae,
+            delta_m_rmse,
+            delta_m_ratio_error,
+            delta_m_clip_rate,
+            direct_gap,
             hidden_stack,
         )
         return loss_total, aux
@@ -747,11 +793,18 @@ def train_step(
         loss_gen,
         loss_dir,
         loss_boot,
+        loss_mag,
+        loss_boot_mag,
         cos_dir,
         cos_boot,
         y_ab_norm_mean,
         y_ab_norm_min,
         y_ab_norm_max,
+        delta_m_mae,
+        delta_m_rmse,
+        delta_m_ratio_error,
+        delta_m_clip_rate,
+        direct_gap,
         hidden_stack,
     ) = aux
 
@@ -761,11 +814,18 @@ def train_step(
     loss_gen = jax.lax.pmean(loss_gen, axis_name="batch")
     loss_dir = jax.lax.pmean(loss_dir, axis_name="batch")
     loss_boot = jax.lax.pmean(loss_boot, axis_name="batch")
+    loss_mag = jax.lax.pmean(loss_mag, axis_name="batch")
+    loss_boot_mag = jax.lax.pmean(loss_boot_mag, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
     cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
     y_ab_norm_mean = jax.lax.pmean(y_ab_norm_mean, axis_name="batch")
     y_ab_norm_min = jax.lax.pmin(y_ab_norm_min, axis_name="batch")
     y_ab_norm_max = jax.lax.pmax(y_ab_norm_max, axis_name="batch")
+    delta_m_mae = jax.lax.pmean(delta_m_mae, axis_name="batch")
+    delta_m_rmse = jax.lax.pmean(delta_m_rmse, axis_name="batch")
+    delta_m_ratio_error = jax.lax.pmean(delta_m_ratio_error, axis_name="batch")
+    delta_m_clip_rate = jax.lax.pmean(delta_m_clip_rate, axis_name="batch")
+    direct_gap = jax.lax.pmean(direct_gap.astype(jnp.float32), axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -786,11 +846,18 @@ def train_step(
         "train/loss_gen": loss_gen,
         "train/loss_dir": loss_dir,
         "train/loss_boot": loss_boot,
+        "train/loss_mag": loss_mag,
+        "train/loss_boot_mag": loss_boot_mag,
         "train/cos_dir": cos_dir,
         "train/cos_boot": cos_boot,
         "train/y_ab_norm_mean": y_ab_norm_mean,
         "train/y_ab_norm_min": y_ab_norm_min,
         "train/y_ab_norm_max": y_ab_norm_max,
+        "train/delta_m_mae": delta_m_mae,
+        "train/delta_m_rmse": delta_m_rmse,
+        "train/delta_m_ratio_error": delta_m_ratio_error,
+        "train/delta_m_clip_rate": delta_m_clip_rate,
+        "train/direct_gap": direct_gap,
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -1077,6 +1144,12 @@ def make_sample_latents_pmap_fn(
     num_steps=50,
     cfg_scale=1.0,
     depth_shortcut_skip=False,
+    depth_shortcut_predict_magnitude=False,
+    depth_shortcut_mag_scale=3.0,
+    depth_shortcut_mag_abs_center=5.5,
+    depth_shortcut_mag_abs_scale=1.5,
+    depth_shortcut_mag_clip_min=3.0,
+    depth_shortcut_mag_clip_max=8.0,
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
 ):
@@ -1219,6 +1292,12 @@ def make_sample_latents_pmap_fn(
                 depth_shortcut_l2_ema=l2_ema_local,
                 depth_shortcut_variant=shortcut_predictor_variant,
                 depth_shortcut_skip_every_other=True,
+                depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
+                depth_shortcut_mag_scale=float(depth_shortcut_mag_scale),
+                depth_shortcut_mag_abs_center=float(depth_shortcut_mag_abs_center),
+                depth_shortcut_mag_abs_scale=float(depth_shortcut_mag_abs_scale),
+                depth_shortcut_mag_clip_min=float(depth_shortcut_mag_clip_min),
+                depth_shortcut_mag_clip_max=float(depth_shortcut_mag_clip_max),
                 depth_shortcut_timesteps=int(shortcut_timesteps),
             )
 
@@ -1423,8 +1502,22 @@ def main():
                         choices=["tiny", "small", "base", "large",
                                  "p-tiny", "p-small", "p-base", "p-large"],
                         help="Depth shortcut predictor size.")
+    parser.add_argument(
+        "--shortcut-training-mode",
+        type=str,
+        default="direction",
+        choices=["direction", "direction-magnitude"],
+        help="direction keeps EMA-L2 skip calibration; direction-magnitude trains an extra log-magnitude head and uses it for skip sampling.",
+    )
     parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
+    parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
+    parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
+    parser.add_argument("--shortcut-mag-scale", type=float, default=3.0)
+    parser.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
+    parser.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
+    parser.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
+    parser.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
     parser.add_argument("--shortcut-timesteps", type=int, default=50)
     parser.add_argument("--shortcut-predictor-lr", type=float, default=1e-4)
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
@@ -1546,7 +1639,7 @@ def main():
         dest="fid_skip_eval",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Also compute FID/sFID with depth shortcuts 1->3, 3->5, ... using predictor EMA and L2 EMA magnitudes.",
+        help="Also compute FID/sFID with depth shortcuts 1->3, 3->5, ... using predictor EMA. Direction mode uses L2 EMA magnitudes; direction-magnitude mode uses the magnitude head.",
     )
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
@@ -1602,6 +1695,12 @@ def main():
             raise ValueError("--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
     if args.shortcut_timesteps <= 0:
         raise ValueError("--shortcut-timesteps must be greater than 0")
+    if args.shortcut_mag_scale <= 0:
+        raise ValueError("--shortcut-mag-scale must be greater than 0")
+    if args.shortcut_mag_abs_scale <= 0:
+        raise ValueError("--shortcut-mag-abs-scale must be greater than 0")
+    if args.shortcut_mag_clip_min >= args.shortcut_mag_clip_max:
+        raise ValueError("--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
 
@@ -1640,7 +1739,12 @@ def main():
     )
     log_stage(
         f"DepthShortcut: predictor={args.shortcut_predictor} "
+        f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
+        f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
+        f"mag_scale={args.shortcut_mag_scale} "
+        f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
+        f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
         f"pred_lr={args.shortcut_predictor_lr} pred_wd={args.shortcut_predictor_weight_decay}"
     )
 
@@ -1662,6 +1766,9 @@ def main():
         predictor_lr=args.shortcut_predictor_lr,
         predictor_weight_decay=args.shortcut_predictor_weight_decay,
         predictor_grad_clip=args.shortcut_predictor_grad_clip,
+        shortcut_training_mode=args.shortcut_training_mode,
+        shortcut_mag_abs_center=args.shortcut_mag_abs_center,
+        shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
     )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
@@ -1673,6 +1780,11 @@ def main():
     shortcut_timesteps_rep = jax_utils.replicate(jnp.int32(args.shortcut_timesteps))
     shortcut_lambda_dir_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_dir))
     shortcut_lambda_boot_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_boot))
+    effective_lambda_mag = args.shortcut_lambda_mag if args.shortcut_training_mode == "direction-magnitude" else 0.0
+    effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if args.shortcut_training_mode == "direction-magnitude" else 0.0
+    shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
+    shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
+    shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -1725,6 +1837,12 @@ def main():
             num_steps=args.fid_num_steps,
             cfg_scale=args.fid_cfg_scale,
             depth_shortcut_skip=True,
+            depth_shortcut_predict_magnitude=args.shortcut_training_mode == "direction-magnitude",
+            depth_shortcut_mag_scale=args.shortcut_mag_scale,
+            depth_shortcut_mag_abs_center=args.shortcut_mag_abs_center,
+            depth_shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
+            depth_shortcut_mag_clip_min=args.shortcut_mag_clip_min,
+            depth_shortcut_mag_clip_max=args.shortcut_mag_clip_max,
             shortcut_predictor_variant=args.shortcut_predictor,
             shortcut_timesteps=args.shortcut_timesteps,
         )
@@ -1991,6 +2109,9 @@ def main():
             shortcut_timesteps_rep,
             shortcut_lambda_dir_rep,
             shortcut_lambda_boot_rep,
+            shortcut_lambda_mag_rep,
+            shortcut_lambda_boot_mag_rep,
+            shortcut_mag_scale_rep,
             shortcut_l2_ema_alpha_rep,
         )
         block_pytree(probe_metrics)
@@ -2413,6 +2534,9 @@ def main():
                 shortcut_timesteps_rep,
                 shortcut_lambda_dir_rep,
                 shortcut_lambda_boot_rep,
+                shortcut_lambda_mag_rep,
+                shortcut_lambda_boot_mag_rep,
+                shortcut_mag_scale_rep,
                 shortcut_l2_ema_alpha_rep,
             )
             global_step += 1

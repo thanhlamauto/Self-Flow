@@ -134,6 +134,94 @@ The predictor teacher is updated after each optimizer step:
     \bar\theta\leftarrow0.999\,\bar\theta+0.001\,\theta.
 \]
 
+\section{Direction--Magnitude Training Mode}
+The optional \texttt{direction-magnitude} mode adds a log-norm transport head
+and uses natural logarithms:
+\[
+    r_l(i)=\|Z_l(i)\|_2,\qquad
+    m_l(i)=\ln(r_l(i)+10^{-6}).
+\]
+For the current SiT-B/2 setting, the measured token L2 range is roughly
+$45.5$ to $1496.4$, corresponding to $\ln r\approx 3.82$ to $7.31$.
+The head predicts a bounded normalized log-norm residual rather than a raw
+norm. Use scale $s_m=3$:
+\[
+    \hat{\delta m}^{\mathrm{norm}}_{a\rightarrow b}(i)=\tanh(o_m(i)),
+\]
+\[
+    \hat{\delta m}_{a\rightarrow b}(i)
+    =
+    s_m\,\hat{\delta m}^{\mathrm{norm}}_{a\rightarrow b}(i),
+    \qquad
+    \hat m_b(i)=m_a(i)+\hat{\delta m}_{a\rightarrow b}(i),
+    \qquad
+    \hat r_b(i)=\exp(\hat m_b(i)).
+\]
+The magnitude input uses two channels, not the raw log norm alone:
+\[
+    m_a^{\mathrm{abs}}(i)=\frac{m_a(i)-5.5}{1.5},
+\]
+\[
+    m_a^{\mathrm{sp}}(i)=
+    \frac{m_a(i)-\operatorname{mean}_{j}m_a(j)}
+    {\operatorname{std}_{j}m_a(j)+10^{-6}}.
+\]
+Thus the magnitude head receives
+\[
+    M_a=[m_a^{\mathrm{abs}},m_a^{\mathrm{sp}}]\in\mathbb{R}^{B\times16\times16\times2}
+\]
+and applies
+\[
+    [h,M_a]\rightarrow \mathrm{AdaLN}(c)\rightarrow
+    \mathrm{DWConv}_{3\times3}\rightarrow
+    \mathrm{Linear}(C+2,C/4)\rightarrow\mathrm{GELU}\rightarrow
+    \mathrm{Linear}(C/4,1).
+\]
+The final magnitude linear layer is zero-initialized. Its raw output $o_m$ is
+bounded in normalized units:
+\[
+    \hat{\delta m}^{\mathrm{norm}}_{a\rightarrow b}=\tanh(o_m).
+\]
+The direct target is scaled and clipped:
+\[
+    \delta m_{a\rightarrow b}^{\mathrm{norm,tgt}}
+    =
+    \operatorname{clip}\left(\frac{m_b-m_a}{s_m},-1,1\right).
+\]
+The magnitude loss is bounded MSE on normalized log deltas:
+\[
+    \mathcal{L}_{\mathrm{mag}}
+    =
+    \frac{1}{2BP}\sum_{n,i}
+    \left(
+    \hat{\delta m}_{a\rightarrow b}^{\mathrm{norm},(n)}(i)
+    -
+    \operatorname{sg}\!\left(
+    \delta m_{a\rightarrow b}^{\mathrm{norm,tgt},(n)}(i)
+    \right)
+    \right)^2.
+\]
+For bootstrap magnitude consistency, log residuals compose additively:
+\[
+    \delta m_{a\rightarrow c}
+    =
+    \delta m_{a\rightarrow b}+\delta m_{b\rightarrow c}.
+\]
+The loss compares the composed student residual to the EMA teacher residual:
+\[
+    \mathcal{L}_{\mathrm{boot-mag}}
+    =
+    \frac{1}{2BP}\sum_{n,i}
+    \left(
+    \hat{\delta m}_{a\rightarrow b}^{\mathrm{norm},(n)}(i)
+    +\hat{\delta m}_{b\rightarrow c}^{\mathrm{norm},(n)}(i)
+    -
+    \operatorname{sg}\!\left(
+    \hat{\delta m}_{a\rightarrow c}^{\mathrm{norm,ema},(n)}(i)
+    \right)
+    \right)^2.
+\]
+
 \section{Total Objective}
 The backbone is still trained by the original flow matching loss:
 \[
@@ -151,31 +239,94 @@ The joint objective is
     +0.25\,\mathcal{L}_{\mathrm{boot}}
     }.
 \]
+In \texttt{direction-magnitude} mode, the objective becomes
+\[
+    \boxed{
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{FM}}
+    +0.5\,\mathcal{L}_{\mathrm{dir}}
+    +0.25\,\mathcal{L}_{\mathrm{boot}}
+    +0.375\,\mathcal{L}_{\mathrm{mag}}
+    +0.1875\,\mathcal{L}_{\mathrm{boot-mag}}
+    }.
+\]
 Targets $U_b$ and $P_{\bar\theta}$ are stop-gradient. Gradients from the
 shortcut losses can flow through the source state $U_a$ into the DiT backbone.
 
 \section{EMA Magnitude Calibration}
-Magnitude is not used in the shortcut training losses. For skip inference
-ablation only, maintain
+In the default \texttt{direction} mode, magnitude is not predicted by the
+shortcut model. For skip inference ablation in that mode only, maintain
 \[
     R_{\mathrm{EMA}}\in\mathbb{R}^{(L+1)\times5\times P}.
 \]
-The timestep bin is $\tau(q)=\lfloor q/10\rfloor$. For each layer, bin, and
-token:
+The timestep bin is
+\[
+    \tau(q)=\left\lfloor \frac{q}{10}\right\rfloor,\qquad
+    \tau(q)\in\{0,1,2,3,4\}.
+\]
+For a minibatch, define the per-sample token magnitude
+\[
+    r_l^{(n)}(i)=\|Z_l^{(n)}(i)\|_2,\qquad
+    l\in\{0,\ldots,L\},\quad i\in\{1,\ldots,P\}.
+\]
+For each layer $l$, bin $\tau$, and token $i$, compute the batch estimate
+\[
+    \bar r_{l,\tau,i}
+    =
+    \frac{
+        \sum_{n=1}^{B}\mathbf{1}[\tau(q_n)=\tau]\,
+        r_l^{(n)}(i)
+    }{
+        \max\left(1,\sum_{n=1}^{B}\mathbf{1}[\tau(q_n)=\tau]\right)
+    }.
+\]
+Across devices, the numerator and denominator are summed before applying the
+EMA update. If a bin has no samples in the global batch, that entry is left
+unchanged. Otherwise:
 \[
     R_{\mathrm{EMA}}[l,\tau,i]
     \leftarrow
     0.99\,R_{\mathrm{EMA}}[l,\tau,i]
-    +0.01\,
-    \mathbb{E}_{n:\tau(q_n)=\tau}\|Z_l^{(n)}(i)\|_2 .
+    +0.01\,\bar r_{l,\tau,i}.
 \]
-At skip inference from layer $a$ to $b$:
+Thus $R_{\mathrm{EMA}}[l,\tau,i]$ estimates
 \[
-    \tilde Z_b(i)=
-    R_{\mathrm{EMA}}[b,\tau(q),i]\,
-    \operatorname{dir}(P_\theta(\operatorname{dir}(Z_a),a,b,t_q))(i).
+    \mathbb{E}\!\left[\|Z_l(i)\|_2\,\middle|\,\tau(q)=\tau\right].
 \]
-The DiT then resumes from block $b+1$.
+
+At skip inference from layer $a$ to $b$, the predictor first produces only a
+direction:
+\[
+    U_a=\operatorname{dir}(Z_a),\qquad
+    Y_{a\rightarrow b}=P_\theta(U_a,a,b,t_q),\qquad
+    \hat U_{a\rightarrow b}=\operatorname{dir}(Y_{a\rightarrow b}).
+\]
+The restored hidden state is then
+\[
+    \boxed{
+    \tilde Z_b^{(n)}(i)=
+    R_{\mathrm{EMA}}[b,\tau(q_n),i]\,
+    \hat U_{a\rightarrow b}^{(n)}(i)
+    }.
+\]
+This is the state passed back to the DiT before resuming from block $b+1$.
+Without this calibration, skip sampling would feed unit-norm hidden directions
+into later DiT blocks, which expect layer- and timestep-dependent hidden-state
+magnitudes.
+
+In \texttt{direction-magnitude} mode, this EMA calibration is not used for
+skip sampling. Instead, the predictor restores each skipped state from its
+own predicted log magnitude:
+\[
+    \hat Z_b^{(n)}(i)
+    =
+    \exp\!\left(
+    \operatorname{clip}\left(m_a^{(n)}(i)+
+    \hat{\delta m}_{a\rightarrow b}^{(n)}(i),3,8\right)
+    \right)
+    \hat U_{a\rightarrow b}^{(n)}(i).
+\]
 
 \section{Optimization and Metrics}
 The DiT uses AdamW with backbone learning rate from the main config and
@@ -197,6 +348,37 @@ Log the training losses and cosine similarities:
 \]
 For inference ablations, also report restored-state relative error, output
 deviation, FID, wall-clock speedup, and the FID--speed curve.
+In \texttt{direction-magnitude} mode, also log direct-pair magnitude errors:
+\[
+    \operatorname{ClipRate}_{\delta m}
+    =
+    \mathbb{P}_{n,i}\left(|m_b^{(n)}(i)-m_a^{(n)}(i)|>s_m\right).
+\]
+If this rate is above roughly $1\%$ for SiT-B/2, increase $s_m$ from $3$ to
+$3.5$.
+\[
+    \operatorname{MAE}_{\delta m}=
+    \mathbb{E}_{n,i}\left|\hat{\delta m}_{a\rightarrow b}^{(n)}(i)
+    -\delta m_{a\rightarrow b}^{\mathrm{tgt},(n)}(i)\right|,
+\]
+\[
+    \operatorname{RMSE}_{\delta m}
+    =
+    \sqrt{
+    \mathbb{E}_{n,i}
+    \left(\hat{\delta m}_{a\rightarrow b}^{(n)}(i)
+    -\delta m_{a\rightarrow b}^{\mathrm{tgt},(n)}(i)\right)^2
+    },
+\]
+\[
+    \operatorname{RatioError}
+    =
+    \mathbb{E}_{n,i}
+    \exp\!\left(
+    \left|\hat{\delta m}_{a\rightarrow b}^{(n)}(i)
+    -\delta m_{a\rightarrow b}^{\mathrm{tgt},(n)}(i)\right|
+    \right).
+\]
 
 \section{Skip-FID Evaluation}
 In addition to full-backbone FID, evaluate a skip sampler that repeatedly
@@ -210,11 +392,23 @@ At each source layer $a$, the predictor estimates only direction:
     =
     \operatorname{dir}(P_{\bar\theta}(\operatorname{dir}(Z_a),a,a+2,t_q)).
 \]
-Before continuing the DiT, restore the target-layer magnitude with the L2 EMA:
+In the default direction-only mode, restore the target-layer magnitude with
+the L2 EMA:
 \[
     \tilde Z_{a+2}(i)=
     R_{\mathrm{EMA}}[a+2,\tau(q),i]\,
     \hat U_{a\rightarrow a+2}(i).
+\]
+This is exactly the magnitude calibration above: the raw predictor output
+$Y$ is not used as a full hidden state; only its direction is used, and the
+target magnitude comes from $R_{\mathrm{EMA}}$.
+In \texttt{direction-magnitude} mode, skip-FID instead uses predicted log
+magnitude and no EMA calibration:
+\[
+    \tilde Z_{a+2}(i)=
+    \exp\!\left(\operatorname{clip}\left(
+    m_a(i)+\hat{\delta m}_{a\rightarrow a+2}(i),3,8
+    \right)\right)\hat U_{a\rightarrow a+2}(i).
 \]
 The sampler then skips the true intervening blocks and resumes from the block
 after the restored target state. Report these metrics separately, e.g.

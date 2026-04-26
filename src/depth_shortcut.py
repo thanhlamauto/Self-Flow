@@ -14,7 +14,29 @@ NORMAL_002 = nn.initializers.normal(stddev=0.02)
 
 def l2_normalize_tokens(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     """Normalize each token vector to unit L2 direction."""
-    return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
+    x_f32 = x.astype(jnp.float32)
+    return x_f32 / (jnp.linalg.norm(x_f32, axis=-1, keepdims=True) + eps)
+
+
+def log_token_magnitudes(x: jax.Array, eps: float = 1e-6) -> jax.Array:
+    """Tokenwise log L2 magnitudes."""
+    x_f32 = x.astype(jnp.float32)
+    return jnp.log(jnp.linalg.norm(x_f32, axis=-1, keepdims=True) + eps)
+
+
+def magnitude_input_features(
+    m_source: jax.Array,
+    abs_center: float = 5.5,
+    abs_scale: float = 1.5,
+    eps: float = 1e-6,
+) -> jax.Array:
+    """Build absolute and within-image contrast log-magnitude channels."""
+    m_source = m_source.astype(jnp.float32)
+    m_abs = (m_source - float(abs_center)) / float(abs_scale)
+    token_mean = jnp.mean(m_source, axis=1, keepdims=True)
+    token_std = jnp.std(m_source, axis=1, keepdims=True)
+    m_spatial = (m_source - token_mean) / (token_std + eps)
+    return jnp.concatenate([m_abs, m_spatial], axis=-1)
 
 
 class AdaLNConvNeXtBlock(nn.Module):
@@ -61,6 +83,61 @@ class AdaLNConvNeXtBlock(nn.Module):
         return h + x
 
 
+class MagnitudeHead(nn.Module):
+    """Predicts log-magnitude residuals conditioned like the shared backbone."""
+
+    width: int
+    cond_dim: int
+    mag_abs_center: float = 5.5
+    mag_abs_scale: float = 1.5
+
+    @nn.compact
+    def __call__(self, h: jax.Array, m_source: jax.Array, c: jax.Array) -> jax.Array:
+        batch_size, height, width, channels = h.shape
+        m_features = magnitude_input_features(
+            m_source,
+            abs_center=self.mag_abs_center,
+            abs_scale=self.mag_abs_scale,
+        )
+        m_grid = m_features.reshape(batch_size, height, width, 2)
+        x = jnp.concatenate([h, m_grid], axis=-1)
+        mag_channels = channels + 2
+
+        gamma_beta = nn.Dense(
+            2 * mag_channels,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            name="adaln_mod",
+        )(nn.gelu(c, approximate=True))
+        gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
+
+        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln")(x)
+        x = x * (1.0 + gamma[:, None, None, :]) + beta[:, None, None, :]
+        x = nn.Conv(
+            features=mag_channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            feature_group_count=mag_channels,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="dwconv",
+        )(x)
+        x = nn.Dense(
+            max(channels // 4, 1),
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="pw1",
+        )(x)
+        x = nn.gelu(x, approximate=True)
+        raw_delta_m = nn.Dense(
+            1,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            name="pw2",
+        )(x)
+        return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1)
+
+
 class DepthShortcutPredictor(nn.Module):
     """Predicts target hidden-state directions from source directions."""
 
@@ -74,6 +151,8 @@ class DepthShortcutPredictor(nn.Module):
     cond_hidden_dim: int = 512
     cond_dim: int | None = None
     gamma_out_init: float = 0.05
+    mag_abs_center: float = 5.5
+    mag_abs_scale: float = 1.5
 
     @property
     def grid_size(self) -> int:
@@ -86,6 +165,7 @@ class DepthShortcutPredictor(nn.Module):
         source_layer: jax.Array,
         target_layer: jax.Array,
         timestep_embed: jax.Array,
+        m_source: jax.Array | None = None,
     ) -> jax.Array:
         batch_size = u_source.shape[0]
         cond_dim = int(self.cond_dim or self.width)
@@ -142,7 +222,8 @@ class DepthShortcutPredictor(nn.Module):
                 expansion=self.expansion,
                 name=f"blocks_{idx}",
             )(h, c)
-        h = h.reshape(batch_size, self.num_tokens, self.width)
+        h_grid = h
+        h = h_grid.reshape(batch_size, self.num_tokens, self.width)
         delta_y = nn.Dense(
             self.hidden_size,
             kernel_init=ZERO_INIT,
@@ -154,7 +235,17 @@ class DepthShortcutPredictor(nn.Module):
             nn.initializers.constant(self.gamma_out_init),
             (),
         )
-        return u_source + gamma_out * delta_y
+        y = u_source + gamma_out * delta_y
+        if m_source is None:
+            return y
+        delta_m = MagnitudeHead(
+            width=self.width,
+            cond_dim=cond_dim,
+            mag_abs_center=self.mag_abs_center,
+            mag_abs_scale=self.mag_abs_scale,
+            name="mag_head",
+        )(h_grid, m_source, c)
+        return y, delta_m
 
 
 def predictor_config_from_name(name: str, hidden_size: int) -> dict:
