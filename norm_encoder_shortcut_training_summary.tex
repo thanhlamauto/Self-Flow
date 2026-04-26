@@ -161,6 +161,15 @@ Default weights:
     \lambda_{\mathrm{mag}}=0.375,\quad
     \lambda_{\mathrm{boot-mag}}=0.1875.
 \]
+By default, bootstrap losses can backpropagate through the source hidden state
+into the DiT backbone. Setting
+\[
+    \texttt{--shortcut-bootstrap-detach-source}
+\]
+uses \(\operatorname{sg}(U_a)\) and \(\operatorname{sg}(m_a)\) for the
+bootstrap student path, so \(\mathcal{L}_{\mathrm{boot}}\) and
+\(\mathcal{L}_{\mathrm{boot-mag}}\) update the predictor without updating the
+backbone through the bootstrap source. Direct loss and skip-FM are unchanged.
 
 \section{Skip-in-the-Loop Mode}
 In \texttt{direction-magnitude-skip} mode, a stochastic skip-FM branch is added

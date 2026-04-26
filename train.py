@@ -681,6 +681,7 @@ def train_step(
     shortcut_timesteps,
     lambda_dir,
     lambda_boot,
+    bootstrap_detach_source,
     lambda_mag,
     lambda_boot_mag,
     lambda_skip_fm,
@@ -764,16 +765,30 @@ def train_step(
         direct_gap = direct_b - direct_a
 
         boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
+        boot_source_u = directions[boot_a]
+        boot_source_m = log_magnitudes[boot_a]
+        boot_source_u = jax.lax.cond(
+            bootstrap_detach_source,
+            jax.lax.stop_gradient,
+            lambda z: z,
+            boot_source_u,
+        )
+        boot_source_m = jax.lax.cond(
+            bootstrap_detach_source,
+            jax.lax.stop_gradient,
+            lambda z: z,
+            boot_source_m,
+        )
         y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
             {"params": params["predictor"]},
-            directions[boot_a],
+            boot_source_u,
             boot_a,
             boot_b,
             dit_time_emb,
-            log_magnitudes[boot_a],
+            boot_source_m,
         )
         u_boot_ab = l2_normalize_tokens(y_boot_ab)
-        m_boot_ab = log_magnitudes[boot_a] + mag_scale * delta_m_boot_ab
+        m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
         y_abc, delta_m_abc = state.predictor_apply_fn(
             {"params": params["predictor"]},
             u_boot_ab,
@@ -785,11 +800,11 @@ def train_step(
         u_abc = l2_normalize_tokens(y_abc)
         y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
             {"params": predictor_ema_params},
-            directions[boot_a],
+            boot_source_u,
             boot_a,
             boot_c,
             dit_time_emb,
-            log_magnitudes[boot_a],
+            boot_source_m,
         )
         u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
         cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
@@ -1750,6 +1765,12 @@ def main():
     )
     parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
+    parser.add_argument(
+        "--shortcut-bootstrap-detach-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Detach bootstrap source U_a and m_a so bootstrap losses update predictor only, not the DiT backbone through the source state.",
+    )
     parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
     parser.add_argument(
@@ -2021,6 +2042,7 @@ def main():
         f"DepthShortcut: predictor={args.shortcut_predictor} "
         f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
+        f"bootstrap_detach_source={args.shortcut_bootstrap_detach_source} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
@@ -2087,6 +2109,7 @@ def main():
     shortcut_timesteps_rep = jax_utils.replicate(jnp.int32(args.shortcut_timesteps))
     shortcut_lambda_dir_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_dir))
     shortcut_lambda_boot_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_boot))
+    shortcut_bootstrap_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_bootstrap_detach_source, dtype=jnp.bool_))
     uses_magnitude_losses = args.shortcut_training_mode in {"direction-magnitude", "direction-magnitude-skip"}
     uses_skip_in_loop = args.shortcut_training_mode == "direction-magnitude-skip"
     effective_lambda_mag = args.shortcut_lambda_mag if uses_magnitude_losses else 0.0
@@ -2435,6 +2458,7 @@ def main():
             shortcut_timesteps_rep,
             shortcut_lambda_dir_rep,
             shortcut_lambda_boot_rep,
+            shortcut_bootstrap_detach_source_rep,
             shortcut_lambda_mag_rep,
             shortcut_lambda_boot_mag_rep,
             shortcut_lambda_skip_fm_rep,
@@ -2871,6 +2895,7 @@ def main():
                 shortcut_timesteps_rep,
                 shortcut_lambda_dir_rep,
                 shortcut_lambda_boot_rep,
+                shortcut_bootstrap_detach_source_rep,
                 shortcut_lambda_mag_rep,
                 shortcut_lambda_boot_mag_rep,
                 shortcut_lambda_skip_fm_rep,
