@@ -34,8 +34,9 @@ def magnitude_input_features(
     m_source = m_source.astype(jnp.float32)
     m_abs = (m_source - float(abs_center)) / float(abs_scale)
     token_mean = jnp.mean(m_source, axis=1, keepdims=True)
-    token_std = jnp.std(m_source, axis=1, keepdims=True)
-    m_spatial = (m_source - token_mean) / (token_std + eps)
+    centered = m_source - token_mean
+    token_std = jnp.sqrt(jnp.mean(jnp.square(centered), axis=1, keepdims=True))
+    m_spatial = centered / (token_std + eps)
     return jnp.concatenate([m_abs, m_spatial], axis=-1)
 
 
@@ -219,16 +220,25 @@ class MagnitudeHead(nn.Module):
     stop_gradient_input: bool = True
 
     @nn.compact
-    def __call__(self, h: jax.Array, m_source: jax.Array, c: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        h: jax.Array,
+        m_source: jax.Array,
+        c: jax.Array,
+        m_features_grid: jax.Array | None = None,
+    ) -> jax.Array:
         batch_size, height, width, channels = h.shape
-        m_features = magnitude_input_features(
-            m_source,
-            abs_center=self.mag_abs_center,
-            abs_scale=self.mag_abs_scale,
-        )
-        if self.stop_gradient_input:
-            m_features = jax.lax.stop_gradient(m_features)
-        m_grid = m_features.reshape(batch_size, height, width, 2)
+        if m_features_grid is None:
+            m_features = magnitude_input_features(
+                m_source,
+                abs_center=self.mag_abs_center,
+                abs_scale=self.mag_abs_scale,
+            )
+            if self.stop_gradient_input:
+                m_features = jax.lax.stop_gradient(m_features)
+            m_grid = m_features.reshape(batch_size, height, width, 2)
+        else:
+            m_grid = m_features_grid
         x = jnp.concatenate([h, m_grid], axis=-1)
         mag_channels = channels + 2
 
@@ -426,7 +436,7 @@ class DepthShortcutPredictor(nn.Module):
             mag_abs_scale=self.mag_abs_scale,
             stop_gradient_input=self.norm_input_stop_gradient,
             name="mag_head",
-        )(h_grid, m_source, c)
+        )(h_grid, m_source, c, m_grid)
         return y, delta_m
 
 

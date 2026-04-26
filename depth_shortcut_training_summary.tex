@@ -600,23 +600,23 @@ source--target pairs for each gap $d\in\{1,\ldots,10\}$, e.g.
 \texttt{train/debug\_gap\_3/loss\_dir}.
 
 \section{Skip-FID Evaluation}
-In addition to full-backbone FID, evaluate a skip sampler that repeatedly
-jumps by two state indices:
+In addition to full-backbone FID, evaluate a simpler skip sampler that makes
+one shortcut jump only:
 \[
-    1\rightarrow3,\quad 3\rightarrow5,\quad 5\rightarrow7,\quad \ldots
+    3\rightarrow7.
 \]
-At each source layer $a$, the predictor estimates only direction:
+At source layer $3$, the predictor estimates the target direction:
 \[
-    \hat U_{a\rightarrow a+2}
+    \hat U_{3\rightarrow7}
     =
-    \operatorname{dir}(P_{\bar\theta}(\operatorname{dir}(Z_a),a,a+2,t_q)).
+    \operatorname{dir}(P_{\bar\theta}(\operatorname{dir}(Z_3),3,7,t_q)).
 \]
 In the default direction-only mode, restore the target-layer magnitude with
 the L2 EMA:
 \[
-    \tilde Z_{a+2}(i)=
-    R_{\mathrm{EMA}}[a+2,\tau(q),i]\,
-    \hat U_{a\rightarrow a+2}(i).
+    \tilde Z_7(i)=
+    R_{\mathrm{EMA}}[7,\tau(q),i]\,
+    \hat U_{3\rightarrow7}(i).
 \]
 This is exactly the magnitude calibration above: the raw predictor output
 $Y$ is not used as a full hidden state; only its direction is used, and the
@@ -624,15 +624,14 @@ target magnitude comes from $R_{\mathrm{EMA}}$.
 In \texttt{direction-magnitude} mode, skip-FID instead uses predicted log
 magnitude and no EMA calibration:
 \[
-    \tilde Z_{a+2}(i)=
+    \tilde Z_7(i)=
     \exp\!\left(\operatorname{clip}\left(
-    m_a(i)+\hat{\delta m}_{a\rightarrow a+2}(i),3,8
-    \right)\right)\hat U_{a\rightarrow a+2}(i).
+    m_3(i)+\hat{\delta m}_{3\rightarrow7}(i),3,8
+    \right)\right)\hat U_{3\rightarrow7}(i).
 \]
 The sampler then skips the true intervening blocks and resumes from the block
-after the restored target state. Report these metrics separately, e.g.
-$\mathrm{FID}_{\mathrm{skip}}$ and $\mathrm{sFID}_{\mathrm{skip}}$, so the
-quality--speed tradeoff is visible next to full-backbone FID.
+after the restored target state. The validation metrics are logged as
+\texttt{val/FID\_skip\_3to7} and \texttt{val/sFID\_skip\_3to7}.
 
 \section{Experimental Plan}
 Run the method in four stages so implementation bugs, capacity limits, and

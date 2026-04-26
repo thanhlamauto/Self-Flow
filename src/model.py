@@ -319,6 +319,8 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_l2_ema: Optional[jax.Array] = None,
         depth_shortcut_variant: str = "tiny",
         depth_shortcut_skip_every_other: bool = False,
+        depth_shortcut_skip_source_layer: int = -1,
+        depth_shortcut_skip_target_layer: int = -1,
         depth_shortcut_predict_magnitude: bool = False,
         depth_shortcut_mag_scale: float = 3.0,
         depth_shortcut_mag_abs_center: float = 5.5,
@@ -398,12 +400,20 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
+        shortcut_single_jump = (
+            int(depth_shortcut_skip_source_layer) > 0
+            and int(depth_shortcut_skip_target_layer) > int(depth_shortcut_skip_source_layer)
+        )
         shortcut_enabled = (
             depth_shortcut_skip_every_other
             and depth_shortcut_predictor_params is not None
             and (depth_shortcut_predict_magnitude or depth_shortcut_l2_ema is not None)
         )
-        shortcut_sources = tuple(range(1, self.depth, 2))
+        shortcut_sources = (
+            (int(depth_shortcut_skip_source_layer),)
+            if shortcut_single_jump
+            else tuple(range(1, self.depth, 2))
+        )
         shortcut_skip_until = 0
         shortcut_q = None
         shortcut_predictor = None
@@ -445,8 +455,12 @@ class SelfFlowDiT(nn.Module):
                 should_apply_block = jnp.asarray(i, dtype=jnp.int32) >= resume_start_block
                 x = jnp.where(should_apply_block, block_out, x)
 
-            if shortcut_enabled and layer_idx in shortcut_sources and (layer_idx + 2) <= self.depth:
-                target_layer = layer_idx + 2
+            target_layer = (
+                int(depth_shortcut_skip_target_layer)
+                if shortcut_single_jump
+                else layer_idx + 2
+            )
+            if shortcut_enabled and layer_idx in shortcut_sources and target_layer <= self.depth:
                 u_source_short = l2_normalize_tokens(x)
                 m_source_short = log_token_magnitudes(x)
                 pred_short = shortcut_predictor.apply(

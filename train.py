@@ -417,7 +417,6 @@ except ImportError:
 from src.model import SelfFlowDiT
 from src.depth_shortcut import (
     DepthShortcutPredictor,
-    log_token_magnitudes,
     l2_normalize_tokens,
     predictor_config_from_name,
     predictor_size_bucket,
@@ -481,6 +480,7 @@ def create_train_state(
     config,
     learning_rate,
     grad_clip=1.0,
+    weight_decay=0.01,
     predictor_variant="tiny",
     predictor_lr=1e-4,
     predictor_weight_decay=0.1,
@@ -557,7 +557,7 @@ def create_train_state(
                 optax.clip_by_global_norm(grad_clip),
                 optax.adamw(
                     learning_rate,
-                    weight_decay=0.01,
+                    weight_decay=weight_decay,
                     mask=make_adamw_decay_mask(params),
                 ),
             ),
@@ -728,8 +728,10 @@ def train_step(
         pred, hidden_tuple, dit_time_emb = pred
         loss_gen = jnp.mean((pred - target) ** 2)
         hidden_stack = jnp.stack(hidden_tuple, axis=0)
-        directions = l2_normalize_tokens(hidden_stack)
-        log_magnitudes = log_token_magnitudes(hidden_stack)
+        hidden_stack_f32 = hidden_stack.astype(jnp.float32)
+        hidden_norms = jnp.linalg.norm(hidden_stack_f32, axis=-1, keepdims=True)
+        directions = hidden_stack_f32 / (hidden_norms + 1e-6)
+        log_magnitudes = jnp.log(hidden_norms + 1e-6)
 
         direct_a, direct_b = sample_pair_uniform_gap(pair_rng, directions.shape[0] - 1)
         y_ab, delta_m_ab = state.predictor_apply_fn(
@@ -1370,6 +1372,8 @@ def make_sample_latents_pmap_fn(
     num_steps=50,
     cfg_scale=1.0,
     depth_shortcut_skip=False,
+    depth_shortcut_skip_source_layer=-1,
+    depth_shortcut_skip_target_layer=-1,
     depth_shortcut_predict_magnitude=False,
     depth_shortcut_mag_scale=3.0,
     depth_shortcut_mag_abs_center=5.5,
@@ -1518,6 +1522,8 @@ def make_sample_latents_pmap_fn(
                 depth_shortcut_l2_ema=l2_ema_local,
                 depth_shortcut_variant=shortcut_predictor_variant,
                 depth_shortcut_skip_every_other=True,
+                depth_shortcut_skip_source_layer=int(depth_shortcut_skip_source_layer),
+                depth_shortcut_skip_target_layer=int(depth_shortcut_skip_target_layer),
                 depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
                 depth_shortcut_mag_scale=float(depth_shortcut_mag_scale),
                 depth_shortcut_mag_abs_center=float(depth_shortcut_mag_abs_center),
@@ -1708,6 +1714,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="Backbone AdamW weight decay. Bias, norm, and embedding params are excluded.")
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
@@ -1897,7 +1905,7 @@ def main():
         dest="fid_skip_eval",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Also compute FID/sFID with depth shortcuts 1->3, 3->5, ... using predictor EMA. Direction mode uses L2 EMA magnitudes; direction-magnitude mode uses the magnitude head.",
+        help="Also compute FID/sFID with a single depth shortcut 3->7 using predictor EMA. Direction mode uses L2 EMA magnitudes; direction-magnitude mode uses the magnitude head.",
     )
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
@@ -2007,7 +2015,7 @@ def main():
     )
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
-        f"cfg_dropout_rate={args.cfg_dropout_rate}"
+        f"weight_decay={args.weight_decay} cfg_dropout_rate={args.cfg_dropout_rate}"
     )
     log_stage(
         f"DepthShortcut: predictor={args.shortcut_predictor} "
@@ -2044,6 +2052,7 @@ def main():
         config,
         args.learning_rate,
         args.grad_clip,
+        weight_decay=args.weight_decay,
         predictor_variant=args.shortcut_predictor,
         predictor_lr=args.shortcut_predictor_lr,
         predictor_weight_decay=args.shortcut_predictor_weight_decay,
@@ -2151,6 +2160,8 @@ def main():
             num_steps=args.fid_num_steps,
             cfg_scale=args.fid_cfg_scale,
             depth_shortcut_skip=True,
+            depth_shortcut_skip_source_layer=3,
+            depth_shortcut_skip_target_layer=7,
             depth_shortcut_predict_magnitude=uses_magnitude_losses,
             depth_shortcut_mag_scale=args.shortcut_mag_scale,
             depth_shortcut_mag_abs_center=args.shortcut_mag_abs_center,
@@ -2644,7 +2655,7 @@ def main():
         if args.fid_skip_eval and fid_sample_latents_skip_pmapped is not None:
             log_stage(
                 f"[EVAL] generating skip fake pool: {need} samples @ step {step} "
-                f"(1->3, 3->5, ...; L2 EMA magnitude restore)…"
+                f"(3->7 only; L2 EMA magnitude restore)…"
             )
             acc_skip_pooled = init_gaussian_sums(2048)
             acc_skip_spatial = init_gaussian_sums(2048)
@@ -2682,8 +2693,8 @@ def main():
 
             mu_skip, cov_skip, _ = finalize_gaussian_sums(acc_skip_pooled)
             mu_skip_s, cov_skip_s, _ = finalize_gaussian_sums(acc_skip_spatial)
-            metrics["val/FID_skip_1to3_3to5"] = fid_from_stats(mu_real, cov_real, mu_skip, cov_skip)
-            metrics["val/sFID_skip_1to3_3to5"] = fid_from_stats(mu_real_s, cov_real_s, mu_skip_s, cov_skip_s)
+            metrics["val/FID_skip_3to7"] = fid_from_stats(mu_real, cov_real, mu_skip, cov_skip)
+            metrics["val/sFID_skip_3to7"] = fid_from_stats(mu_real_s, cov_real_s, mu_skip_s, cov_skip_s)
 
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)
@@ -2733,9 +2744,9 @@ def main():
             current_val_iter = probe_iter
 
         summary_parts = [f"[EVAL] step {step}:", f"FID={fid_val:.2f}", f"sFID={sfid_val:.2f}"]
-        if "val/FID_skip_1to3_3to5" in metrics:
-            summary_parts.append(f"FIDskip={metrics['val/FID_skip_1to3_3to5']:.2f}")
-            summary_parts.append(f"sFIDskip={metrics['val/sFID_skip_1to3_3to5']:.2f}")
+        if "val/FID_skip_3to7" in metrics:
+            summary_parts.append(f"FIDskip3to7={metrics['val/FID_skip_3to7']:.2f}")
+            summary_parts.append(f"sFIDskip3to7={metrics['val/sFID_skip_3to7']:.2f}")
         if is_enabled and "val/InceptionScore" in metrics:
             summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
         if "val/Precision" in metrics and "val/Recall" in metrics:
