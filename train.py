@@ -420,6 +420,8 @@ from src.depth_shortcut import (
     log_token_magnitudes,
     l2_normalize_tokens,
     predictor_config_from_name,
+    predictor_size_bucket,
+    predictor_variant_names,
 )
 from src.sampling import denoise_loop
 from src.metrics import (
@@ -442,6 +444,19 @@ from src.inception_is_subprocess import InceptionISSubprocess
 
 class ShortcutTrainState(train_state.TrainState):
     predictor_apply_fn: Callable = struct.field(pytree_node=False)
+
+
+PREDICTOR_PARAM_TARGET_RANGES = {
+    # Broad implementation checks; counts include condition MLP and magnitude head.
+    "tiny": (1_000_000, 2_500_000),
+    "small": (3_000_000, 6_000_000),
+    "base": (9_000_000, 19_000_000),
+    "large": (14_000_000, 27_000_000),
+}
+
+
+def count_tree_params(tree) -> int:
+    return int(sum(np.size(x) for x in jax.tree_util.tree_leaves(tree)))
 
 
 def make_adamw_decay_mask(params):
@@ -1709,10 +1724,15 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
     # ── Depth Shortcut Predictor args ────────────────────────────────────────
-    parser.add_argument("--shortcut-predictor", type=str, default="tiny",
-                        choices=["tiny", "small", "base", "large",
-                                 "p-tiny", "p-small", "p-base", "p-large"],
-                        help="Depth shortcut predictor size.")
+    parser.add_argument(
+        "--shortcut-predictor",
+        "--predictor-variant",
+        dest="shortcut_predictor",
+        type=str,
+        default="tiny",
+        choices=predictor_variant_names(),
+        help="Depth shortcut predictor variant. Includes convnext_*, dilated_*, and attn_hybrid_* families.",
+    )
     parser.add_argument(
         "--shortcut-training-mode",
         type=str,
@@ -2032,6 +2052,22 @@ def main():
         shortcut_mag_abs_center=args.shortcut_mag_abs_center,
         shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
     )
+    predictor_param_count = count_tree_params(state.params["predictor"])
+    backbone_param_count = count_tree_params(state.params["backbone"])
+    total_param_count = count_tree_params(state.params)
+    predictor_bucket = predictor_size_bucket(args.shortcut_predictor)
+    predictor_range = PREDICTOR_PARAM_TARGET_RANGES[predictor_bucket]
+    predictor_cfg = predictor_config_from_name(args.shortcut_predictor, config["hidden_size"])
+    log_stage(
+        f"DepthShortcut params: predictor={predictor_param_count:,} "
+        f"backbone={backbone_param_count:,} total={total_param_count:,} "
+        f"cfg={predictor_cfg}"
+    )
+    if not (predictor_range[0] <= predictor_param_count <= predictor_range[1]):
+        log_stage(
+            f"WARNING: predictor params {predictor_param_count:,} are outside "
+            f"{predictor_bucket} target range [{predictor_range[0]:,}, {predictor_range[1]:,}]"
+        )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     predictor_ema_params = jax_utils.replicate(predictor_ema_params)
