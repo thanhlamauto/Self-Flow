@@ -222,6 +222,26 @@ The loss compares the composed student residual to the EMA teacher residual:
     \right)^2.
 \]
 
+\paragraph{SiT-B/2 magnitude config.}
+Use the following explicit config for the current SiT-B/2 experiments:
+\[
+\begin{array}{ll}
+\text{log base} & \ln \\
+\epsilon & 10^{-6} \\
+s_m & 3.0 \\
+m_a^{\mathrm{abs}} & (m_a-5.5)/1.5 \\
+m_a^{\mathrm{sp}} & (m_a-\operatorname{mean}_j m_a(j))/(\operatorname{std}_j m_a(j)+10^{-6}) \\
+\text{normalized target} & \operatorname{clip}((m_b-m_a)/3,-1,1) \\
+\text{output bound} & \tanh(o_m) \\
+\text{restore delta} & \hat{\delta m}=3\tanh(o_m) \\
+\text{inference clamp} & \hat m_b\in[3,8] \\
+\lambda_{\mathrm{mag}} & 0.375 \\
+\lambda_{\mathrm{boot-mag}} & 0.1875
+\end{array}
+\]
+Monitor $\operatorname{ClipRate}_{\delta m}=\mathbb{P}(|m_b-m_a|>3)$; if it
+exceeds roughly $1\%$, rerun with $s_m=3.5$.
+
 \section{Total Objective}
 The backbone is still trained by the original flow matching loss:
 \[
