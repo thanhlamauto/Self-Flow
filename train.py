@@ -734,7 +734,6 @@ def train_step(
     bootstrap_detach_source,
     lambda_mag,
     lambda_boot_mag,
-    lambda_skip_fm,
     skip_in_loop_prob,
     skip_in_loop_gap_mode,
     skip_in_loop_gap,
@@ -1034,15 +1033,15 @@ def train_step(
             ),
             operand=None,
         )
-        loss_total = (
-            loss_gen
-            + lambda_dir * loss_dir
+        loss_fm = jnp.where(skip_do, loss_skip_fm, loss_gen)
+        loss_repr = (
+            lambda_dir * loss_dir
             + lambda_boot * loss_boot
             + lambda_mag * loss_mag
             + lambda_boot_mag * loss_boot_mag
-            + lambda_skip_fm * loss_skip_fm
             + lambda_private_eff * loss_private
         )
+        loss_total = loss_fm + loss_repr
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         aux = (
@@ -1894,7 +1893,12 @@ def main():
         default=False,
         help="Log fixed-pair predictor debug losses for representative layer gaps.",
     )
-    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.1)
+    parser.add_argument(
+        "--shortcut-lambda-skip-fm",
+        type=float,
+        default=0.1,
+        help="Deprecated compatibility flag; skip FM is now selected by --shortcut-skip-in-loop-prob and is not separately weighted.",
+    )
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
     parser.add_argument(
         "--shortcut-skip-in-loop-gap-mode",
@@ -2200,7 +2204,7 @@ def main():
         f"bootstrap_detach_source={args.shortcut_bootstrap_detach_source} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
-        f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
+        f"lambda_skip_fm_compat={args.shortcut_lambda_skip_fm} "
         f"skip_p={args.shortcut_skip_in_loop_prob} "
         f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
         f"skip_gap={args.shortcut_skip_in_loop_gap} "
@@ -2274,11 +2278,9 @@ def main():
     uses_skip_in_loop = args.shortcut_training_mode == "direction-magnitude-skip"
     effective_lambda_mag = args.shortcut_lambda_mag if uses_magnitude_losses else 0.0
     effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if uses_magnitude_losses else 0.0
-    effective_lambda_skip_fm = args.shortcut_lambda_skip_fm if uses_skip_in_loop else 0.0
     effective_skip_prob = args.shortcut_skip_in_loop_prob if uses_skip_in_loop else 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
-    shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
     shortcut_skip_in_loop_prob_rep = jax_utils.replicate(jnp.float32(effective_skip_prob))
     shortcut_skip_in_loop_gap_mode_rep = jax_utils.replicate(
         jnp.int32(0 if args.shortcut_skip_in_loop_gap_mode == "fixed" else 1)
@@ -2627,7 +2629,6 @@ def main():
             shortcut_bootstrap_detach_source_rep,
             shortcut_lambda_mag_rep,
             shortcut_lambda_boot_mag_rep,
-            shortcut_lambda_skip_fm_rep,
             shortcut_skip_in_loop_prob_rep,
             shortcut_skip_in_loop_gap_mode_rep,
             shortcut_skip_in_loop_gap_rep,
@@ -3069,7 +3070,6 @@ def main():
                 shortcut_bootstrap_detach_source_rep,
                 shortcut_lambda_mag_rep,
                 shortcut_lambda_boot_mag_rep,
-                shortcut_lambda_skip_fm_rep,
                 shortcut_skip_in_loop_prob_rep,
                 shortcut_skip_in_loop_gap_mode_rep,
                 shortcut_skip_in_loop_gap_rep,
