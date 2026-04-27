@@ -937,6 +937,12 @@ def train_step(
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
     if output_distill_pair_mode not in {"trunc_normal", "gap2_biased"}:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
+    if output_distill_update_mode not in {
+        "predictor_only",
+        "predictor_plus_downstream",
+        "predictor_plus_all",
+    }:
+        raise ValueError(f"Unknown output distill update mode: {output_distill_update_mode!r}")
     if private_cosine_mode not in {"bnd", "nd", "token"}:
         raise ValueError(f"Unknown private cosine mode: {private_cosine_mode!r}")
     if private_pair_mode not in {"first", "random"}:
@@ -1280,7 +1286,9 @@ def train_step(
                     skip_in_loop_gap_sigma,
                     output_pair_rng,
                 )
-            z_source = jax.lax.stop_gradient(hidden_stack_f32[output_a, subset_idx])
+            z_source = hidden_stack_f32[output_a, subset_idx]
+            if output_distill_update_mode != "predictor_plus_all":
+                z_source = jax.lax.stop_gradient(z_source)
             predictor_source, m_source = build_predictor_source(
                 z_source,
                 normalize_input=predictor_normalize_input,
@@ -1310,6 +1318,8 @@ def train_step(
                     resume_backbone_params,
                     output_b,
                 )
+            elif output_distill_update_mode == "predictor_plus_all":
+                pass
             else:
                 raise ValueError(f"Unknown output distill update mode: {output_distill_update_mode!r}")
             v_skip = state.apply_fn(
@@ -1627,7 +1637,11 @@ def train_step(
         "train/output_distill_gap": output_distill_gap,
         "train/output_distill_batch_size": output_distill_batch_size_metric,
         "train/output_distill_update_mode": jnp.asarray(
-            0.0 if output_distill_update_mode == "predictor_only" else 1.0,
+            {
+                "predictor_only": 0.0,
+                "predictor_plus_downstream": 1.0,
+                "predictor_plus_all": 2.0,
+            }[output_distill_update_mode],
             dtype=jnp.float32,
         ),
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
@@ -2390,7 +2404,12 @@ def main():
         "--output-distill-update-mode",
         type=str,
         default="predictor_plus_downstream",
-        choices=["predictor_only", "predictor_plus_downstream"],
+        choices=["predictor_only", "predictor_plus_downstream", "predictor_plus_all"],
+        help=(
+            "Gradient routing for output distillation: predictor_only freezes DiT for this branch; "
+            "predictor_plus_downstream updates predictor plus blocks after b; "
+            "predictor_plus_all also lets gradients flow through source hidden to blocks before a."
+        ),
     )
     parser.add_argument(
         "--output-distill-pair-mode",
