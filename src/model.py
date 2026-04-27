@@ -328,6 +328,7 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_mag_clip_min: float = 3.0,
         depth_shortcut_mag_clip_max: float = 8.0,
         depth_shortcut_timesteps: int = 50,
+        depth_shortcut_normalize_input: bool = True,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -461,7 +462,7 @@ class SelfFlowDiT(nn.Module):
                 else layer_idx + 2
             )
             if shortcut_enabled and layer_idx in shortcut_sources and target_layer <= self.depth:
-                u_source_short = l2_normalize_tokens(x)
+                u_source_short = l2_normalize_tokens(x) if depth_shortcut_normalize_input else x.astype(jnp.float32)
                 m_source_short = log_token_magnitudes(x) if depth_shortcut_predict_magnitude else None
                 pred_short = shortcut_predictor.apply(
                     {"params": depth_shortcut_predictor_params},

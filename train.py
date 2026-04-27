@@ -1968,6 +1968,7 @@ def make_sample_latents_pmap_fn(
     depth_shortcut_mag_clip_max=8.0,
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
+    depth_shortcut_normalize_input=True,
 ):
     """Build a sharded (pmap) sampling function for eval.
 
@@ -2117,6 +2118,7 @@ def make_sample_latents_pmap_fn(
                 depth_shortcut_mag_clip_min=float(depth_shortcut_mag_clip_min),
                 depth_shortcut_mag_clip_max=float(depth_shortcut_mag_clip_max),
                 depth_shortcut_timesteps=int(shortcut_timesteps),
+                depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
             )
 
         rng_local, denoise_rng = jax.random.split(rng_local)
@@ -2955,6 +2957,7 @@ def main():
             depth_shortcut_mag_clip_max=args.shortcut_mag_clip_max,
             shortcut_predictor_variant=args.shortcut_predictor,
             shortcut_timesteps=args.shortcut_timesteps,
+            depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
         )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
