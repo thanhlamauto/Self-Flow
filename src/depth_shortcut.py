@@ -181,6 +181,56 @@ class AttentionHybridShortcutBlock(nn.Module):
         return h + x
 
 
+class AdaLNDiTShortcutBlock(nn.Module):
+    """Small DiT block for tokenwise shortcut prediction."""
+
+    width: int
+    cond_dim: int
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+
+    @nn.compact
+    def __call__(self, h: jax.Array, c: jax.Array) -> jax.Array:
+        gamma_beta = nn.Dense(
+            6 * self.width,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            name="adaln_mod",
+        )(nn.gelu(c, approximate=True))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(gamma_beta, 6, axis=-1)
+
+        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln_attn")(h)
+        x = x * (1.0 + scale_msa[:, None, :]) + shift_msa[:, None, :]
+        x = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.width,
+            out_features=self.width,
+            kernel_init=XAVIER_UNIFORM,
+            out_kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            out_bias_init=ZERO_INIT,
+            name="attn",
+        )(x, x)
+        h = h + gate_msa[:, None, :] * x
+
+        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln_mlp")(h)
+        x = x * (1.0 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
+        x = nn.Dense(
+            int(self.width * self.mlp_ratio),
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="mlp_0",
+        )(x)
+        x = nn.gelu(x, approximate=True)
+        x = nn.Dense(
+            self.width,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            name="mlp_1",
+        )(x)
+        return h + gate_mlp[:, None, :] * x
+
+
 class MagnitudeHead(nn.Module):
     """Predicts log-magnitude residuals conditioned like the shared backbone."""
 
@@ -250,6 +300,7 @@ class DepthShortcutPredictor(nn.Module):
     attn_dim: int | None = None
     num_heads: int | None = None
     attn_gamma_init: float = 0.05
+    mlp_ratio: float = 4.0
     layer_cond_dim: int = 16
     cond_hidden_dim: int = 512
     cond_dim: int | None = None
@@ -317,7 +368,15 @@ class DepthShortcutPredictor(nn.Module):
             bias_init=ZERO_INIT,
             name="in_proj",
         )(u_source)
-        h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+        if self.arch == "dit":
+            pos_embed = self.param(
+                "pos_embed",
+                NORMAL_002,
+                (1, self.num_tokens, self.width),
+            )
+            h = h + pos_embed
+        else:
+            h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
         dilation_schedule = self.dilation_schedule or tuple([1] * self.num_blocks)
         if len(dilation_schedule) != self.num_blocks:
             raise ValueError("dilation_schedule length must match num_blocks")
@@ -344,10 +403,23 @@ class DepthShortcutPredictor(nn.Module):
                     attn_gamma_init=self.attn_gamma_init,
                     name=f"blocks_{idx}",
                 )(h, c)
+            elif self.arch == "dit":
+                if self.num_heads is None:
+                    raise ValueError("dit requires num_heads")
+                h = AdaLNDiTShortcutBlock(
+                    width=self.width,
+                    cond_dim=cond_dim,
+                    num_heads=int(self.num_heads),
+                    mlp_ratio=self.mlp_ratio,
+                    name=f"blocks_{idx}",
+                )(h, c)
             else:
                 raise ValueError(f"Unknown shortcut predictor arch: {self.arch!r}")
-        h_grid = h
-        h = h_grid.reshape(batch_size, self.num_tokens, self.width)
+        if self.arch == "dit":
+            h_grid = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+        else:
+            h_grid = h
+            h = h_grid.reshape(batch_size, self.num_tokens, self.width)
         delta_y = nn.Dense(
             self.hidden_size,
             kernel_init=ZERO_INIT,
@@ -481,6 +553,36 @@ PREDICTOR_VARIANTS = {
         "attn_dim": None,
         "num_heads": 8,
     },
+    "dit_tiny": {
+        "arch": "dit",
+        "width": 256,
+        "num_blocks": 2,
+        "expansion": 1,
+        "dilation_schedule": (1, 1),
+        "attn_dim": None,
+        "num_heads": 4,
+        "mlp_ratio": 4.0,
+    },
+    "dit_small": {
+        "arch": "dit",
+        "width": 384,
+        "num_blocks": 2,
+        "expansion": 1,
+        "dilation_schedule": (1, 1),
+        "attn_dim": None,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+    },
+    "dit_base": {
+        "arch": "dit",
+        "width": None,
+        "num_blocks": 2,
+        "expansion": 1,
+        "dilation_schedule": (1, 1),
+        "attn_dim": None,
+        "num_heads": 8,
+        "mlp_ratio": 4.0,
+    },
 }
 
 
@@ -497,6 +599,9 @@ PREDICTOR_VARIANT_ALIASES = {
     "large": "convnext_large",
     "p_large": "convnext_large",
     "plarge": "convnext_large",
+    "dit": "dit_tiny",
+    "dit_2layer": "dit_tiny",
+    "dit_2_layer": "dit_tiny",
 }
 
 

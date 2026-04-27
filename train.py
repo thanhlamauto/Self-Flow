@@ -683,6 +683,21 @@ def _scheduled_lambda(lambda_value, global_step, start_step, warmup_iters):
     return lambda_value * warmup_scale, warmup_scale
 
 
+def _cosine_ramp_value(global_step, start_step, end_step, value_min, value_max, zero_before_start=False):
+    """Cosine ramp from value_min to value_max, clamped outside the interval."""
+    step = global_step.astype(jnp.float32)
+    start = start_step.astype(jnp.float32)
+    end = end_step.astype(jnp.float32)
+    r = (step - start) / jnp.maximum(end - start, 1.0)
+    r = jnp.clip(r, 0.0, 1.0)
+    ramp = 0.5 * (1.0 - jnp.cos(jnp.pi * r))
+    value = value_min + (value_max - value_min) * ramp
+    before_start = jnp.where(zero_before_start, jnp.float32(0.0), value_min)
+    value = jnp.where(step < start, before_start, value)
+    value = jnp.where(step >= end, value_max, value)
+    return value
+
+
 def private_activation_loss(activations, max_pairs=0, eps=1e-8):
     """Common/private activation loss from feat/common-private-activations.
 
@@ -734,11 +749,23 @@ def train_step(
     bootstrap_detach_source,
     lambda_mag,
     lambda_boot_mag,
+    mixture_training,
+    lambda_skip_fm,
     skip_in_loop_prob,
+    skip_prob_schedule,
+    skip_prob_start_step,
+    skip_prob_end_step,
+    skip_prob_min,
+    skip_prob_max,
     skip_in_loop_gap_mode,
     skip_in_loop_gap,
     skip_in_loop_max_gap,
     skip_in_loop_gap_loc,
+    skip_gap_schedule,
+    skip_gap_loc_start,
+    skip_gap_loc_end,
+    skip_gap_schedule_start_step,
+    skip_gap_schedule_end_step,
     skip_in_loop_gap_sigma,
     skip_in_loop_warmup_steps,
     skip_in_loop_detach_source,
@@ -945,13 +972,45 @@ def train_step(
             lambda _: tuple(jnp.float32(0.0) for _ in range(debug_metric_count)),
             operand=None,
         )
+        fixed_skip_prob = jnp.where(
+            global_step >= skip_in_loop_warmup_steps,
+            skip_in_loop_prob,
+            jnp.float32(0.0),
+        )
+        scheduled_skip_prob = _cosine_ramp_value(
+            global_step,
+            skip_prob_start_step,
+            skip_prob_end_step,
+            skip_prob_min,
+            skip_prob_max,
+            zero_before_start=True,
+        )
+        skip_prob_eff = jax.lax.cond(
+            skip_prob_schedule == 0,
+            lambda _: fixed_skip_prob,
+            lambda _: scheduled_skip_prob,
+            operand=None,
+        )
+        scheduled_gap_loc = _cosine_ramp_value(
+            global_step,
+            skip_gap_schedule_start_step,
+            skip_gap_schedule_end_step,
+            skip_gap_loc_start,
+            skip_gap_loc_end,
+        )
+        gap_loc_eff = jax.lax.cond(
+            skip_gap_schedule == 0,
+            lambda _: skip_in_loop_gap_loc,
+            lambda _: scheduled_gap_loc,
+            operand=None,
+        )
 
         def compute_skip_fm_loss(_):
             gap_rng, source_rng = jax.random.split(skip_pair_rng)
             max_gap = jnp.minimum(skip_in_loop_max_gap, directions.shape[0] - 1)
             fixed_gap = jnp.clip(skip_in_loop_gap, 1, max_gap)
             gap_candidates = jnp.arange(1, directions.shape[0], dtype=jnp.int32)
-            gap_offsets = (gap_candidates.astype(jnp.float32) - skip_in_loop_gap_loc) / skip_in_loop_gap_sigma
+            gap_offsets = (gap_candidates.astype(jnp.float32) - gap_loc_eff) / skip_in_loop_gap_sigma
             gap_logits = -0.5 * jnp.square(gap_offsets)
             gap_logits = jnp.where(gap_candidates <= max_gap, gap_logits, -jnp.inf)
             sampled_gap = jax.random.categorical(gap_rng, gap_logits).astype(jnp.int32) + 1
@@ -1006,11 +1065,6 @@ def train_step(
                 skip_gap.astype(jnp.float32),
             )
 
-        skip_prob_eff = jnp.where(
-            global_step >= skip_in_loop_warmup_steps,
-            skip_in_loop_prob,
-            jnp.float32(0.0),
-        )
         skip_do = jax.random.uniform(skip_rng, ()) < skip_prob_eff
         loss_skip_fm, skip_a_metric, skip_b_metric, skip_gap_metric = jax.lax.cond(
             skip_do,
@@ -1041,7 +1095,14 @@ def train_step(
             + lambda_boot_mag * loss_boot_mag
             + lambda_private_eff * loss_private
         )
-        loss_total = loss_fm + loss_repr
+        mixture_loss_total = loss_fm + loss_repr
+        auxiliary_loss_total = loss_gen + loss_repr + lambda_skip_fm * loss_skip_fm
+        loss_total = jax.lax.cond(
+            mixture_training,
+            lambda _: mixture_loss_total,
+            lambda _: auxiliary_loss_total,
+            operand=None,
+        )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
         aux = (
@@ -1053,6 +1114,7 @@ def train_step(
             loss_mag,
             loss_boot_mag,
             loss_skip_fm,
+            loss_repr,
             loss_private,
             cos_dir,
             cos_boot,
@@ -1074,6 +1136,7 @@ def train_step(
             skip_a_metric,
             skip_b_metric,
             skip_gap_metric,
+            gap_loc_eff,
             debug_pair_metrics,
             hidden_stack,
         )
@@ -1090,6 +1153,7 @@ def train_step(
         loss_mag,
         loss_boot_mag,
         loss_skip_fm,
+        loss_repr,
         loss_private,
         cos_dir,
         cos_boot,
@@ -1111,6 +1175,7 @@ def train_step(
         skip_a_metric,
         skip_b_metric,
         skip_gap_metric,
+        gap_loc_eff,
         debug_pair_metrics,
         hidden_stack,
     ) = aux
@@ -1124,6 +1189,7 @@ def train_step(
     loss_mag = jax.lax.pmean(loss_mag, axis_name="batch")
     loss_boot_mag = jax.lax.pmean(loss_boot_mag, axis_name="batch")
     loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
+    loss_repr = jax.lax.pmean(loss_repr, axis_name="batch")
     loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
     cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
@@ -1145,6 +1211,7 @@ def train_step(
     skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
     skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
     skip_gap_metric = jax.lax.pmean(skip_gap_metric, axis_name="batch")
+    gap_loc_eff = jax.lax.pmean(gap_loc_eff, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
@@ -1164,11 +1231,15 @@ def train_step(
         "train/loss": loss,
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
+        "train/loss_fm_full": loss_gen,
         "train/loss_dir": loss_dir,
         "train/loss_boot": loss_boot,
         "train/loss_mag": loss_mag,
         "train/loss_boot_mag": loss_boot_mag,
         "train/loss_skip_fm": loss_skip_fm,
+        "train/loss_repr": loss_repr,
+        "train/path_is_skip": skip_do_metric,
+        "train/p_skip": skip_prob_eff,
         "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
         "train/cos_boot": cos_boot,
@@ -1190,6 +1261,7 @@ def train_step(
         "train/skip_in_loop_source": skip_a_metric,
         "train/skip_in_loop_target": skip_b_metric,
         "train/skip_in_loop_gap": skip_gap_metric,
+        "train/skip_in_loop_gap_loc_effective": gap_loc_eff,
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -1868,7 +1940,7 @@ def main():
         type=str,
         default="tiny",
         choices=predictor_variant_names(),
-        help="Depth shortcut predictor variant. Includes convnext_*, dilated_*, and attn_hybrid_* families.",
+        help="Depth shortcut predictor variant. Includes convnext_*, dilated_*, attn_hybrid_*, and dit_* families.",
     )
     parser.add_argument(
         "--shortcut-training-mode",
@@ -1897,9 +1969,26 @@ def main():
         "--shortcut-lambda-skip-fm",
         type=float,
         default=0.1,
-        help="Deprecated compatibility flag; skip FM is now selected by --shortcut-skip-in-loop-prob and is not separately weighted.",
+        help="Compatibility flag used only with --no-shortcut-mixture-training.",
+    )
+    parser.add_argument(
+        "--shortcut-mixture-training",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use mixture skip-FM objective: each step optimizes full FM or skip FM, plus representation losses.",
     )
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
+    parser.add_argument(
+        "--shortcut-skip-prob-schedule",
+        type=str,
+        default="fixed",
+        choices=["fixed", "cosine"],
+        help="Schedule for mixture skip probability. fixed uses --shortcut-skip-in-loop-prob after warmup; cosine uses min/max ramp.",
+    )
+    parser.add_argument("--shortcut-skip-prob-start-step", type=int, default=10000)
+    parser.add_argument("--shortcut-skip-prob-end-step", type=int, default=150000)
+    parser.add_argument("--shortcut-skip-prob-min", type=float, default=0.02)
+    parser.add_argument("--shortcut-skip-prob-max", type=float, default=0.15)
     parser.add_argument(
         "--shortcut-skip-in-loop-gap-mode",
         type=str,
@@ -1910,6 +1999,17 @@ def main():
     parser.add_argument("--shortcut-skip-in-loop-gap", type=int, default=2)
     parser.add_argument("--shortcut-skip-in-loop-max-gap", type=int, default=10)
     parser.add_argument("--shortcut-skip-in-loop-gap-loc", type=float, default=3.0)
+    parser.add_argument(
+        "--shortcut-gap-loc-schedule",
+        type=str,
+        default="none",
+        choices=["none", "cosine"],
+        help="Optional cosine curriculum for truncated-normal skip gap location.",
+    )
+    parser.add_argument("--shortcut-gap-loc-start", type=float, default=2.0)
+    parser.add_argument("--shortcut-gap-loc-end", type=float, default=5.5)
+    parser.add_argument("--shortcut-gap-schedule-start-step", type=int, default=10000)
+    parser.add_argument("--shortcut-gap-schedule-end-step", type=int, default=150000)
     parser.add_argument("--shortcut-skip-in-loop-gap-sigma", type=float, default=2.0)
     parser.add_argument("--shortcut-skip-in-loop-warmup-steps", type=int, default=5000)
     parser.add_argument(
@@ -2139,6 +2239,16 @@ def main():
         raise ValueError("--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max")
     if not 0.0 <= args.shortcut_skip_in_loop_prob <= 1.0:
         raise ValueError("--shortcut-skip-in-loop-prob must be between 0 and 1")
+    if not 0.0 <= args.shortcut_skip_prob_min <= 1.0:
+        raise ValueError("--shortcut-skip-prob-min must be between 0 and 1")
+    if not 0.0 <= args.shortcut_skip_prob_max <= 1.0:
+        raise ValueError("--shortcut-skip-prob-max must be between 0 and 1")
+    if args.shortcut_skip_prob_min > args.shortcut_skip_prob_max:
+        raise ValueError("--shortcut-skip-prob-min must be <= --shortcut-skip-prob-max")
+    if args.shortcut_skip_prob_start_step < 0:
+        raise ValueError("--shortcut-skip-prob-start-step must be >= 0")
+    if args.shortcut_skip_prob_end_step < args.shortcut_skip_prob_start_step:
+        raise ValueError("--shortcut-skip-prob-end-step must be >= --shortcut-skip-prob-start-step")
     if args.shortcut_skip_in_loop_gap <= 0:
         raise ValueError("--shortcut-skip-in-loop-gap must be greater than 0")
     if args.shortcut_skip_in_loop_max_gap <= 0:
@@ -2147,6 +2257,10 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-gap-sigma must be greater than 0")
     if args.shortcut_skip_in_loop_warmup_steps < 0:
         raise ValueError("--shortcut-skip-in-loop-warmup-steps must be >= 0")
+    if args.shortcut_gap_schedule_start_step < 0:
+        raise ValueError("--shortcut-gap-schedule-start-step must be >= 0")
+    if args.shortcut_gap_schedule_end_step < args.shortcut_gap_schedule_start_step:
+        raise ValueError("--shortcut-gap-schedule-end-step must be >= --shortcut-gap-schedule-start-step")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
 
@@ -2205,11 +2319,18 @@ def main():
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"lambda_skip_fm_compat={args.shortcut_lambda_skip_fm} "
+        f"mixture={args.shortcut_mixture_training} "
         f"skip_p={args.shortcut_skip_in_loop_prob} "
+        f"skip_p_schedule={args.shortcut_skip_prob_schedule} "
+        f"skip_p_range=({args.shortcut_skip_prob_min},{args.shortcut_skip_prob_max}) "
+        f"skip_p_steps=({args.shortcut_skip_prob_start_step},{args.shortcut_skip_prob_end_step}) "
         f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
         f"skip_gap={args.shortcut_skip_in_loop_gap} "
         f"skip_max_gap={args.shortcut_skip_in_loop_max_gap} "
         f"skip_gap_loc={args.shortcut_skip_in_loop_gap_loc} "
+        f"skip_gap_loc_schedule={args.shortcut_gap_loc_schedule} "
+        f"skip_gap_loc_range=({args.shortcut_gap_loc_start},{args.shortcut_gap_loc_end}) "
+        f"skip_gap_loc_steps=({args.shortcut_gap_schedule_start_step},{args.shortcut_gap_schedule_end_step}) "
         f"skip_gap_sigma={args.shortcut_skip_in_loop_gap_sigma} "
         f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
         f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
@@ -2279,15 +2400,33 @@ def main():
     effective_lambda_mag = args.shortcut_lambda_mag if uses_magnitude_losses else 0.0
     effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if uses_magnitude_losses else 0.0
     effective_skip_prob = args.shortcut_skip_in_loop_prob if uses_skip_in_loop else 0.0
+    effective_skip_prob_min = args.shortcut_skip_prob_min if uses_skip_in_loop else 0.0
+    effective_skip_prob_max = args.shortcut_skip_prob_max if uses_skip_in_loop else 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
+    shortcut_mixture_training_rep = jax_utils.replicate(jnp.asarray(args.shortcut_mixture_training, dtype=jnp.bool_))
+    shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_skip_fm))
     shortcut_skip_in_loop_prob_rep = jax_utils.replicate(jnp.float32(effective_skip_prob))
+    shortcut_skip_prob_schedule_rep = jax_utils.replicate(
+        jnp.int32(0 if args.shortcut_skip_prob_schedule == "fixed" else 1)
+    )
+    shortcut_skip_prob_start_step_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_prob_start_step))
+    shortcut_skip_prob_end_step_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_prob_end_step))
+    shortcut_skip_prob_min_rep = jax_utils.replicate(jnp.float32(effective_skip_prob_min))
+    shortcut_skip_prob_max_rep = jax_utils.replicate(jnp.float32(effective_skip_prob_max))
     shortcut_skip_in_loop_gap_mode_rep = jax_utils.replicate(
         jnp.int32(0 if args.shortcut_skip_in_loop_gap_mode == "fixed" else 1)
     )
     shortcut_skip_in_loop_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_gap))
     shortcut_skip_in_loop_max_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_max_gap))
     shortcut_skip_in_loop_gap_loc_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_loc))
+    shortcut_gap_loc_schedule_rep = jax_utils.replicate(
+        jnp.int32(0 if args.shortcut_gap_loc_schedule == "none" else 1)
+    )
+    shortcut_gap_loc_start_rep = jax_utils.replicate(jnp.float32(args.shortcut_gap_loc_start))
+    shortcut_gap_loc_end_rep = jax_utils.replicate(jnp.float32(args.shortcut_gap_loc_end))
+    shortcut_gap_schedule_start_step_rep = jax_utils.replicate(jnp.int32(args.shortcut_gap_schedule_start_step))
+    shortcut_gap_schedule_end_step_rep = jax_utils.replicate(jnp.int32(args.shortcut_gap_schedule_end_step))
     shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
     shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
     shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
@@ -2629,11 +2768,23 @@ def main():
             shortcut_bootstrap_detach_source_rep,
             shortcut_lambda_mag_rep,
             shortcut_lambda_boot_mag_rep,
+            shortcut_mixture_training_rep,
+            shortcut_lambda_skip_fm_rep,
             shortcut_skip_in_loop_prob_rep,
+            shortcut_skip_prob_schedule_rep,
+            shortcut_skip_prob_start_step_rep,
+            shortcut_skip_prob_end_step_rep,
+            shortcut_skip_prob_min_rep,
+            shortcut_skip_prob_max_rep,
             shortcut_skip_in_loop_gap_mode_rep,
             shortcut_skip_in_loop_gap_rep,
             shortcut_skip_in_loop_max_gap_rep,
             shortcut_skip_in_loop_gap_loc_rep,
+            shortcut_gap_loc_schedule_rep,
+            shortcut_gap_loc_start_rep,
+            shortcut_gap_loc_end_rep,
+            shortcut_gap_schedule_start_step_rep,
+            shortcut_gap_schedule_end_step_rep,
             shortcut_skip_in_loop_gap_sigma_rep,
             shortcut_skip_in_loop_warmup_steps_rep,
             shortcut_skip_in_loop_detach_source_rep,
@@ -3070,11 +3221,23 @@ def main():
                 shortcut_bootstrap_detach_source_rep,
                 shortcut_lambda_mag_rep,
                 shortcut_lambda_boot_mag_rep,
+                shortcut_mixture_training_rep,
+                shortcut_lambda_skip_fm_rep,
                 shortcut_skip_in_loop_prob_rep,
+                shortcut_skip_prob_schedule_rep,
+                shortcut_skip_prob_start_step_rep,
+                shortcut_skip_prob_end_step_rep,
+                shortcut_skip_prob_min_rep,
+                shortcut_skip_prob_max_rep,
                 shortcut_skip_in_loop_gap_mode_rep,
                 shortcut_skip_in_loop_gap_rep,
                 shortcut_skip_in_loop_max_gap_rep,
                 shortcut_skip_in_loop_gap_loc_rep,
+                shortcut_gap_loc_schedule_rep,
+                shortcut_gap_loc_start_rep,
+                shortcut_gap_loc_end_rep,
+                shortcut_gap_schedule_start_step_rep,
+                shortcut_gap_schedule_end_step_rep,
                 shortcut_skip_in_loop_gap_sigma_rep,
                 shortcut_skip_in_loop_warmup_steps_rep,
                 shortcut_skip_in_loop_detach_source_rep,
