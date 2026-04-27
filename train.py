@@ -784,6 +784,8 @@ def private_activation_loss(
     eps=1e-8,
     use_residual=True,
     cosine_mode="bnd",
+    pair_mode="first",
+    rng=None,
 ):
     """Common/private activation loss from feat/common-private-activations.
 
@@ -834,9 +836,18 @@ def private_activation_loss(
     else:
         raise ValueError(f"Unknown private cosine mode: {cosine_mode!r}")
 
-    max_pairs = jnp.asarray(max_pairs, dtype=jnp.int32)
     pair_ids = jnp.arange(pair_cosine_squares.shape[0], dtype=jnp.int32)
-    pair_mask = (max_pairs <= 0) | (pair_ids < max_pairs)
+    max_pairs = jnp.asarray(max_pairs, dtype=jnp.int32)
+    if pair_mode == "first":
+        pair_ranks = pair_ids
+    elif pair_mode == "random":
+        if rng is None:
+            raise ValueError("private pair_mode='random' requires rng")
+        perm = jax.random.permutation(rng, pair_ids)
+        pair_ranks = jnp.empty_like(perm).at[perm].set(pair_ids)
+    else:
+        raise ValueError(f"Unknown private pair mode: {pair_mode!r}")
+    pair_mask = (max_pairs <= 0) | (pair_ranks < max_pairs)
     pair_mask = pair_mask.astype(pair_cosine_squares.dtype)
     pair_count = jnp.maximum(jnp.sum(pair_mask), jnp.asarray(1.0, dtype=pair_cosine_squares.dtype))
     loss_private = jnp.sum(pair_cosine_squares * pair_mask) / pair_count
@@ -897,6 +908,7 @@ def train_step(
     direct_pair_mode="trunc_normal",
     private_use_residual=True,
     private_cosine_mode="bnd",
+    private_pair_mode="first",
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
 ):
@@ -919,6 +931,8 @@ def train_step(
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
     if private_cosine_mode not in {"bnd", "nd", "token"}:
         raise ValueError(f"Unknown private cosine mode: {private_cosine_mode!r}")
+    if private_pair_mode not in {"first", "random"}:
+        raise ValueError(f"Unknown private pair mode: {private_pair_mode!r}")
 
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
@@ -933,7 +947,8 @@ def train_step(
         output_subset_rng,
         output_pair_rng,
         output_resume_drop_rng,
-    ) = jax.random.split(rng, 9)
+        private_pair_rng,
+    ) = jax.random.split(rng, 10)
     lambda_private_eff, private_warmup_scale = _scheduled_lambda(
         lambda_private,
         global_step,
@@ -1317,6 +1332,8 @@ def train_step(
                 max_pairs=private_max_pairs,
                 use_residual=private_use_residual,
                 cosine_mode=private_cosine_mode,
+                pair_mode=private_pair_mode,
+                rng=private_pair_rng,
             )
 
         loss_private, common_norm, private_avg_norm, private_pairwise_cosine = jax.lax.cond(
@@ -1550,6 +1567,10 @@ def train_step(
         "train/private_use_residual": jnp.asarray(1.0 if private_use_residual else 0.0, dtype=jnp.float32),
         "train/private_cosine_mode": jnp.asarray(
             {"bnd": 0.0, "nd": 1.0, "token": 2.0}[private_cosine_mode],
+            dtype=jnp.float32,
+        ),
+        "train/private_pair_mode": jnp.asarray(
+            0.0 if private_pair_mode == "first" else 1.0,
             dtype=jnp.float32,
         ),
         "train/y_ab_norm_mean": y_ab_norm_mean,
@@ -2399,6 +2420,13 @@ def main():
         ),
     )
     parser.add_argument(
+        "--private-pair-mode",
+        type=str,
+        default="first",
+        choices=["first", "random"],
+        help="Private loss pair selection: first uses deterministic first upper-triangular pairs; random samples pairs each step.",
+    )
+    parser.add_argument(
         "--private-start-step",
         type=int,
         default=0,
@@ -2652,6 +2680,8 @@ def main():
         raise ValueError("--private-max-pairs must be non-negative")
     if args.private_cosine_mode not in {"bnd", "nd", "token"}:
         raise ValueError("--private-cosine-mode must be one of: bnd, nd, token")
+    if args.private_pair_mode not in {"first", "random"}:
+        raise ValueError("--private-pair-mode must be one of: first, random")
     if args.private_start_step < 0:
         raise ValueError("--private-start-step must be non-negative")
     if args.private_warmup_iters < 0:
@@ -2700,7 +2730,7 @@ def main():
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
         f"max_pairs={args.private_max_pairs} start_step={args.private_start_step} "
         f"warmup_iters={args.private_warmup_iters} use_residual={args.private_use_residual} "
-        f"cosine_mode={args.private_cosine_mode} pairing=first_post_block_pairs"
+        f"cosine_mode={args.private_cosine_mode} pair_mode={args.private_pair_mode}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -2821,6 +2851,7 @@ def main():
             direct_pair_mode=args.direct_pair_mode,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
+            private_pair_mode=args.private_pair_mode,
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
         ),
