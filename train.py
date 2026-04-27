@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+import functools
 from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
@@ -614,6 +615,96 @@ def sample_pair_uniform_gap(rng, depth):
     return source, source + gap
 
 
+def build_direction_and_norm_map(hidden, eps=1e-6):
+    norms = jnp.linalg.norm(hidden.astype(jnp.float32), axis=-1, keepdims=True)
+    directions = hidden.astype(jnp.float32) / (norms + eps)
+    log_magnitudes = jnp.log(norms + eps)
+    return directions, log_magnitudes, log_magnitudes
+
+
+def sample_discrete_truncated_normal_gap(max_gap, loc, sigma, rng, depth):
+    """Sample d in [1, min(max_gap, depth)] with discrete truncated-normal logits."""
+    max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
+    gaps = jnp.arange(1, depth + 1, dtype=jnp.int32)
+    offsets = (gaps.astype(jnp.float32) - loc) / sigma
+    logits = -0.5 * jnp.square(offsets)
+    logits = jnp.where(gaps <= max_gap, logits, -jnp.inf)
+    return jax.random.categorical(rng, logits).astype(jnp.int32) + 1
+
+
+def sample_layer_pair_trunc_normal(num_hidden, max_gap, loc, sigma, rng):
+    depth = int(num_hidden) - 1
+    gap_rng, source_rng = jax.random.split(rng)
+    gap = sample_discrete_truncated_normal_gap(max_gap, loc, sigma, gap_rng, depth)
+    max_source = jnp.asarray(depth, dtype=jnp.int32) - gap
+    source = jax.random.randint(source_rng, (), 0, max_source + 1, dtype=jnp.int32)
+    return source, source + gap
+
+
+def sample_three_distinct_pairs_trunc_normal(num_hidden, max_gap, loc, sigma, rng):
+    """Sample three distinct layer pairs with gap-first truncated-normal weighting."""
+    return sample_three_distinct_pairs_weighted(num_hidden, max_gap, loc, sigma, rng, gap2_bias=0.0)
+
+
+def sample_three_distinct_pairs_weighted(num_hidden, max_gap, loc, sigma, rng, gap2_bias=0.0):
+    depth = int(num_hidden) - 1
+    candidates = tuple((a, b, b - a) for a in range(depth) for b in range(a + 1, depth + 1))
+    candidate_a = jnp.asarray([a for a, _, _ in candidates], dtype=jnp.int32)
+    candidate_b = jnp.asarray([b for _, b, _ in candidates], dtype=jnp.int32)
+    candidate_gap = jnp.asarray([d for _, _, d in candidates], dtype=jnp.int32)
+    max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
+    gap_sources = (jnp.asarray(depth, dtype=jnp.float32) - candidate_gap.astype(jnp.float32) + 1.0)
+    offsets = (candidate_gap.astype(jnp.float32) - loc) / sigma
+    logits = -0.5 * jnp.square(offsets) - jnp.log(gap_sources)
+    logits = logits + jnp.where(candidate_gap == 2, jnp.asarray(gap2_bias, dtype=jnp.float32), 0.0)
+    logits = jnp.where(candidate_gap <= max_gap, logits, -jnp.inf)
+    probs = jax.nn.softmax(logits)
+    indices = jax.random.choice(
+        rng,
+        jnp.arange(len(candidates), dtype=jnp.int32),
+        shape=(3,),
+        replace=False,
+        p=probs,
+    )
+    return candidate_a[indices], candidate_b[indices]
+
+
+def sample_layer_pair_gap2_biased(num_hidden, max_gap, loc, sigma, rng):
+    pair_as, pair_bs = sample_three_distinct_pairs_weighted(
+        num_hidden,
+        max_gap,
+        loc,
+        sigma,
+        rng,
+        gap2_bias=2.0,
+    )
+    return pair_as[0], pair_bs[0]
+
+
+def stop_gradient_except_downstream_backbone_params(backbone_params, target_layer):
+    """Allow gradients only through blocks target_layer..L and the final layer."""
+    flat = traverse_util.flatten_dict(backbone_params)
+    filtered = {}
+    for path, value in flat.items():
+        module = str(path[0])
+        if module == "FinalLayer_0":
+            filtered[path] = value
+        elif module.startswith("DiTBlock_"):
+            try:
+                block_idx = int(module.rsplit("_", 1)[1])
+            except ValueError:
+                block_idx = -1
+            filtered[path] = jax.lax.cond(
+                jnp.asarray(block_idx, dtype=jnp.int32) >= target_layer,
+                lambda z: z,
+                jax.lax.stop_gradient,
+                value,
+            )
+        else:
+            filtered[path] = jax.lax.stop_gradient(value)
+    return traverse_util.unflatten_dict(filtered)
+
+
 def sample_triplet_uniform(rng, depth):
     def draw(key):
         key, d1_rng, d2_rng = jax.random.split(key, 3)
@@ -750,7 +841,23 @@ def train_step(
     private_warmup_iters,
     debug_gap_logs,
     mag_scale,
+    mag_clip_min,
+    mag_clip_max,
+    lambda_output_distill,
     l2_ema_alpha,
+    *,
+    use_output_distill=True,
+    output_distill_batch_size=1,
+    output_distill_ratio=0.10,
+    output_distill_every=1,
+    output_distill_update_mode="predictor_plus_downstream",
+    output_distill_pair_mode="trunc_normal",
+    direct_num_pairs=3,
+    direct_num_joint_pairs=1,
+    direct_num_predictor_only_pairs=2,
+    direct_pair_mode="trunc_normal",
+    learning_rate=1e-4,
+    predictor_learning_rate=2e-4,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -759,10 +866,27 @@ def train_step(
       target  = x0 - x1
       loss    = E[||v_theta(x_tau, tau) - target||^2]
     """
+    if direct_num_pairs != 3 or direct_num_joint_pairs != 1 or direct_num_predictor_only_pairs != 2:
+        raise ValueError("This train_step implementation expects 3 direct pairs: 1 joint and 2 predictor-only.")
+    if direct_pair_mode not in {"trunc_normal", "gap2_biased"}:
+        raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
+    if output_distill_pair_mode not in {"trunc_normal", "gap2_biased"}:
+        raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
+
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng, skip_rng, skip_pair_rng, skip_drop_rng = jax.random.split(rng, 9)
+    (
+        rng,
+        tau_rng,
+        noise_rng,
+        drop_rng,
+        direct_pair_rng,
+        triplet_rng,
+        output_subset_rng,
+        output_pair_rng,
+        output_resume_drop_rng,
+    ) = jax.random.split(rng, 9)
     lambda_private_eff, private_warmup_scale = _scheduled_lambda(
         lambda_private,
         global_step,
@@ -795,35 +919,109 @@ def train_step(
         directions = hidden_stack_f32 / (hidden_norms + 1e-6)
         log_magnitudes = jnp.log(hidden_norms + 1e-6)
 
-        direct_a, direct_b = sample_pair_uniform_gap(pair_rng, directions.shape[0] - 1)
-        y_ab, delta_m_ab = state.predictor_apply_fn(
-            {"params": params["predictor"]},
-            directions[direct_a],
-            direct_a,
-            direct_b,
-            dit_time_emb,
-            log_magnitudes[direct_a],
+        def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
+            za = hidden_stack_f32[source_layer]
+            if source_detach:
+                za = jax.lax.stop_gradient(za)
+            zb_target = jax.lax.stop_gradient(hidden_stack_f32[target_layer])
+            ua, ma_condition, _ = build_direction_and_norm_map(za)
+            ub, _, _ = build_direction_and_norm_map(zb_target)
+            t_embed_pair = jax.lax.stop_gradient(dit_time_emb) if source_detach else dit_time_emb
+            y_pair, delta_m_pair = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                ua,
+                source_layer,
+                target_layer,
+                t_embed_pair,
+                ma_condition,
+                detach_timestep_embed=source_detach,
+            )
+            u_pair = l2_normalize_tokens(y_pair)
+            cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
+            loss_dir_pair = 1.0 - cos_pair
+
+            ma_target = jnp.log(
+                jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[source_layer]), axis=-1, keepdims=True)
+                + 1e-6
+            )
+            mb_target = jnp.log(
+                jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[target_layer]), axis=-1, keepdims=True)
+                + 1e-6
+            )
+            target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target - ma_target)
+            target_delta_m_pair = jax.lax.stop_gradient(
+                jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
+            )
+            loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
+            pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_mag_pair
+            delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
+            delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
+            y_pair_norm = jnp.linalg.norm(y_pair, axis=-1)
+            return (
+                pair_loss,
+                loss_dir_pair,
+                loss_mag_pair,
+                cos_pair,
+                jnp.mean(delta_m_abs_error_pair),
+                jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair))),
+                jnp.mean(jnp.exp(delta_m_abs_error_pair)),
+                jnp.mean((jnp.abs(target_delta_m_raw_pair) > mag_scale).astype(jnp.float32)),
+                jnp.mean(y_pair_norm),
+                jnp.min(y_pair_norm),
+                jnp.max(y_pair_norm),
+            )
+
+        if direct_pair_mode == "trunc_normal":
+            direct_as, direct_bs = sample_three_distinct_pairs_trunc_normal(
+                directions.shape[0],
+                skip_in_loop_max_gap,
+                skip_in_loop_gap_loc,
+                skip_in_loop_gap_sigma,
+                direct_pair_rng,
+            )
+        else:
+            direct_as, direct_bs = sample_three_distinct_pairs_weighted(
+                directions.shape[0],
+                skip_in_loop_max_gap,
+                skip_in_loop_gap_loc,
+                skip_in_loop_gap_sigma,
+                direct_pair_rng,
+                gap2_bias=2.0,
+            )
+        direct_joint_a, direct_ponly_1_a, direct_ponly_2_a = direct_as
+        direct_joint_b, direct_ponly_1_b, direct_ponly_2_b = direct_bs
+        joint_values = shortcut_direct_mag_loss_for_pair(
+            direct_joint_a,
+            direct_joint_b,
+            False,
         )
-        u_ab = l2_normalize_tokens(y_ab)
-        y_ab_norm = jnp.linalg.norm(y_ab, axis=-1)
-        y_ab_norm_mean = jnp.mean(y_ab_norm)
-        y_ab_norm_min = jnp.min(y_ab_norm)
-        y_ab_norm_max = jnp.max(y_ab_norm)
-        target_u_b = jax.lax.stop_gradient(directions[direct_b])
-        cos_dir = jnp.sum(u_ab * target_u_b, axis=-1).mean()
-        loss_dir = 1.0 - cos_dir
-        target_delta_m_raw = jax.lax.stop_gradient(log_magnitudes[direct_b] - log_magnitudes[direct_a])
-        delta_m_clip_rate = jnp.mean((jnp.abs(target_delta_m_raw) > mag_scale).astype(jnp.float32))
-        target_delta_m_ab = jax.lax.stop_gradient(
-            jnp.clip(target_delta_m_raw / mag_scale, -1.0, 1.0)
+        ponly_1_values = shortcut_direct_mag_loss_for_pair(
+            direct_ponly_1_a,
+            direct_ponly_1_b,
+            True,
         )
-        loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_ab - target_delta_m_ab))
-        delta_m_raw_error = mag_scale * delta_m_ab - target_delta_m_raw
-        delta_m_abs_error = jnp.abs(delta_m_raw_error)
-        delta_m_mae = jnp.mean(delta_m_abs_error)
-        delta_m_rmse = jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error)))
-        delta_m_ratio_error = jnp.mean(jnp.exp(delta_m_abs_error))
-        direct_gap = direct_b - direct_a
+        ponly_2_values = shortcut_direct_mag_loss_for_pair(
+            direct_ponly_2_a,
+            direct_ponly_2_b,
+            True,
+        )
+        loss_direct_joint = joint_values[0]
+        loss_direct_ponly_1 = ponly_1_values[0]
+        loss_direct_ponly_2 = ponly_2_values[0]
+        loss_direct_3pair = (loss_direct_joint + loss_direct_ponly_1 + loss_direct_ponly_2) / 3.0
+        loss_dir = joint_values[1]
+        loss_mag = joint_values[2]
+        loss_dir_ponly_mean = (ponly_1_values[1] + ponly_2_values[1]) / 2.0
+        loss_mag_ponly_mean = (ponly_1_values[2] + ponly_2_values[2]) / 2.0
+        cos_dir = joint_values[3]
+        y_ab_norm_mean = joint_values[8]
+        y_ab_norm_min = joint_values[9]
+        y_ab_norm_max = joint_values[10]
+        delta_m_mae = joint_values[4]
+        delta_m_rmse = joint_values[5]
+        delta_m_ratio_error = joint_values[6]
+        delta_m_clip_rate = joint_values[7]
+        direct_gap = direct_joint_b - direct_joint_a
 
         boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
         boot_source_u = directions[boot_a]
@@ -947,78 +1145,102 @@ def train_step(
             operand=None,
         )
 
-        def compute_skip_fm_loss(_):
-            gap_rng, source_rng = jax.random.split(skip_pair_rng)
-            max_gap = jnp.minimum(skip_in_loop_max_gap, directions.shape[0] - 1)
-            fixed_gap = jnp.clip(skip_in_loop_gap, 1, max_gap)
-            gap_candidates = jnp.arange(1, directions.shape[0], dtype=jnp.int32)
-            gap_offsets = (gap_candidates.astype(jnp.float32) - skip_in_loop_gap_loc) / skip_in_loop_gap_sigma
-            gap_logits = -0.5 * jnp.square(gap_offsets)
-            gap_logits = jnp.where(gap_candidates <= max_gap, gap_logits, -jnp.inf)
-            sampled_gap = jax.random.categorical(gap_rng, gap_logits).astype(jnp.int32) + 1
-            skip_gap = jax.lax.cond(
-                skip_in_loop_gap_mode == 0,
-                lambda _: fixed_gap,
-                lambda _: sampled_gap,
-                operand=None,
-            )
-            max_source = directions.shape[0] - 1 - skip_gap
-            skip_a = jax.random.randint(source_rng, (), 0, max_source + 1, dtype=jnp.int32)
-            skip_b = skip_a + skip_gap
-            u_skip_source = directions[skip_a]
-            m_skip_source = log_magnitudes[skip_a]
-            u_skip_source = jax.lax.cond(
-                skip_in_loop_detach_source,
-                jax.lax.stop_gradient,
-                lambda z: z,
-                u_skip_source,
-            )
-            m_skip_source = jax.lax.cond(
-                skip_in_loop_detach_source,
-                jax.lax.stop_gradient,
-                lambda z: z,
-                m_skip_source,
-            )
-            y_skip, delta_m_skip = state.predictor_apply_fn(
+        loss_skip_fm = jnp.float32(0.0)
+        skip_prob_eff = jnp.float32(0.0)
+        skip_do = jnp.asarray(False, dtype=jnp.bool_)
+        skip_a_metric = jnp.float32(-1.0)
+        skip_b_metric = jnp.float32(-1.0)
+        skip_gap_metric = jnp.float32(0.0)
+
+        def compute_output_distill_loss(_):
+            subset_idx = jax.random.permutation(output_subset_rng, local_batch)[:output_distill_batch_size]
+            x_out = x_tau[subset_idx]
+            t_out = tau[subset_idx]
+            y_out = y[subset_idx]
+            v_teacher = jax.lax.stop_gradient(pred[subset_idx])
+            t_emb_teacher = jax.lax.stop_gradient(dit_time_emb[subset_idx])
+
+            if output_distill_pair_mode == "trunc_normal":
+                output_a, output_b = sample_layer_pair_trunc_normal(
+                    hidden_stack_f32.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    output_pair_rng,
+                )
+            else:
+                output_a, output_b = sample_layer_pair_gap2_biased(
+                    hidden_stack_f32.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    output_pair_rng,
+                )
+            z_source = jax.lax.stop_gradient(hidden_stack_f32[output_a, subset_idx])
+            u_source, m_source, _ = build_direction_and_norm_map(z_source)
+            y_pred, delta_m_pred = state.predictor_apply_fn(
                 {"params": params["predictor"]},
-                u_skip_source,
-                skip_a,
-                skip_b,
-                dit_time_emb,
-                m_skip_source,
+                u_source,
+                output_a,
+                output_b,
+                t_emb_teacher,
+                m_source,
+                detach_timestep_embed=True,
             )
-            u_skip = l2_normalize_tokens(y_skip)
-            m_skip = jnp.clip(m_skip_source + mag_scale * delta_m_skip, 3.0, 8.0)
-            z_skip = jnp.exp(m_skip) * u_skip
-            pred_skip = state.apply_fn(
-                {"params": params["backbone"]},
-                x_tau,
-                timesteps=tau,
-                vector=y,
+            u_pred = l2_normalize_tokens(y_pred)
+            m_pred = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
+            z_hat_b = jnp.exp(m_pred) * u_pred
+
+            resume_backbone_params = params["backbone"]
+            if output_distill_update_mode == "predictor_only":
+                resume_backbone_params = jax.tree_util.tree_map(
+                    jax.lax.stop_gradient,
+                    resume_backbone_params,
+                )
+            elif output_distill_update_mode == "predictor_plus_downstream":
+                resume_backbone_params = stop_gradient_except_downstream_backbone_params(
+                    resume_backbone_params,
+                    output_b,
+                )
+            else:
+                raise ValueError(f"Unknown output distill update mode: {output_distill_update_mode!r}")
+            v_skip = state.apply_fn(
+                {"params": resume_backbone_params},
+                x_out,
+                timesteps=t_out,
+                vector=y_out,
                 deterministic=False,
-                rngs={"dropout": skip_drop_rng},
-                resume_hidden=z_skip,
-                resume_start_layer=skip_b + 1,
+                rngs={"dropout": output_resume_drop_rng},
+                resume_hidden=z_hat_b,
+                resume_start_layer=output_b + 1,
             )
+            reduce_axes = tuple(range(1, v_skip.ndim))
+            numer = jnp.sum(jnp.square(v_skip - v_teacher), axis=reduce_axes)
+            denom = jnp.sum(jnp.square(v_teacher), axis=reduce_axes) + 1e-6
+            loss_out = jnp.mean(numer / denom)
             return (
-                jnp.mean((pred_skip - target) ** 2),
-                skip_a.astype(jnp.float32),
-                skip_b.astype(jnp.float32),
-                skip_gap.astype(jnp.float32),
+                loss_out,
+                output_a.astype(jnp.float32),
+                output_b.astype(jnp.float32),
+                (output_b - output_a).astype(jnp.float32),
+                jnp.asarray(output_distill_batch_size, dtype=jnp.float32),
             )
 
-        skip_prob_eff = jnp.where(
-            global_step >= skip_in_loop_warmup_steps,
-            skip_in_loop_prob,
-            jnp.float32(0.0),
-        )
-        skip_do = jax.random.uniform(skip_rng, ()) < skip_prob_eff
-        loss_skip_fm, skip_a_metric, skip_b_metric, skip_gap_metric = jax.lax.cond(
-            skip_do,
-            compute_skip_fm_loss,
-            lambda _: (jnp.float32(0.0), jnp.float32(-1.0), jnp.float32(-1.0), jnp.float32(0.0)),
+        output_distill_due = (global_step % jnp.asarray(max(int(output_distill_every), 1), dtype=jnp.int32)) == 0
+        output_distill_enabled = jnp.asarray(use_output_distill, dtype=jnp.bool_) & output_distill_due
+        loss_output_distill, output_distill_a, output_distill_b, output_distill_gap, output_distill_batch_size_metric = jax.lax.cond(
+            output_distill_enabled,
+            compute_output_distill_loss,
+            lambda _: (
+                jnp.float32(0.0),
+                jnp.float32(-1.0),
+                jnp.float32(-1.0),
+                jnp.float32(0.0),
+                jnp.asarray(output_distill_batch_size, dtype=jnp.float32),
+            ),
             operand=None,
         )
+        loss_output_distill_weighted = lambda_output_distill * loss_output_distill
 
         def compute_private_metrics(_):
             return private_activation_loss(hidden_stack[1:], max_pairs=private_max_pairs)
@@ -1036,12 +1258,11 @@ def train_step(
         )
         loss_total = (
             loss_gen
-            + lambda_dir * loss_dir
+            + loss_direct_3pair
             + lambda_boot * loss_boot
-            + lambda_mag * loss_mag
             + lambda_boot_mag * loss_boot_mag
-            + lambda_skip_fm * loss_skip_fm
             + lambda_private_eff * loss_private
+            + loss_output_distill_weighted
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -1053,6 +1274,14 @@ def train_step(
             loss_boot,
             loss_mag,
             loss_boot_mag,
+            loss_direct_3pair,
+            loss_direct_joint,
+            loss_direct_ponly_1,
+            loss_direct_ponly_2,
+            loss_dir_ponly_mean,
+            loss_mag_ponly_mean,
+            loss_output_distill,
+            loss_output_distill_weighted,
             loss_skip_fm,
             loss_private,
             cos_dir,
@@ -1070,11 +1299,23 @@ def train_step(
             delta_m_ratio_error,
             delta_m_clip_rate,
             direct_gap,
+            direct_joint_a.astype(jnp.float32),
+            direct_joint_b.astype(jnp.float32),
+            direct_ponly_1_a.astype(jnp.float32),
+            direct_ponly_1_b.astype(jnp.float32),
+            direct_ponly_2_a.astype(jnp.float32),
+            direct_ponly_2_b.astype(jnp.float32),
+            (direct_ponly_1_b - direct_ponly_1_a).astype(jnp.float32),
+            (direct_ponly_2_b - direct_ponly_2_a).astype(jnp.float32),
             skip_do.astype(jnp.float32),
             skip_prob_eff,
             skip_a_metric,
             skip_b_metric,
             skip_gap_metric,
+            output_distill_a,
+            output_distill_b,
+            output_distill_gap,
+            output_distill_batch_size_metric,
             debug_pair_metrics,
             hidden_stack,
         )
@@ -1090,6 +1331,14 @@ def train_step(
         loss_boot,
         loss_mag,
         loss_boot_mag,
+        loss_direct_3pair,
+        loss_direct_joint,
+        loss_direct_ponly_1,
+        loss_direct_ponly_2,
+        loss_dir_ponly_mean,
+        loss_mag_ponly_mean,
+        loss_output_distill,
+        loss_output_distill_weighted,
         loss_skip_fm,
         loss_private,
         cos_dir,
@@ -1107,11 +1356,23 @@ def train_step(
         delta_m_ratio_error,
         delta_m_clip_rate,
         direct_gap,
+        direct_joint_a,
+        direct_joint_b,
+        direct_ponly_1_a,
+        direct_ponly_1_b,
+        direct_ponly_2_a,
+        direct_ponly_2_b,
+        direct_gap_ponly_1,
+        direct_gap_ponly_2,
         skip_do_metric,
         skip_prob_eff,
         skip_a_metric,
         skip_b_metric,
         skip_gap_metric,
+        output_distill_a,
+        output_distill_b,
+        output_distill_gap,
+        output_distill_batch_size_metric,
         debug_pair_metrics,
         hidden_stack,
     ) = aux
@@ -1124,6 +1385,14 @@ def train_step(
     loss_boot = jax.lax.pmean(loss_boot, axis_name="batch")
     loss_mag = jax.lax.pmean(loss_mag, axis_name="batch")
     loss_boot_mag = jax.lax.pmean(loss_boot_mag, axis_name="batch")
+    loss_direct_3pair = jax.lax.pmean(loss_direct_3pair, axis_name="batch")
+    loss_direct_joint = jax.lax.pmean(loss_direct_joint, axis_name="batch")
+    loss_direct_ponly_1 = jax.lax.pmean(loss_direct_ponly_1, axis_name="batch")
+    loss_direct_ponly_2 = jax.lax.pmean(loss_direct_ponly_2, axis_name="batch")
+    loss_dir_ponly_mean = jax.lax.pmean(loss_dir_ponly_mean, axis_name="batch")
+    loss_mag_ponly_mean = jax.lax.pmean(loss_mag_ponly_mean, axis_name="batch")
+    loss_output_distill = jax.lax.pmean(loss_output_distill, axis_name="batch")
+    loss_output_distill_weighted = jax.lax.pmean(loss_output_distill_weighted, axis_name="batch")
     loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
     loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
@@ -1141,11 +1410,26 @@ def train_step(
     delta_m_ratio_error = jax.lax.pmean(delta_m_ratio_error, axis_name="batch")
     delta_m_clip_rate = jax.lax.pmean(delta_m_clip_rate, axis_name="batch")
     direct_gap = jax.lax.pmean(direct_gap.astype(jnp.float32), axis_name="batch")
+    direct_joint_a = jax.lax.pmean(direct_joint_a.astype(jnp.float32), axis_name="batch")
+    direct_joint_b = jax.lax.pmean(direct_joint_b.astype(jnp.float32), axis_name="batch")
+    direct_ponly_1_a = jax.lax.pmean(direct_ponly_1_a.astype(jnp.float32), axis_name="batch")
+    direct_ponly_1_b = jax.lax.pmean(direct_ponly_1_b.astype(jnp.float32), axis_name="batch")
+    direct_ponly_2_a = jax.lax.pmean(direct_ponly_2_a.astype(jnp.float32), axis_name="batch")
+    direct_ponly_2_b = jax.lax.pmean(direct_ponly_2_b.astype(jnp.float32), axis_name="batch")
+    direct_gap_ponly_1 = jax.lax.pmean(direct_gap_ponly_1.astype(jnp.float32), axis_name="batch")
+    direct_gap_ponly_2 = jax.lax.pmean(direct_gap_ponly_2.astype(jnp.float32), axis_name="batch")
     skip_do_metric = jax.lax.pmean(skip_do_metric, axis_name="batch")
     skip_prob_eff = jax.lax.pmean(skip_prob_eff, axis_name="batch")
     skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
     skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
     skip_gap_metric = jax.lax.pmean(skip_gap_metric, axis_name="batch")
+    output_distill_a = jax.lax.pmean(output_distill_a.astype(jnp.float32), axis_name="batch")
+    output_distill_b = jax.lax.pmean(output_distill_b.astype(jnp.float32), axis_name="batch")
+    output_distill_gap = jax.lax.pmean(output_distill_gap.astype(jnp.float32), axis_name="batch")
+    output_distill_batch_size_metric = jax.lax.pmean(
+        output_distill_batch_size_metric.astype(jnp.float32),
+        axis_name="batch",
+    )
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
@@ -1169,6 +1453,16 @@ def train_step(
         "train/loss_boot": loss_boot,
         "train/loss_mag": loss_mag,
         "train/loss_boot_mag": loss_boot_mag,
+        "train/loss_direct_3pair": loss_direct_3pair,
+        "train/loss_direct_joint": loss_direct_joint,
+        "train/loss_direct_ponly_1": loss_direct_ponly_1,
+        "train/loss_direct_ponly_2": loss_direct_ponly_2,
+        "train/loss_dir_joint": loss_dir,
+        "train/loss_mag_joint": loss_mag,
+        "train/loss_dir_ponly_mean": loss_dir_ponly_mean,
+        "train/loss_mag_ponly_mean": loss_mag_ponly_mean,
+        "train/loss_output_distill": loss_output_distill,
+        "train/loss_output_distill_weighted": loss_output_distill_weighted,
         "train/loss_skip_fm": loss_skip_fm,
         "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
@@ -1186,11 +1480,31 @@ def train_step(
         "train/delta_m_ratio_error": delta_m_ratio_error,
         "train/delta_m_clip_rate": delta_m_clip_rate,
         "train/direct_gap": direct_gap,
+        "train/direct_pair_joint_a": direct_joint_a,
+        "train/direct_pair_joint_b": direct_joint_b,
+        "train/direct_pair_ponly_1_a": direct_ponly_1_a,
+        "train/direct_pair_ponly_1_b": direct_ponly_1_b,
+        "train/direct_pair_ponly_2_a": direct_ponly_2_a,
+        "train/direct_pair_ponly_2_b": direct_ponly_2_b,
+        "train/direct_gap_joint": direct_gap,
+        "train/direct_gap_ponly_1": direct_gap_ponly_1,
+        "train/direct_gap_ponly_2": direct_gap_ponly_2,
         "train/skip_in_loop_do": skip_do_metric,
         "train/skip_in_loop_prob": skip_prob_eff,
         "train/skip_in_loop_source": skip_a_metric,
         "train/skip_in_loop_target": skip_b_metric,
         "train/skip_in_loop_gap": skip_gap_metric,
+        "train/output_distill_a": output_distill_a,
+        "train/output_distill_b": output_distill_b,
+        "train/output_distill_gap": output_distill_gap,
+        "train/output_distill_batch_size": output_distill_batch_size_metric,
+        "train/output_distill_update_mode": jnp.asarray(
+            0.0 if output_distill_update_mode == "predictor_only" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
+        "train/lr_backbone": jnp.asarray(learning_rate, dtype=jnp.float32),
+        "train/lr_predictor": jnp.asarray(predictor_learning_rate, dtype=jnp.float32),
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -1874,9 +2188,9 @@ def main():
     parser.add_argument(
         "--shortcut-training-mode",
         type=str,
-        default="direction",
+        default="direction-magnitude",
         choices=["direction", "direction-magnitude", "direction-magnitude-skip"],
-        help="direction keeps EMA-L2 skip calibration; direction-magnitude trains an extra log-magnitude head; direction-magnitude-skip also adds stochastic skip-in-the-loop FM loss.",
+        help="Depth-shortcut training preset. Stochastic skip-FM is disabled by default and replaced by output distillation.",
     )
     parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
@@ -1894,12 +2208,12 @@ def main():
         default=False,
         help="Log fixed-pair predictor debug losses for representative layer gaps.",
     )
-    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.1)
-    parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.1)
+    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0)
+    parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0)
     parser.add_argument(
         "--shortcut-skip-in-loop-gap-mode",
         type=str,
-        default="fixed",
+        default="truncated-normal",
         choices=["fixed", "truncated-normal"],
         help="How to sample skip-in-loop gaps. truncated-normal samples discrete gaps on [1, max_gap] with a right tail.",
     )
@@ -1913,7 +2227,7 @@ def main():
         dest="shortcut_skip_in_loop_detach_source",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Detach U_a and m_a in the skip-FM branch so skip loss updates predictor and downstream blocks, not upstream source blocks.",
+        help="Legacy skip-FM option retained for compatibility; skip-FM is disabled by default.",
     )
     parser.add_argument("--shortcut-mag-scale", type=float, default=3.0)
     parser.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
@@ -1921,7 +2235,50 @@ def main():
     parser.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
     parser.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
     parser.add_argument("--shortcut-timesteps", type=int, default=50)
-    parser.add_argument("--shortcut-predictor-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--shortcut-predictor-lr",
+        "--predictor-learning-rate",
+        dest="shortcut_predictor_lr",
+        type=float,
+        default=2e-4,
+    )
+    parser.add_argument(
+        "--output-distill",
+        "--shortcut-output-distill",
+        dest="output_distill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--output-distill-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--lambda-output-distill",
+        "--shortcut-lambda-output-distill",
+        dest="lambda_output_distill",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--output-distill-every", type=int, default=1)
+    parser.add_argument(
+        "--output-distill-update-mode",
+        type=str,
+        default="predictor_plus_downstream",
+        choices=["predictor_only", "predictor_plus_downstream"],
+    )
+    parser.add_argument(
+        "--output-distill-pair-mode",
+        type=str,
+        default="trunc_normal",
+        choices=["trunc_normal", "gap2_biased"],
+    )
+    parser.add_argument("--direct-num-pairs", type=int, default=3)
+    parser.add_argument("--direct-joint-pairs", type=int, default=1)
+    parser.add_argument("--direct-predictor-only-pairs", type=int, default=2)
+    parser.add_argument(
+        "--direct-pair-mode",
+        type=str,
+        default="trunc_normal",
+        choices=["trunc_normal", "gap2_biased"],
+    )
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
     parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
     parser.add_argument("--shortcut-predictor-ema-decay", type=float, default=0.999)
@@ -2145,6 +2502,20 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-warmup-steps must be >= 0")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
+    if args.shortcut_predictor_lr <= 0.0:
+        raise ValueError("--predictor-learning-rate/--shortcut-predictor-lr must be greater than 0")
+    if not 0.0 <= args.output_distill_ratio <= 1.0:
+        raise ValueError("--output-distill-ratio must be between 0 and 1")
+    if args.lambda_output_distill < 0.0:
+        raise ValueError("--lambda-output-distill must be non-negative")
+    if args.output_distill_every <= 0:
+        raise ValueError("--output-distill-every must be greater than 0")
+    if (
+        args.direct_num_pairs != 3
+        or args.direct_joint_pairs != 1
+        or args.direct_predictor_only_pairs != 2
+    ):
+        raise ValueError("Direct shortcut training currently requires 3 pairs: 1 joint and 2 predictor-only")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -2165,6 +2536,8 @@ def main():
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
+    output_distill_local_batch_size = max(1, int(round(args.output_distill_ratio * local_batch_size)))
+    output_distill_local_batch_size = min(output_distill_local_batch_size, local_batch_size)
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
@@ -2209,10 +2582,20 @@ def main():
         f"skip_gap_sigma={args.shortcut_skip_in_loop_gap_sigma} "
         f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
         f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
+        f"output_distill={args.output_distill} "
+        f"output_distill_ratio={args.output_distill_ratio} "
+        f"output_distill_local_batch={output_distill_local_batch_size} "
+        f"lambda_output_distill={args.lambda_output_distill} "
+        f"output_distill_every={args.output_distill_every} "
+        f"output_distill_update_mode={args.output_distill_update_mode} "
+        f"output_distill_pair_mode={args.output_distill_pair_mode} "
+        f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
+        f"direct_pair_mode={args.direct_pair_mode} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
-        f"pred_lr={args.shortcut_predictor_lr} pred_wd={args.shortcut_predictor_weight_decay}"
+        f"lr_backbone={args.learning_rate} pred_lr={args.shortcut_predictor_lr} "
+        f"pred_wd={args.shortcut_predictor_weight_decay}"
     )
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
@@ -2270,12 +2653,11 @@ def main():
     shortcut_lambda_dir_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_dir))
     shortcut_lambda_boot_rep = jax_utils.replicate(jnp.float32(args.shortcut_lambda_boot))
     shortcut_bootstrap_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_bootstrap_detach_source, dtype=jnp.bool_))
-    uses_magnitude_losses = args.shortcut_training_mode in {"direction-magnitude", "direction-magnitude-skip"}
-    uses_skip_in_loop = args.shortcut_training_mode == "direction-magnitude-skip"
-    effective_lambda_mag = args.shortcut_lambda_mag if uses_magnitude_losses else 0.0
-    effective_lambda_boot_mag = args.shortcut_lambda_boot_mag if uses_magnitude_losses else 0.0
-    effective_lambda_skip_fm = args.shortcut_lambda_skip_fm if uses_skip_in_loop else 0.0
-    effective_skip_prob = args.shortcut_skip_in_loop_prob if uses_skip_in_loop else 0.0
+    uses_magnitude_losses = True
+    effective_lambda_mag = args.shortcut_lambda_mag
+    effective_lambda_boot_mag = args.shortcut_lambda_boot_mag
+    effective_lambda_skip_fm = 0.0
+    effective_skip_prob = 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
     shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
@@ -2289,6 +2671,7 @@ def main():
     shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
     shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
     shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
+    lambda_output_distill_rep = jax_utils.replicate(jnp.float32(args.lambda_output_distill))
     private_loss_enabled_rep = jax_utils.replicate(jnp.asarray(args.private_loss, dtype=jnp.bool_))
     effective_lambda_private = args.lambda_private if args.private_loss else 0.0
     lambda_private_rep = jax_utils.replicate(jnp.float32(effective_lambda_private))
@@ -2297,6 +2680,8 @@ def main():
     private_warmup_iters_rep = jax_utils.replicate(jnp.int32(args.private_warmup_iters))
     shortcut_debug_gap_logs_rep = jax_utils.replicate(jnp.asarray(args.shortcut_debug_gap_logs, dtype=jnp.bool_))
     shortcut_mag_scale_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_scale))
+    shortcut_mag_clip_min_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_clip_min))
+    shortcut_mag_clip_max_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_clip_max))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -2321,7 +2706,24 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            use_output_distill=args.output_distill,
+            output_distill_batch_size=output_distill_local_batch_size,
+            output_distill_ratio=args.output_distill_ratio,
+            output_distill_every=args.output_distill_every,
+            output_distill_update_mode=args.output_distill_update_mode,
+            output_distill_pair_mode=args.output_distill_pair_mode,
+            direct_num_pairs=args.direct_num_pairs,
+            direct_num_joint_pairs=args.direct_joint_pairs,
+            direct_num_predictor_only_pairs=args.direct_predictor_only_pairs,
+            direct_pair_mode=args.direct_pair_mode,
+            learning_rate=args.learning_rate,
+            predictor_learning_rate=args.shortcut_predictor_lr,
+        ),
+        axis_name="batch",
+    )
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -2643,6 +3045,9 @@ def main():
             private_warmup_iters_rep,
             shortcut_debug_gap_logs_rep,
             shortcut_mag_scale_rep,
+            shortcut_mag_clip_min_rep,
+            shortcut_mag_clip_max_rep,
+            lambda_output_distill_rep,
             shortcut_l2_ema_alpha_rep,
         )
         block_pytree(probe_metrics)
@@ -3085,6 +3490,9 @@ def main():
                 private_warmup_iters_rep,
                 shortcut_debug_gap_logs_rep,
                 shortcut_mag_scale_rep,
+                shortcut_mag_clip_min_rep,
+                shortcut_mag_clip_max_rep,
+                lambda_output_distill_rep,
                 shortcut_l2_ema_alpha_rep,
             )
             global_step += 1

@@ -269,6 +269,7 @@ class DepthShortcutPredictor(nn.Module):
         target_layer: jax.Array,
         timestep_embed: jax.Array,
         m_source: jax.Array | None = None,
+        detach_timestep_embed: bool = True,
     ) -> jax.Array:
         batch_size = u_source.shape[0]
         cond_dim = int(self.cond_dim or self.width)
@@ -295,7 +296,7 @@ class DepthShortcutPredictor(nn.Module):
         h_depth = jnp.concatenate([h_a, h_b, h_b - h_a, h_delta], axis=-1)
         h_depth = jnp.broadcast_to(h_depth[None, :], (batch_size, h_depth.shape[-1]))
 
-        t_cond = jax.lax.stop_gradient(timestep_embed)
+        t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
         c_in = jnp.concatenate([h_depth, t_cond], axis=-1)
         c = nn.Dense(
             self.cond_hidden_dim,
