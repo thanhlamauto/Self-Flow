@@ -39,6 +39,64 @@ def magnitude_input_features(
     return jnp.concatenate([m_abs, m_spatial], axis=-1)
 
 
+def modulate(x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
+    return x * (1 + scale[:, None, :]) + shift[:, None, :]
+
+
+class ShortcutDiTBlock(nn.Module):
+    """DiT-style adaLN-Zero block for shortcut predictor tokens."""
+
+    hidden_size: int
+    num_heads: int
+    mlp_ratio: float = 4.0
+
+    @nn.compact
+    def __call__(self, x: jax.Array, c: jax.Array) -> jax.Array:
+        norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="norm1")
+        norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="norm2")
+        modulation = nn.Dense(
+            6 * self.hidden_size,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            name="adaLN_modulation",
+        )(nn.swish(c))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
+            modulation,
+            6,
+            axis=1,
+        )
+
+        x_norm = modulate(norm1(x), shift_msa, scale_msa)
+        attn = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.hidden_size,
+            out_features=self.hidden_size,
+            kernel_init=XAVIER_UNIFORM,
+            out_kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            out_bias_init=ZERO_INIT,
+            name="attn",
+        )(x_norm, x_norm)
+        x = x + gate_msa[:, None, :] * attn
+
+        x_norm = modulate(norm2(x), shift_mlp, scale_mlp)
+        mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
+        x_mlp = nn.Dense(
+            mlp_hidden_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="mlp_fc1",
+        )(x_norm)
+        x_mlp = nn.gelu(x_mlp, approximate=True)
+        x_mlp = nn.Dense(
+            self.hidden_size,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="mlp_fc2",
+        )(x_mlp)
+        return x + gate_mlp[:, None, :] * x_mlp
+
+
 class AdaLNConvNeXtBlock(nn.Module):
     """Small ConvNeXt-style block conditioned by AdaLN shift/scale."""
 
@@ -249,6 +307,7 @@ class DepthShortcutPredictor(nn.Module):
     dilation_schedule: tuple[int, ...] | None = None
     attn_dim: int | None = None
     num_heads: int | None = None
+    mlp_ratio: float = 4.0
     attn_gamma_init: float = 0.05
     layer_cond_dim: int = 16
     cond_hidden_dim: int = 512
@@ -318,36 +377,48 @@ class DepthShortcutPredictor(nn.Module):
             bias_init=ZERO_INIT,
             name="in_proj",
         )(u_source)
-        h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
-        dilation_schedule = self.dilation_schedule or tuple([1] * self.num_blocks)
-        if len(dilation_schedule) != self.num_blocks:
-            raise ValueError("dilation_schedule length must match num_blocks")
-        for idx in range(self.num_blocks):
-            dilation = int(dilation_schedule[idx])
-            if self.arch in {"convnext", "dilated_convnext"}:
-                h = AdaLNConvNeXtBlock(
-                    width=self.width,
-                    cond_dim=cond_dim,
-                    expansion=self.expansion,
-                    dilation=dilation,
-                    name=f"blocks_{idx}",
-                )(h, c)
-            elif self.arch == "attn_hybrid":
-                if self.attn_dim is None or self.num_heads is None:
-                    raise ValueError("attn_hybrid requires attn_dim and num_heads")
-                h = AttentionHybridShortcutBlock(
-                    width=self.width,
-                    cond_dim=cond_dim,
-                    expansion=self.expansion,
-                    attn_dim=int(self.attn_dim),
+        if self.arch == "dit2":
+            if self.num_heads is None:
+                raise ValueError("dit2 predictor requires num_heads")
+            for idx in range(self.num_blocks):
+                h = ShortcutDiTBlock(
+                    hidden_size=self.width,
                     num_heads=int(self.num_heads),
-                    dilation=dilation,
-                    attn_gamma_init=self.attn_gamma_init,
+                    mlp_ratio=float(self.mlp_ratio),
                     name=f"blocks_{idx}",
                 )(h, c)
-            else:
-                raise ValueError(f"Unknown shortcut predictor arch: {self.arch!r}")
-        h_grid = h
+            h_grid = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+        else:
+            h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+            dilation_schedule = self.dilation_schedule or tuple([1] * self.num_blocks)
+            if len(dilation_schedule) != self.num_blocks:
+                raise ValueError("dilation_schedule length must match num_blocks")
+            for idx in range(self.num_blocks):
+                dilation = int(dilation_schedule[idx])
+                if self.arch in {"convnext", "dilated_convnext"}:
+                    h = AdaLNConvNeXtBlock(
+                        width=self.width,
+                        cond_dim=cond_dim,
+                        expansion=self.expansion,
+                        dilation=dilation,
+                        name=f"blocks_{idx}",
+                    )(h, c)
+                elif self.arch == "attn_hybrid":
+                    if self.attn_dim is None or self.num_heads is None:
+                        raise ValueError("attn_hybrid requires attn_dim and num_heads")
+                    h = AttentionHybridShortcutBlock(
+                        width=self.width,
+                        cond_dim=cond_dim,
+                        expansion=self.expansion,
+                        attn_dim=int(self.attn_dim),
+                        num_heads=int(self.num_heads),
+                        dilation=dilation,
+                        attn_gamma_init=self.attn_gamma_init,
+                        name=f"blocks_{idx}",
+                    )(h, c)
+                else:
+                    raise ValueError(f"Unknown shortcut predictor arch: {self.arch!r}")
+            h_grid = h
         h = h_grid.reshape(batch_size, self.num_tokens, self.width)
         delta_y = nn.Dense(
             self.hidden_size,
@@ -374,6 +445,46 @@ class DepthShortcutPredictor(nn.Module):
 
 
 PREDICTOR_VARIANTS = {
+    "dit2_tiny": {
+        "arch": "dit2",
+        "width": 256,
+        "num_blocks": 2,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 4,
+        "mlp_ratio": 4.0,
+    },
+    "dit2_small": {
+        "arch": "dit2",
+        "width": 384,
+        "num_blocks": 2,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+    },
+    "dit2_base": {
+        "arch": "dit2",
+        "width": 512,
+        "num_blocks": 2,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 8,
+        "mlp_ratio": 4.0,
+    },
+    "dit2_large": {
+        "arch": "dit2",
+        "width": 768,
+        "num_blocks": 2,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 12,
+        "mlp_ratio": 4.0,
+    },
     "convnext_tiny": {
         "arch": "convnext",
         "width": 256,
@@ -489,15 +600,23 @@ PREDICTOR_VARIANT_ALIASES = {
     "tiny": "convnext_tiny",
     "p_tiny": "convnext_tiny",
     "ptiny": "convnext_tiny",
+    "dit_tiny": "dit2_tiny",
+    "dit_t": "dit2_tiny",
     "small": "convnext_small",
     "p_small": "convnext_small",
     "psmall": "convnext_small",
+    "dit_small": "dit2_small",
+    "dit_s": "dit2_small",
     "base": "convnext_base",
     "p_base": "convnext_base",
     "pbase": "convnext_base",
+    "dit_base": "dit2_base",
+    "dit_b": "dit2_base",
     "large": "convnext_large",
     "p_large": "convnext_large",
     "plarge": "convnext_large",
+    "dit_large": "dit2_large",
+    "dit_l": "dit2_large",
 }
 
 

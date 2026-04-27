@@ -448,10 +448,10 @@ class ShortcutTrainState(train_state.TrainState):
 
 PREDICTOR_PARAM_TARGET_RANGES = {
     # Broad implementation checks; counts include condition MLP and magnitude head.
-    "tiny": (1_000_000, 2_500_000),
-    "small": (3_000_000, 6_000_000),
-    "base": (9_000_000, 19_000_000),
-    "large": (14_000_000, 27_000_000),
+    "tiny": (1_000_000, 4_000_000),
+    "small": (3_000_000, 8_000_000),
+    "base": (7_000_000, 19_000_000),
+    "large": (14_000_000, 30_000_000),
 }
 
 
