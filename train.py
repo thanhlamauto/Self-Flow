@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+import functools
 from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
@@ -683,33 +684,79 @@ def _scheduled_lambda(lambda_value, global_step, start_step, warmup_iters):
     return lambda_value * warmup_scale, warmup_scale
 
 
-def private_activation_loss(activations, max_pairs=0, eps=1e-8):
+def private_activation_loss(
+    activations,
+    max_pairs=0,
+    eps=1e-8,
+    use_residual=True,
+    cosine_mode="bnd",
+    pair_mode="first",
+    rng=None,
+):
     """Common/private activation loss from feat/common-private-activations.
 
     `activations` is `[L, B, P, D]`, normally post-block states `Z_1..Z_L`.
-    The loss penalizes squared cosine similarity between private residuals
-    from selected layer pairs, after subtracting a stop-gradient common activation.
+    The loss penalizes squared cosine similarity between selected layer pairs.
+    With use_residual=True, it subtracts a stop-gradient common activation.
     """
     activations = activations.astype(jnp.float32)
-    activations = activations / jnp.maximum(
-        jnp.linalg.norm(activations, axis=-1, keepdims=True),
-        eps,
-    )
-    common = jnp.mean(activations, axis=0)
-    private = activations - jax.lax.stop_gradient(common)[None, ...]
-    private_flat = private.reshape(private.shape[0], -1)
-    private_norm = private_flat / jnp.maximum(
-        jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
-        eps,
-    )
-    cosine_matrix = private_norm @ private_norm.T
-    pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
+    if use_residual:
+        activations_for_common = activations / jnp.maximum(
+            jnp.linalg.norm(activations, axis=-1, keepdims=True),
+            eps,
+        )
+        common = jnp.mean(activations_for_common, axis=0)
+        private = activations_for_common - jax.lax.stop_gradient(common)[None, ...]
+    else:
+        common = jnp.mean(activations, axis=0)
+        private = activations
+
+    if cosine_mode == "bnd":
+        private_flat = private.reshape(private.shape[0], -1)
+        private_norm = private_flat / jnp.maximum(
+            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_matrix = private_norm @ private_norm.T
+        pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
+        pair_cosine_squares = jnp.square(pair_cosines)
+    elif cosine_mode == "nd":
+        private_flat = private.reshape(private.shape[0], private.shape[1], -1)
+        private_norm = private_flat / jnp.maximum(
+            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_tensor = jnp.einsum("lbd,mbd->lmb", private_norm, private_norm)
+        pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
+        pair_cosine_squares = jnp.mean(jnp.square(pair_cosines), axis=-1)
+        pair_cosines = jnp.mean(pair_cosines, axis=-1)
+    elif cosine_mode == "token":
+        private_norm = private / jnp.maximum(
+            jnp.linalg.norm(private, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_tensor = jnp.einsum("lbpd,mbpd->lmbp", private_norm, private_norm)
+        pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
+        pair_cosine_squares = jnp.mean(jnp.square(pair_cosines), axis=(-1, -2))
+        pair_cosines = jnp.mean(pair_cosines, axis=(-1, -2))
+    else:
+        raise ValueError(f"Unknown private cosine mode: {cosine_mode!r}")
+
+    pair_ids = jnp.arange(pair_cosine_squares.shape[0], dtype=jnp.int32)
     max_pairs = jnp.asarray(max_pairs, dtype=jnp.int32)
-    pair_ids = jnp.arange(pair_cosines.shape[0], dtype=jnp.int32)
-    pair_mask = (max_pairs <= 0) | (pair_ids < max_pairs)
-    pair_mask = pair_mask.astype(pair_cosines.dtype)
-    pair_count = jnp.maximum(jnp.sum(pair_mask), jnp.asarray(1.0, dtype=pair_cosines.dtype))
-    loss_private = jnp.sum(jnp.square(pair_cosines) * pair_mask) / pair_count
+    if pair_mode == "first":
+        pair_ranks = pair_ids
+    elif pair_mode == "random":
+        if rng is None:
+            raise ValueError("private pair_mode='random' requires rng")
+        perm = jax.random.permutation(rng, pair_ids)
+        pair_ranks = jnp.empty_like(perm).at[perm].set(pair_ids)
+    else:
+        raise ValueError(f"Unknown private pair mode: {pair_mode!r}")
+    pair_mask = (max_pairs <= 0) | (pair_ranks < max_pairs)
+    pair_mask = pair_mask.astype(pair_cosine_squares.dtype)
+    pair_count = jnp.maximum(jnp.sum(pair_mask), jnp.asarray(1.0, dtype=pair_cosine_squares.dtype))
+    loss_private = jnp.sum(pair_cosine_squares * pair_mask) / pair_count
     common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
     private_avg_norm = jnp.mean(
         jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
@@ -751,6 +798,10 @@ def train_step(
     debug_gap_logs,
     mag_scale,
     l2_ema_alpha,
+    *,
+    private_use_residual=True,
+    private_cosine_mode="bnd",
+    private_pair_mode="first",
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -762,7 +813,12 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng, skip_rng, skip_pair_rng, skip_drop_rng = jax.random.split(rng, 9)
+    if private_cosine_mode not in {"bnd", "nd", "token"}:
+        raise ValueError(f"Unknown private cosine mode: {private_cosine_mode!r}")
+    if private_pair_mode not in {"first", "random"}:
+        raise ValueError(f"Unknown private pair mode: {private_pair_mode!r}")
+
+    rng, tau_rng, noise_rng, drop_rng, pair_rng, triplet_rng, skip_rng, skip_pair_rng, skip_drop_rng, private_pair_rng = jax.random.split(rng, 10)
     lambda_private_eff, private_warmup_scale = _scheduled_lambda(
         lambda_private,
         global_step,
@@ -1021,7 +1077,14 @@ def train_step(
         )
 
         def compute_private_metrics(_):
-            return private_activation_loss(hidden_stack[1:], max_pairs=private_max_pairs)
+            return private_activation_loss(
+                hidden_stack[1:],
+                max_pairs=private_max_pairs,
+                use_residual=private_use_residual,
+                cosine_mode=private_cosine_mode,
+                pair_mode=private_pair_mode,
+                rng=private_pair_rng,
+            )
 
         loss_private, common_norm, private_avg_norm, private_pairwise_cosine = jax.lax.cond(
             private_loss_enabled & (lambda_private_eff > 0.0),
@@ -1178,6 +1241,15 @@ def train_step(
         "train/common_norm": common_norm,
         "train/private_avg_norm": private_avg_norm,
         "train/private_pairwise_cosine": private_pairwise_cosine,
+        "train/private_use_residual": jnp.asarray(1.0 if private_use_residual else 0.0, dtype=jnp.float32),
+        "train/private_cosine_mode": jnp.asarray(
+            {"bnd": 0.0, "nd": 1.0, "token": 2.0}[private_cosine_mode],
+            dtype=jnp.float32,
+        ),
+        "train/private_pair_mode": jnp.asarray(
+            0.0 if private_pair_mode == "first" else 1.0,
+            dtype=jnp.float32,
+        ),
         "train/y_ab_norm_mean": y_ab_norm_mean,
         "train/y_ab_norm_min": y_ab_norm_min,
         "train/y_ab_norm_max": y_ab_norm_max,
@@ -1945,6 +2017,29 @@ def main():
         help="Maximum number of post-block layer pairs for private loss. 0 means all pairs.",
     )
     parser.add_argument(
+        "--private-use-residual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use common-activation residuals for private loss. Disable to use raw activations.",
+    )
+    parser.add_argument(
+        "--private-cosine-mode",
+        type=str,
+        default="bnd",
+        choices=["bnd", "nd", "token"],
+        help=(
+            "Private cosine reduction: bnd flattens batch/tokens/channels like the original loss; "
+            "nd computes per-sample N*D cosine then averages; token computes tokenwise D cosine then averages."
+        ),
+    )
+    parser.add_argument(
+        "--private-pair-mode",
+        type=str,
+        default="first",
+        choices=["first", "random"],
+        help="Private loss pair selection: first uses deterministic first upper-triangular pairs; random samples pairs each step.",
+    )
+    parser.add_argument(
         "--private-start-step",
         type=int,
         default=0,
@@ -2180,6 +2275,10 @@ def main():
         raise ValueError("--lambda-private must be non-negative")
     if args.private_max_pairs < 0:
         raise ValueError("--private-max-pairs must be non-negative")
+    if args.private_cosine_mode not in {"bnd", "nd", "token"}:
+        raise ValueError("--private-cosine-mode must be one of: bnd, nd, token")
+    if args.private_pair_mode not in {"first", "random"}:
+        raise ValueError("--private-pair-mode must be one of: first, random")
     if args.private_start_step < 0:
         raise ValueError("--private-start-step must be non-negative")
     if args.private_warmup_iters < 0:
@@ -2217,7 +2316,8 @@ def main():
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
         f"max_pairs={args.private_max_pairs} start_step={args.private_start_step} "
-        f"warmup_iters={args.private_warmup_iters} pairing=first_post_block_pairs"
+        f"warmup_iters={args.private_warmup_iters} use_residual={args.private_use_residual} "
+        f"cosine_mode={args.private_cosine_mode} pair_mode={args.private_pair_mode}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -2321,7 +2421,15 @@ def main():
     accumulated_train_tflops = 0.0
 
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    pmapped_train_step = jax.pmap(
+        functools.partial(
+            train_step,
+            private_use_residual=args.private_use_residual,
+            private_cosine_mode=args.private_cosine_mode,
+            private_pair_mode=args.private_pair_mode,
+        ),
+        axis_name="batch",
+    )
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
