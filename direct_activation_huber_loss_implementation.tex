@@ -8,7 +8,7 @@
 \usepackage{hyperref}
 \geometry{margin=1in}
 
-\title{Ghi chú implementation: Direct Activation Huber Loss}
+\title{Ghi chú implementation: Shortcut Direction--Activation Loss}
 \author{}
 \date{}
 
@@ -17,8 +17,8 @@
 
 \section{Mục tiêu thay đổi}
 
-Branch \texttt{feat/depth-shortcut-output-distill} được thêm một option mới cho direct predictor loss.
-Trước thay đổi, direct loss luôn dùng:
+Branch \texttt{feat/depth-shortcut-output-distill} được thêm một option mới cho shortcut predictor loss.
+Trước thay đổi, các shortcut losses dùng output predictor theo dạng direction + log-magnitude:
 \[
 L_{\text{pair}}
 =
@@ -30,9 +30,9 @@ Trong đó \(L_{\text{mag}}\) là mean squared error trên log-magnitude delta �
 
 Sau thay đổi, code hỗ trợ thêm mode mới:
 \[
-\texttt{--direct-loss-mode direction\_activation\_huber}.
+\texttt{--shortcut-loss-mode direction\_activation}.
 \]
-Mode này vẫn giữ direction loss như hiện tại, nhưng thay magnitude loss bằng Huber loss giữa output activation dự đoán và activation thật của layer target:
+Mode này coi output đầu tiên của predictor là activation dự đoán. Direction loss vẫn lấy hướng từ output này, còn loss phụ thay magnitude loss bằng Huber loss giữa activation dự đoán và activation target:
 \[
 L_{\text{pair}}
 =
@@ -44,21 +44,23 @@ L_{\text{pair}}
 
 \section{CLI mới}
 
-Hai argument mới được thêm vào \texttt{train.py}:
+Hai argument được thêm vào \texttt{train.py}:
 
 \begin{verbatim}
---direct-loss-mode
---direct-activation-huber-delta
+--shortcut-loss-mode
+--shortcut-activation-huber-delta
 \end{verbatim}
 
-\texttt{--direct-loss-mode} có hai giá trị:
+\texttt{--shortcut-loss-mode} có hai giá trị chính:
 
 \begin{itemize}
   \item \texttt{direction\_magnitude}: mode mặc định, giữ nguyên behavior cũ.
-  \item \texttt{direction\_activation\_huber}: mode mới, dùng direction loss cộng activation Huber loss.
+  \item \texttt{direction\_activation}: mode mới, dùng direction loss cộng activation Huber loss.
 \end{itemize}
 
-\texttt{--direct-activation-huber-delta} là tham số \(\delta\) của Huber loss, mặc định bằng \(1.0\).
+\texttt{--direct-loss-mode} và \texttt{direction\_activation\_huber} vẫn được accept như alias cũ để không làm gãy command cũ, nhưng tên mới nên dùng là \texttt{--shortcut-loss-mode direction\_activation}.
+
+\texttt{--shortcut-activation-huber-delta} là tham số \(\delta\) của Huber loss, mặc định bằng \(1.0\).
 Code validate rằng giá trị này phải lớn hơn \(0\).
 
 \section{Direct pair forward}
@@ -168,7 +170,7 @@ L_{\text{pair}}
 
 \section{Mode mới: direction\_activation\_huber}
 
-Mode \texttt{direction\_activation\_huber} thay \(L_{\text{mag}}\) bằng Huber loss trực tiếp trên activation.
+Mode \texttt{direction\_activation} thay \(L_{\text{mag}}\) bằng Huber loss trực tiếp trên activation.
 
 Activation prediction được lấy thẳng từ output đầu tiên của predictor:
 \[
@@ -192,7 +194,7 @@ L_{\text{act}}
 \right)
 \right],
 \]
-với \(\delta = \texttt{direct\_activation\_huber\_delta}\).
+với \(\delta = \texttt{shortcut\_activation\_huber\_delta}\).
 
 Pair loss trong mode mới:
 \[
@@ -205,6 +207,70 @@ L_{\text{pair}}
 
 Điểm quan trọng là \texttt{--shortcut-lambda-mag} vẫn là weight của loss phụ.
 Nó không còn nhân magnitude loss trong mode mới, mà nhân activation Huber loss.
+
+\section{Bootstrap shortcut loss trong mode mới}
+
+Trong mode cũ, bootstrap dùng composition theo direction và log-magnitude:
+\[
+Z_a \rightarrow Z_b \rightarrow Z_c
+\quad \text{so với} \quad
+Z_a \rightarrow Z_c \text{ của EMA predictor}.
+\]
+Direction bootstrap vẫn dùng cosine giữa hướng của output composition và hướng của EMA output.
+Magnitude bootstrap dùng delta-magnitude cộng dồn.
+
+Trong mode \texttt{direction\_activation}, magnitude head không còn được dùng cho bootstrap loss.
+Output \(Y_{a \rightarrow b}\) được coi là activation dự đoán tại layer \(b\).
+Predictor bước hai nhận activation này làm source:
+\[
+Y_{a \rightarrow b} \rightarrow Y_{a \rightarrow b \rightarrow c}.
+\]
+EMA predictor tạo target activation:
+\[
+Y^{\text{ema}}_{a \rightarrow c}.
+\]
+Loss direction bootstrap vẫn là cosine trên hướng của hai output này:
+\[
+L_{\text{boot-dir}}
+=
+1 -
+\mathbb{E}_{B,N}
+\left[
+\left\langle
+\operatorname{norm}(Y_{a \rightarrow b \rightarrow c}),
+\operatorname{norm}(\operatorname{stopgrad}(Y^{\text{ema}}_{a \rightarrow c}))
+\right\rangle
+\right].
+\]
+Loss phụ bootstrap trong mode mới là:
+\[
+L_{\text{boot-act}}
+=
+\mathbb{E}
+\left[
+\operatorname{Huber}_{\delta}
+\left(
+Y_{a \rightarrow b \rightarrow c}
+-
+\operatorname{stopgrad}(Y^{\text{ema}}_{a \rightarrow c})
+\right)
+\right].
+\]
+Loss này thay cho \texttt{loss\_boot\_mag} và vẫn được nhân bởi \texttt{--shortcut-lambda-boot-mag}.
+
+\section{Output distillation và FID skip}
+
+Trong mode \texttt{direction\_magnitude}, output distillation và FID skip reconstruct hidden bằng hướng dự đoán cộng magnitude dự đoán:
+\[
+\hat{Z}_b = \exp(\hat{m}_b)\operatorname{norm}(Y_{a \rightarrow b}).
+\]
+
+Trong mode \texttt{direction\_activation}, magnitude head bị bỏ qua ở các nhánh này.
+Hidden synthetic/resume được lấy trực tiếp từ output predictor:
+\[
+\hat{Z}_b = Y_{a \rightarrow b}.
+\]
+Vì vậy validation FID/sFID skip 3-to-7 cũng dùng activation output trực tiếp khi \texttt{--shortcut-loss-mode direction\_activation}.
 
 \section{Gradient routing}
 
@@ -253,39 +319,52 @@ Sampling truncated-normal/gap2-biased không đổi.
 Các metric mới được thêm:
 
 \begin{verbatim}
-train/direct_loss_mode
-train/direct_activation_huber_delta
+train/shortcut_loss_mode
+train/shortcut_activation_huber_delta
+train/loss_boot_aux
 train/loss_direct_aux_joint
 train/loss_direct_aux_ponly_mean
+val/FID_skip_output_mode
 \end{verbatim}
 
-\texttt{train/direct\_loss\_mode} được encode:
+\texttt{train/shortcut\_loss\_mode} được encode:
 \[
 0 = \texttt{direction\_magnitude},
 \qquad
-1 = \texttt{direction\_activation\_huber}.
+1 = \texttt{direction\_activation}.
 \]
 
 \texttt{train/loss\_direct\_aux\_joint} và \texttt{train/loss\_direct\_aux\_ponly\_mean} là tên trung lập cho loss phụ.
 Trong mode cũ, chúng tương ứng với magnitude loss.
 Trong mode mới, chúng tương ứng với activation Huber loss.
 
+\texttt{train/loss\_boot\_aux} là tên trung lập cho bootstrap auxiliary loss.
+Trong mode cũ, nó bằng magnitude bootstrap loss.
+Trong mode mới, nó bằng activation Huber bootstrap loss.
+
+\texttt{val/FID\_skip\_output\_mode} được encode:
+\[
+0 = \texttt{direction\_magnitude},
+\qquad
+1 = \texttt{direction\_activation}.
+\]
+
 Các metric cũ \texttt{train/loss\_mag\_joint} và \texttt{train/loss\_mag\_ponly\_mean} vẫn được giữ để không phá logging hiện tại.
 Trong mode mới, hai metric này thực chất đang chứa activation Huber loss.
 
 \section{Ví dụ sử dụng}
 
-Để bật direct activation Huber loss:
+Để bật shortcut direction--activation loss:
 
 \begin{verbatim}
---direct-loss-mode direction_activation_huber \
---direct-activation-huber-delta 1.0
+--shortcut-loss-mode direction_activation \
+--shortcut-activation-huber-delta 1.0
 \end{verbatim}
 
 Nếu không truyền hai argument này, training vẫn dùng behavior cũ:
 
 \begin{verbatim}
---direct-loss-mode direction_magnitude
+--shortcut-loss-mode direction_magnitude
 \end{verbatim}
 
 \end{document}

@@ -912,8 +912,8 @@ def train_step(
     direct_num_joint_pairs=1,
     direct_num_predictor_only_pairs=2,
     direct_pair_mode="trunc_normal",
-    direct_loss_mode="direction_magnitude",
-    direct_activation_huber_delta=1.0,
+    shortcut_loss_mode="direction_magnitude",
+    shortcut_activation_huber_delta=1.0,
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
@@ -937,10 +937,12 @@ def train_step(
         raise ValueError("Direct shortcut training supports 2 or 3 static pairs.")
     if direct_pair_mode not in {"trunc_normal", "gap2_biased"}:
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
-    if direct_loss_mode not in {"direction_magnitude", "direction_activation_huber"}:
-        raise ValueError(f"Unknown direct loss mode: {direct_loss_mode!r}")
-    if direct_activation_huber_delta <= 0.0:
-        raise ValueError("direct_activation_huber_delta must be positive.")
+    if shortcut_loss_mode == "direction_activation_huber":
+        shortcut_loss_mode = "direction_activation"
+    if shortcut_loss_mode not in {"direction_magnitude", "direction_activation"}:
+        raise ValueError(f"Unknown shortcut loss mode: {shortcut_loss_mode!r}")
+    if shortcut_activation_huber_delta <= 0.0:
+        raise ValueError("shortcut_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in {"trunc_normal", "gap2_biased"}:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
     if output_distill_update_mode not in {
@@ -1026,41 +1028,49 @@ def train_step(
             cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
             loss_dir_pair = 1.0 - cos_pair
 
-            ma_target = jnp.log(
-                jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[source_layer]), axis=-1, keepdims=True)
-                + 1e-6
-            )
-            mb_target = jnp.log(
-                jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[target_layer]), axis=-1, keepdims=True)
-                + 1e-6
-            )
-            target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target - ma_target)
-            target_delta_m_pair = jax.lax.stop_gradient(
-                jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
-            )
-            loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
-            if direct_loss_mode == "direction_magnitude":
+            if shortcut_loss_mode == "direction_magnitude":
+                ma_target = jnp.log(
+                    jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[source_layer]), axis=-1, keepdims=True)
+                    + 1e-6
+                )
+                mb_target = jnp.log(
+                    jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[target_layer]), axis=-1, keepdims=True)
+                    + 1e-6
+                )
+                target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target - ma_target)
+                target_delta_m_pair = jax.lax.stop_gradient(
+                    jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
+                )
+                loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
                 loss_aux_pair = loss_mag_pair
+                delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
+                delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
+                delta_m_mae_pair = jnp.mean(delta_m_abs_error_pair)
+                delta_m_rmse_pair = jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair)))
+                delta_m_ratio_error_pair = jnp.mean(jnp.exp(delta_m_abs_error_pair))
+                delta_m_clip_rate_pair = jnp.mean((jnp.abs(target_delta_m_raw_pair) > mag_scale).astype(jnp.float32))
             else:
                 loss_aux_pair = jnp.mean(
                     optax.huber_loss(
                         y_pair - zb_target,
-                        delta=jnp.asarray(direct_activation_huber_delta, dtype=jnp.float32),
+                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
                     )
                 )
+                delta_m_mae_pair = jnp.float32(0.0)
+                delta_m_rmse_pair = jnp.float32(0.0)
+                delta_m_ratio_error_pair = jnp.float32(0.0)
+                delta_m_clip_rate_pair = jnp.float32(0.0)
             pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_aux_pair
-            delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
-            delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
             y_pair_norm = jnp.linalg.norm(y_pair, axis=-1)
             return (
                 pair_loss,
                 loss_dir_pair,
                 loss_aux_pair,
                 cos_pair,
-                jnp.mean(delta_m_abs_error_pair),
-                jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair))),
-                jnp.mean(jnp.exp(delta_m_abs_error_pair)),
-                jnp.mean((jnp.abs(target_delta_m_raw_pair) > mag_scale).astype(jnp.float32)),
+                delta_m_mae_pair,
+                delta_m_rmse_pair,
+                delta_m_ratio_error_pair,
+                delta_m_clip_rate_pair,
                 jnp.mean(y_pair_norm),
                 jnp.min(y_pair_norm),
                 jnp.max(y_pair_norm),
@@ -1165,10 +1175,15 @@ def train_step(
             use_timestep_embed=predictor_use_timestep,
         )
         u_boot_ab = l2_normalize_tokens(y_boot_ab)
-        m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
+        if shortcut_loss_mode == "direction_magnitude":
+            m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
+            boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
+        else:
+            m_boot_ab = jnp.log(jnp.linalg.norm(y_boot_ab.astype(jnp.float32), axis=-1, keepdims=True) + 1e-6)
+            boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
         y_abc, delta_m_abc = state.predictor_apply_fn(
             {"params": params["predictor"]},
-            u_boot_ab if predictor_normalize_input else y_boot_ab,
+            boot_b_source,
             boot_b,
             boot_c,
             dit_time_emb,
@@ -1188,9 +1203,17 @@ def train_step(
         u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
         cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
         loss_boot = 1.0 - cos_boot
-        target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
-        pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
-        loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+        if shortcut_loss_mode == "direction_magnitude":
+            target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
+            pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+            loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+        else:
+            loss_boot_mag = jnp.mean(
+                optax.huber_loss(
+                    y_abc - jax.lax.stop_gradient(y_ac_ema),
+                    delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                )
+            )
 
         def compute_debug_pair_metrics(_):
             def compute_pair_metrics(source_layer, target_layer):
@@ -1319,8 +1342,11 @@ def train_step(
                 use_timestep_embed=predictor_use_timestep,
             )
             u_pred = l2_normalize_tokens(y_pred)
-            m_pred = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
-            z_hat_b = jnp.exp(m_pred) * u_pred
+            if shortcut_loss_mode == "direction_magnitude":
+                m_pred = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
+                z_hat_b = jnp.exp(m_pred) * u_pred
+            else:
+                z_hat_b = y_pred.astype(jnp.float32)
 
             resume_backbone_params = params["backbone"]
             if output_distill_update_mode == "predictor_only":
@@ -1593,6 +1619,7 @@ def train_step(
         "train/loss_boot": loss_boot,
         "train/loss_mag": loss_mag,
         "train/loss_boot_mag": loss_boot_mag,
+        "train/loss_boot_aux": loss_boot_mag,
         "train/loss_direct_3pair": loss_direct_3pair,
         "train/loss_direct_npairs": loss_direct_3pair,
         "train/loss_direct_joint": loss_direct_joint,
@@ -1644,11 +1671,15 @@ def train_step(
         "train/direct_gap_ponly_1": direct_gap_ponly_1,
         "train/direct_gap_ponly_2": direct_gap_ponly_2,
         "train/direct_num_pairs": jnp.asarray(direct_num_pairs, dtype=jnp.float32),
-        "train/direct_loss_mode": jnp.asarray(
-            0.0 if direct_loss_mode == "direction_magnitude" else 1.0,
+        "train/shortcut_loss_mode": jnp.asarray(
+            0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
             dtype=jnp.float32,
         ),
-        "train/direct_activation_huber_delta": jnp.asarray(direct_activation_huber_delta, dtype=jnp.float32),
+        "train/direct_loss_mode": jnp.asarray(
+            0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/shortcut_activation_huber_delta": jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
         "train/skip_in_loop_do": skip_do_metric,
         "train/skip_in_loop_prob": skip_prob_eff,
         "train/skip_in_loop_source": skip_a_metric,
@@ -1991,6 +2022,8 @@ def make_sample_latents_pmap_fn(
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
     depth_shortcut_normalize_input=True,
+    depth_shortcut_skip_timestep_mode="alternate",
+    depth_shortcut_output_mode="direction_magnitude",
 ):
     """Build a sharded (pmap) sampling function for eval.
 
@@ -2121,27 +2154,52 @@ def make_sample_latents_pmap_fn(
             )
 
         def model_fn(z_x, t):
-            return model.apply(
-                {"params": ema_params_local},
-                z_x,
-                timesteps=t,
-                vector=class_labels_local,
-                deterministic=True,
-                depth_shortcut_predictor_params=predictor_params_local,
-                depth_shortcut_l2_ema=l2_ema_local,
-                depth_shortcut_variant=shortcut_predictor_variant,
-                depth_shortcut_skip_every_other=True,
-                depth_shortcut_skip_source_layer=int(depth_shortcut_skip_source_layer),
-                depth_shortcut_skip_target_layer=int(depth_shortcut_skip_target_layer),
-                depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
-                depth_shortcut_mag_scale=float(depth_shortcut_mag_scale),
-                depth_shortcut_mag_abs_center=float(depth_shortcut_mag_abs_center),
-                depth_shortcut_mag_abs_scale=float(depth_shortcut_mag_abs_scale),
-                depth_shortcut_mag_clip_min=float(depth_shortcut_mag_clip_min),
-                depth_shortcut_mag_clip_max=float(depth_shortcut_mag_clip_max),
-                depth_shortcut_timesteps=int(shortcut_timesteps),
-                depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
-            )
+            def apply_full(_):
+                return model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels_local,
+                    deterministic=True,
+                )
+
+            def apply_shortcut(_):
+                return model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels_local,
+                    deterministic=True,
+                    depth_shortcut_predictor_params=predictor_params_local,
+                    depth_shortcut_l2_ema=l2_ema_local,
+                    depth_shortcut_variant=shortcut_predictor_variant,
+                    depth_shortcut_skip_every_other=True,
+                    depth_shortcut_skip_source_layer=int(depth_shortcut_skip_source_layer),
+                    depth_shortcut_skip_target_layer=int(depth_shortcut_skip_target_layer),
+                    depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
+                    depth_shortcut_mag_scale=float(depth_shortcut_mag_scale),
+                    depth_shortcut_mag_abs_center=float(depth_shortcut_mag_abs_center),
+                    depth_shortcut_mag_abs_scale=float(depth_shortcut_mag_abs_scale),
+                    depth_shortcut_mag_clip_min=float(depth_shortcut_mag_clip_min),
+                    depth_shortcut_mag_clip_max=float(depth_shortcut_mag_clip_max),
+                    depth_shortcut_timesteps=int(shortcut_timesteps),
+                    depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
+                    depth_shortcut_output_mode=depth_shortcut_output_mode,
+                )
+
+            if depth_shortcut_skip_timestep_mode == "all":
+                return apply_shortcut(None)
+            if depth_shortcut_skip_timestep_mode != "alternate":
+                raise ValueError(f"Unknown depth shortcut skip timestep mode: {depth_shortcut_skip_timestep_mode!r}")
+
+            # denoise_loop currently uses SDE last_step_size=0.04, so model calls
+            # cover t in [0, 0.96]. Alternate by recovered denoise-step index:
+            # even steps use the 3->7 shortcut, odd steps run the full DiT.
+            t_scalar = t[0] if t.ndim > 0 else t
+            step_idx = jnp.rint(t_scalar * float(num_steps - 1) / 0.96).astype(jnp.int32)
+            step_idx = jnp.clip(step_idx, 0, int(num_steps) - 1)
+            use_shortcut_step = (step_idx % 2) == 0
+            return jax.lax.cond(use_shortcut_step, apply_shortcut, apply_full, operand=None)
 
         rng_local, denoise_rng = jax.random.split(rng_local)
         samples = denoise_loop(
@@ -2451,20 +2509,25 @@ def main():
         choices=["trunc_normal", "gap2_biased"],
     )
     parser.add_argument(
+        "--shortcut-loss-mode",
         "--direct-loss-mode",
+        dest="shortcut_loss_mode",
         type=str,
         default="direction_magnitude",
-        choices=["direction_magnitude", "direction_activation_huber"],
+        choices=["direction_magnitude", "direction_activation", "direction_activation_huber"],
         help=(
-            "Direct predictor loss target. direction_magnitude keeps the current direction + log-magnitude loss; "
-            "direction_activation_huber keeps direction loss and replaces magnitude loss with Huber(y_pred, Z_b)."
+            "Shortcut predictor loss/output mode. direction_magnitude keeps the current direction + log-magnitude losses; "
+            "direction_activation treats the predictor output as the target activation and uses Huber auxiliary losses. "
+            "direction_activation_huber is accepted as a deprecated alias."
         ),
     )
     parser.add_argument(
+        "--shortcut-activation-huber-delta",
         "--direct-activation-huber-delta",
+        dest="shortcut_activation_huber_delta",
         type=float,
         default=1.0,
-        help="Huber delta used when --direct-loss-mode=direction_activation_huber.",
+        help="Huber delta used when --shortcut-loss-mode=direction_activation.",
     )
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
     parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
@@ -2652,6 +2715,16 @@ def main():
         default=True,
         help="Also compute FID/sFID with a single depth shortcut 3->7 using predictor EMA. Direction mode uses L2 EMA magnitudes; direction-magnitude mode uses the magnitude head.",
     )
+    parser.add_argument(
+        "--fid-skip-timestep-mode",
+        type=str,
+        default="alternate",
+        choices=["alternate", "all"],
+        help=(
+            "Validation FID/sFID 3->7 shortcut schedule. alternate uses the shortcut on even denoise "
+            "steps and full DiT on odd steps; all uses the shortcut at every denoise step."
+        ),
+    )
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
@@ -2738,8 +2811,10 @@ def main():
         raise ValueError("--direct-num-pairs must equal --direct-joint-pairs + --direct-predictor-only-pairs")
     if args.direct_num_pairs not in {2, 3}:
         raise ValueError("--direct-num-pairs supports static values 2 or 3")
-    if args.direct_activation_huber_delta <= 0.0:
-        raise ValueError("--direct-activation-huber-delta must be greater than 0")
+    if args.shortcut_loss_mode == "direction_activation_huber":
+        args.shortcut_loss_mode = "direction_activation"
+    if args.shortcut_activation_huber_delta <= 0.0:
+        raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -2819,8 +2894,8 @@ def main():
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
-        f"direct_loss_mode={args.direct_loss_mode} "
-        f"direct_activation_huber_delta={args.direct_activation_huber_delta} "
+        f"shortcut_loss_mode={args.shortcut_loss_mode} "
+        f"shortcut_activation_huber_delta={args.shortcut_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
@@ -2952,8 +3027,8 @@ def main():
             direct_num_joint_pairs=args.direct_joint_pairs,
             direct_num_predictor_only_pairs=args.direct_predictor_only_pairs,
             direct_pair_mode=args.direct_pair_mode,
-            direct_loss_mode=args.direct_loss_mode,
-            direct_activation_huber_delta=args.direct_activation_huber_delta,
+            shortcut_loss_mode=args.shortcut_loss_mode,
+            shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,
@@ -3002,6 +3077,8 @@ def main():
             shortcut_predictor_variant=args.shortcut_predictor,
             shortcut_timesteps=args.shortcut_timesteps,
             depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
+            depth_shortcut_skip_timestep_mode=args.fid_skip_timestep_mode,
+            depth_shortcut_output_mode=args.shortcut_loss_mode,
         )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
@@ -3496,7 +3573,7 @@ def main():
         if args.fid_skip_eval and fid_sample_latents_skip_pmapped is not None:
             log_stage(
                 f"[EVAL] generating skip fake pool: {need} samples @ step {step} "
-                f"(3->7 only; L2 EMA magnitude restore)…"
+                f"(3->7; timestep_mode={args.fid_skip_timestep_mode}; output_mode={args.shortcut_loss_mode})…"
             )
             acc_skip_pooled = init_gaussian_sums(2048)
             acc_skip_spatial = init_gaussian_sums(2048)
@@ -3536,6 +3613,8 @@ def main():
             mu_skip_s, cov_skip_s, _ = finalize_gaussian_sums(acc_skip_spatial)
             metrics["val/FID_skip_3to7"] = fid_from_stats(mu_real, cov_real, mu_skip, cov_skip)
             metrics["val/sFID_skip_3to7"] = fid_from_stats(mu_real_s, cov_real_s, mu_skip_s, cov_skip_s)
+            metrics["val/FID_skip_timestep_mode"] = 1.0 if args.fid_skip_timestep_mode == "alternate" else 0.0
+            metrics["val/FID_skip_output_mode"] = 1.0 if args.shortcut_loss_mode == "direction_activation" else 0.0
 
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)

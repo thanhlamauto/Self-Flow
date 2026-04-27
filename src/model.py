@@ -329,6 +329,7 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_mag_clip_max: float = 8.0,
         depth_shortcut_timesteps: int = 50,
         depth_shortcut_normalize_input: bool = True,
+        depth_shortcut_output_mode: str = "direction_magnitude",
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -476,21 +477,24 @@ class SelfFlowDiT(nn.Module):
                     y_short, delta_m_short = pred_short
                 else:
                     y_short = pred_short
-                u_short = l2_normalize_tokens(y_short)
-                if depth_shortcut_predict_magnitude:
-                    m_target_short = jnp.clip(
-                        m_source_short + float(depth_shortcut_mag_scale) * delta_m_short,
-                        float(depth_shortcut_mag_clip_min),
-                        float(depth_shortcut_mag_clip_max),
-                    )
-                    x = jnp.exp(m_target_short) * u_short
+                if depth_shortcut_output_mode == "direction_activation":
+                    x = y_short.astype(jnp.float32)
                 else:
-                    x = restore_l2_ema_magnitude(
-                        u_short,
-                        depth_shortcut_l2_ema,
-                        jnp.asarray(target_layer, dtype=jnp.int32),
-                        shortcut_q,
-                    )
+                    u_short = l2_normalize_tokens(y_short)
+                    if depth_shortcut_predict_magnitude:
+                        m_target_short = jnp.clip(
+                            m_source_short + float(depth_shortcut_mag_scale) * delta_m_short,
+                            float(depth_shortcut_mag_clip_min),
+                            float(depth_shortcut_mag_clip_max),
+                        )
+                        x = jnp.exp(m_target_short) * u_short
+                    else:
+                        x = restore_l2_ema_magnitude(
+                            u_short,
+                            depth_shortcut_l2_ema,
+                            jnp.asarray(target_layer, dtype=jnp.int32),
+                            shortcut_q,
+                        )
                 shortcut_skip_until = target_layer
 
             if hidden_states is not None:
