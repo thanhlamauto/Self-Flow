@@ -912,6 +912,8 @@ def train_step(
     direct_num_joint_pairs=1,
     direct_num_predictor_only_pairs=2,
     direct_pair_mode="trunc_normal",
+    direct_loss_mode="direction_magnitude",
+    direct_activation_huber_delta=1.0,
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
@@ -935,6 +937,10 @@ def train_step(
         raise ValueError("Direct shortcut training supports 2 or 3 static pairs.")
     if direct_pair_mode not in {"trunc_normal", "gap2_biased"}:
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
+    if direct_loss_mode not in {"direction_magnitude", "direction_activation_huber"}:
+        raise ValueError(f"Unknown direct loss mode: {direct_loss_mode!r}")
+    if direct_activation_huber_delta <= 0.0:
+        raise ValueError("direct_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in {"trunc_normal", "gap2_biased"}:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
     if output_distill_update_mode not in {
@@ -1033,14 +1039,23 @@ def train_step(
                 jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
             )
             loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
-            pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_mag_pair
+            if direct_loss_mode == "direction_magnitude":
+                loss_aux_pair = loss_mag_pair
+            else:
+                loss_aux_pair = jnp.mean(
+                    optax.huber_loss(
+                        y_pair - zb_target,
+                        delta=jnp.asarray(direct_activation_huber_delta, dtype=jnp.float32),
+                    )
+                )
+            pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_aux_pair
             delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
             delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
             y_pair_norm = jnp.linalg.norm(y_pair, axis=-1)
             return (
                 pair_loss,
                 loss_dir_pair,
-                loss_mag_pair,
+                loss_aux_pair,
                 cos_pair,
                 jnp.mean(delta_m_abs_error_pair),
                 jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair))),
@@ -1585,8 +1600,10 @@ def train_step(
         "train/loss_direct_ponly_2": loss_direct_ponly_2,
         "train/loss_dir_joint": loss_dir,
         "train/loss_mag_joint": loss_mag,
+        "train/loss_direct_aux_joint": loss_mag,
         "train/loss_dir_ponly_mean": loss_dir_ponly_mean,
         "train/loss_mag_ponly_mean": loss_mag_ponly_mean,
+        "train/loss_direct_aux_ponly_mean": loss_mag_ponly_mean,
         "train/loss_output_distill": loss_output_distill,
         "train/loss_output_distill_weighted": loss_output_distill_weighted,
         "train/loss_skip_fm": loss_skip_fm,
@@ -1627,6 +1644,11 @@ def train_step(
         "train/direct_gap_ponly_1": direct_gap_ponly_1,
         "train/direct_gap_ponly_2": direct_gap_ponly_2,
         "train/direct_num_pairs": jnp.asarray(direct_num_pairs, dtype=jnp.float32),
+        "train/direct_loss_mode": jnp.asarray(
+            0.0 if direct_loss_mode == "direction_magnitude" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/direct_activation_huber_delta": jnp.asarray(direct_activation_huber_delta, dtype=jnp.float32),
         "train/skip_in_loop_do": skip_do_metric,
         "train/skip_in_loop_prob": skip_prob_eff,
         "train/skip_in_loop_source": skip_a_metric,
@@ -2428,6 +2450,22 @@ def main():
         default="trunc_normal",
         choices=["trunc_normal", "gap2_biased"],
     )
+    parser.add_argument(
+        "--direct-loss-mode",
+        type=str,
+        default="direction_magnitude",
+        choices=["direction_magnitude", "direction_activation_huber"],
+        help=(
+            "Direct predictor loss target. direction_magnitude keeps the current direction + log-magnitude loss; "
+            "direction_activation_huber keeps direction loss and replaces magnitude loss with Huber(y_pred, Z_b)."
+        ),
+    )
+    parser.add_argument(
+        "--direct-activation-huber-delta",
+        type=float,
+        default=1.0,
+        help="Huber delta used when --direct-loss-mode=direction_activation_huber.",
+    )
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
     parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
     parser.add_argument("--shortcut-predictor-ema-decay", type=float, default=0.999)
@@ -2700,6 +2738,8 @@ def main():
         raise ValueError("--direct-num-pairs must equal --direct-joint-pairs + --direct-predictor-only-pairs")
     if args.direct_num_pairs not in {2, 3}:
         raise ValueError("--direct-num-pairs supports static values 2 or 3")
+    if args.direct_activation_huber_delta <= 0.0:
+        raise ValueError("--direct-activation-huber-delta must be greater than 0")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -2779,6 +2819,8 @@ def main():
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
+        f"direct_loss_mode={args.direct_loss_mode} "
+        f"direct_activation_huber_delta={args.direct_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
@@ -2910,6 +2952,8 @@ def main():
             direct_num_joint_pairs=args.direct_joint_pairs,
             direct_num_predictor_only_pairs=args.direct_predictor_only_pairs,
             direct_pair_mode=args.direct_pair_mode,
+            direct_loss_mode=args.direct_loss_mode,
+            direct_activation_huber_delta=args.direct_activation_huber_delta,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,

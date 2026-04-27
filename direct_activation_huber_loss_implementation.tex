@@ -1,0 +1,291 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T5]{fontenc}
+\usepackage[vietnamese]{babel}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\title{Ghi chú implementation: Direct Activation Huber Loss}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Mục tiêu thay đổi}
+
+Branch \texttt{feat/depth-shortcut-output-distill} được thêm một option mới cho direct predictor loss.
+Trước thay đổi, direct loss luôn dùng:
+\[
+L_{\text{pair}}
+=
+\lambda_{\text{dir}} L_{\text{dir}}
++
+\lambda_{\text{mag}} L_{\text{mag}}.
+\]
+Trong đó \(L_{\text{mag}}\) là mean squared error trên log-magnitude delta đã chuẩn hoá.
+
+Sau thay đổi, code hỗ trợ thêm mode mới:
+\[
+\texttt{--direct-loss-mode direction\_activation\_huber}.
+\]
+Mode này vẫn giữ direction loss như hiện tại, nhưng thay magnitude loss bằng Huber loss giữa output activation dự đoán và activation thật của layer target:
+\[
+L_{\text{pair}}
+=
+\lambda_{\text{dir}} L_{\text{dir}}
++
+\lambda_{\text{mag}} L_{\text{act}}.
+\]
+Ở đây \(L_{\text{act}}\) là Huber loss giữa \(Y_{a \rightarrow b}\) và \(Z_b\).
+
+\section{CLI mới}
+
+Hai argument mới được thêm vào \texttt{train.py}:
+
+\begin{verbatim}
+--direct-loss-mode
+--direct-activation-huber-delta
+\end{verbatim}
+
+\texttt{--direct-loss-mode} có hai giá trị:
+
+\begin{itemize}
+  \item \texttt{direction\_magnitude}: mode mặc định, giữ nguyên behavior cũ.
+  \item \texttt{direction\_activation\_huber}: mode mới, dùng direction loss cộng activation Huber loss.
+\end{itemize}
+
+\texttt{--direct-activation-huber-delta} là tham số \(\delta\) của Huber loss, mặc định bằng \(1.0\).
+Code validate rằng giá trị này phải lớn hơn \(0\).
+
+\section{Direct pair forward}
+
+Với một pair \((a,b)\), hidden states từ backbone là:
+\[
+Z_a, Z_b \in \mathbb{R}^{B \times N \times D}.
+\]
+
+Target layer activation luôn được stop-gradient:
+\[
+Z_b^{\text{target}} = \operatorname{stopgrad}(Z_b).
+\]
+
+Source hidden phụ thuộc vào loại pair:
+\[
+\tilde{Z}_a =
+\begin{cases}
+Z_a, & \text{joint pair},\\
+\operatorname{stopgrad}(Z_a), & \text{predictor-only pair}.
+\end{cases}
+\]
+
+Input vào predictor được tạo bằng helper \texttt{build\_predictor\_source}:
+\[
+U_a = \frac{\tilde{Z}_a}{\|\tilde{Z}_a\|_2 + \epsilon},
+\qquad
+m_a = \log(\|\tilde{Z}_a\|_2 + \epsilon).
+\]
+
+Nếu \texttt{--no-shortcut-predictor-normalize-input} được dùng, predictor nhận raw hidden \(\tilde{Z}_a\) thay vì \(U_a\), nhưng \(m_a\) vẫn được tính từ norm của hidden.
+
+Predictor trả về:
+\[
+(Y_{a \rightarrow b}, \Delta m_{a \rightarrow b})
+=
+P(\text{source}, a, b, t_{\text{emb}}, m_a).
+\]
+
+\section{Direction loss giữ nguyên}
+
+Direction prediction vẫn lấy hướng từ output \(Y_{a \rightarrow b}\):
+\[
+\hat{U}_{a \rightarrow b}
+=
+\frac{Y_{a \rightarrow b}}{\|Y_{a \rightarrow b}\|_2 + \epsilon}.
+\]
+
+Target direction:
+\[
+U_b
+=
+\frac{Z_b^{\text{target}}}{\|Z_b^{\text{target}}\|_2 + \epsilon}.
+\]
+
+Direction loss:
+\[
+L_{\text{dir}}
+=
+1 -
+\mathbb{E}_{B,N}
+\left[
+\sum_D
+\hat{U}_{a \rightarrow b} \cdot U_b
+\right].
+\]
+
+\section{Mode cũ: direction\_magnitude}
+
+Mode mặc định \texttt{direction\_magnitude} giữ nguyên loss phụ cũ.
+Target magnitude delta:
+\[
+\Delta m^{\text{target}}_{a \rightarrow b}
+=
+\operatorname{clip}
+\left(
+\frac{\log(\|Z_b\|_2 + \epsilon) - \log(\|Z_a\|_2 + \epsilon)}
+{\texttt{shortcut\_mag\_scale}},
+-1,
+1
+\right).
+\]
+
+Magnitude loss:
+\[
+L_{\text{mag}}
+=
+\frac{1}{2}
+\mathbb{E}
+\left[
+\left(
+\Delta m_{a \rightarrow b}
+-
+\operatorname{stopgrad}(\Delta m^{\text{target}}_{a \rightarrow b})
+\right)^2
+\right].
+\]
+
+Pair loss:
+\[
+L_{\text{pair}}
+=
+\lambda_{\text{dir}} L_{\text{dir}}
++
+\lambda_{\text{mag}} L_{\text{mag}}.
+\]
+
+\section{Mode mới: direction\_activation\_huber}
+
+Mode \texttt{direction\_activation\_huber} thay \(L_{\text{mag}}\) bằng Huber loss trực tiếp trên activation.
+
+Activation prediction được lấy thẳng từ output đầu tiên của predictor:
+\[
+\hat{Z}_b = Y_{a \rightarrow b}.
+\]
+
+Target activation:
+\[
+Z_b^{\text{target}} = \operatorname{stopgrad}(Z_b).
+\]
+
+Activation Huber loss:
+\[
+L_{\text{act}}
+=
+\mathbb{E}_{B,N,D}
+\left[
+\operatorname{Huber}_{\delta}
+\left(
+\hat{Z}_b - Z_b^{\text{target}}
+\right)
+\right],
+\]
+với \(\delta = \texttt{direct\_activation\_huber\_delta}\).
+
+Pair loss trong mode mới:
+\[
+L_{\text{pair}}
+=
+\lambda_{\text{dir}} L_{\text{dir}}
++
+\lambda_{\text{mag}} L_{\text{act}}.
+\]
+
+Điểm quan trọng là \texttt{--shortcut-lambda-mag} vẫn là weight của loss phụ.
+Nó không còn nhân magnitude loss trong mode mới, mà nhân activation Huber loss.
+
+\section{Gradient routing}
+
+Thay đổi này không đổi rule gradient của direct pairs:
+
+\begin{itemize}
+  \item Joint pair: source \(Z_a\) không detach, nên gradient từ \(L_{\text{dir}}\) và \(L_{\text{act}}\) có thể đi vào predictor và backbone qua \(Z_a\).
+  \item Predictor-only pairs: source \(Z_a\) và target \(Z_b\) đều stop-gradient, nên loss chỉ update predictor.
+  \item Target \(Z_b\) luôn stop-gradient trong direct loss.
+\end{itemize}
+
+Trong mode mới, \(Z_b^{\text{target}}\) vẫn là hằng số theo gradient:
+\[
+\frac{\partial Z_b^{\text{target}}}{\partial \theta_{\text{backbone}}} = 0.
+\]
+
+\section{Aggregation qua nhiều pairs}
+
+Logic sample 2 hoặc 3 direct pairs không đổi.
+Nếu dùng 3 pairs:
+\[
+L_{\text{direct}}
+=
+\frac{
+L_{\text{joint}}
++ L_{\text{ponly},1}
++ L_{\text{ponly},2}
+}{3}.
+\]
+
+Nếu dùng 2 pairs:
+\[
+L_{\text{direct}}
+=
+\frac{
+L_{\text{joint}}
++ L_{\text{ponly},1}
+}{2}.
+\]
+
+Mode mới chỉ thay định nghĩa loss phụ bên trong từng pair.
+Sampling truncated-normal/gap2-biased không đổi.
+
+\section{Logging}
+
+Các metric mới được thêm:
+
+\begin{verbatim}
+train/direct_loss_mode
+train/direct_activation_huber_delta
+train/loss_direct_aux_joint
+train/loss_direct_aux_ponly_mean
+\end{verbatim}
+
+\texttt{train/direct\_loss\_mode} được encode:
+\[
+0 = \texttt{direction\_magnitude},
+\qquad
+1 = \texttt{direction\_activation\_huber}.
+\]
+
+\texttt{train/loss\_direct\_aux\_joint} và \texttt{train/loss\_direct\_aux\_ponly\_mean} là tên trung lập cho loss phụ.
+Trong mode cũ, chúng tương ứng với magnitude loss.
+Trong mode mới, chúng tương ứng với activation Huber loss.
+
+Các metric cũ \texttt{train/loss\_mag\_joint} và \texttt{train/loss\_mag\_ponly\_mean} vẫn được giữ để không phá logging hiện tại.
+Trong mode mới, hai metric này thực chất đang chứa activation Huber loss.
+
+\section{Ví dụ sử dụng}
+
+Để bật direct activation Huber loss:
+
+\begin{verbatim}
+--direct-loss-mode direction_activation_huber \
+--direct-activation-huber-delta 1.0
+\end{verbatim}
+
+Nếu không truyền hai argument này, training vẫn dùng behavior cũ:
+
+\begin{verbatim}
+--direct-loss-mode direction_magnitude
+\end{verbatim}
+
+\end{document}
