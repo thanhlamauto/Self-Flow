@@ -622,6 +622,12 @@ def build_direction_and_norm_map(hidden, eps=1e-6):
     return directions, log_magnitudes, log_magnitudes
 
 
+def build_predictor_source(hidden, normalize_input=True, eps=1e-6):
+    directions, log_magnitudes, _ = build_direction_and_norm_map(hidden, eps=eps)
+    predictor_input = directions if normalize_input else hidden.astype(jnp.float32)
+    return predictor_input, log_magnitudes
+
+
 def sample_discrete_truncated_normal_gap(max_gap, loc, sigma, rng, depth):
     """Sample d in [1, min(max_gap, depth)] with discrete truncated-normal logits."""
     max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
@@ -909,6 +915,8 @@ def train_step(
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
+    predictor_use_timestep=True,
+    predictor_normalize_input=True,
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
 ):
@@ -986,17 +994,21 @@ def train_step(
             if source_detach:
                 za = jax.lax.stop_gradient(za)
             zb_target = jax.lax.stop_gradient(hidden_stack_f32[target_layer])
-            ua, ma_condition, _ = build_direction_and_norm_map(za)
+            predictor_source, ma_condition = build_predictor_source(
+                za,
+                normalize_input=predictor_normalize_input,
+            )
             ub, _, _ = build_direction_and_norm_map(zb_target)
             t_embed_pair = jax.lax.stop_gradient(dit_time_emb) if source_detach else dit_time_emb
             y_pair, delta_m_pair = state.predictor_apply_fn(
                 {"params": params["predictor"]},
-                ua,
+                predictor_source,
                 source_layer,
                 target_layer,
                 t_embed_pair,
                 ma_condition,
                 detach_timestep_embed=source_detach,
+                use_timestep_embed=predictor_use_timestep,
             )
             u_pair = l2_normalize_tokens(y_pair)
             cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
@@ -1108,7 +1120,7 @@ def train_step(
         direct_gap = direct_joint_b - direct_joint_a
 
         boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
-        boot_source_u = directions[boot_a]
+        boot_source_u = directions[boot_a] if predictor_normalize_input else hidden_stack_f32[boot_a]
         boot_source_m = log_magnitudes[boot_a]
         boot_source_u = jax.lax.cond(
             bootstrap_detach_source,
@@ -1129,16 +1141,18 @@ def train_step(
             boot_b,
             dit_time_emb,
             boot_source_m,
+            use_timestep_embed=predictor_use_timestep,
         )
         u_boot_ab = l2_normalize_tokens(y_boot_ab)
         m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
         y_abc, delta_m_abc = state.predictor_apply_fn(
             {"params": params["predictor"]},
-            u_boot_ab,
+            u_boot_ab if predictor_normalize_input else y_boot_ab,
             boot_b,
             boot_c,
             dit_time_emb,
             m_boot_ab,
+            use_timestep_embed=predictor_use_timestep,
         )
         u_abc = l2_normalize_tokens(y_abc)
         y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
@@ -1148,6 +1162,7 @@ def train_step(
             boot_c,
             dit_time_emb,
             boot_source_m,
+            use_timestep_embed=predictor_use_timestep,
         )
         u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
         cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
@@ -1158,13 +1173,18 @@ def train_step(
 
         def compute_debug_pair_metrics(_):
             def compute_pair_metrics(source_layer, target_layer):
+                pair_source, pair_source_m = build_predictor_source(
+                    hidden_stack_f32[source_layer],
+                    normalize_input=predictor_normalize_input,
+                )
                 y_pair, delta_m_pair = state.predictor_apply_fn(
                     {"params": params["predictor"]},
-                    directions[source_layer],
+                    pair_source,
                     jnp.asarray(source_layer, dtype=jnp.int32),
                     jnp.asarray(target_layer, dtype=jnp.int32),
                     dit_time_emb,
-                    log_magnitudes[source_layer],
+                    pair_source_m,
+                    use_timestep_embed=predictor_use_timestep,
                 )
                 u_pair = l2_normalize_tokens(y_pair)
                 target_u_pair = jax.lax.stop_gradient(directions[target_layer])
@@ -1261,15 +1281,19 @@ def train_step(
                     output_pair_rng,
                 )
             z_source = jax.lax.stop_gradient(hidden_stack_f32[output_a, subset_idx])
-            u_source, m_source, _ = build_direction_and_norm_map(z_source)
+            predictor_source, m_source = build_predictor_source(
+                z_source,
+                normalize_input=predictor_normalize_input,
+            )
             y_pred, delta_m_pred = state.predictor_apply_fn(
                 {"params": params["predictor"]},
-                u_source,
+                predictor_source,
                 output_a,
                 output_b,
                 t_emb_teacher,
                 m_source,
                 detach_timestep_embed=True,
+                use_timestep_embed=predictor_use_timestep,
             )
             u_pred = l2_normalize_tokens(y_pred)
             m_pred = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
@@ -1573,6 +1597,8 @@ def train_step(
             0.0 if private_pair_mode == "first" else 1.0,
             dtype=jnp.float32,
         ),
+        "train/predictor_use_timestep": jnp.asarray(1.0 if predictor_use_timestep else 0.0, dtype=jnp.float32),
+        "train/predictor_normalize_input": jnp.asarray(1.0 if predictor_normalize_input else 0.0, dtype=jnp.float32),
         "train/y_ab_norm_mean": y_ab_norm_mean,
         "train/y_ab_norm_min": y_ab_norm_min,
         "train/y_ab_norm_max": y_ab_norm_max,
@@ -2384,6 +2410,18 @@ def main():
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
     parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
     parser.add_argument("--shortcut-predictor-ema-decay", type=float, default=0.999)
+    parser.add_argument(
+        "--shortcut-predictor-use-timestep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Condition the shortcut predictor on the DiT timestep embedding. Default true.",
+    )
+    parser.add_argument(
+        "--shortcut-predictor-normalize-input",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Feed L2-normalized source hidden directions into the predictor. Disable to feed raw hidden activations.",
+    )
     parser.add_argument("--shortcut-l2-ema-alpha", type=float, default=0.01)
     parser.add_argument(
         "--private-loss",
@@ -2724,7 +2762,9 @@ def main():
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
         f"mag_clip=({args.shortcut_mag_clip_min},{args.shortcut_mag_clip_max}) "
         f"lr_backbone={args.learning_rate} pred_lr={args.shortcut_predictor_lr} "
-        f"pred_wd={args.shortcut_predictor_weight_decay}"
+        f"pred_wd={args.shortcut_predictor_weight_decay} "
+        f"pred_use_t={args.shortcut_predictor_use_timestep} "
+        f"pred_norm_input={args.shortcut_predictor_normalize_input}"
     )
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
@@ -2852,6 +2892,8 @@ def main():
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,
+            predictor_use_timestep=args.shortcut_predictor_use_timestep,
+            predictor_normalize_input=args.shortcut_predictor_normalize_input,
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
         ),
