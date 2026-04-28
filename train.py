@@ -2006,6 +2006,148 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
+def make_sample_latents_shortcut_fn(
+    config,
+    num_steps=50,
+    cfg_scale=1.0,
+    depth_shortcut_skip_source_layer=3,
+    depth_shortcut_skip_target_layer=7,
+    depth_shortcut_predict_magnitude=False,
+    depth_shortcut_mag_scale=3.0,
+    depth_shortcut_mag_abs_center=5.5,
+    depth_shortcut_mag_abs_scale=1.5,
+    depth_shortcut_mag_clip_min=3.0,
+    depth_shortcut_mag_clip_max=8.0,
+    shortcut_predictor_variant="tiny",
+    shortcut_timesteps=50,
+    depth_shortcut_normalize_input=True,
+    depth_shortcut_skip_timestep_mode="alternate",
+    depth_shortcut_output_mode="direction_magnitude",
+):
+    """Build a non-pmapped sampler for preview images with a 3->7 shortcut."""
+    if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires an unconditional label embedding. "
+            "Use --cfg-dropout-rate > 0 for training, or keep cfg scale at 1.0."
+        )
+
+    model = SelfFlowDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
+        per_token=False,
+    )
+
+    def sample_latents_shortcut(params, predictor_params, l2_ema, class_labels, rng):
+        batch_size = class_labels.shape[0]
+        latent_channels = config["in_channels"]
+        latent_size = config["input_size"]
+        patch_size = config["patch_size"]
+
+        noise = jax.random.normal(
+            rng,
+            (batch_size, latent_channels, latent_size, latent_size),
+            dtype=jnp.float32,
+        )
+
+        from einops import rearrange
+        x = rearrange(
+            noise,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=patch_size,
+            p2=patch_size,
+        ).astype(jnp.float32)
+        token_h = latent_size // patch_size
+        token_w = latent_size // patch_size
+
+        use_cfg = cfg_scale > 1.0
+        if use_cfg:
+            x = jnp.concatenate([x, x], axis=0)
+            class_labels = jnp.concatenate(
+                [jnp.full_like(class_labels, config["num_classes"]), class_labels],
+                axis=0,
+            )
+
+        def model_fn(z_x, t):
+            def apply_full(_):
+                return model.apply(
+                    {"params": params},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels,
+                    deterministic=True,
+                )
+
+            def apply_shortcut(_):
+                return model.apply(
+                    {"params": params},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels,
+                    deterministic=True,
+                    depth_shortcut_predictor_params=predictor_params,
+                    depth_shortcut_l2_ema=l2_ema,
+                    depth_shortcut_variant=shortcut_predictor_variant,
+                    depth_shortcut_skip_every_other=True,
+                    depth_shortcut_skip_source_layer=int(depth_shortcut_skip_source_layer),
+                    depth_shortcut_skip_target_layer=int(depth_shortcut_skip_target_layer),
+                    depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
+                    depth_shortcut_mag_scale=float(depth_shortcut_mag_scale),
+                    depth_shortcut_mag_abs_center=float(depth_shortcut_mag_abs_center),
+                    depth_shortcut_mag_abs_scale=float(depth_shortcut_mag_abs_scale),
+                    depth_shortcut_mag_clip_min=float(depth_shortcut_mag_clip_min),
+                    depth_shortcut_mag_clip_max=float(depth_shortcut_mag_clip_max),
+                    depth_shortcut_timesteps=int(shortcut_timesteps),
+                    depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
+                    depth_shortcut_output_mode=depth_shortcut_output_mode,
+                )
+
+            if depth_shortcut_skip_timestep_mode == "all":
+                return apply_shortcut(None)
+            if depth_shortcut_skip_timestep_mode != "alternate":
+                raise ValueError(f"Unknown depth shortcut skip timestep mode: {depth_shortcut_skip_timestep_mode!r}")
+            t_scalar = t[0] if t.ndim > 0 else t
+            step_idx = jnp.rint(t_scalar * float(num_steps - 1) / 0.96).astype(jnp.int32)
+            step_idx = jnp.clip(step_idx, 0, int(num_steps) - 1)
+            return jax.lax.cond((step_idx % 2) == 0, apply_shortcut, apply_full, operand=None)
+
+        rng, denoise_rng = jax.random.split(rng)
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+            reverse=False,
+        )
+
+        if use_cfg:
+            samples = samples[batch_size:]
+        samples = rearrange(
+            samples,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h,
+            w=token_w,
+            p1=patch_size,
+            p2=patch_size,
+            c=latent_channels,
+        )
+        return samples
+
+    return jax.jit(sample_latents_shortcut)
+
+
 def make_sample_latents_pmap_fn(
     config,
     num_steps=50,
@@ -2644,6 +2786,12 @@ def main():
                              "TPU-friendly default: 50. Paper-like eval: 250.")
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
                         help="CFG scale for sample previews. Default 1.0 (paper setting).")
+    parser.add_argument(
+        "--sample-skip-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also log sample preview images generated with the shortcut 3->7 sampler.",
+    )
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -3047,6 +3195,26 @@ def main():
     sample_latents_jitted = make_sample_latents_fn(
         config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
     )
+    sample_latents_skip_jitted = None
+    if args.sample_skip_eval:
+        sample_latents_skip_jitted = make_sample_latents_shortcut_fn(
+            config,
+            num_steps=args.sample_num_steps,
+            cfg_scale=args.sample_cfg_scale,
+            depth_shortcut_skip_source_layer=3,
+            depth_shortcut_skip_target_layer=7,
+            depth_shortcut_predict_magnitude=uses_magnitude_losses,
+            depth_shortcut_mag_scale=args.shortcut_mag_scale,
+            depth_shortcut_mag_abs_center=args.shortcut_mag_abs_center,
+            depth_shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
+            depth_shortcut_mag_clip_min=args.shortcut_mag_clip_min,
+            depth_shortcut_mag_clip_max=args.shortcut_mag_clip_max,
+            shortcut_predictor_variant=args.shortcut_predictor,
+            shortcut_timesteps=args.shortcut_timesteps,
+            depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
+            depth_shortcut_skip_timestep_mode=args.fid_skip_timestep_mode,
+            depth_shortcut_output_mode=args.shortcut_loss_mode,
+        )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
@@ -3873,21 +4041,41 @@ def main():
                 sample_classes = jax.random.randint(sample_rng, (4,), 0, 1000)
                 # Use EMA params for sample generation (paper-faithful eval)
                 single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
+                single_predictor_ema_params = jax.tree_util.tree_map(lambda w: w[0], predictor_ema_params)
+                single_l2_ema = jax.tree_util.tree_map(lambda w: w[0], l2_ema)
                 latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
+                latents_skip_dev = None
+                if sample_latents_skip_jitted is not None:
+                    latents_skip_dev = sample_latents_skip_jitted(
+                        single_ema_params,
+                        single_predictor_ema_params,
+                        single_l2_ema,
+                        sample_classes,
+                        sample_rng,
+                    )
 
-                def _bg_log(z_dev, classes, target_step):
+                def _bg_log(z_dev, z_skip_dev, classes, target_step):
                     z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
                     classes = jax.device_get(classes)
                     images = decode_latents_batched(z, args.vae_decode_batch_size)
                     images = (images * 255).astype(np.uint8)
-                    safe_wandb_log({
+                    log_payload = {
                         "train/step": target_step,
                         "samples": [wandb.Image(img, caption=f"Class {cls}")
                                     for img, cls in zip(images, classes)],
-                    }, step=target_step)
+                    }
+                    if z_skip_dev is not None:
+                        z_skip = np.asarray(jax.device_get(z_skip_dev), dtype=np.float32)
+                        images_skip = decode_latents_batched(z_skip, args.vae_decode_batch_size)
+                        images_skip = (images_skip * 255).astype(np.uint8)
+                        log_payload["samples_skip_3to7"] = [
+                            wandb.Image(img, caption=f"Class {cls} skip 3->7")
+                            for img, cls in zip(images_skip, classes)
+                        ]
+                    safe_wandb_log(log_payload, step=target_step)
 
                 threading.Thread(target=_bg_log,
-                                 args=(latents_dev, sample_classes, global_step),
+                                 args=(latents_dev, latents_skip_dev, sample_classes, global_step),
                                  daemon=True).start()
 
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
