@@ -628,6 +628,12 @@ def build_predictor_source(hidden, normalize_input=True, eps=1e-6):
     return predictor_input, log_magnitudes
 
 
+def sample_activation_rms(x, eps=1e-6):
+    """Per-sample RMS over token and channel axes for activation-scale normalization."""
+    reduce_axes = tuple(range(1, x.ndim))
+    return jnp.sqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=reduce_axes, keepdims=True) + eps)
+
+
 def sample_discrete_truncated_normal_gap(max_gap, loc, sigma, rng, depth):
     """Sample d in [1, min(max_gap, depth)] with discrete truncated-normal logits."""
     max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
@@ -1050,16 +1056,19 @@ def train_step(
                 delta_m_ratio_error_pair = jnp.mean(jnp.exp(delta_m_abs_error_pair))
                 delta_m_clip_rate_pair = jnp.mean((jnp.abs(target_delta_m_raw_pair) > mag_scale).astype(jnp.float32))
             else:
+                target_rms_pair = jax.lax.stop_gradient(sample_activation_rms(zb_target))
+                pred_rms_pair = sample_activation_rms(y_pair)
+                residual_norm_pair = (y_pair - zb_target) / target_rms_pair
                 loss_aux_pair = jnp.mean(
                     optax.huber_loss(
-                        y_pair - zb_target,
+                        residual_norm_pair,
                         delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
                     )
                 )
-                delta_m_mae_pair = jnp.float32(0.0)
-                delta_m_rmse_pair = jnp.float32(0.0)
+                delta_m_mae_pair = jnp.mean(target_rms_pair)
+                delta_m_rmse_pair = jnp.mean(pred_rms_pair)
                 delta_m_ratio_error_pair = jnp.float32(0.0)
-                delta_m_clip_rate_pair = jnp.float32(0.0)
+                delta_m_clip_rate_pair = jnp.sqrt(jnp.mean(jnp.square(residual_norm_pair)))
             pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_aux_pair
             y_pair_norm = jnp.linalg.norm(y_pair, axis=-1)
             return (
@@ -1208,12 +1217,24 @@ def train_step(
             pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
             loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
         else:
+            y_ac_ema_target = jax.lax.stop_gradient(y_ac_ema)
+            boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(y_ac_ema_target))
+            boot_pred_rms = sample_activation_rms(y_abc)
+            boot_residual_norm = (y_abc - y_ac_ema_target) / boot_target_rms
             loss_boot_mag = jnp.mean(
                 optax.huber_loss(
-                    y_abc - jax.lax.stop_gradient(y_ac_ema),
+                    boot_residual_norm,
                     delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
                 )
             )
+        if shortcut_loss_mode == "direction_magnitude":
+            boot_target_rms_metric = jnp.float32(0.0)
+            boot_pred_rms_metric = jnp.float32(0.0)
+            boot_rel_residual_rms_metric = jnp.float32(0.0)
+        else:
+            boot_target_rms_metric = jnp.mean(boot_target_rms)
+            boot_pred_rms_metric = jnp.mean(boot_pred_rms)
+            boot_rel_residual_rms_metric = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
 
         def compute_debug_pair_metrics(_):
             def compute_pair_metrics(source_layer, target_layer):
@@ -1464,6 +1485,9 @@ def train_step(
             delta_m_rmse,
             delta_m_ratio_error,
             delta_m_clip_rate,
+            boot_target_rms_metric,
+            boot_pred_rms_metric,
+            boot_rel_residual_rms_metric,
             direct_gap,
             direct_joint_a.astype(jnp.float32),
             direct_joint_b.astype(jnp.float32),
@@ -1521,6 +1545,9 @@ def train_step(
         delta_m_rmse,
         delta_m_ratio_error,
         delta_m_clip_rate,
+        boot_target_rms,
+        boot_pred_rms,
+        boot_rel_residual_rms,
         direct_gap,
         direct_joint_a,
         direct_joint_b,
@@ -1575,6 +1602,9 @@ def train_step(
     delta_m_rmse = jax.lax.pmean(delta_m_rmse, axis_name="batch")
     delta_m_ratio_error = jax.lax.pmean(delta_m_ratio_error, axis_name="batch")
     delta_m_clip_rate = jax.lax.pmean(delta_m_clip_rate, axis_name="batch")
+    boot_target_rms = jax.lax.pmean(boot_target_rms, axis_name="batch")
+    boot_pred_rms = jax.lax.pmean(boot_pred_rms, axis_name="batch")
+    boot_rel_residual_rms = jax.lax.pmean(boot_rel_residual_rms, axis_name="batch")
     direct_gap = jax.lax.pmean(direct_gap.astype(jnp.float32), axis_name="batch")
     direct_joint_a = jax.lax.pmean(direct_joint_a.astype(jnp.float32), axis_name="batch")
     direct_joint_b = jax.lax.pmean(direct_joint_b.astype(jnp.float32), axis_name="batch")
@@ -1660,6 +1690,18 @@ def train_step(
         "train/delta_m_rmse": delta_m_rmse,
         "train/delta_m_ratio_error": delta_m_ratio_error,
         "train/delta_m_clip_rate": delta_m_clip_rate,
+        "train/direct_activation_target_rms_joint": (
+            delta_m_mae if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
+        ),
+        "train/direct_activation_pred_rms_joint": (
+            delta_m_rmse if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
+        ),
+        "train/direct_activation_rel_residual_rms_joint": (
+            delta_m_clip_rate if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
+        ),
+        "train/boot_activation_target_rms": boot_target_rms,
+        "train/boot_activation_pred_rms": boot_pred_rms,
+        "train/boot_activation_rel_residual_rms": boot_rel_residual_rms,
         "train/direct_gap": direct_gap,
         "train/direct_pair_joint_a": direct_joint_a,
         "train/direct_pair_joint_b": direct_joint_b,

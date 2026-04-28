@@ -170,7 +170,7 @@ L_{\text{pair}}
 
 \section{Mode mới: direction\_activation\_huber}
 
-Mode \texttt{direction\_activation} thay \(L_{\text{mag}}\) bằng Huber loss trực tiếp trên activation.
+Mode \texttt{direction\_activation} thay \(L_{\text{mag}}\) bằng normalized element-wise Huber loss trên activation.
 
 Activation prediction được lấy thẳng từ output đầu tiên của predictor:
 \[
@@ -184,13 +184,26 @@ Z_b^{\text{target}} = \operatorname{stopgrad}(Z_b).
 
 Activation Huber loss:
 \[
+s_b
+=
+\sqrt{
+\mathbb{E}_{N,D}
+\left[
+\left(Z_b^{\text{target}}\right)^2
+\right]
++ \epsilon
+}.
+\]
+Scale \(s_b\) được tính riêng cho từng sample trong batch và được stop-gradient.
+
+\[
 L_{\text{act}}
 =
 \mathbb{E}_{B,N,D}
 \left[
 \operatorname{Huber}_{\delta}
 \left(
-\hat{Z}_b - Z_b^{\text{target}}
+\frac{\hat{Z}_b - Z_b^{\text{target}}}{\operatorname{stopgrad}(s_b)}
 \right)
 \right],
 \]
@@ -242,7 +255,20 @@ L_{\text{boot-dir}}
 \right\rangle
 \right].
 \]
-Loss phụ bootstrap trong mode mới là:
+Loss phụ bootstrap trong mode mới cũng dùng normalized element-wise Huber. Với:
+\[
+s^{\text{ema}}_{a \rightarrow c}
+=
+\sqrt{
+\mathbb{E}_{N,D}
+\left[
+\left(Y^{\text{ema}}_{a \rightarrow c}\right)^2
+\right]
++ \epsilon
+}.
+\]
+
+Loss phụ bootstrap là:
 \[
 L_{\text{boot-act}}
 =
@@ -250,9 +276,13 @@ L_{\text{boot-act}}
 \left[
 \operatorname{Huber}_{\delta}
 \left(
+\frac{
 Y_{a \rightarrow b \rightarrow c}
 -
 \operatorname{stopgrad}(Y^{\text{ema}}_{a \rightarrow c})
+}{
+\operatorname{stopgrad}(s^{\text{ema}}_{a \rightarrow c})
+}
 \right)
 \right].
 \]
@@ -324,6 +354,12 @@ train/shortcut_activation_huber_delta
 train/loss_boot_aux
 train/loss_direct_aux_joint
 train/loss_direct_aux_ponly_mean
+train/direct_activation_target_rms_joint
+train/direct_activation_pred_rms_joint
+train/direct_activation_rel_residual_rms_joint
+train/boot_activation_target_rms
+train/boot_activation_pred_rms
+train/boot_activation_rel_residual_rms
 val/FID_skip_output_mode
 \end{verbatim}
 
