@@ -555,6 +555,116 @@ def compute_layersync_loss(raw_features):
     return -mean_cosine, mean_cosine
 
 
+def scheduled_lambda(lambda_value, current_step, start_step=0, warmup_iters=0):
+    lambda_value = jnp.asarray(lambda_value, dtype=jnp.float32)
+    current_step = jnp.asarray(current_step, dtype=jnp.int32)
+    start_step = jnp.asarray(start_step, dtype=jnp.int32)
+    warmup_iters = jnp.asarray(warmup_iters, dtype=jnp.int32)
+
+    has_started = current_step >= start_step
+    no_warmup = warmup_iters <= 0
+    warmup_progress = (current_step - start_step + 1).astype(jnp.float32) / jnp.maximum(
+        warmup_iters.astype(jnp.float32), 1.0
+    )
+    warmup_scale = jnp.where(
+        has_started,
+        jnp.where(no_warmup, 1.0, jnp.clip(warmup_progress, 0.0, 1.0)),
+        0.0,
+    )
+    return lambda_value * warmup_scale, warmup_scale
+
+
+def private_activation_loss(
+    activations,
+    *,
+    weak_layer,
+    strong_layer,
+    max_pairs=0,
+    use_residual=True,
+    cosine_mode="bnd",
+    pair_mode="random",
+    rng=None,
+):
+    """Common/private activation loss with LayerSync interval pair filtering.
+
+    Layer numbers are 1-based. Pairs where both endpoints are strictly inside
+    (weak_layer, strong_layer) are excluded; all other pairs remain eligible.
+    """
+    activations = jnp.asarray(activations, dtype=jnp.float32)  # [L, B, N, D]
+    eps = jnp.float32(1e-8)
+
+    if use_residual:
+        common = jnp.mean(activations, axis=0)
+        private = activations - jax.lax.stop_gradient(common)[None, ...]
+    else:
+        common = jnp.mean(activations, axis=0)
+        private = activations
+
+    if cosine_mode == "bnd":
+        private_flat = private.reshape(private.shape[0], -1)
+        private_norm = private_flat / jnp.maximum(
+            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_matrix = private_norm @ private_norm.T
+        pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
+    elif cosine_mode == "nd":
+        private_flat = private.reshape(private.shape[0], private.shape[1], -1)
+        private_norm = private_flat / jnp.maximum(
+            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_tensor = jnp.einsum("lbd,mbd->lmb", private_norm, private_norm)
+        pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
+        pair_cosines = jnp.mean(pair_cosines, axis=-1)
+    elif cosine_mode == "token":
+        private_norm = private / jnp.maximum(
+            jnp.linalg.norm(private, axis=-1, keepdims=True),
+            eps,
+        )
+        cosine_tensor = jnp.einsum("lbpd,mbpd->lmbp", private_norm, private_norm)
+        pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
+        pair_cosines = jnp.mean(pair_cosines, axis=(-1, -2))
+    else:
+        raise ValueError(f"Unknown private cosine mode: {cosine_mode!r}")
+
+    pair_sources, pair_targets = jnp.triu_indices(private.shape[0], k=1)
+    source_layers = pair_sources + 1
+    target_layers = pair_targets + 1
+    source_inside = (source_layers > weak_layer) & (source_layers < strong_layer)
+    target_inside = (target_layers > weak_layer) & (target_layers < strong_layer)
+    eligible_mask = ~(source_inside & target_inside)
+    valid_count = jnp.sum(eligible_mask.astype(jnp.int32))
+    pair_limit = jnp.where(max_pairs <= 0, valid_count, jnp.minimum(max_pairs, valid_count))
+
+    if pair_mode == "first":
+        valid_rank = jnp.cumsum(eligible_mask.astype(jnp.int32)) - 1
+        pair_mask = eligible_mask & (valid_rank < pair_limit)
+    elif pair_mode == "random":
+        if rng is None:
+            raise ValueError("private pair_mode='random' requires rng")
+        random_scores = jax.random.uniform(rng, pair_cosines.shape)
+        random_scores = jnp.where(eligible_mask, random_scores, jnp.inf)
+        ordered = jnp.argsort(random_scores)
+        selected_ranks = jnp.zeros_like(eligible_mask, dtype=jnp.int32).at[ordered].set(
+            jnp.arange(eligible_mask.shape[0], dtype=jnp.int32)
+        )
+        pair_mask = eligible_mask & (selected_ranks < pair_limit)
+    else:
+        raise ValueError(f"Unknown private pair mode: {pair_mode!r}")
+
+    pair_mask_f = pair_mask.astype(jnp.float32)
+    pair_count = jnp.maximum(jnp.sum(pair_mask_f), 1.0)
+    pair_cosine_squares = jnp.square(pair_cosines)
+    loss_private = jnp.sum(pair_cosine_squares * pair_mask_f) / pair_count
+    common_norm = jnp.mean(jnp.linalg.norm(common.reshape(common.shape[0], -1), axis=-1))
+    private_avg_norm = jnp.mean(
+        jnp.linalg.norm(private.reshape(private.shape[0], private.shape[1], -1), axis=-1)
+    )
+    private_pairwise_cosine = jnp.sum(pair_cosines * pair_mask_f) / pair_count
+    return loss_private, common_norm, private_avg_norm, private_pairwise_cosine, pair_count
+
+
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
 
 def train_step(
@@ -563,10 +673,19 @@ def train_step(
     batch,
     rng,
     ema_decay,
+    current_step,
     layersync_lambda,
+    lambda_private,
+    private_max_pairs,
+    private_start_step,
+    private_warmup_iters,
     *,
     layersync_enabled,
     layersync_capture_layers,
+    private_loss_enabled,
+    private_use_residual,
+    private_cosine_mode,
+    private_pair_mode,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -578,7 +697,13 @@ def train_step(
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+    rng, tau_rng, noise_rng, drop_rng, private_pair_rng = jax.random.split(rng, 5)
+    lambda_private_eff, private_warmup_scale = scheduled_lambda(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)  # [B]
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
@@ -587,17 +712,26 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        if layersync_enabled:
-            pred, raw_features = state.apply_fn(
+        if layersync_enabled or private_loss_enabled:
+            outputs = state.apply_fn(
                 {"params": params},
                 x_tau,
                 timesteps=tau,
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_raw_features=layersync_capture_layers if layersync_enabled else False,
+                return_activations=private_loss_enabled,
             )
-            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+            pred = outputs[0]
+            output_idx = 1
+            if layersync_enabled:
+                raw_features = outputs[output_idx]
+                output_idx += 1
+            if private_loss_enabled:
+                activations = outputs[output_idx]
+            else:
+                activations = None
         else:
             pred = state.apply_fn(
                 {"params": params},
@@ -607,17 +741,63 @@ def train_step(
                 deterministic=False,
                 rngs={"dropout": drop_rng},
             )
+
+        if layersync_enabled:
+            loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        else:
             loss_layersync = jnp.array(0.0, dtype=jnp.float32)
             layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+        if private_loss_enabled:
+            loss_private, common_norm, private_avg_norm, private_pairwise_cosine, private_pair_count = private_activation_loss(
+                activations,
+                weak_layer=layersync_capture_layers[0],
+                strong_layer=layersync_capture_layers[1],
+                max_pairs=private_max_pairs,
+                use_residual=private_use_residual,
+                cosine_mode=private_cosine_mode,
+                pair_mode=private_pair_mode,
+                rng=private_pair_rng,
+            )
+        else:
+            loss_private = jnp.array(0.0, dtype=jnp.float32)
+            common_norm = jnp.array(0.0, dtype=jnp.float32)
+            private_avg_norm = jnp.array(0.0, dtype=jnp.float32)
+            private_pairwise_cosine = jnp.array(0.0, dtype=jnp.float32)
+            private_pair_count = jnp.array(0.0, dtype=jnp.float32)
 
         loss_gen = jnp.mean((pred - target) ** 2)
-        loss = loss_gen + layersync_lambda * loss_layersync
+        loss = loss_gen + layersync_lambda * loss_layersync + lambda_private_eff * loss_private
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean, loss_gen, loss_layersync, layersync_cosine)
+        return loss, (
+            v_abs_mean,
+            v_pred_abs_mean,
+            loss_gen,
+            loss_layersync,
+            layersync_cosine,
+            loss_private,
+            common_norm,
+            private_avg_norm,
+            private_pairwise_cosine,
+            private_pair_count,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, loss_gen, loss_layersync, layersync_cosine)), grads = grad_fn(state.params)
+    (
+        loss,
+        (
+            v_abs,
+            v_pred,
+            loss_gen,
+            loss_layersync,
+            layersync_cosine,
+            loss_private,
+            common_norm,
+            private_avg_norm,
+            private_pairwise_cosine,
+            private_pair_count,
+        ),
+    ), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
@@ -626,6 +806,13 @@ def train_step(
     loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
     layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
     layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_private = jax.lax.pmean(loss_private, axis_name="batch")
+    lambda_private_eff = jax.lax.pmean(lambda_private_eff, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
+    common_norm = jax.lax.pmean(common_norm, axis_name="batch")
+    private_avg_norm = jax.lax.pmean(private_avg_norm, axis_name="batch")
+    private_pairwise_cosine = jax.lax.pmean(private_pairwise_cosine, axis_name="batch")
+    private_pair_count = jax.lax.pmean(private_pair_count, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -639,8 +826,15 @@ def train_step(
         "train/loss_total": loss,
         "train/loss_gen": loss_gen,
         "train/loss_layersync": loss_layersync,
+        "train/l_private": loss_private,
         "train/layersync_lambda": layersync_lambda,
         "train/layersync_cosine": layersync_cosine,
+        "train/lambda_private_effective": lambda_private_eff,
+        "train/private_warmup_scale": private_warmup_scale,
+        "train/common_norm": common_norm,
+        "train/private_avg_norm": private_avg_norm,
+        "train/private_pairwise_cosine": private_pairwise_cosine,
+        "train/private_pair_count": private_pair_count,
         "train/ema_decay": ema_decay,
         "train/grad_norm": grad_norm,
         "train/param_norm": param_norm,
@@ -655,16 +849,31 @@ def eval_step(
     ema_params,
     batch,
     rng,
+    current_step,
     layersync_lambda,
+    lambda_private,
+    private_max_pairs,
+    private_start_step,
+    private_warmup_iters,
     *,
     layersync_enabled,
     layersync_capture_layers,
+    private_loss_enabled,
+    private_use_residual,
+    private_cosine_mode,
+    private_pair_mode,
 ):
     """Vanilla SiT validation step (mirrors train_step; no grads; no EMA teacher)."""
     x0, y = batch
     local_batch = x0.shape[0]
 
-    rng, tau_rng, noise_rng = jax.random.split(rng, 3)
+    rng, tau_rng, noise_rng, private_pair_rng = jax.random.split(rng, 4)
+    lambda_private_eff, private_warmup_scale = scheduled_lambda(
+        lambda_private,
+        current_step,
+        start_step=private_start_step,
+        warmup_iters=private_warmup_iters,
+    )
 
     tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)
@@ -672,16 +881,25 @@ def eval_step(
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
 
-    if layersync_enabled:
-        pred, raw_features = state.apply_fn(
+    if layersync_enabled or private_loss_enabled:
+        outputs = state.apply_fn(
             {"params": state.params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_raw_features=layersync_capture_layers if layersync_enabled else False,
+            return_activations=private_loss_enabled,
         )
-        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+        pred = outputs[0]
+        output_idx = 1
+        if layersync_enabled:
+            raw_features = outputs[output_idx]
+            output_idx += 1
+        if private_loss_enabled:
+            activations = outputs[output_idx]
+        else:
+            activations = None
     else:
         pred = state.apply_fn(
             {"params": state.params},
@@ -690,11 +908,32 @@ def eval_step(
             vector=y,
             deterministic=True,
         )
+
+    if layersync_enabled:
+        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
+    else:
         loss_layersync = jnp.array(0.0, dtype=jnp.float32)
         layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+    if private_loss_enabled:
+        loss_private, common_norm, private_avg_norm, private_pairwise_cosine, private_pair_count = private_activation_loss(
+            activations,
+            weak_layer=layersync_capture_layers[0],
+            strong_layer=layersync_capture_layers[1],
+            max_pairs=private_max_pairs,
+            use_residual=private_use_residual,
+            cosine_mode=private_cosine_mode,
+            pair_mode=private_pair_mode,
+            rng=private_pair_rng,
+        )
+    else:
+        loss_private = jnp.array(0.0, dtype=jnp.float32)
+        common_norm = jnp.array(0.0, dtype=jnp.float32)
+        private_avg_norm = jnp.array(0.0, dtype=jnp.float32)
+        private_pairwise_cosine = jnp.array(0.0, dtype=jnp.float32)
+        private_pair_count = jnp.array(0.0, dtype=jnp.float32)
 
     loss_gen = jnp.mean((pred - target) ** 2)
-    loss = loss_gen + layersync_lambda * loss_layersync
+    loss = loss_gen + layersync_lambda * loss_layersync + lambda_private_eff * loss_private
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
 
@@ -703,6 +942,13 @@ def eval_step(
     loss_layersync = jax.lax.pmean(loss_layersync, axis_name="batch")
     layersync_cosine = jax.lax.pmean(layersync_cosine, axis_name="batch")
     layersync_lambda = jax.lax.pmean(layersync_lambda, axis_name="batch")
+    loss_private = jax.lax.pmean(loss_private, axis_name="batch")
+    lambda_private_eff = jax.lax.pmean(lambda_private_eff, axis_name="batch")
+    private_warmup_scale = jax.lax.pmean(private_warmup_scale, axis_name="batch")
+    common_norm = jax.lax.pmean(common_norm, axis_name="batch")
+    private_avg_norm = jax.lax.pmean(private_avg_norm, axis_name="batch")
+    private_pairwise_cosine = jax.lax.pmean(private_pairwise_cosine, axis_name="batch")
+    private_pair_count = jax.lax.pmean(private_pair_count, axis_name="batch")
     v_abs_mean = jax.lax.pmean(v_abs_mean, axis_name="batch")
     v_pred_abs_mean = jax.lax.pmean(v_pred_abs_mean, axis_name="batch")
 
@@ -711,8 +957,15 @@ def eval_step(
         "val/loss_total": loss,
         "val/loss_gen": loss_gen,
         "val/loss_layersync": loss_layersync,
+        "val/l_private": loss_private,
         "val/layersync_lambda": layersync_lambda,
         "val/layersync_cosine": layersync_cosine,
+        "val/lambda_private_effective": lambda_private_eff,
+        "val/private_warmup_scale": private_warmup_scale,
+        "val/common_norm": common_norm,
+        "val/private_avg_norm": private_avg_norm,
+        "val/private_pairwise_cosine": private_pairwise_cosine,
+        "val/private_pair_count": private_pair_count,
         "val/v_abs_mean": v_abs_mean,
         "val/v_pred_abs_mean": v_pred_abs_mean,
     }
@@ -1237,6 +1490,58 @@ def main():
         default=DEFAULT_LAYERSYNC_STRONG_LAYER,
         help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
     )
+    parser.add_argument(
+        "--private-loss",
+        action="store_true",
+        help="Enable common/private activation diversity loss.",
+    )
+    parser.add_argument(
+        "--lambda-private",
+        type=float,
+        default=0.0,
+        help="Weight for private activation diversity loss. Requires --private-loss when > 0.",
+    )
+    parser.add_argument(
+        "--private-max-pairs",
+        type=int,
+        default=0,
+        help="Maximum eligible layer pairs sampled for private loss. 0 means all eligible pairs.",
+    )
+    parser.add_argument(
+        "--private-start-step",
+        type=int,
+        default=0,
+        help="Global step where private activation loss starts contributing.",
+    )
+    parser.add_argument(
+        "--private-warmup-iters",
+        type=int,
+        default=0,
+        help="Linear warmup steps for --lambda-private after --private-start-step.",
+    )
+    parser.add_argument(
+        "--private-use-residual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use activation minus stopped common activation for private loss.",
+    )
+    parser.add_argument(
+        "--private-cosine-mode",
+        type=str,
+        default="bnd",
+        choices=["bnd", "nd", "token"],
+        help="Private cosine reduction mode.",
+    )
+    parser.add_argument(
+        "--private-pair-mode",
+        type=str,
+        default="random",
+        choices=["first", "random"],
+        help=(
+            "Private loss pair selection after excluding pairs where both layers are strictly "
+            "between --layersync-weak-layer and --layersync-strong-layer."
+        ),
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1385,6 +1690,16 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.layersync_lambda < 0.0:
         raise ValueError("--layersync-lambda must be non-negative")
+    if args.private_loss and args.lambda_private <= 0.0:
+        raise ValueError("--private-loss requires --lambda-private > 0")
+    if args.lambda_private < 0.0:
+        raise ValueError("--lambda-private must be non-negative")
+    if args.private_max_pairs < 0:
+        raise ValueError("--private-max-pairs must be non-negative")
+    if args.private_start_step < 0:
+        raise ValueError("--private-start-step must be non-negative")
+    if args.private_warmup_iters < 0:
+        raise ValueError("--private-warmup-iters must be non-negative")
     if not 0.0 <= args.cfg_dropout_rate < 1.0:
         raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
     if args.cfg_dropout_rate <= 0.0 and (args.sample_cfg_scale > 1.0 or args.fid_cfg_scale > 1.0):
@@ -1424,16 +1739,28 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
     layersync_enabled = args.layersync_lambda > 0.0
+    private_loss_enabled = bool(args.private_loss)
     layersync_capture_layers = None
-    if layersync_enabled:
+    if layersync_enabled or private_loss_enabled:
         weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = (weak_layer, strong_layer)
+    if layersync_enabled:
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
             f"weak_layer={weak_layer} strong_layer={strong_layer}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
+    if private_loss_enabled:
+        log_stage(
+            f"PrivateActivations ENABLED: lambda_private={args.lambda_private} "
+            f"max_pairs={args.private_max_pairs} pair_mode={args.private_pair_mode} "
+            f"exclude_both_inside=({weak_layer},{strong_layer}) start_step={args.private_start_step} "
+            f"warmup_iters={args.private_warmup_iters} use_residual={args.private_use_residual} "
+            f"cosine_mode={args.private_cosine_mode}"
+        )
+    else:
+        log_stage("PrivateActivations DISABLED")
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1450,6 +1777,11 @@ def main():
     rng = jax.random.split(rng, num_devices)
     ema_decay_rep = replicate_tree(jnp.float32(args.ema_decay))
     layersync_lambda_rep = replicate_tree(jnp.float32(args.layersync_lambda))
+    effective_lambda_private = args.lambda_private if args.private_loss else 0.0
+    lambda_private_rep = replicate_tree(jnp.float32(effective_lambda_private))
+    private_max_pairs_rep = replicate_tree(jnp.int32(args.private_max_pairs))
+    private_start_step_rep = replicate_tree(jnp.int32(args.private_start_step))
+    private_warmup_iters_rep = replicate_tree(jnp.int32(args.private_warmup_iters))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -1478,6 +1810,10 @@ def main():
             train_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            private_loss_enabled=private_loss_enabled,
+            private_use_residual=args.private_use_residual,
+            private_cosine_mode=args.private_cosine_mode,
+            private_pair_mode=args.private_pair_mode,
         ),
         axis_name="batch",
     )
@@ -1486,6 +1822,10 @@ def main():
             eval_step,
             layersync_enabled=layersync_enabled,
             layersync_capture_layers=layersync_capture_layers,
+            private_loss_enabled=private_loss_enabled,
+            private_use_residual=args.private_use_residual,
+            private_cosine_mode=args.private_cosine_mode,
+            private_pair_mode=args.private_pair_mode,
         ),
         axis_name="batch",
     )
@@ -1759,8 +2099,19 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        current_step_rep = replicate_tree(jnp.int32(global_step))
         _, _, probe_metrics, _ = pmapped_train_step(
-            state, ema_params, (probe_x, probe_y), rng, ema_decay_rep, layersync_lambda_rep
+            state,
+            ema_params,
+            (probe_x, probe_y),
+            rng,
+            ema_decay_rep,
+            current_step_rep,
+            layersync_lambda_rep,
+            lambda_private_rep,
+            private_max_pairs_rep,
+            private_start_step_rep,
+            private_warmup_iters_rep,
         )
         block_pytree(probe_metrics)
 
@@ -2123,8 +2474,19 @@ def main():
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
+            current_step_rep = replicate_tree(jnp.int32(global_step))
             state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep, layersync_lambda_rep
+                state,
+                ema_params,
+                (batch_x, batch_y),
+                rng,
+                ema_decay_rep,
+                current_step_rep,
+                layersync_lambda_rep,
+                lambda_private_rep,
+                private_max_pairs_rep,
+                private_start_step_rep,
+                private_warmup_iters_rep,
             )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
@@ -2150,8 +2512,18 @@ def main():
                     )
                     val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                     val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    current_step_rep = replicate_tree(jnp.int32(global_step))
                     val_metrics, rng = pmapped_eval_step(
-                        state, ema_params, (val_x, val_y), rng, layersync_lambda_rep
+                        state,
+                        ema_params,
+                        (val_x, val_y),
+                        rng,
+                        current_step_rep,
+                        layersync_lambda_rep,
+                        lambda_private_rep,
+                        private_max_pairs_rep,
+                        private_start_step_rep,
+                        private_warmup_iters_rep,
                     )
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
