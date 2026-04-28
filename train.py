@@ -1985,6 +1985,16 @@ def replicated_metrics_to_host(metrics):
     )
 
 
+def scalar_to_host_int(value) -> int:
+    """Convert a scalar or replicated scalar JAX value to a Python int."""
+    try:
+        value = jax_utils.unreplicate(value)
+    except Exception:
+        pass
+    value = np.asarray(jax.device_get(value))
+    return int(value.reshape(-1)[0])
+
+
 PRIVATE_TRAIN_METRIC_KEYS = {
     "train/l_private",
     "train/lambda_private_effective",
@@ -4366,7 +4376,7 @@ def main():
             return
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step = 0
+    global_step = scalar_to_host_int(state.step)
     t0 = time.time()
 
     for epoch in range(args.epochs):
