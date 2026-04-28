@@ -2099,7 +2099,7 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
-        current_step_rep = replicate_tree(jnp.int32(global_step))
+        current_step_rep = replicate_tree(jnp.int32(0))
         _, _, probe_metrics, _ = pmapped_train_step(
             state,
             ema_params,
