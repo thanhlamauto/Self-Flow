@@ -9,6 +9,7 @@ import queue
 import logging
 import zipfile
 import functools
+import json
 from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
@@ -1922,8 +1923,10 @@ def filter_private_metrics(metrics):
 
 class AsyncWandbLogger:
     """Background thread to log metrics without blocking TPU pipeline."""
-    def __init__(self, max_queue_size=50, enabled=True):
+    def __init__(self, max_queue_size=50, enabled=True, summary_writer=None, history_writers=None):
         self.enabled = enabled
+        self.summary_writer = summary_writer
+        self.history_writers = tuple(history_writers or ())
         self.thread = None
         if not self.enabled:
             return
@@ -1943,6 +1946,11 @@ class AsyncWandbLogger:
             try:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
                 safe_wandb_log(metrics_cpu, step=step)
+                if self.summary_writer is not None:
+                    section = "val" if any(str(key).startswith("val/") for key in metrics_cpu) else "train"
+                    self.summary_writer.update(metrics_cpu, step=step, section=section)
+                for history_writer in self.history_writers:
+                    history_writer.update(metrics_cpu, step=step)
             except Exception as e:
                 log_stage(f"WandB logging failed: {e}")
             finally:
@@ -1962,6 +1970,162 @@ class AsyncWandbLogger:
             return
         self.queue.put(None)
         self.thread.join()
+
+
+class WandbRunSummaryFile:
+    """Maintains one small JSON file with latest and best scalar metrics."""
+
+    MIN_BEST_KEYS = {
+        "val/FID",
+        "val/sFID",
+        "val/FID_skip_3to7",
+        "val/sFID_skip_3to7",
+        "train/loss",
+        "train/loss_total",
+        "train/loss_gen",
+    }
+    MAX_BEST_KEYS = {
+        "val/InceptionScore",
+        "val/Precision",
+        "val/Recall",
+        "val/LinearProbeAcc@1",
+    }
+
+    def __init__(self, path, enabled=True):
+        self.path = path
+        self.enabled = enabled
+        self.payload = {
+            "updated_at": None,
+            "latest_step": 0,
+            "latest": {},
+            "best": {},
+        }
+        self._lock = threading.Lock()
+
+    def initialize(self, config=None):
+        if not self.enabled:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if config is not None:
+            self.payload["config"] = self._jsonify(config)
+        self._write_locked()
+        if getattr(wandb, "run", None) is not None:
+            try:
+                wandb.save(self.path, policy="live")
+            except Exception as exc:
+                log_stage(f"WandB summary file registration failed: {exc}")
+
+    def update(self, metrics, step=None, section="train"):
+        if not self.enabled:
+            return
+        scalar_metrics = {}
+        for key, value in metrics.items():
+            scalar_value = self._to_scalar(value)
+            if scalar_value is not None:
+                scalar_metrics[key] = scalar_value
+        if not scalar_metrics:
+            return
+
+        with self._lock:
+            if step is not None:
+                self.payload["latest_step"] = int(step)
+            self.payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.payload["latest"][section] = scalar_metrics
+            self._update_best(scalar_metrics, step)
+            self._write_locked()
+
+    def _update_best(self, metrics, step):
+        for key, value in metrics.items():
+            if key in self.MIN_BEST_KEYS:
+                self._maybe_update_best(key, value, step, lower_is_better=True)
+            elif key in self.MAX_BEST_KEYS:
+                self._maybe_update_best(key, value, step, lower_is_better=False)
+
+    def _maybe_update_best(self, key, value, step, lower_is_better):
+        current = self.payload["best"].get(key)
+        should_update = current is None
+        if current is not None:
+            old_value = current["value"]
+            should_update = value < old_value if lower_is_better else value > old_value
+        if should_update:
+            self.payload["best"][key] = {
+                "value": value,
+                "step": int(step) if step is not None else None,
+            }
+
+    def _write_locked(self):
+        tmp_path = f"{self.path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(self.payload, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, self.path)
+
+    @classmethod
+    def _to_scalar(cls, value):
+        value = cls._jsonify(value)
+        if isinstance(value, (int, float, bool)):
+            return float(value) if not isinstance(value, bool) else bool(value)
+        return None
+
+    @classmethod
+    def _jsonify(cls, value):
+        if isinstance(value, dict):
+            return {str(k): cls._jsonify(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._jsonify(v) for v in value]
+        if isinstance(value, np.ndarray):
+            if value.shape == ():
+                return value.item()
+            return value.tolist()
+        if hasattr(value, "shape"):
+            value = jax.device_get(value)
+            return cls._jsonify(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+
+class WandbMetricHistoryFile:
+    """Append selected scalar metrics to one JSONL file for time-series downloads."""
+
+    def __init__(self, path, key_prefixes, active_key=None, enabled=True):
+        self.path = path
+        self.key_prefixes = tuple(key_prefixes)
+        self.active_key = active_key
+        self.enabled = enabled
+        self._lock = threading.Lock()
+
+    def initialize(self):
+        if not self.enabled:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as f:
+            f.write("")
+        if getattr(wandb, "run", None) is not None:
+            try:
+                wandb.save(self.path, policy="live")
+            except Exception as exc:
+                log_stage(f"WandB history file registration failed for {self.path}: {exc}")
+
+    def update(self, metrics, step=None):
+        if not self.enabled:
+            return
+        if self.active_key is not None and not bool(metrics.get(self.active_key, False)):
+            return
+        row = {}
+        for key, value in metrics.items():
+            if key == self.active_key or any(str(key).startswith(prefix) for prefix in self.key_prefixes):
+                scalar_value = WandbRunSummaryFile._to_scalar(value)
+                if scalar_value is not None:
+                    row[key] = scalar_value
+        if not row:
+            return
+        row["step"] = int(step) if step is not None else int(metrics.get("train/step", 0))
+        row["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with self._lock:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
@@ -3221,7 +3385,23 @@ def main():
         wandb.init(project=args.wandb_project, config=vars(args))
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-    logger = AsyncWandbLogger(enabled=not args.no_wandb)
+    summary_writer = WandbRunSummaryFile(
+        os.path.join(args.ckpt_dir, "wandb_run_summary.json"),
+        enabled=not args.no_wandb,
+    )
+    summary_writer.initialize(config=vars(args))
+    debug_gap_history_writer = WandbMetricHistoryFile(
+        os.path.join(args.ckpt_dir, "wandb_debug_gap_history.jsonl"),
+        key_prefixes=("train/debug_pair_", "train/debug_gap_"),
+        active_key="train/debug_gap_logs_active",
+        enabled=not args.no_wandb,
+    )
+    debug_gap_history_writer.initialize()
+    logger = AsyncWandbLogger(
+        enabled=not args.no_wandb,
+        summary_writer=summary_writer,
+        history_writers=(debug_gap_history_writer,),
+    )
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -4012,6 +4192,7 @@ def main():
         summary_parts.append(f"(n={need})")
         log_stage("  ".join(summary_parts))
         safe_wandb_log(metrics, step=step)
+        summary_writer.update(metrics, step=step, section="val")
         return current_val_iter
 
     def compute_block_corr(step, val_data_iter):
