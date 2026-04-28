@@ -641,6 +641,17 @@ PREDICTOR_VARIANTS = {
         "num_heads": 5,
         "mlp_ratio": 4.0,
     },
+    "dit2_deep_256": {
+        "arch": "dit2",
+        "width": 256,
+        "num_blocks": 8,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 4,
+        "mlp_ratio": 4.0,
+        "residual_output": True,
+    },
     "dit2_large": {
         "arch": "dit2",
         "width": 384,
@@ -810,6 +821,8 @@ PREDICTOR_VARIANT_ALIASES = {
     "dit_b": "dit2_base",
     "dit_base_v2": "dit2_base_v2",
     "dit_b_v2": "dit2_base_v2",
+    "dit_deep_256": "dit2_deep_256",
+    "dit_d256": "dit2_deep_256",
     "large": "convnext_large",
     "p_large": "convnext_large",
     "plarge": "convnext_large",
@@ -839,6 +852,8 @@ def predictor_size_bucket(name: str) -> str:
     canonical = canonical_predictor_variant_name(name)
     if canonical in {"deep_dilated_mlp", "hybrid_deep"}:
         return "large"
+    if canonical == "dit2_deep_256":
+        return "base"
     return canonical.rsplit("_", 1)[-1]
 
 
