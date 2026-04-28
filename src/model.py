@@ -15,6 +15,7 @@ import flax.linen as nn
 from einops import rearrange
 from src.depth_shortcut import (
     DepthShortcutPredictor,
+    apply_predictor_config_overrides,
     log_token_magnitudes,
     l2_normalize_tokens,
     predictor_config_from_name,
@@ -330,6 +331,16 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_timesteps: int = 50,
         depth_shortcut_normalize_input: bool = True,
         depth_shortcut_output_mode: str = "direction_magnitude",
+        depth_shortcut_predictor_arch: str = "existing",
+        depth_shortcut_predictor_hidden_size: Optional[int] = None,
+        depth_shortcut_predictor_depth: Optional[int] = None,
+        depth_shortcut_predictor_mlp_ratio: Optional[float] = None,
+        depth_shortcut_predictor_dilation_cycle: Optional[Sequence[int]] = None,
+        depth_shortcut_predictor_grid_size: Optional[int] = None,
+        depth_shortcut_predictor_residual_output: Optional[bool] = None,
+        depth_shortcut_predictor_attention_every: Optional[int] = None,
+        depth_shortcut_predictor_num_heads: Optional[int] = None,
+        depth_shortcut_predictor_adaln_zero: Optional[bool] = None,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -421,6 +432,19 @@ class SelfFlowDiT(nn.Module):
         shortcut_predictor = None
         if shortcut_enabled:
             predictor_cfg = predictor_config_from_name(depth_shortcut_variant, self.hidden_size)
+            predictor_cfg = apply_predictor_config_overrides(
+                predictor_cfg,
+                arch=depth_shortcut_predictor_arch,
+                hidden_size=depth_shortcut_predictor_hidden_size,
+                depth=depth_shortcut_predictor_depth,
+                mlp_ratio=depth_shortcut_predictor_mlp_ratio,
+                dilation_cycle=tuple(depth_shortcut_predictor_dilation_cycle or ()),
+                grid_size=depth_shortcut_predictor_grid_size,
+                residual_output=depth_shortcut_predictor_residual_output,
+                attention_every=depth_shortcut_predictor_attention_every,
+                num_heads=depth_shortcut_predictor_num_heads,
+                adaln_zero=depth_shortcut_predictor_adaln_zero,
+            )
             shortcut_predictor = DepthShortcutPredictor(
                 hidden_size=self.hidden_size,
                 depth=self.depth,

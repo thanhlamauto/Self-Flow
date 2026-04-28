@@ -418,6 +418,7 @@ except ImportError:
 from src.model import SelfFlowDiT
 from src.depth_shortcut import (
     DepthShortcutPredictor,
+    apply_predictor_config_overrides,
     l2_normalize_tokens,
     predictor_config_from_name,
     predictor_size_bucket,
@@ -459,6 +460,12 @@ def count_tree_params(tree) -> int:
     return int(sum(np.size(x) for x in jax.tree_util.tree_leaves(tree)))
 
 
+def parse_int_cycle(value: str | None) -> tuple[int, ...]:
+    if value is None or str(value).strip() == "":
+        return ()
+    return tuple(int(part.strip()) for part in str(value).split(",") if part.strip())
+
+
 def make_adamw_decay_mask(params):
     """Apply AdamW decay to matrix/conv kernels, excluding bias/norm/embeddings."""
     flat = traverse_util.flatten_dict(params)
@@ -489,6 +496,7 @@ def create_train_state(
     shortcut_training_mode="direction",
     shortcut_mag_abs_center=5.5,
     shortcut_mag_abs_scale=1.5,
+    predictor_config_overrides=None,
 ):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -513,6 +521,10 @@ def create_train_state(
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
     predictor_cfg = predictor_config_from_name(predictor_variant, config["hidden_size"])
+    predictor_cfg = apply_predictor_config_overrides(
+        predictor_cfg,
+        **(predictor_config_overrides or {}),
+    )
     predictor = DepthShortcutPredictor(
         hidden_size=config["hidden_size"],
         depth=config["depth"],
@@ -2065,6 +2077,7 @@ def make_sample_latents_shortcut_fn(
     depth_shortcut_normalize_input=True,
     depth_shortcut_skip_timestep_mode="alternate",
     depth_shortcut_output_mode="direction_magnitude",
+    depth_shortcut_predictor_overrides=None,
 ):
     """Build a non-pmapped sampler for preview images with a 3->7 shortcut."""
     if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
@@ -2150,6 +2163,7 @@ def make_sample_latents_shortcut_fn(
                     depth_shortcut_timesteps=int(shortcut_timesteps),
                     depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
                     depth_shortcut_output_mode=depth_shortcut_output_mode,
+                    **(depth_shortcut_predictor_overrides or {}),
                 )
 
             if depth_shortcut_skip_timestep_mode == "all":
@@ -2208,6 +2222,7 @@ def make_sample_latents_pmap_fn(
     depth_shortcut_normalize_input=True,
     depth_shortcut_skip_timestep_mode="alternate",
     depth_shortcut_output_mode="direction_magnitude",
+    depth_shortcut_predictor_overrides=None,
 ):
     """Build a sharded (pmap) sampling function for eval.
 
@@ -2369,6 +2384,7 @@ def make_sample_latents_pmap_fn(
                     depth_shortcut_timesteps=int(shortcut_timesteps),
                     depth_shortcut_normalize_input=bool(depth_shortcut_normalize_input),
                     depth_shortcut_output_mode=depth_shortcut_output_mode,
+                    **(depth_shortcut_predictor_overrides or {}),
                 )
 
             if depth_shortcut_skip_timestep_mode == "all":
@@ -2728,6 +2744,37 @@ def main():
         default=True,
         help="Feed L2-normalized source hidden directions into the predictor. Disable to feed raw hidden activations.",
     )
+    parser.add_argument(
+        "--shortcut-predictor-arch",
+        type=str,
+        default="existing",
+        choices=["existing", "deep_dilated_mlp", "hybrid_deep"],
+        help="Override the shortcut predictor architecture while keeping --shortcut-predictor as the base variant.",
+    )
+    parser.add_argument("--shortcut-predictor-hidden-size", type=int, default=None)
+    parser.add_argument("--shortcut-predictor-depth", type=int, default=None)
+    parser.add_argument("--shortcut-predictor-mlp-ratio", type=float, default=None)
+    parser.add_argument(
+        "--shortcut-predictor-dilation-cycle",
+        type=str,
+        default=None,
+        help="Comma-separated dilation cycle, e.g. 1,2,4. Repeated to predictor depth.",
+    )
+    parser.add_argument("--shortcut-predictor-grid-size", type=int, default=None)
+    parser.add_argument(
+        "--shortcut-predictor-residual-output",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether predictor output is source + delta. Default follows the selected architecture.",
+    )
+    parser.add_argument("--shortcut-predictor-attention-every", type=int, default=None)
+    parser.add_argument("--shortcut-predictor-num-heads", type=int, default=None)
+    parser.add_argument(
+        "--shortcut-predictor-adaln-zero",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use zero-init AdaLN modulation/gates for deep shortcut predictor blocks.",
+    )
     parser.add_argument("--shortcut-l2-ema-alpha", type=float, default=0.01)
     parser.add_argument(
         "--private-loss",
@@ -2989,6 +3036,21 @@ def main():
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
     if args.shortcut_predictor_lr <= 0.0:
         raise ValueError("--predictor-learning-rate/--shortcut-predictor-lr must be greater than 0")
+    if args.shortcut_predictor_hidden_size is not None and args.shortcut_predictor_hidden_size <= 0:
+        raise ValueError("--shortcut-predictor-hidden-size must be greater than 0")
+    if args.shortcut_predictor_depth is not None and args.shortcut_predictor_depth <= 0:
+        raise ValueError("--shortcut-predictor-depth must be greater than 0")
+    if args.shortcut_predictor_mlp_ratio is not None and args.shortcut_predictor_mlp_ratio <= 0:
+        raise ValueError("--shortcut-predictor-mlp-ratio must be greater than 0")
+    shortcut_predictor_dilation_cycle = parse_int_cycle(args.shortcut_predictor_dilation_cycle)
+    if any(dilation <= 0 for dilation in shortcut_predictor_dilation_cycle):
+        raise ValueError("--shortcut-predictor-dilation-cycle values must be positive")
+    if args.shortcut_predictor_grid_size is not None and args.shortcut_predictor_grid_size <= 0:
+        raise ValueError("--shortcut-predictor-grid-size must be greater than 0")
+    if args.shortcut_predictor_attention_every is not None and args.shortcut_predictor_attention_every < 0:
+        raise ValueError("--shortcut-predictor-attention-every must be non-negative")
+    if args.shortcut_predictor_num_heads is not None and args.shortcut_predictor_num_heads <= 0:
+        raise ValueError("--shortcut-predictor-num-heads must be greater than 0")
     if not 0.0 <= args.output_distill_ratio <= 1.0:
         raise ValueError("--output-distill-ratio must be between 0 and 1")
     if args.lambda_output_distill < 0.0:
@@ -3032,6 +3094,30 @@ def main():
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
     depth = int(config["depth"])
+    shortcut_predictor_overrides = {
+        "arch": args.shortcut_predictor_arch,
+        "hidden_size": args.shortcut_predictor_hidden_size,
+        "depth": args.shortcut_predictor_depth,
+        "mlp_ratio": args.shortcut_predictor_mlp_ratio,
+        "dilation_cycle": shortcut_predictor_dilation_cycle,
+        "grid_size": args.shortcut_predictor_grid_size,
+        "residual_output": args.shortcut_predictor_residual_output,
+        "attention_every": args.shortcut_predictor_attention_every,
+        "num_heads": args.shortcut_predictor_num_heads,
+        "adaln_zero": args.shortcut_predictor_adaln_zero,
+    }
+    depth_shortcut_predictor_overrides = {
+        "depth_shortcut_predictor_arch": args.shortcut_predictor_arch,
+        "depth_shortcut_predictor_hidden_size": args.shortcut_predictor_hidden_size,
+        "depth_shortcut_predictor_depth": args.shortcut_predictor_depth,
+        "depth_shortcut_predictor_mlp_ratio": args.shortcut_predictor_mlp_ratio,
+        "depth_shortcut_predictor_dilation_cycle": shortcut_predictor_dilation_cycle,
+        "depth_shortcut_predictor_grid_size": args.shortcut_predictor_grid_size,
+        "depth_shortcut_predictor_residual_output": args.shortcut_predictor_residual_output,
+        "depth_shortcut_predictor_attention_every": args.shortcut_predictor_attention_every,
+        "depth_shortcut_predictor_num_heads": args.shortcut_predictor_num_heads,
+        "depth_shortcut_predictor_adaln_zero": args.shortcut_predictor_adaln_zero,
+    }
     if args.shortcut_skip_in_loop_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
     if args.shortcut_skip_in_loop_max_gap > depth:
@@ -3092,7 +3178,17 @@ def main():
         f"lr_backbone={args.learning_rate} pred_lr={args.shortcut_predictor_lr} "
         f"pred_wd={args.shortcut_predictor_weight_decay} "
         f"pred_use_t={args.shortcut_predictor_use_timestep} "
-        f"pred_norm_input={args.shortcut_predictor_normalize_input}"
+        f"pred_norm_input={args.shortcut_predictor_normalize_input} "
+        f"pred_arch={args.shortcut_predictor_arch} "
+        f"pred_hidden={args.shortcut_predictor_hidden_size} "
+        f"pred_depth={args.shortcut_predictor_depth} "
+        f"pred_mlp_ratio={args.shortcut_predictor_mlp_ratio} "
+        f"pred_dilation_cycle={shortcut_predictor_dilation_cycle} "
+        f"pred_grid={args.shortcut_predictor_grid_size} "
+        f"pred_residual_output={args.shortcut_predictor_residual_output} "
+        f"pred_attention_every={args.shortcut_predictor_attention_every} "
+        f"pred_heads={args.shortcut_predictor_num_heads} "
+        f"pred_adaln_zero={args.shortcut_predictor_adaln_zero}"
     )
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
@@ -3123,13 +3219,19 @@ def main():
         shortcut_training_mode=args.shortcut_training_mode,
         shortcut_mag_abs_center=args.shortcut_mag_abs_center,
         shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
+        predictor_config_overrides=shortcut_predictor_overrides,
     )
     predictor_param_count = count_tree_params(state.params["predictor"])
     backbone_param_count = count_tree_params(state.params["backbone"])
     total_param_count = count_tree_params(state.params)
-    predictor_bucket = predictor_size_bucket(args.shortcut_predictor)
+    predictor_bucket = (
+        "large"
+        if args.shortcut_predictor_arch in {"deep_dilated_mlp", "hybrid_deep"}
+        else predictor_size_bucket(args.shortcut_predictor)
+    )
     predictor_range = PREDICTOR_PARAM_TARGET_RANGES[predictor_bucket]
     predictor_cfg = predictor_config_from_name(args.shortcut_predictor, config["hidden_size"])
+    predictor_cfg = apply_predictor_config_overrides(predictor_cfg, **shortcut_predictor_overrides)
     log_stage(
         f"DepthShortcut params: predictor={predictor_param_count:,} "
         f"backbone={backbone_param_count:,} total={total_param_count:,} "
@@ -3256,6 +3358,7 @@ def main():
             depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
             depth_shortcut_skip_timestep_mode=args.fid_skip_timestep_mode,
             depth_shortcut_output_mode=args.shortcut_loss_mode,
+            depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
         )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
@@ -3289,6 +3392,7 @@ def main():
             depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
             depth_shortcut_skip_timestep_mode=args.fid_skip_timestep_mode,
             depth_shortcut_output_mode=args.shortcut_loss_mode,
+            depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
         )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────

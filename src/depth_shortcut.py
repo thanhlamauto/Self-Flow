@@ -239,6 +239,103 @@ class AttentionHybridShortcutBlock(nn.Module):
         return h + x
 
 
+class DeepDilatedShortcutBlock(nn.Module):
+    """Deep conditional residual block with dilated depthwise conv, optional attention, and MLP."""
+
+    width: int
+    grid_size: int
+    mlp_ratio: float = 4.0
+    dilation: int = 1
+    use_attention: bool = False
+    num_heads: int = 6
+    adaln_zero: bool = True
+
+    @nn.compact
+    def __call__(self, h: jax.Array, c: jax.Array) -> jax.Array:
+        mod_init = ZERO_INIT if self.adaln_zero else XAVIER_UNIFORM
+
+        def modulation(name: str):
+            shift, scale, gate = jnp.split(
+                nn.Dense(
+                    3 * self.width,
+                    kernel_init=mod_init,
+                    bias_init=ZERO_INIT,
+                    name=name,
+                )(nn.silu(c)),
+                3,
+                axis=-1,
+            )
+            return shift, scale, gate
+
+        shift_conv, scale_conv, gate_conv = modulation("conv_adaln")
+        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="conv_ln")(h)
+        x = modulate(x, shift_conv, scale_conv)
+        batch_size, num_tokens, channels = x.shape
+        if num_tokens != self.grid_size * self.grid_size:
+            raise ValueError("num_tokens must equal grid_size * grid_size for deep shortcut predictor")
+        x_grid = x.reshape(batch_size, self.grid_size, self.grid_size, channels)
+        x_grid = nn.Conv(
+            features=self.width,
+            kernel_size=(3, 3),
+            padding="SAME",
+            feature_group_count=self.width,
+            kernel_dilation=(self.dilation, self.dilation),
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="dwconv",
+        )(x_grid)
+        x_grid = nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="pwconv",
+        )(x_grid)
+        x = x_grid.reshape(batch_size, num_tokens, self.width)
+        h = h + gate_conv[:, None, :] * x
+
+        if self.use_attention:
+            if self.width % self.num_heads != 0:
+                raise ValueError("width must be divisible by num_heads")
+            shift_attn, scale_attn, gate_attn = modulation("attn_adaln")
+            x = modulate(
+                nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="attn_ln")(h),
+                shift_attn,
+                scale_attn,
+            )
+            x_attn = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                qkv_features=self.width,
+                out_features=self.width,
+                kernel_init=XAVIER_UNIFORM,
+                out_kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                out_bias_init=ZERO_INIT,
+                name="attn",
+            )(x, x)
+            h = h + gate_attn[:, None, :] * x_attn
+
+        shift_mlp, scale_mlp, gate_mlp = modulation("mlp_adaln")
+        x = modulate(
+            nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="mlp_ln")(h),
+            shift_mlp,
+            scale_mlp,
+        )
+        x = nn.Dense(
+            int(self.width * self.mlp_ratio),
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="mlp_fc1",
+        )(x)
+        x = nn.gelu(x, approximate=True)
+        x = nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            name="mlp_fc2",
+        )(x)
+        return h + gate_mlp[:, None, :] * x
+
+
 class MagnitudeHead(nn.Module):
     """Predicts log-magnitude residuals conditioned like the shared backbone."""
 
@@ -312,13 +409,17 @@ class DepthShortcutPredictor(nn.Module):
     layer_cond_dim: int = 16
     cond_hidden_dim: int = 512
     cond_dim: int | None = None
+    grid_size_override: int | None = None
+    residual_output: bool = True
+    attention_every: int = 4
+    adaln_zero: bool = True
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
 
     @property
     def grid_size(self) -> int:
-        return int(self.num_tokens ** 0.5)
+        return int(self.grid_size_override or int(self.num_tokens ** 0.5))
 
     @nn.compact
     def __call__(
@@ -337,43 +438,74 @@ class DepthShortcutPredictor(nn.Module):
         target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
         delta = target_layer - source_layer
 
-        state_embed = nn.Dense(
-            self.layer_cond_dim,
-            use_bias=False,
-            kernel_init=NORMAL_002,
-            name="state_layer_proj",
-        )
-        delta_embed = nn.Dense(
-            self.layer_cond_dim,
-            use_bias=False,
-            kernel_init=NORMAL_002,
-            name="delta_layer_proj",
-        )
-
-        h_a = state_embed(jax.nn.one_hot(source_layer, self.depth + 1))
-        h_b = state_embed(jax.nn.one_hot(target_layer, self.depth + 1))
-        h_delta = delta_embed(jax.nn.one_hot(delta - 1, self.depth))
-        h_depth = jnp.concatenate([h_a, h_b, h_b - h_a, h_delta], axis=-1)
-        h_depth = jnp.broadcast_to(h_depth[None, :], (batch_size, h_depth.shape[-1]))
-
         if use_timestep_embed:
             t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
         else:
             t_cond = jnp.zeros_like(timestep_embed)
-        c_in = jnp.concatenate([h_depth, t_cond], axis=-1)
-        c = nn.Dense(
-            self.cond_hidden_dim,
-            kernel_init=XAVIER_UNIFORM,
-            bias_init=ZERO_INIT,
-            name="cond_mlp_0",
-        )(c_in)
-        c = nn.gelu(c, approximate=True)
-        c = nn.Dense(
-            cond_dim,
-            kernel_init=XAVIER_UNIFORM,
-            bias_init=ZERO_INIT,
-            name="cond_mlp_1",
-        )(c)
+        if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+            t_proj = nn.Dense(
+                cond_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_t_proj",
+            )(t_cond)
+            layer_embed = nn.Embed(
+                num_embeddings=self.depth + 1,
+                features=cond_dim,
+                embedding_init=NORMAL_002,
+                name="cond_layer_embed",
+            )
+            delta_embed = nn.Embed(
+                num_embeddings=self.depth,
+                features=cond_dim,
+                embedding_init=NORMAL_002,
+                name="cond_delta_embed",
+            )
+            c = (
+                t_proj
+                + layer_embed(source_layer)
+                + layer_embed(target_layer)
+                + delta_embed(jnp.clip(delta - 1, 0, self.depth - 1))
+            )
+            c = nn.Dense(
+                cond_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_out",
+            )(nn.gelu(c, approximate=True))
+        else:
+            state_embed = nn.Dense(
+                self.layer_cond_dim,
+                use_bias=False,
+                kernel_init=NORMAL_002,
+                name="state_layer_proj",
+            )
+            delta_embed = nn.Dense(
+                self.layer_cond_dim,
+                use_bias=False,
+                kernel_init=NORMAL_002,
+                name="delta_layer_proj",
+            )
+
+            h_a = state_embed(jax.nn.one_hot(source_layer, self.depth + 1))
+            h_b = state_embed(jax.nn.one_hot(target_layer, self.depth + 1))
+            h_delta = delta_embed(jax.nn.one_hot(delta - 1, self.depth))
+            h_depth = jnp.concatenate([h_a, h_b, h_b - h_a, h_delta], axis=-1)
+            h_depth = jnp.broadcast_to(h_depth[None, :], (batch_size, h_depth.shape[-1]))
+            c_in = jnp.concatenate([h_depth, t_cond], axis=-1)
+            c = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_mlp_0",
+            )(c_in)
+            c = nn.gelu(c, approximate=True)
+            c = nn.Dense(
+                cond_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_mlp_1",
+            )(c)
 
         h = nn.Dense(
             self.width,
@@ -399,7 +531,25 @@ class DepthShortcutPredictor(nn.Module):
                 raise ValueError("dilation_schedule length must match num_blocks")
             for idx in range(self.num_blocks):
                 dilation = int(dilation_schedule[idx])
-                if self.arch in {"convnext", "dilated_convnext"}:
+                if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+                    h = h.reshape(batch_size, self.num_tokens, self.width)
+                    use_attention = (
+                        self.arch == "hybrid_deep"
+                        and self.attention_every > 0
+                        and ((idx + 1) % self.attention_every == 0)
+                    )
+                    h = DeepDilatedShortcutBlock(
+                        width=self.width,
+                        grid_size=self.grid_size,
+                        mlp_ratio=float(self.mlp_ratio),
+                        dilation=dilation,
+                        use_attention=use_attention,
+                        num_heads=int(self.num_heads or 1),
+                        adaln_zero=bool(self.adaln_zero),
+                        name=f"blocks_{idx}",
+                    )(h, c)
+                    h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
+                elif self.arch in {"convnext", "dilated_convnext"}:
                     h = AdaLNConvNeXtBlock(
                         width=self.width,
                         cond_dim=cond_dim,
@@ -424,6 +574,8 @@ class DepthShortcutPredictor(nn.Module):
                     raise ValueError(f"Unknown shortcut predictor arch: {self.arch!r}")
             h_grid = h
         h = h_grid.reshape(batch_size, self.num_tokens, self.width)
+        if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+            h = nn.LayerNorm(epsilon=1e-6, name="final_ln")(h)
         delta_y = nn.Dense(
             self.hidden_size,
             kernel_init=ZERO_INIT,
@@ -435,7 +587,7 @@ class DepthShortcutPredictor(nn.Module):
             nn.initializers.constant(self.gamma_out_init),
             (),
         )
-        y = u_source + gamma_out * delta_y
+        y = u_source + gamma_out * delta_y if self.residual_output else delta_y
         if m_source is None:
             return y
         delta_m = MagnitudeHead(
@@ -597,6 +749,36 @@ PREDICTOR_VARIANTS = {
         "attn_dim": None,
         "num_heads": 8,
     },
+    "deep_dilated_mlp": {
+        "arch": "deep_dilated_mlp",
+        "width": 384,
+        "num_blocks": 12,
+        "expansion": 2,
+        "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2, 4, 1, 2, 4),
+        "attn_dim": None,
+        "num_heads": None,
+        "mlp_ratio": 4.0,
+        "cond_dim": 32,
+        "grid_size_override": 16,
+        "residual_output": True,
+        "attention_every": 0,
+        "adaln_zero": True,
+    },
+    "hybrid_deep": {
+        "arch": "hybrid_deep",
+        "width": 384,
+        "num_blocks": 12,
+        "expansion": 2,
+        "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2, 4, 1, 2, 4),
+        "attn_dim": None,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+        "cond_dim": 32,
+        "grid_size_override": 16,
+        "residual_output": True,
+        "attention_every": 4,
+        "adaln_zero": True,
+    },
 }
 
 
@@ -643,6 +825,8 @@ def canonical_predictor_variant_name(name: str) -> str:
 def predictor_size_bucket(name: str) -> str:
     """Return tiny/small/base/large for a predictor variant."""
     canonical = canonical_predictor_variant_name(name)
+    if canonical in {"deep_dilated_mlp", "hybrid_deep"}:
+        return "large"
     return canonical.rsplit("_", 1)[-1]
 
 
@@ -654,6 +838,48 @@ def predictor_config_from_name(name: str, hidden_size: int) -> dict:
         cfg["width"] = int(hidden_size)
     if cfg["attn_dim"] is None and cfg["arch"] == "attn_hybrid":
         cfg["attn_dim"] = max(int(cfg["width"]) // 2, 1)
+    return cfg
+
+
+def apply_predictor_config_overrides(
+    cfg: dict,
+    *,
+    arch: str = "existing",
+    hidden_size: int | None = None,
+    depth: int | None = None,
+    mlp_ratio: float | None = None,
+    dilation_cycle: tuple[int, ...] | None = None,
+    grid_size: int | None = None,
+    residual_output: bool | None = None,
+    attention_every: int | None = None,
+    num_heads: int | None = None,
+    adaln_zero: bool | None = None,
+) -> dict:
+    """Apply optional CLI overrides to a predictor config."""
+    cfg = dict(cfg)
+    if arch != "existing":
+        if arch not in PREDICTOR_VARIANTS:
+            raise ValueError(f"Unknown shortcut predictor arch override: {arch!r}")
+        cfg.update(dict(PREDICTOR_VARIANTS[arch]))
+    if hidden_size is not None:
+        cfg["width"] = int(hidden_size)
+    if depth is not None:
+        cfg["num_blocks"] = int(depth)
+    if mlp_ratio is not None:
+        cfg["mlp_ratio"] = float(mlp_ratio)
+    if dilation_cycle:
+        blocks = int(cfg.get("num_blocks", len(dilation_cycle)))
+        cfg["dilation_schedule"] = tuple(int(dilation_cycle[idx % len(dilation_cycle)]) for idx in range(blocks))
+    if grid_size is not None:
+        cfg["grid_size_override"] = int(grid_size)
+    if residual_output is not None:
+        cfg["residual_output"] = bool(residual_output)
+    if attention_every is not None:
+        cfg["attention_every"] = int(attention_every)
+    if num_heads is not None:
+        cfg["num_heads"] = int(num_heads)
+    if adaln_zero is not None:
+        cfg["adaln_zero"] = bool(adaln_zero)
     return cfg
 
 
