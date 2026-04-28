@@ -932,6 +932,7 @@ def train_step(
     direct_pair_mode="trunc_normal",
     shortcut_loss_mode="direction_magnitude",
     shortcut_activation_huber_delta=1.0,
+    debug_gap_log_freq=10000,
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
@@ -1319,8 +1320,12 @@ def train_step(
             (len(PREDICTOR_DEBUG_PAIRS) + PREDICTOR_DEBUG_MAX_GAP)
             * len(PREDICTOR_DEBUG_METRIC_NAMES)
         )
-        debug_pair_metrics = jax.lax.cond(
+        debug_gap_logs_now = jnp.logical_and(
             debug_gap_logs,
+            jnp.equal(jnp.mod(global_step, jnp.asarray(debug_gap_log_freq, dtype=jnp.int32)), 0),
+        )
+        debug_pair_metrics = jax.lax.cond(
+            debug_gap_logs_now,
             compute_debug_pair_metrics,
             lambda _: tuple(jnp.float32(0.0) for _ in range(debug_metric_count)),
             operand=None,
@@ -1518,6 +1523,7 @@ def train_step(
             output_distill_b,
             output_distill_gap,
             output_distill_batch_size_metric,
+            debug_gap_logs_now.astype(jnp.float32),
             debug_pair_metrics,
             hidden_stack,
         )
@@ -1578,6 +1584,7 @@ def train_step(
         output_distill_b,
         output_distill_gap,
         output_distill_batch_size_metric,
+        debug_gap_logs_now,
         debug_pair_metrics,
         hidden_stack,
     ) = aux
@@ -1638,6 +1645,7 @@ def train_step(
         output_distill_batch_size_metric.astype(jnp.float32),
         axis_name="batch",
     )
+    debug_gap_logs_now = jax.lax.pmean(debug_gap_logs_now, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
@@ -1754,6 +1762,8 @@ def train_step(
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
         "train/lr_backbone": jnp.asarray(learning_rate, dtype=jnp.float32),
         "train/lr_predictor": jnp.asarray(predictor_learning_rate, dtype=jnp.float32),
+        "train/debug_gap_logs_active": debug_gap_logs_now,
+        "train/debug_gap_log_freq": jnp.asarray(debug_gap_log_freq, dtype=jnp.float32),
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -2632,6 +2642,12 @@ def main():
         default=False,
         help="Log fixed-pair predictor debug losses for representative layer gaps.",
     )
+    parser.add_argument(
+        "--shortcut-debug-gap-log-freq",
+        type=int,
+        default=10000,
+        help="Run fixed-pair predictor debug gap logging every N training steps when --shortcut-debug-gap-logs is enabled.",
+    )
     parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0)
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0)
     parser.add_argument(
@@ -3036,6 +3052,8 @@ def main():
         raise ValueError("--shortcut-l2-ema-alpha must be between 0 and 1")
     if args.shortcut_predictor_lr <= 0.0:
         raise ValueError("--predictor-learning-rate/--shortcut-predictor-lr must be greater than 0")
+    if args.shortcut_debug_gap_log_freq <= 0:
+        raise ValueError("--shortcut-debug-gap-log-freq must be greater than 0")
     if args.shortcut_predictor_hidden_size is not None and args.shortcut_predictor_hidden_size <= 0:
         raise ValueError("--shortcut-predictor-hidden-size must be greater than 0")
     if args.shortcut_predictor_depth is not None and args.shortcut_predictor_depth <= 0:
@@ -3152,6 +3170,7 @@ def main():
         f"bootstrap_detach_source={args.shortcut_bootstrap_detach_source} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
+        f"debug_gap_log_freq={args.shortcut_debug_gap_log_freq} "
         f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
         f"skip_p={args.shortcut_skip_in_loop_prob} "
         f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
@@ -3321,6 +3340,7 @@ def main():
             direct_pair_mode=args.direct_pair_mode,
             shortcut_loss_mode=args.shortcut_loss_mode,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
+            debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,
