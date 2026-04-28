@@ -852,7 +852,7 @@ def predictor_size_bucket(name: str) -> str:
     canonical = canonical_predictor_variant_name(name)
     if canonical in {"deep_dilated_mlp", "hybrid_deep"}:
         return "large"
-    if canonical == "dit2_deep_256":
+    if canonical in {"dit2_base_v2", "dit2_deep_256"}:
         return "base"
     return canonical.rsplit("_", 1)[-1]
 
