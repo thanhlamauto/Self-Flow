@@ -657,6 +657,38 @@ def sample_discrete_truncated_normal_gap(max_gap, loc, sigma, rng, depth):
     return jax.random.categorical(rng, logits).astype(jnp.int32) + 1
 
 
+def pair_sampling_uniform_mix(global_step, anneal_start_step, anneal_steps):
+    progress = (
+        (global_step.astype(jnp.float32) - jnp.asarray(anneal_start_step, dtype=jnp.float32))
+        / jnp.maximum(jnp.asarray(anneal_steps, dtype=jnp.float32), 1.0)
+    )
+    return jnp.clip(progress, 0.0, 1.0)
+
+
+def sample_layer_pair_trunc_normal_to_uniform(
+    num_hidden,
+    max_gap,
+    loc,
+    sigma,
+    rng,
+    uniform_mix,
+):
+    depth = int(num_hidden) - 1
+    gap_rng, source_rng = jax.random.split(rng)
+    max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
+    gaps = jnp.arange(1, depth + 1, dtype=jnp.int32)
+    offsets = (gaps.astype(jnp.float32) - loc) / sigma
+    trunc_logits = jnp.where(gaps <= max_gap, -0.5 * jnp.square(offsets), -jnp.inf)
+    uniform_logits = jnp.where(gaps <= max_gap, 0.0, -jnp.inf)
+    trunc_probs = jax.nn.softmax(trunc_logits)
+    uniform_probs = jax.nn.softmax(uniform_logits)
+    probs = (1.0 - uniform_mix) * trunc_probs + uniform_mix * uniform_probs
+    gap = jax.random.choice(gap_rng, gaps, p=probs).astype(jnp.int32)
+    max_source = jnp.asarray(depth, dtype=jnp.int32) - gap
+    source = jax.random.randint(source_rng, (), 0, max_source + 1, dtype=jnp.int32)
+    return source, source + gap
+
+
 def sample_layer_pair_trunc_normal(num_hidden, max_gap, loc, sigma, rng):
     depth = int(num_hidden) - 1
     gap_rng, source_rng = jax.random.split(rng)
@@ -671,7 +703,16 @@ def sample_three_distinct_pairs_trunc_normal(num_hidden, max_gap, loc, sigma, rn
     return sample_distinct_pairs_weighted(num_hidden, max_gap, loc, sigma, rng, num_pairs=3, gap2_bias=0.0)
 
 
-def sample_distinct_pairs_weighted(num_hidden, max_gap, loc, sigma, rng, num_pairs=3, gap2_bias=0.0):
+def sample_distinct_pairs_weighted(
+    num_hidden,
+    max_gap,
+    loc,
+    sigma,
+    rng,
+    num_pairs=3,
+    gap2_bias=0.0,
+    uniform_mix=0.0,
+):
     depth = int(num_hidden) - 1
     candidates = tuple((a, b, b - a) for a in range(depth) for b in range(a + 1, depth + 1))
     candidate_a = jnp.asarray([a for a, _, _ in candidates], dtype=jnp.int32)
@@ -680,10 +721,14 @@ def sample_distinct_pairs_weighted(num_hidden, max_gap, loc, sigma, rng, num_pai
     max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
     gap_sources = (jnp.asarray(depth, dtype=jnp.float32) - candidate_gap.astype(jnp.float32) + 1.0)
     offsets = (candidate_gap.astype(jnp.float32) - loc) / sigma
-    logits = -0.5 * jnp.square(offsets) - jnp.log(gap_sources)
-    logits = logits + jnp.where(candidate_gap == 2, jnp.asarray(gap2_bias, dtype=jnp.float32), 0.0)
-    logits = jnp.where(candidate_gap <= max_gap, logits, -jnp.inf)
-    probs = jax.nn.softmax(logits)
+    trunc_logits = -0.5 * jnp.square(offsets) - jnp.log(gap_sources)
+    trunc_logits = trunc_logits + jnp.where(candidate_gap == 2, jnp.asarray(gap2_bias, dtype=jnp.float32), 0.0)
+    uniform_gap_logits = -jnp.log(gap_sources)
+    trunc_logits = jnp.where(candidate_gap <= max_gap, trunc_logits, -jnp.inf)
+    uniform_gap_logits = jnp.where(candidate_gap <= max_gap, uniform_gap_logits, -jnp.inf)
+    trunc_probs = jax.nn.softmax(trunc_logits)
+    uniform_probs = jax.nn.softmax(uniform_gap_logits)
+    probs = (1.0 - uniform_mix) * trunc_probs + uniform_mix * uniform_probs
     indices = jax.random.choice(
         rng,
         jnp.arange(len(candidates), dtype=jnp.int32),
@@ -927,6 +972,8 @@ def train_step(
     output_distill_every=1,
     output_distill_update_mode="predictor_plus_downstream",
     output_distill_pair_mode="trunc_normal",
+    pair_uniform_anneal_start_step=0,
+    pair_uniform_anneal_steps=100000,
     direct_num_pairs=3,
     direct_num_joint_pairs=1,
     direct_num_predictor_only_pairs=2,
@@ -955,7 +1002,7 @@ def train_step(
         raise ValueError("direct_num_pairs must equal direct_num_joint_pairs + direct_num_predictor_only_pairs.")
     if direct_num_pairs not in {2, 3}:
         raise ValueError("Direct shortcut training supports 2 or 3 static pairs.")
-    if direct_pair_mode not in {"trunc_normal", "gap2_biased"}:
+    if direct_pair_mode not in {"trunc_normal", "trunc_normal_to_uniform", "gap2_biased"}:
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
     if shortcut_loss_mode == "direction_activation_huber":
         shortcut_loss_mode = "direction_activation"
@@ -963,7 +1010,7 @@ def train_step(
         raise ValueError(f"Unknown shortcut loss mode: {shortcut_loss_mode!r}")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
-    if output_distill_pair_mode not in {"trunc_normal", "gap2_biased"}:
+    if output_distill_pair_mode not in {"trunc_normal", "trunc_normal_to_uniform", "gap2_biased"}:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
     if output_distill_update_mode not in {
         "predictor_only",
@@ -996,6 +1043,11 @@ def train_step(
         global_step,
         private_start_step,
         private_warmup_iters,
+    )
+    pair_uniform_mix = pair_sampling_uniform_mix(
+        global_step,
+        pair_uniform_anneal_start_step,
+        pair_uniform_anneal_steps,
     )
 
     q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
@@ -1108,6 +1160,17 @@ def train_step(
                 direct_pair_rng,
                 num_pairs=direct_num_pairs,
                 gap2_bias=0.0,
+            )
+        elif direct_pair_mode == "trunc_normal_to_uniform":
+            direct_as, direct_bs = sample_distinct_pairs_weighted(
+                directions.shape[0],
+                skip_in_loop_max_gap,
+                skip_in_loop_gap_loc,
+                skip_in_loop_gap_sigma,
+                direct_pair_rng,
+                num_pairs=direct_num_pairs,
+                gap2_bias=0.0,
+                uniform_mix=pair_uniform_mix,
             )
         else:
             direct_as, direct_bs = sample_distinct_pairs_weighted(
@@ -1355,6 +1418,15 @@ def train_step(
                     skip_in_loop_gap_sigma,
                     output_pair_rng,
                 )
+            elif output_distill_pair_mode == "trunc_normal_to_uniform":
+                output_a, output_b = sample_layer_pair_trunc_normal_to_uniform(
+                    hidden_stack_f32.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    output_pair_rng,
+                    pair_uniform_mix,
+                )
             else:
                 output_a, output_b = sample_layer_pair_gap2_biased(
                     hidden_stack_f32.shape[0],
@@ -1524,6 +1596,7 @@ def train_step(
             output_distill_b,
             output_distill_gap,
             output_distill_batch_size_metric,
+            pair_uniform_mix,
             debug_gap_logs_now.astype(jnp.float32),
             debug_pair_metrics,
             hidden_stack,
@@ -1585,6 +1658,7 @@ def train_step(
         output_distill_b,
         output_distill_gap,
         output_distill_batch_size_metric,
+        pair_uniform_mix,
         debug_gap_logs_now,
         debug_pair_metrics,
         hidden_stack,
@@ -1646,6 +1720,7 @@ def train_step(
         output_distill_batch_size_metric.astype(jnp.float32),
         axis_name="batch",
     )
+    pair_uniform_mix = jax.lax.pmean(pair_uniform_mix, axis_name="batch")
     debug_gap_logs_now = jax.lax.pmean(debug_gap_logs_now, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -1761,6 +1836,9 @@ def train_step(
             dtype=jnp.float32,
         ),
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
+        "train/pair_uniform_mix": pair_uniform_mix,
+        "train/pair_uniform_anneal_start_step": jnp.asarray(pair_uniform_anneal_start_step, dtype=jnp.float32),
+        "train/pair_uniform_anneal_steps": jnp.asarray(pair_uniform_anneal_steps, dtype=jnp.float32),
         "train/lr_backbone": jnp.asarray(learning_rate, dtype=jnp.float32),
         "train/lr_predictor": jnp.asarray(predictor_learning_rate, dtype=jnp.float32),
         "train/debug_gap_logs_active": debug_gap_logs_now,
@@ -2877,7 +2955,19 @@ def main():
         "--output-distill-pair-mode",
         type=str,
         default="trunc_normal",
-        choices=["trunc_normal", "gap2_biased"],
+        choices=["trunc_normal", "trunc_normal_to_uniform", "gap2_biased"],
+    )
+    parser.add_argument(
+        "--pair-uniform-anneal-start-step",
+        type=int,
+        default=0,
+        help="Step where trunc_normal_to_uniform pair sampling starts annealing toward uniform gaps.",
+    )
+    parser.add_argument(
+        "--pair-uniform-anneal-steps",
+        type=int,
+        default=100000,
+        help="Number of steps to anneal pair sampling from truncated-normal gaps to uniform gaps.",
     )
     parser.add_argument("--direct-num-pairs", type=int, default=3)
     parser.add_argument("--direct-joint-pairs", type=int, default=1)
@@ -2886,7 +2976,7 @@ def main():
         "--direct-pair-mode",
         type=str,
         default="trunc_normal",
-        choices=["trunc_normal", "gap2_biased"],
+        choices=["trunc_normal", "trunc_normal_to_uniform", "gap2_biased"],
     )
     parser.add_argument(
         "--shortcut-loss-mode",
@@ -3239,6 +3329,10 @@ def main():
         raise ValueError("--lambda-output-distill must be non-negative")
     if args.output_distill_every <= 0:
         raise ValueError("--output-distill-every must be greater than 0")
+    if args.pair_uniform_anneal_start_step < 0:
+        raise ValueError("--pair-uniform-anneal-start-step must be non-negative")
+    if args.pair_uniform_anneal_steps <= 0:
+        raise ValueError("--pair-uniform-anneal-steps must be greater than 0")
     if args.direct_joint_pairs != 1 or args.direct_predictor_only_pairs not in {1, 2}:
         raise ValueError("--direct-joint-pairs must be 1 and --direct-predictor-only-pairs must be 1 or 2")
     if args.direct_num_pairs != args.direct_joint_pairs + args.direct_predictor_only_pairs:
@@ -3351,6 +3445,7 @@ def main():
         f"output_distill_every={args.output_distill_every} "
         f"output_distill_update_mode={args.output_distill_update_mode} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
+        f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
@@ -3514,6 +3609,8 @@ def main():
             output_distill_every=args.output_distill_every,
             output_distill_update_mode=args.output_distill_update_mode,
             output_distill_pair_mode=args.output_distill_pair_mode,
+            pair_uniform_anneal_start_step=args.pair_uniform_anneal_start_step,
+            pair_uniform_anneal_steps=args.pair_uniform_anneal_steps,
             direct_num_pairs=args.direct_num_pairs,
             direct_num_joint_pairs=args.direct_joint_pairs,
             direct_num_predictor_only_pairs=args.direct_predictor_only_pairs,
