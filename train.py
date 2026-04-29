@@ -592,6 +592,10 @@ def private_activation_loss(
     """
     activations = jnp.asarray(activations, dtype=jnp.float32)  # [L, B, N, D]
     eps = jnp.float32(1e-4)
+    activation_denom = jax.lax.stop_gradient(
+        jnp.maximum(jnp.linalg.norm(activations, axis=-1, keepdims=True), eps)
+    )
+    activations = activations / activation_denom
 
     if use_residual:
         common = jnp.mean(activations, axis=0)
