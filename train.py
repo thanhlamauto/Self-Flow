@@ -591,7 +591,7 @@ def private_activation_loss(
     (weak_layer, strong_layer) are excluded; all other pairs remain eligible.
     """
     activations = jnp.asarray(activations, dtype=jnp.float32)  # [L, B, N, D]
-    eps = jnp.float32(1e-8)
+    eps = jnp.float32(1e-4)
 
     if use_residual:
         common = jnp.mean(activations, axis=0)
@@ -602,26 +602,26 @@ def private_activation_loss(
 
     if cosine_mode == "bnd":
         private_flat = private.reshape(private.shape[0], -1)
-        private_norm = private_flat / jnp.maximum(
-            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
-            eps,
+        denom = jax.lax.stop_gradient(
+            jnp.maximum(jnp.linalg.norm(private_flat, axis=-1, keepdims=True), eps)
         )
+        private_norm = private_flat / denom
         cosine_matrix = private_norm @ private_norm.T
         pair_cosines = cosine_matrix[jnp.triu_indices(private.shape[0], k=1)]
     elif cosine_mode == "nd":
         private_flat = private.reshape(private.shape[0], private.shape[1], -1)
-        private_norm = private_flat / jnp.maximum(
-            jnp.linalg.norm(private_flat, axis=-1, keepdims=True),
-            eps,
+        denom = jax.lax.stop_gradient(
+            jnp.maximum(jnp.linalg.norm(private_flat, axis=-1, keepdims=True), eps)
         )
+        private_norm = private_flat / denom
         cosine_tensor = jnp.einsum("lbd,mbd->lmb", private_norm, private_norm)
         pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
         pair_cosines = jnp.mean(pair_cosines, axis=-1)
     elif cosine_mode == "token":
-        private_norm = private / jnp.maximum(
-            jnp.linalg.norm(private, axis=-1, keepdims=True),
-            eps,
+        denom = jax.lax.stop_gradient(
+            jnp.maximum(jnp.linalg.norm(private, axis=-1, keepdims=True), eps)
         )
+        private_norm = private / denom
         cosine_tensor = jnp.einsum("lbpd,mbpd->lmbp", private_norm, private_norm)
         pair_cosines = cosine_tensor[jnp.triu_indices(private.shape[0], k=1)]
         pair_cosines = jnp.mean(pair_cosines, axis=(-1, -2))
