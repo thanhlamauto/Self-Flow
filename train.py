@@ -971,6 +971,7 @@ def train_step(
     output_distill_ratio=0.10,
     output_distill_every=1,
     output_distill_update_mode="predictor_plus_downstream",
+    output_distill_full_backbone_start_step=0,
     output_distill_pair_mode="trunc_normal",
     pair_uniform_anneal_start_step=0,
     pair_uniform_anneal_steps=100000,
@@ -1016,6 +1017,7 @@ def train_step(
         "predictor_only",
         "predictor_plus_downstream",
         "predictor_plus_all",
+        "predictor_only_then_all",
     }:
         raise ValueError(f"Unknown output distill update mode: {output_distill_update_mode!r}")
     if private_cosine_mode not in {"bnd", "nd", "token"}:
@@ -1048,6 +1050,13 @@ def train_step(
         global_step,
         pair_uniform_anneal_start_step,
         pair_uniform_anneal_steps,
+    )
+    output_distill_full_backbone_active = jnp.logical_or(
+        output_distill_update_mode == "predictor_plus_all",
+        jnp.logical_and(
+            output_distill_update_mode == "predictor_only_then_all",
+            global_step >= jnp.asarray(output_distill_full_backbone_start_step, dtype=jnp.int32),
+        ),
     )
 
     q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
@@ -1436,7 +1445,16 @@ def train_step(
                     output_pair_rng,
                 )
             z_source = hidden_stack_f32[output_a, subset_idx]
-            if output_distill_update_mode != "predictor_plus_all":
+            if output_distill_update_mode == "predictor_plus_all":
+                pass
+            elif output_distill_update_mode == "predictor_only_then_all":
+                z_source = jax.lax.cond(
+                    output_distill_full_backbone_active,
+                    lambda z: z,
+                    jax.lax.stop_gradient,
+                    z_source,
+                )
+            else:
                 z_source = jax.lax.stop_gradient(z_source)
             predictor_source, m_source = build_predictor_source(
                 z_source,
@@ -1463,6 +1481,16 @@ def train_step(
             if output_distill_update_mode == "predictor_only":
                 resume_backbone_params = jax.tree_util.tree_map(
                     jax.lax.stop_gradient,
+                    resume_backbone_params,
+                )
+            elif output_distill_update_mode == "predictor_only_then_all":
+                resume_backbone_params = jax.tree_util.tree_map(
+                    lambda param: jax.lax.cond(
+                        output_distill_full_backbone_active,
+                        lambda x: x,
+                        jax.lax.stop_gradient,
+                        param,
+                    ),
                     resume_backbone_params,
                 )
             elif output_distill_update_mode == "predictor_plus_downstream":
@@ -1597,6 +1625,7 @@ def train_step(
             output_distill_gap,
             output_distill_batch_size_metric,
             pair_uniform_mix,
+            output_distill_full_backbone_active.astype(jnp.float32),
             debug_gap_logs_now.astype(jnp.float32),
             debug_pair_metrics,
             hidden_stack,
@@ -1659,6 +1688,7 @@ def train_step(
         output_distill_gap,
         output_distill_batch_size_metric,
         pair_uniform_mix,
+        output_distill_full_backbone_active,
         debug_gap_logs_now,
         debug_pair_metrics,
         hidden_stack,
@@ -1721,6 +1751,7 @@ def train_step(
         axis_name="batch",
     )
     pair_uniform_mix = jax.lax.pmean(pair_uniform_mix, axis_name="batch")
+    output_distill_full_backbone_active = jax.lax.pmean(output_distill_full_backbone_active, axis_name="batch")
     debug_gap_logs_now = jax.lax.pmean(debug_gap_logs_now, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -1832,7 +1863,13 @@ def train_step(
                 "predictor_only": 0.0,
                 "predictor_plus_downstream": 1.0,
                 "predictor_plus_all": 2.0,
+                "predictor_only_then_all": 3.0,
             }[output_distill_update_mode],
+            dtype=jnp.float32,
+        ),
+        "train/output_distill_full_backbone_active": output_distill_full_backbone_active,
+        "train/output_distill_full_backbone_start_step": jnp.asarray(
+            output_distill_full_backbone_start_step,
             dtype=jnp.float32,
         ),
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
@@ -2954,11 +2991,26 @@ def main():
         "--output-distill-update-mode",
         type=str,
         default="predictor_plus_downstream",
-        choices=["predictor_only", "predictor_plus_downstream", "predictor_plus_all"],
+        choices=[
+            "predictor_only",
+            "predictor_plus_downstream",
+            "predictor_plus_all",
+            "predictor_only_then_all",
+        ],
         help=(
             "Gradient routing for output distillation: predictor_only freezes DiT for this branch; "
             "predictor_plus_downstream updates predictor plus blocks after b; "
-            "predictor_plus_all also lets gradients flow through source hidden to blocks before a."
+            "predictor_plus_all also lets gradients flow through source hidden to blocks before a; "
+            "predictor_only_then_all starts as predictor_only and switches to predictor_plus_all."
+        ),
+    )
+    parser.add_argument(
+        "--output-distill-full-backbone-start-step",
+        type=int,
+        default=0,
+        help=(
+            "For --output-distill-update-mode predictor_only_then_all, switch output distillation "
+            "from predictor-only updates to predictor plus full-backbone updates at this global step."
         ),
     )
     parser.add_argument(
@@ -3339,6 +3391,8 @@ def main():
         raise ValueError("--lambda-output-distill must be non-negative")
     if args.output_distill_every <= 0:
         raise ValueError("--output-distill-every must be greater than 0")
+    if args.output_distill_full_backbone_start_step < 0:
+        raise ValueError("--output-distill-full-backbone-start-step must be non-negative")
     if args.pair_uniform_anneal_start_step < 0:
         raise ValueError("--pair-uniform-anneal-start-step must be non-negative")
     if args.pair_uniform_anneal_steps <= 0:
@@ -3454,6 +3508,7 @@ def main():
         f"lambda_output_distill={args.lambda_output_distill} "
         f"output_distill_every={args.output_distill_every} "
         f"output_distill_update_mode={args.output_distill_update_mode} "
+        f"output_distill_full_backbone_start_step={args.output_distill_full_backbone_start_step} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
@@ -3618,6 +3673,7 @@ def main():
             output_distill_ratio=args.output_distill_ratio,
             output_distill_every=args.output_distill_every,
             output_distill_update_mode=args.output_distill_update_mode,
+            output_distill_full_backbone_start_step=args.output_distill_full_backbone_start_step,
             output_distill_pair_mode=args.output_distill_pair_mode,
             pair_uniform_anneal_start_step=args.pair_uniform_anneal_start_step,
             pair_uniform_anneal_steps=args.pair_uniform_anneal_steps,
