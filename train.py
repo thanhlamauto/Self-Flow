@@ -997,12 +997,12 @@ def train_step(
       target  = x0 - x1
       loss    = E[||v_theta(x_tau, tau) - target||^2]
     """
-    if direct_num_joint_pairs != 1 or direct_num_predictor_only_pairs not in {1, 2}:
-        raise ValueError("Direct shortcut training expects 1 joint pair and 1 or 2 predictor-only pairs.")
+    if direct_num_joint_pairs != 1 or direct_num_predictor_only_pairs not in {0, 1, 2}:
+        raise ValueError("Direct shortcut training expects 1 joint pair and 0, 1, or 2 predictor-only pairs.")
     if direct_num_pairs != direct_num_joint_pairs + direct_num_predictor_only_pairs:
         raise ValueError("direct_num_pairs must equal direct_num_joint_pairs + direct_num_predictor_only_pairs.")
-    if direct_num_pairs not in {2, 3}:
-        raise ValueError("Direct shortcut training supports 2 or 3 static pairs.")
+    if direct_num_pairs not in {1, 2, 3}:
+        raise ValueError("Direct shortcut training supports 1, 2, or 3 static pairs.")
     if direct_pair_mode not in {"trunc_normal", "trunc_normal_to_uniform", "gap2_biased"}:
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
     if shortcut_loss_mode == "direction_activation_huber":
@@ -1193,18 +1193,23 @@ def train_step(
             )
         direct_joint_a = direct_as[0]
         direct_joint_b = direct_bs[0]
-        direct_ponly_1_a = direct_as[1]
-        direct_ponly_1_b = direct_bs[1]
         joint_values = shortcut_direct_mag_loss_for_pair(
             direct_joint_a,
             direct_joint_b,
             False,
         )
-        ponly_1_values = shortcut_direct_mag_loss_for_pair(
-            direct_ponly_1_a,
-            direct_ponly_1_b,
-            True,
-        )
+        if direct_num_predictor_only_pairs >= 1:
+            direct_ponly_1_a = direct_as[1]
+            direct_ponly_1_b = direct_bs[1]
+            ponly_1_values = shortcut_direct_mag_loss_for_pair(
+                direct_ponly_1_a,
+                direct_ponly_1_b,
+                True,
+            )
+        else:
+            direct_ponly_1_a = jnp.asarray(-1, dtype=jnp.int32)
+            direct_ponly_1_b = jnp.asarray(-1, dtype=jnp.int32)
+            ponly_1_values = tuple(jnp.float32(0.0) for _ in range(len(joint_values)))
         if direct_num_pairs == 3:
             direct_ponly_2_a = direct_as[2]
             direct_ponly_2_b = direct_bs[2]
@@ -1222,19 +1227,23 @@ def train_step(
         loss_direct_ponly_2 = ponly_2_values[0]
         loss_direct_3pair = (
             loss_direct_joint
-            + loss_direct_ponly_1
+            + jnp.asarray(direct_num_predictor_only_pairs >= 1, dtype=jnp.float32) * loss_direct_ponly_1
             + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * loss_direct_ponly_2
         ) / float(direct_num_pairs)
         loss_dir = joint_values[1]
         loss_mag = joint_values[2]
-        loss_dir_ponly_mean = (
-            ponly_1_values[1]
-            + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[1]
-        ) / float(direct_num_predictor_only_pairs)
-        loss_mag_ponly_mean = (
-            ponly_1_values[2]
-            + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[2]
-        ) / float(direct_num_predictor_only_pairs)
+        if direct_num_predictor_only_pairs > 0:
+            loss_dir_ponly_mean = (
+                ponly_1_values[1]
+                + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[1]
+            ) / float(direct_num_predictor_only_pairs)
+            loss_mag_ponly_mean = (
+                ponly_1_values[2]
+                + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[2]
+            ) / float(direct_num_predictor_only_pairs)
+        else:
+            loss_dir_ponly_mean = jnp.float32(0.0)
+            loss_mag_ponly_mean = jnp.float32(0.0)
         cos_dir = joint_values[3]
         y_ab_norm_mean = joint_values[8]
         y_ab_norm_min = joint_values[9]
@@ -3397,12 +3406,12 @@ def main():
         raise ValueError("--pair-uniform-anneal-start-step must be non-negative")
     if args.pair_uniform_anneal_steps <= 0:
         raise ValueError("--pair-uniform-anneal-steps must be greater than 0")
-    if args.direct_joint_pairs != 1 or args.direct_predictor_only_pairs not in {1, 2}:
-        raise ValueError("--direct-joint-pairs must be 1 and --direct-predictor-only-pairs must be 1 or 2")
+    if args.direct_joint_pairs != 1 or args.direct_predictor_only_pairs not in {0, 1, 2}:
+        raise ValueError("--direct-joint-pairs must be 1 and --direct-predictor-only-pairs must be 0, 1, or 2")
     if args.direct_num_pairs != args.direct_joint_pairs + args.direct_predictor_only_pairs:
         raise ValueError("--direct-num-pairs must equal --direct-joint-pairs + --direct-predictor-only-pairs")
-    if args.direct_num_pairs not in {2, 3}:
-        raise ValueError("--direct-num-pairs supports static values 2 or 3")
+    if args.direct_num_pairs not in {1, 2, 3}:
+        raise ValueError("--direct-num-pairs supports static values 1, 2, or 3")
     if args.shortcut_loss_mode == "direction_activation_huber":
         args.shortcut_loss_mode = "direction_activation"
     if args.shortcut_activation_huber_delta <= 0.0:
