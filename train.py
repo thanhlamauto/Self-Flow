@@ -3235,7 +3235,7 @@ def main():
     parser.add_argument(
         "--fid-skip-timestep-mode",
         type=str,
-        default="alternate",
+        default="all",
         choices=["alternate", "all"],
         help=(
             "Validation FID/sFID 3->7 shortcut schedule. alternate uses the shortcut on even denoise "
