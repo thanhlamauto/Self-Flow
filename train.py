@@ -421,6 +421,7 @@ from src.depth_shortcut import (
     DepthShortcutPredictor,
     apply_predictor_config_overrides,
     l2_normalize_tokens,
+    log_token_magnitudes,
     predictor_config_from_name,
     predictor_size_bucket,
     predictor_variant_names,
@@ -2710,6 +2711,8 @@ class WandbRunSummaryFile:
         "val/sFID",
         "val/FID_skip_3to7",
         "val/sFID_skip_3to7",
+        "val/FID_skip_timestep_l5_j2",
+        "val/sFID_skip_timestep_l5_j2",
         "train/loss",
         "train/loss_total",
         "train/loss_gen",
@@ -3337,6 +3340,209 @@ def make_sample_latents_pmap_fn(
     return jax.pmap(_sample_latents_local, axis_name="batch")
 
 
+def make_sample_latents_timestep_skip_pmap_fn(
+    config,
+    *,
+    num_steps=50,
+    cfg_scale=1.0,
+    shortcut_predictor_variant="tiny",
+    shortcut_timesteps=50,
+    depth_shortcut_output_mode="direction_magnitude",
+    depth_shortcut_normalize_input=True,
+    depth_shortcut_mag_scale=3.0,
+    depth_shortcut_mag_clip_min=3.0,
+    depth_shortcut_mag_clip_max=8.0,
+    depth_shortcut_predictor_overrides=None,
+    skip_layer=5,
+    skip_jump_steps=2,
+    skip_every_steps=2,
+):
+    """Build a sharded sampler that does timestep jumping via layer predictor.
+
+    At selected denoise steps, it predicts hidden at `skip_layer` for a future
+    timestep (`+skip_jump_steps`) and resumes DiT from layer `skip_layer + 1`.
+    """
+    if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires an unconditional label embedding. "
+            "Use --cfg-dropout-rate > 0 for training, or keep cfg scale at 1.0."
+        )
+    if int(skip_layer) <= 0 or int(skip_layer) > int(config["depth"]):
+        raise ValueError(f"skip_layer must be in [1, {int(config['depth'])}], got {skip_layer}")
+    if int(skip_jump_steps) <= 0:
+        raise ValueError(f"skip_jump_steps must be positive, got {skip_jump_steps}")
+    if int(skip_every_steps) <= 0:
+        raise ValueError(f"skip_every_steps must be positive, got {skip_every_steps}")
+
+    model = SelfFlowDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        class_dropout_prob=config["class_dropout_prob"],
+        per_token=False,
+    )
+    predictor_cfg = predictor_config_from_name(shortcut_predictor_variant, config["hidden_size"])
+    predictor_cfg = apply_predictor_config_overrides(predictor_cfg, **(depth_shortcut_predictor_overrides or {}))
+    predictor = DepthShortcutPredictor(
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_tokens=(config["input_size"] // config["patch_size"]) ** 2,
+        **predictor_cfg,
+    )
+    patch_size = config["patch_size"]
+    latent_channels = config["in_channels"]
+    latent_size = config["input_size"]
+    token_h = latent_size // patch_size
+    token_w = latent_size // patch_size
+
+    def _sample_latents_local(
+        ema_params_local,
+        predictor_params_local,
+        class_labels_local,
+        rng_local,
+    ):
+        batch_size = class_labels_local.shape[0]
+        rng_local, noise_rng = jax.random.split(rng_local)
+        noise = jax.random.normal(
+            noise_rng,
+            (batch_size, latent_channels, latent_size, latent_size),
+            dtype=jnp.float32,
+        )
+        from einops import rearrange
+        x = rearrange(
+            noise,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=patch_size,
+            p2=patch_size,
+        ).astype(jnp.float32)
+
+        use_cfg = cfg_scale > 1.0
+        if use_cfg:
+            x = jnp.concatenate([x, x], axis=0)
+            class_labels_local = jnp.concatenate(
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
+                axis=0,
+            )
+
+        t_scale = jnp.asarray(0.96 / float(max(int(num_steps) - 1, 1)), dtype=jnp.float32)
+
+        def model_fn(z_x, t):
+            t_scalar = t[0] if t.ndim > 0 else t
+            step_idx = jnp.rint(t_scalar * float(num_steps - 1) / 0.96).astype(jnp.int32)
+            step_idx = jnp.clip(step_idx, 0, int(num_steps) - 1)
+            jump_idx = jnp.minimum(step_idx + jnp.asarray(int(skip_jump_steps), dtype=jnp.int32), int(num_steps) - 1)
+            can_jump = jump_idx > step_idx
+            jump_now = jnp.logical_and((step_idx % int(skip_every_steps)) == 0, can_jump)
+
+            def apply_full(_):
+                return model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels_local,
+                    deterministic=True,
+                )
+
+            def apply_timestep_jump(_):
+                t_future_scalar = jump_idx.astype(jnp.float32) * t_scale
+                t_future = jnp.full_like(t, t_future_scalar)
+
+                _, hidden_now, t_emb_now = model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels_local,
+                    deterministic=True,
+                    return_hidden_states=True,
+                )
+                _, hidden_future, t_emb_future = model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t_future,
+                    vector=class_labels_local,
+                    deterministic=True,
+                    return_hidden_states=True,
+                )
+                h_now = jnp.stack(hidden_now, axis=0).astype(jnp.float32)
+                h_future = jnp.stack(hidden_future, axis=0).astype(jnp.float32)
+                src_hidden = h_now[int(skip_layer)]
+                h0_tgt = h_future[0]
+                pred_input = l2_normalize_tokens(src_hidden) if depth_shortcut_normalize_input else src_hidden
+                m_source = log_token_magnitudes(src_hidden)
+                q_src = jnp.rint(t * jnp.float32(max(int(shortcut_timesteps) - 1, 1))).astype(jnp.int32)
+                q_tgt = jnp.rint(t_future * jnp.float32(max(int(shortcut_timesteps) - 1, 1))).astype(jnp.int32)
+                y_pred, delta_m = predictor.apply(
+                    {"params": predictor_params_local},
+                    pred_input,
+                    jnp.asarray(int(skip_layer), dtype=jnp.int32),
+                    jnp.asarray(int(skip_layer), dtype=jnp.int32),
+                    t_emb_now,
+                    m_source,
+                    use_timestep_embed=True,
+                    h0_tgt=h0_tgt,
+                    timestep_tgt_embed=t_emb_future,
+                    t_src_idx=q_src,
+                    t_tgt_idx=q_tgt,
+                    delta_t_idx=jnp.abs(q_tgt - q_src),
+                )
+                if depth_shortcut_output_mode == "direction_activation":
+                    z_hat = y_pred.astype(jnp.float32)
+                else:
+                    u_pred = l2_normalize_tokens(y_pred)
+                    m_pred = jnp.clip(
+                        m_source + float(depth_shortcut_mag_scale) * delta_m,
+                        float(depth_shortcut_mag_clip_min),
+                        float(depth_shortcut_mag_clip_max),
+                    )
+                    z_hat = jnp.exp(m_pred) * u_pred
+                return model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t_future,
+                    vector=class_labels_local,
+                    deterministic=True,
+                    resume_hidden=z_hat,
+                    resume_start_layer=int(skip_layer) + 1,
+                )
+
+            return jax.lax.cond(jump_now, apply_timestep_jump, apply_full, operand=None)
+
+        rng_local, denoise_rng = jax.random.split(rng_local)
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+            reverse=False,
+        )
+
+        if use_cfg:
+            samples = samples[batch_size:]
+        samples = rearrange(
+            samples,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=token_h,
+            w=token_w,
+            p1=patch_size,
+            p2=patch_size,
+            c=latent_channels,
+        )
+        return samples.astype(jnp.float32)
+
+    return jax.pmap(_sample_latents_local, axis_name="batch")
+
+
 def run_preflight_checks(
     state,
     ema_params,
@@ -3941,6 +4147,19 @@ def main():
             "steps and full DiT on odd steps; all uses the shortcut at every denoise step."
         ),
     )
+    parser.add_argument(
+        "--fid-timestep-skip-eval",
+        dest="fid_timestep_skip_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Also compute FID/sFID with timestep-jump sampling via predictor at a fixed layer "
+            "(current step hidden -> future timestep hidden, then resume tail)."
+        ),
+    )
+    parser.add_argument("--fid-timestep-skip-layer", type=int, default=5)
+    parser.add_argument("--fid-timestep-skip-jump", type=int, default=2)
+    parser.add_argument("--fid-timestep-skip-every", type=int, default=2)
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
@@ -3970,6 +4189,12 @@ def main():
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
     if args.fid_freq > 0 and args.fid_eval_local_batch <= 0:
         raise ValueError("--fid-eval-local-batch must be greater than 0 when FID is enabled")
+    if args.fid_timestep_skip_layer <= 0:
+        raise ValueError("--fid-timestep-skip-layer must be > 0")
+    if args.fid_timestep_skip_jump <= 0:
+        raise ValueError("--fid-timestep-skip-jump must be > 0")
+    if args.fid_timestep_skip_every <= 0:
+        raise ValueError("--fid-timestep-skip-every must be > 0")
     if args.inception_score_splits <= 0:
         raise ValueError("--inception-score-splits must be greater than 0")
     if args.pr_k <= 0:
@@ -4528,6 +4753,24 @@ def main():
             depth_shortcut_output_mode=args.shortcut_loss_mode,
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
         )
+    fid_sample_latents_timestep_skip_pmapped = None
+    if args.fid_timestep_skip_eval:
+        fid_sample_latents_timestep_skip_pmapped = make_sample_latents_timestep_skip_pmap_fn(
+            config,
+            num_steps=args.fid_num_steps,
+            cfg_scale=args.fid_cfg_scale,
+            shortcut_predictor_variant=args.shortcut_predictor,
+            shortcut_timesteps=args.shortcut_timesteps,
+            depth_shortcut_output_mode=args.shortcut_loss_mode,
+            depth_shortcut_normalize_input=args.shortcut_predictor_normalize_input,
+            depth_shortcut_mag_scale=args.shortcut_mag_scale,
+            depth_shortcut_mag_clip_min=args.shortcut_mag_clip_min,
+            depth_shortcut_mag_clip_max=args.shortcut_mag_clip_max,
+            depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
+            skip_layer=args.fid_timestep_skip_layer,
+            skip_jump_steps=args.fid_timestep_skip_jump,
+            skip_every_steps=args.fid_timestep_skip_every,
+        )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
@@ -5063,6 +5306,51 @@ def main():
             metrics["val/sFID_skip_3to7"] = fid_from_stats(mu_real_s, cov_real_s, mu_skip_s, cov_skip_s)
             metrics["val/FID_skip_timestep_mode"] = 1.0 if args.fid_skip_timestep_mode == "alternate" else 0.0
             metrics["val/FID_skip_output_mode"] = 1.0 if args.shortcut_loss_mode == "direction_activation" else 0.0
+        if args.fid_timestep_skip_eval and fid_sample_latents_timestep_skip_pmapped is not None:
+            log_stage(
+                f"[EVAL] generating timestep-skip fake pool: {need} samples @ step {step} "
+                f"(layer={args.fid_timestep_skip_layer}, jump={args.fid_timestep_skip_jump}, every={args.fid_timestep_skip_every})…"
+            )
+            acc_tskip_pooled = init_gaussian_sums(2048)
+            acc_tskip_spatial = init_gaussian_sums(2048)
+            produced_tskip = 0
+            chunk_idx_tskip = 0
+            tskip_rng = jax.vmap(
+                lambda key: jax.random.fold_in(key, jnp.uint32((step + 0x7E57) & 0xFFFFFFFF))
+            )(rng)
+            while produced_tskip < need:
+                valid = min(global_b, need - produced_tskip)
+                class_rng, sample_rng = make_eval_chunk_rngs(tskip_rng, chunk_idx_tskip)
+                classes = jax.vmap(
+                    lambda key: jax.random.randint(key, (local_b,), 0, 1000),
+                    in_axes=0,
+                )(class_rng)
+                latents_sharded = fid_sample_latents_timestep_skip_pmapped(
+                    ema_params,
+                    predictor_ema_params,
+                    classes,
+                    sample_rng,
+                )
+                imgs_sharded = decode_latents_sharded(latents_sharded)
+                pooled, spatial, valid_mask = apply_inception_to_decoded_sharded(
+                    imgs_sharded,
+                    inception_fn,
+                    mode="pooled+spatial",
+                    valid_global=valid,
+                )
+                acc_tskip_pooled, acc_tskip_spatial = _update_accumulators(
+                    acc_tskip_pooled, acc_tskip_spatial, pooled, spatial, valid_mask
+                )
+                produced_tskip += valid
+                chunk_idx_tskip += 1
+
+            mu_tskip, cov_tskip, _ = finalize_gaussian_sums(acc_tskip_pooled)
+            mu_tskip_s, cov_tskip_s, _ = finalize_gaussian_sums(acc_tskip_spatial)
+            metrics["val/FID_skip_timestep_l5_j2"] = fid_from_stats(mu_real, cov_real, mu_tskip, cov_tskip)
+            metrics["val/sFID_skip_timestep_l5_j2"] = fid_from_stats(mu_real_s, cov_real_s, mu_tskip_s, cov_tskip_s)
+            metrics["val/FID_skip_timestep_layer"] = float(args.fid_timestep_skip_layer)
+            metrics["val/FID_skip_timestep_jump"] = float(args.fid_timestep_skip_jump)
+            metrics["val/FID_skip_timestep_every"] = float(args.fid_timestep_skip_every)
 
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)
@@ -5115,6 +5403,9 @@ def main():
         if "val/FID_skip_3to7" in metrics:
             summary_parts.append(f"FIDskip3to7={metrics['val/FID_skip_3to7']:.2f}")
             summary_parts.append(f"sFIDskip3to7={metrics['val/sFID_skip_3to7']:.2f}")
+        if "val/FID_skip_timestep_l5_j2" in metrics:
+            summary_parts.append(f"FIDskipT={metrics['val/FID_skip_timestep_l5_j2']:.2f}")
+            summary_parts.append(f"sFIDskipT={metrics['val/sFID_skip_timestep_l5_j2']:.2f}")
         if is_enabled and "val/InceptionScore" in metrics:
             summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
         if "val/Precision" in metrics and "val/Recall" in metrics:
