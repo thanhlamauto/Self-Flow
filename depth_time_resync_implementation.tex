@@ -46,10 +46,10 @@ python train.py \
   --block-corr-batches 2 \
   --wandb-project selfflow-jax \
   --ema-decay 0.9999 \
-  --shortcut-predictor hybrid_deep_30m \
+  --shortcut-predictor hybrid_deep_10 \
   --shortcut-training-mode direction-magnitude \
-  --shortcut-lambda-dir 1.0 \
-  --shortcut-lambda-mag 0.5 \
+  --shortcut-lambda-dir 1 \
+  --shortcut-lambda-mag 0.375 \
   --shortcut-lambda-boot 0.25 \
   --shortcut-lambda-boot-mag 0.1875 \
   --shortcut-mag-scale 3.0 \
@@ -65,10 +65,12 @@ python train.py \
   --no-use-legacy-bootstrap-loss \
   --lambda-depth 0.25 \
   --lambda-time 0.25 \
-  --lambda-dt 0.15 \
+  --no-use-dt-loss \
+  --lambda-dt 0.0 \
   --lambda-depth-cons 0.10 \
   --lambda-time-cons 0.10 \
-  --lambda-dt-cons 0.10 \
+  --no-use-dt-consistency \
+  --lambda-dt-cons 0.0 \
   --lambda-out-time 0.10 \
   --dt-delta-t-values 1,2,4 \
   --dt-sampling-mode uniform \
@@ -86,7 +88,7 @@ python train.py \
   --private-loss \
   --lambda-private 1.0 \
   --private-max-pairs 4 \
-  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-depth-time-resync-hybrid-deep-30m \
+  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-depth-time-resync-hybrid-deep-10 \
   --shortcut-predictor-use-timestep \
   --no-shortcut-predictor-normalize-input \
   --private-use-residual \
@@ -97,12 +99,14 @@ python train.py \
   --shortcut-predictor-weight-decay 0.1
 \end{lstlisting}
 
-The current \texttt{hybrid\_deep\_30m} is:
+The recommended \texttt{hybrid\_deep\_10} predictor follows the best previous
+depth-shortcut run:
 \[
-\texttt{width}=448,\qquad \texttt{blocks}=12,\qquad \texttt{heads}=7,
+\texttt{width}=384,\qquad \texttt{blocks}=10,\qquad \texttt{heads}=6,
 \]
-which gives about $30.08$M predictor parameters on DiT-B with
-\texttt{dt-cond-mode=factorized} and \texttt{dt-h0-fusion=concat}.
+with \texttt{dt-cond-mode=factorized}, \texttt{dt-h0-fusion=concat},
+\(\lambda_{\mathrm{mag}}=0.375\), and
+\(\lambda_{\mathrm{boot,mag}}=0.1875\).
 
 \section{Current Implementation Check}
 
@@ -134,8 +138,12 @@ which gives about $30.08$M predictor parameters on DiT-B with
   Direction is cosine. Magnitude is now L1 on predicted log-magnitude versus
   stopped target log-magnitude.
 
-  \item \textbf{Full objective from the beginning: implemented.}
-  Depth, time, depth-time, consistency, and output-time distillation default on.
+  \item \textbf{Depth/time objective from the beginning: implemented.}
+  Depth, time, depth consistency, time consistency, and output-time distillation
+  default on. Direct depth-time and bootstrap depth-time losses default off.
+  The bootstrap depth-time predictor branch is skipped when both
+  \texttt{--use-dt-consistency} and legacy bootstrap are disabled. Direct
+  depth-time prediction is skipped too when output-time distillation is disabled.
 
   \item \textbf{Predictor EMA consistency target: implemented.}
   Consistency uses $P_{\bar\psi}$ as no-gradient teacher.
