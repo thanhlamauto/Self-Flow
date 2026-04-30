@@ -1840,7 +1840,6 @@ def train_step(
 
             needs_dt_prediction = bool(
                 use_dt_loss
-                or use_output_time_distill
                 or use_legacy_bootstrap_loss
                 or use_dt_consistency
             )
@@ -2076,12 +2075,24 @@ def train_step(
                 boot_rel_residual_rms_metric_local = zero
 
             if use_output_time_distill:
-                u_dt_out = l2_normalize_tokens(pred_dt)
+                pred_dt_out, dm_dt_out, ms_dt_out = predictor_transition(
+                    params["predictor"],
+                    jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                    dt_a,
+                    dt_b,
+                    jax.lax.stop_gradient(dit_time_emb),
+                    jax.lax.stop_gradient(dit_time_emb_s),
+                    jax.lax.stop_gradient(h0_s),
+                    q,
+                    q_s,
+                    True,
+                )
+                u_dt_out = l2_normalize_tokens(pred_dt_out)
                 if shortcut_loss_mode == "direction_magnitude":
-                    m_dt_out = jnp.clip(ms_dt + mag_scale * dm_dt, mag_clip_min, mag_clip_max)
+                    m_dt_out = jnp.clip(ms_dt_out + mag_scale * dm_dt_out, mag_clip_min, mag_clip_max)
                     z_hat_dt = jnp.exp(m_dt_out) * u_dt_out
                 else:
-                    z_hat_dt = pred_dt.astype(jnp.float32)
+                    z_hat_dt = pred_dt_out.astype(jnp.float32)
                 tail_params = params["backbone"] if dt_outdistill_train_tail else jax.tree_util.tree_map(
                     jax.lax.stop_gradient,
                     params["backbone"],
