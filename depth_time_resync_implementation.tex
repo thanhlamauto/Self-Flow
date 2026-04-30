@@ -95,6 +95,10 @@ python train.py \
   --private-cosine-mode bnd \
   --private-pair-mode random \
   --fid-skip-timestep-mode alternate \
+  --fid-timestep-skip-eval \
+  --fid-timestep-skip-layer 5 \
+  --fid-timestep-skip-jump 25 \
+  --fid-timestep-skip-every 25 \
   --weight-decay 0.1 \
   --shortcut-predictor-weight-decay 0.1
 \end{lstlisting}

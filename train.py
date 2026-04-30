@@ -10,6 +10,7 @@ import logging
 import zipfile
 import functools
 import json
+import math
 from typing import Callable
 
 os.environ.setdefault("USE_TF", "0")
@@ -2868,6 +2869,8 @@ class WandbRunSummaryFile:
         "val/sFID",
         "val/FID_skip_3to7",
         "val/sFID_skip_3to7",
+        "val/FID_skip_timestep",
+        "val/sFID_skip_timestep",
         "val/FID_skip_timestep_l5_j2",
         "val/sFID_skip_timestep_l5_j2",
         "train/loss",
@@ -3501,6 +3504,7 @@ def make_sample_latents_timestep_skip_pmap_fn(
     config,
     *,
     num_steps=50,
+    sampler_num_steps=None,
     cfg_scale=1.0,
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
@@ -3518,6 +3522,8 @@ def make_sample_latents_timestep_skip_pmap_fn(
 
     At selected denoise steps, it predicts hidden at `skip_layer` for a future
     timestep (`+skip_jump_steps`) and resumes DiT from layer `skip_layer + 1`.
+    `num_steps` is the original timestep grid used for predictor conditioning;
+    `sampler_num_steps` is the actual number of SDE model calls.
     """
     if cfg_scale > 1.0 and config.get("class_dropout_prob", 0.1) <= 0.0:
         raise ValueError(
@@ -3530,6 +3536,12 @@ def make_sample_latents_timestep_skip_pmap_fn(
         raise ValueError(f"skip_jump_steps must be positive, got {skip_jump_steps}")
     if int(skip_every_steps) <= 0:
         raise ValueError(f"skip_every_steps must be positive, got {skip_every_steps}")
+    base_num_steps = int(num_steps)
+    actual_num_steps = int(sampler_num_steps) if sampler_num_steps is not None else base_num_steps
+    if base_num_steps <= 1:
+        raise ValueError(f"num_steps must be greater than 1, got {num_steps}")
+    if actual_num_steps <= 1:
+        raise ValueError(f"sampler_num_steps must be greater than 1, got {actual_num_steps}")
 
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -3612,13 +3624,13 @@ def make_sample_latents_timestep_skip_pmap_fn(
                 axis=0,
             )
 
-        t_scale = jnp.asarray(0.96 / float(max(int(num_steps) - 1, 1)), dtype=jnp.float32)
+        t_scale = jnp.asarray(0.96 / float(base_num_steps - 1), dtype=jnp.float32)
 
         def model_fn(z_x, t):
             t_scalar = t[0] if t.ndim > 0 else t
-            step_idx = jnp.rint(t_scalar * float(num_steps - 1) / 0.96).astype(jnp.int32)
-            step_idx = jnp.clip(step_idx, 0, int(num_steps) - 1)
-            jump_idx = jnp.minimum(step_idx + jnp.asarray(int(skip_jump_steps), dtype=jnp.int32), int(num_steps) - 1)
+            step_idx = jnp.rint(t_scalar * float(base_num_steps - 1) / 0.96).astype(jnp.int32)
+            step_idx = jnp.clip(step_idx, 0, base_num_steps - 1)
+            jump_idx = jnp.minimum(step_idx + jnp.asarray(int(skip_jump_steps), dtype=jnp.int32), base_num_steps - 1)
             can_jump = jump_idx > step_idx
             jump_now = jnp.logical_and((step_idx % int(skip_every_steps)) == 0, can_jump)
 
@@ -3700,7 +3712,7 @@ def make_sample_latents_timestep_skip_pmap_fn(
             model_fn=model_fn,
             x=x,
             rng=denoise_rng,
-            num_steps=num_steps,
+            num_steps=actual_num_steps,
             cfg_scale=cfg_scale,
             guidance_low=0.0,
             guidance_high=0.7,
@@ -4335,12 +4347,13 @@ def main():
         default=True,
         help=(
             "Also compute FID/sFID with timestep-jump sampling via predictor at a fixed layer "
-            "(current step hidden -> future timestep hidden, then resume tail)."
+            "(current step hidden -> future timestep hidden, then resume tail). "
+            "The sampler uses ceil(fid-num-steps / fid-timestep-skip-jump) model calls."
         ),
     )
     parser.add_argument("--fid-timestep-skip-layer", type=int, default=5)
-    parser.add_argument("--fid-timestep-skip-jump", type=int, default=2)
-    parser.add_argument("--fid-timestep-skip-every", type=int, default=2)
+    parser.add_argument("--fid-timestep-skip-jump", type=int, default=25)
+    parser.add_argument("--fid-timestep-skip-every", type=int, default=25)
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
@@ -4938,10 +4951,16 @@ def main():
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
         )
     fid_sample_latents_timestep_skip_pmapped = None
+    fid_timestep_skip_sampler_steps = None
     if args.fid_timestep_skip_eval:
+        fid_timestep_skip_sampler_steps = max(
+            2,
+            int(math.ceil(float(args.fid_num_steps) / float(args.fid_timestep_skip_jump))),
+        )
         fid_sample_latents_timestep_skip_pmapped = make_sample_latents_timestep_skip_pmap_fn(
             config,
             num_steps=args.fid_num_steps,
+            sampler_num_steps=fid_timestep_skip_sampler_steps,
             cfg_scale=args.fid_cfg_scale,
             shortcut_predictor_variant=args.shortcut_predictor,
             shortcut_timesteps=args.shortcut_timesteps,
@@ -5493,7 +5512,8 @@ def main():
         if args.fid_timestep_skip_eval and fid_sample_latents_timestep_skip_pmapped is not None:
             log_stage(
                 f"[EVAL] generating timestep-skip fake pool: {need} samples @ step {step} "
-                f"(layer={args.fid_timestep_skip_layer}, jump={args.fid_timestep_skip_jump}, every={args.fid_timestep_skip_every})…"
+                f"(layer={args.fid_timestep_skip_layer}, jump={args.fid_timestep_skip_jump}, "
+                f"every={args.fid_timestep_skip_every}, sampler_steps={fid_timestep_skip_sampler_steps})…"
             )
             acc_tskip_pooled = init_gaussian_sums(2048)
             acc_tskip_spatial = init_gaussian_sums(2048)
@@ -5530,11 +5550,16 @@ def main():
 
             mu_tskip, cov_tskip, _ = finalize_gaussian_sums(acc_tskip_pooled)
             mu_tskip_s, cov_tskip_s, _ = finalize_gaussian_sums(acc_tskip_spatial)
-            metrics["val/FID_skip_timestep_l5_j2"] = fid_from_stats(mu_real, cov_real, mu_tskip, cov_tskip)
-            metrics["val/sFID_skip_timestep_l5_j2"] = fid_from_stats(mu_real_s, cov_real_s, mu_tskip_s, cov_tskip_s)
+            fid_tskip = fid_from_stats(mu_real, cov_real, mu_tskip, cov_tskip)
+            sfid_tskip = fid_from_stats(mu_real_s, cov_real_s, mu_tskip_s, cov_tskip_s)
+            metrics["val/FID_skip_timestep"] = fid_tskip
+            metrics["val/sFID_skip_timestep"] = sfid_tskip
+            metrics[f"val/FID_skip_timestep_l{args.fid_timestep_skip_layer}_j{args.fid_timestep_skip_jump}"] = fid_tskip
+            metrics[f"val/sFID_skip_timestep_l{args.fid_timestep_skip_layer}_j{args.fid_timestep_skip_jump}"] = sfid_tskip
             metrics["val/FID_skip_timestep_layer"] = float(args.fid_timestep_skip_layer)
             metrics["val/FID_skip_timestep_jump"] = float(args.fid_timestep_skip_jump)
             metrics["val/FID_skip_timestep_every"] = float(args.fid_timestep_skip_every)
+            metrics["val/FID_skip_timestep_sampler_steps"] = float(fid_timestep_skip_sampler_steps)
 
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)
@@ -5587,9 +5612,10 @@ def main():
         if "val/FID_skip_3to7" in metrics:
             summary_parts.append(f"FIDskip3to7={metrics['val/FID_skip_3to7']:.2f}")
             summary_parts.append(f"sFIDskip3to7={metrics['val/sFID_skip_3to7']:.2f}")
-        if "val/FID_skip_timestep_l5_j2" in metrics:
-            summary_parts.append(f"FIDskipT={metrics['val/FID_skip_timestep_l5_j2']:.2f}")
-            summary_parts.append(f"sFIDskipT={metrics['val/sFID_skip_timestep_l5_j2']:.2f}")
+        if "val/FID_skip_timestep" in metrics:
+            summary_parts.append(f"FIDskipT={metrics['val/FID_skip_timestep']:.2f}")
+            summary_parts.append(f"sFIDskipT={metrics['val/sFID_skip_timestep']:.2f}")
+            summary_parts.append(f"Tsteps={metrics['val/FID_skip_timestep_sampler_steps']:.0f}")
         if is_enabled and "val/InceptionScore" in metrics:
             summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
         if "val/Precision" in metrics and "val/Recall" in metrics:
