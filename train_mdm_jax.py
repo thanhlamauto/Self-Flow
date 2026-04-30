@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import pickle
 import time
@@ -40,6 +41,9 @@ def parse_args():
     parser.add_argument("--num-actions", type=int, default=1)
     parser.add_argument("--text-embed-dim", type=int, default=512)
     parser.add_argument("--cond-mask-prob", type=float, default=0.0)
+    parser.add_argument("--layersync-lambda", type=float, default=0.2)
+    parser.add_argument("--layersync-weak-layer", type=int, default=3)
+    parser.add_argument("--layersync-strong-layer", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1)
@@ -83,6 +87,16 @@ def save_checkpoint(save_dir: str, step: int, state, args):
 
 def main():
     args = parse_args()
+    if args.layersync_lambda < 0.0:
+        raise ValueError("--layersync-lambda must be non-negative")
+    if args.layersync_lambda > 0.0:
+        if not (1 <= args.layersync_weak_layer <= args.num_layers):
+            raise ValueError("--layersync-weak-layer must be in [1, --num-layers]")
+        if not (1 <= args.layersync_strong_layer <= args.num_layers):
+            raise ValueError("--layersync-strong-layer must be in [1, --num-layers]")
+        if args.layersync_weak_layer >= args.layersync_strong_layer:
+            raise ValueError("--layersync-weak-layer must be strictly less than --layersync-strong-layer")
+
     njoints, nfeats, max_frames = infer_dataset_shape(args)
     if args.max_frames is not None:
         max_frames = int(args.max_frames)
@@ -110,12 +124,24 @@ def main():
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    step_fn = jax.jit(train_step)
+    layersync_layers = (
+        (args.layersync_weak_layer, args.layersync_strong_layer)
+        if args.layersync_lambda > 0.0
+        else None
+    )
+    step_fn = jax.jit(
+        functools.partial(
+            train_step,
+            layersync_lambda=float(args.layersync_lambda),
+            layersync_layers=layersync_layers,
+        )
+    )
 
     global_step = 0
     print(
         f"[train_mdm_jax] dataset={args.dataset or args.data} shape=[N,{njoints},{nfeats},{max_frames}] "
-        f"devices={jax.local_device_count()}"
+        f"devices={jax.local_device_count()} "
+        f"layersync_lambda={args.layersync_lambda} layersync_layers={layersync_layers}"
     )
     for epoch in range(args.epochs):
         data_path = args.data or ("humanml" if args.dataset == "humanml" else None)

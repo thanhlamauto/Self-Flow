@@ -9,6 +9,7 @@ conditioning, and the standard diffusion epsilon-prediction MSE objective.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Optional
 
 import flax.linen as nn
@@ -111,6 +112,7 @@ class MDMJax(nn.Module):
         action: Optional[Array] = None,
         text_embed: Optional[Array] = None,
         force_uncond: bool = False,
+        return_layersync_features: Optional[Sequence[int]] = None,
         deterministic: bool = True,
     ) -> Array:
         batch, njoints, nfeats, nframes = x.shape
@@ -156,23 +158,51 @@ class MDMJax(nn.Module):
         h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
 
         attention_mask = None
+        frame_mask = None
         if mask is not None:
             frame_mask = normalize_frame_mask(mask, batch, nframes)
             token_mask = jnp.concatenate([jnp.ones((batch, 1), dtype=bool), frame_mask], axis=1)
             attention_mask = nn.make_attention_mask(token_mask, token_mask)
 
-        for _ in range(self.num_layers):
+        layersync_layers = None
+        layersync_weak_z = None
+        layersync_strong_z = None
+        if return_layersync_features is not None:
+            layersync_layers = tuple(int(layer) for layer in return_layersync_features)
+            if len(layersync_layers) != 2:
+                raise ValueError(
+                    f"return_layersync_features expects exactly (weak_layer, strong_layer), got {layersync_layers}"
+                )
+            weak_layer, strong_layer = layersync_layers
+            if not (1 <= weak_layer <= self.num_layers and 1 <= strong_layer <= self.num_layers):
+                raise ValueError(
+                    f"LayerSync layers must be in [1, {self.num_layers}], got {layersync_layers}"
+                )
+            if weak_layer >= strong_layer:
+                raise ValueError(f"LayerSync weak layer must be < strong layer, got {layersync_layers}")
+
+        for layer_idx in range(self.num_layers):
             h = TransformerEncoderBlock(
                 latent_dim=self.latent_dim,
                 num_heads=self.num_heads,
                 ff_size=self.ff_size,
                 dropout=self.dropout,
             )(h, attention_mask, deterministic=deterministic)
+            if layersync_layers is not None:
+                weak_layer, strong_layer = layersync_layers
+                layer_num = layer_idx + 1
+                if layer_num == weak_layer:
+                    layersync_weak_z = h[:, 1:, :]
+                elif layer_num == strong_layer:
+                    layersync_strong_z = h[:, 1:, :]
 
         h = nn.LayerNorm(epsilon=1e-5)(h[:, 1:, :])
         h = nn.Dense(njoints * nfeats, name="pose_final")(h)
         h = h.reshape(batch, nframes, njoints, nfeats)
-        return jnp.transpose(h, (0, 2, 3, 1))
+        out = jnp.transpose(h, (0, 2, 3, 1))
+        if layersync_layers is not None:
+            return out, (layersync_weak_z, layersync_strong_z)
+        return out
 
     def _mask_cond(self, cond: Array, force_uncond: bool, deterministic: bool) -> Array:
         if force_uncond:
@@ -262,6 +292,8 @@ def mdm_loss_and_metrics(
     batch: dict[str, Array],
     rng: Array,
     *,
+    layersync_lambda: float = 0.0,
+    layersync_layers: Optional[Sequence[int]] = None,
     deterministic: bool = False,
 ) -> tuple[Array, dict[str, Array]]:
     motion = batch["motion"]
@@ -271,16 +303,35 @@ def mdm_loss_and_metrics(
     noise = jax.random.normal(noise_rng, motion.shape, dtype=motion.dtype)
     x_t = diffusion.q_sample(motion, timesteps, noise)
 
-    pred = apply_fn(
-        {"params": params},
-        x_t,
-        timesteps,
-        mask=batch.get("mask"),
-        action=batch.get("action"),
-        text_embed=batch.get("text_embed"),
-        deterministic=deterministic,
-        rngs={"dropout": drop_rng},
-    )
+    if layersync_lambda > 0.0:
+        if layersync_layers is None:
+            raise ValueError("layersync_layers must be provided when layersync_lambda > 0")
+        pred, raw_features = apply_fn(
+            {"params": params},
+            x_t,
+            timesteps,
+            mask=batch.get("mask"),
+            action=batch.get("action"),
+            text_embed=batch.get("text_embed"),
+            deterministic=deterministic,
+            rngs={"dropout": drop_rng},
+            return_layersync_features=layersync_layers,
+        )
+        loss_layersync, layersync_cosine = compute_layersync_loss(raw_features, batch.get("mask"))
+    else:
+        pred = apply_fn(
+            {"params": params},
+            x_t,
+            timesteps,
+            mask=batch.get("mask"),
+            action=batch.get("action"),
+            text_embed=batch.get("text_embed"),
+            deterministic=deterministic,
+            rngs={"dropout": drop_rng},
+        )
+        loss_layersync = jnp.array(0.0, dtype=jnp.float32)
+        layersync_cosine = jnp.array(0.0, dtype=jnp.float32)
+
     loss_mask = batch.get("mask")
     if loss_mask is not None:
         loss_mask = normalize_frame_mask(loss_mask, local_batch, motion.shape[-1])
@@ -289,17 +340,56 @@ def mdm_loss_and_metrics(
         mse = jnp.sum(((pred - noise) ** 2) * loss_mask) / denom
     else:
         mse = jnp.mean((pred - noise) ** 2)
+    total_loss = mse + jnp.asarray(layersync_lambda, dtype=mse.dtype) * loss_layersync
     metrics = {
-        "loss": mse,
+        "loss": total_loss,
+        "loss_gen": mse,
+        "loss_layersync": loss_layersync,
+        "layersync_lambda": jnp.asarray(layersync_lambda, dtype=jnp.float32),
+        "layersync_cosine": layersync_cosine,
         "pred_abs_mean": jnp.mean(jnp.abs(pred)),
         "noise_abs_mean": jnp.mean(jnp.abs(noise)),
     }
-    return mse, metrics
+    return total_loss, metrics
 
 
-def train_step(state: MDMTrainState, batch: dict[str, Array], rng: Array):
+def compute_layersync_loss(
+    raw_features: tuple[Array, Array],
+    mask: Optional[Array] = None,
+) -> tuple[Array, Array]:
+    z_weak, z_strong = raw_features
+    eps = jnp.float32(1e-8)
+    z_strong = jax.lax.stop_gradient(z_strong)
+    z_weak = z_weak / (jnp.linalg.norm(z_weak, axis=-1, keepdims=True) + eps)
+    z_strong = z_strong / (jnp.linalg.norm(z_strong, axis=-1, keepdims=True) + eps)
+    cosine = jnp.sum(z_weak * z_strong, axis=-1)
+    if mask is not None:
+        frame_mask = normalize_frame_mask(mask, z_weak.shape[0], z_weak.shape[1]).astype(cosine.dtype)
+        denom = jnp.maximum(jnp.sum(frame_mask), 1.0)
+        mean_cosine = jnp.sum(cosine * frame_mask) / denom
+    else:
+        mean_cosine = jnp.mean(cosine)
+    return -mean_cosine, mean_cosine
+
+
+def train_step(
+    state: MDMTrainState,
+    batch: dict[str, Array],
+    rng: Array,
+    *,
+    layersync_lambda: float = 0.0,
+    layersync_layers: Optional[Sequence[int]] = None,
+):
     def loss_fn(params):
-        return mdm_loss_and_metrics(state.apply_fn, params, state.diffusion, batch, rng)
+        return mdm_loss_and_metrics(
+            state.apply_fn,
+            params,
+            state.diffusion,
+            batch,
+            rng,
+            layersync_lambda=layersync_lambda,
+            layersync_layers=layersync_layers,
+        )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
