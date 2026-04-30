@@ -1,0 +1,119 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\title{Loss Summary and Current Implementation}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+This note summarizes all training losses in current \texttt{train.py}, grouped by role,
+and states what is active for the current depth-time-resync run configuration.
+
+\section{Grouped Losses (Current Codebase)}
+
+\subsection*{Group A: Core diffusion objective}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{gen}}\)}: main diffusion generation loss on backbone output.
+\end{itemize}
+
+\subsection*{Group B: Shortcut direct learning}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{direct}}\)}: predictor learns direct transition between source/target states.
+\end{itemize}
+
+\subsection*{Group C: Shortcut bootstrap consistency (legacy)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{boot}}\)}: compositional consistency of shortcut transitions using EMA predictor as teacher.
+\end{itemize}
+
+\subsection*{Group D: Legacy output distillation}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{output\_distill}}\)}: distill final output using resumed backbone from predicted intermediate hidden.
+\end{itemize}
+
+\subsection*{Group E: Depth-time-resync core}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{depth}}\)}: layer transition at same time.
+  \item \textbf{\(L_{\text{time}}\)}: time transition at same layer.
+  \item \textbf{\(L_{\text{dt}}\)}: joint depth-time transition.
+\end{itemize}
+
+\subsection*{Group F: Depth-time-resync consistency}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{depth\_cons}}\)}: composition consistency along depth transitions.
+  \item \textbf{\(L_{\text{time\_cons}}\)}: composition consistency along time transitions.
+  \item \textbf{\(L_{\text{dt\_cons}}\)}: composition consistency along depth-time transitions.
+\end{itemize}
+
+\subsection*{Group G: Depth-time output-time distillation}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{out\_time}}\)}: from predicted depth-time hidden, resume tail and match output at target time.
+\end{itemize}
+
+\subsection*{Group H: Auxiliary regularization}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\(L_{\text{skip\_fm}}\)}: skip-in-loop feature matching regularizer.
+  \item \textbf{\(L_{\text{private}}\)}: common/private activation regularization.
+\end{itemize}
+
+\section{Complete Loss Inventory}
+
+Total losses implemented in current code:
+\[
+\{L_{\text{gen}},L_{\text{direct}},L_{\text{boot}},L_{\text{output\_distill}},
+L_{\text{depth}},L_{\text{time}},L_{\text{dt}},
+L_{\text{depth\_cons}},L_{\text{time\_cons}},L_{\text{dt\_cons}},
+L_{\text{out\_time}},L_{\text{skip\_fm}},L_{\text{private}}\}.
+\]
+
+So there are \textbf{13} available loss terms in the current implementation.
+
+\section{Status for Current Command (\texttt{feat/depth-time-resync})}
+
+For the command in \texttt{depth\_time\_resync\_implementation.tex}:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{--no-output-distill}
+  \item \texttt{--use-depth-time-resync}
+  \item \texttt{--lambda-depth/time/dt > 0}
+  \item \texttt{--lambda-depth-cons/time-cons/dt-cons > 0}
+  \item \texttt{--lambda-out-time > 0}
+  \item \texttt{--private-loss}, \texttt{--lambda-private > 0}
+  \item \texttt{--shortcut-lambda-skip-fm 0.0}
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Loss Group & Term & Status in current command \\
+\midrule
+Core diffusion & \(L_{\text{gen}}\) & Active \\
+Shortcut direct & \(L_{\text{direct}}\) & Active \\
+Shortcut bootstrap & \(L_{\text{boot}}\) & Active \\
+Legacy out distill & \(L_{\text{output\_distill}}\) & Inactive \\
+Resync core & \(L_{\text{depth}},L_{\text{time}},L_{\text{dt}}\) & Active \\
+Resync consistency & \(L_{\text{depth\_cons}},L_{\text{time\_cons}},L_{\text{dt\_cons}}\) & Active (masked by \(p\)) \\
+Resync out-time distill & \(L_{\text{out\_time}}\) & Active \\
+Aux regularization & \(L_{\text{skip\_fm}}\) & Inactive (weight \(=0\)) \\
+Aux regularization & \(L_{\text{private}}\) & Active \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Here \(p=\)\texttt{dt-consistency-prob}; with \texttt{1.0}, consistency terms are always active.
+
+\section{Practical Reading}
+
+Under this current command, effectively active losses are:
+\[
+L_{\text{gen}} + L_{\text{direct}} + L_{\text{boot}} +
+L_{\text{depth}} + L_{\text{time}} + L_{\text{dt}} +
+L_{\text{depth\_cons}} + L_{\text{time\_cons}} + L_{\text{dt\_cons}} +
+L_{\text{out\_time}} + L_{\text{private}}.
+\]
+
+That is \textbf{11 active} and \textbf{2 inactive} (\(L_{\text{output\_distill}},L_{\text{skip\_fm}}\)).
+
+\end{document}

@@ -1,0 +1,132 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\title{Forward Pass Count Analysis (Per Train Step)}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Scope}
+
+This note counts forward passes per training step for the two concrete commands:
+\begin{itemize}[leftmargin=*]
+  \item Branch \texttt{feat/depth-time-resync}: command in \texttt{depth\_time\_resync\_implementation.tex}.
+  \item Branch \texttt{feat/depth-shortcut-output-distill}: command provided by user.
+\end{itemize}
+
+Counting is based on the current \texttt{train.py} logic and the command flags.
+Only training-step forwards are counted (not eval/FID/checkpoint code paths).
+
+\section{A) feat/depth-time-resync command}
+
+Key flags affecting count:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{--use-depth-time-resync}
+  \item \texttt{--no-output-distill}
+  \item \texttt{--dt-consistency-prob 1.0}
+  \item \texttt{--direct-num-pairs 1}, \texttt{--direct-predictor-only-pairs 0}
+\end{itemize}
+
+\subsection*{Backbone forwards per step}
+\begin{itemize}[leftmargin=*]
+  \item 3 forwards for hidden stacks: at \(\tau_t\), \(\tau_s\), \(\tau_r\).
+  \item 1 resumed-tail forward for \(L_{\text{out-time}}\) (resume from \(\hat z_{\text{dt}}\)).
+\end{itemize}
+Total backbone forwards:
+\[
+N_{\text{backbone}}^{\text{resync}} = 3 + 1 = 4.
+\]
+
+\subsection*{Predictor forwards per step}
+\begin{itemize}[leftmargin=*]
+  \item Direct loss: 1 predictor forward (joint pair only).
+  \item Bootstrap consistency (legacy shortcut): 3 predictor forwards
+  (\(a\!\to\!b\), \(b\!\to\!c\), EMA \(a\!\to\!c\)).
+  \item Depth-time-resync losses: 12 predictor forwards:
+  \begin{itemize}[leftmargin=*]
+    \item 3 core terms: depth, time, depth-time.
+    \item 9 consistency terms:
+    \((ab,ab\!\to\!bc,ac_{\text{ema}})\),
+    \((ts,ts\!\to\!sr,tr_{\text{ema}})\),
+    \((as\!\to\!bs,bs\!\to\!cr,at\!\to\!cr_{\text{ema}})\).
+  \end{itemize}
+\end{itemize}
+Total predictor forwards:
+\[
+N_{\text{predictor}}^{\text{resync}} = 1 + 3 + 12 = 16.
+\]
+
+\subsection*{Total forwards per step}
+\[
+N_{\text{total}}^{\text{resync}} = N_{\text{backbone}}^{\text{resync}} + N_{\text{predictor}}^{\text{resync}} = 4 + 16 = 20.
+\]
+
+\section{B) feat/depth-shortcut-output-distill command}
+
+Key flags affecting count:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{--output-distill --output-distill-every 1}
+  \item No \texttt{depth-time-resync} flags.
+  \item \texttt{--direct-num-pairs 1}, \texttt{--direct-predictor-only-pairs 0}
+\end{itemize}
+
+\subsection*{Backbone forwards per step}
+\begin{itemize}[leftmargin=*]
+  \item 1 standard backbone forward at \(\tau\) (with hidden states).
+  \item 1 resumed-tail backbone forward for legacy output distill \(L_{\text{out}}\).
+\end{itemize}
+Total backbone forwards:
+\[
+N_{\text{backbone}}^{\text{outdistill}} = 1 + 1 = 2.
+\]
+
+\subsection*{Predictor forwards per step}
+\begin{itemize}[leftmargin=*]
+  \item Direct loss: 1 predictor forward.
+  \item Bootstrap consistency: 3 predictor forwards.
+  \item Legacy output distill predictor step: 1 predictor forward (to produce \(\hat z_b\)).
+\end{itemize}
+Total predictor forwards:
+\[
+N_{\text{predictor}}^{\text{outdistill}} = 1 + 3 + 1 = 5.
+\]
+
+\subsection*{Total forwards per step}
+\[
+N_{\text{total}}^{\text{outdistill}} = N_{\text{backbone}}^{\text{outdistill}} + N_{\text{predictor}}^{\text{outdistill}} = 2 + 5 = 7.
+\]
+
+\section{Side-by-side summary}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Setup & Backbone forwards & Predictor forwards & Total forwards \\
+\midrule
+feat/depth-time-resync & 4 & 16 & 20 \\
+feat/depth-shortcut-output-distill & 2 & 5 & 7 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Ratio by total forward count:
+\[
+\frac{20}{7} \approx 2.86\times
+\]
+before considering additional overhead from larger predictor config
+(\texttt{hybrid\_deep\_30m} vs \texttt{hybrid\_deep\_10}).
+
+\section{Optimization notes}
+
+In depth-time-resync path, three predictor calls are duplicated in meaning:
+\begin{itemize}[leftmargin=*]
+  \item \(a\!\to\!b\) appears in both \texttt{pred\_depth} and \texttt{pred\_ab}.
+  \item \(t\!\to\!s\) at fixed layer appears in both \texttt{pred\_time} and \texttt{pred\_ts}.
+  \item \((a,t)\!\to\!(b,s)\) appears in both \texttt{pred\_dt} and \texttt{pred\_as\_bs}.
+\end{itemize}
+
+These can be cached/reused to reduce predictor forwards and step time.
+
+\end{document}
