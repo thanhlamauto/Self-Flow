@@ -1001,6 +1001,8 @@ def train_step(
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
     use_depth_time_resync=True,
+    use_legacy_direct_loss=True,
+    use_legacy_bootstrap_loss=True,
     use_depth_loss=True,
     use_time_loss=True,
     use_dt_loss=True,
@@ -1295,176 +1297,196 @@ def train_step(
                 jnp.max(y_pair_norm),
             )
 
-        if direct_pair_mode == "trunc_normal":
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=0.0,
-            )
-        elif direct_pair_mode == "trunc_normal_to_uniform":
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=0.0,
-                uniform_mix=pair_uniform_mix,
-            )
-        else:
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=2.0,
-            )
-        direct_joint_a = direct_as[0]
-        direct_joint_b = direct_bs[0]
-        joint_values = shortcut_direct_mag_loss_for_pair(
-            direct_joint_a,
-            direct_joint_b,
-            False,
-        )
-        if direct_num_predictor_only_pairs >= 1:
-            direct_ponly_1_a = direct_as[1]
-            direct_ponly_1_b = direct_bs[1]
-            ponly_1_values = shortcut_direct_mag_loss_for_pair(
-                direct_ponly_1_a,
-                direct_ponly_1_b,
-                True,
-            )
-        else:
-            direct_ponly_1_a = jnp.asarray(-1, dtype=jnp.int32)
-            direct_ponly_1_b = jnp.asarray(-1, dtype=jnp.int32)
-            ponly_1_values = tuple(jnp.float32(0.0) for _ in range(len(joint_values)))
-        if direct_num_pairs == 3:
-            direct_ponly_2_a = direct_as[2]
-            direct_ponly_2_b = direct_bs[2]
-            ponly_2_values = shortcut_direct_mag_loss_for_pair(
-                direct_ponly_2_a,
-                direct_ponly_2_b,
-                True,
-            )
-        else:
-            direct_ponly_2_a = jnp.asarray(-1, dtype=jnp.int32)
-            direct_ponly_2_b = jnp.asarray(-1, dtype=jnp.int32)
-            ponly_2_values = tuple(jnp.float32(0.0) for _ in range(len(ponly_1_values)))
-        loss_direct_joint = joint_values[0]
-        loss_direct_ponly_1 = ponly_1_values[0]
-        loss_direct_ponly_2 = ponly_2_values[0]
-        loss_direct_3pair = (
-            loss_direct_joint
-            + jnp.asarray(direct_num_predictor_only_pairs >= 1, dtype=jnp.float32) * loss_direct_ponly_1
-            + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * loss_direct_ponly_2
-        ) / float(direct_num_pairs)
-        loss_dir = joint_values[1]
-        loss_mag = joint_values[2]
-        if direct_num_predictor_only_pairs > 0:
-            loss_dir_ponly_mean = (
-                ponly_1_values[1]
-                + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[1]
-            ) / float(direct_num_predictor_only_pairs)
-            loss_mag_ponly_mean = (
-                ponly_1_values[2]
-                + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[2]
-            ) / float(direct_num_predictor_only_pairs)
-        else:
-            loss_dir_ponly_mean = jnp.float32(0.0)
-            loss_mag_ponly_mean = jnp.float32(0.0)
-        cos_dir = joint_values[3]
-        y_ab_norm_mean = joint_values[8]
-        y_ab_norm_min = joint_values[9]
-        y_ab_norm_max = joint_values[10]
-        delta_m_mae = joint_values[4]
-        delta_m_rmse = joint_values[5]
-        delta_m_ratio_error = joint_values[6]
-        delta_m_clip_rate = joint_values[7]
-        direct_gap = direct_joint_b - direct_joint_a
+        direct_joint_a = jnp.asarray(-1, dtype=jnp.int32)
+        direct_joint_b = jnp.asarray(-1, dtype=jnp.int32)
+        direct_ponly_1_a = jnp.asarray(-1, dtype=jnp.int32)
+        direct_ponly_1_b = jnp.asarray(-1, dtype=jnp.int32)
+        direct_ponly_2_a = jnp.asarray(-1, dtype=jnp.int32)
+        direct_ponly_2_b = jnp.asarray(-1, dtype=jnp.int32)
+        loss_direct_joint = jnp.float32(0.0)
+        loss_direct_ponly_1 = jnp.float32(0.0)
+        loss_direct_ponly_2 = jnp.float32(0.0)
+        loss_direct_3pair = jnp.float32(0.0)
+        loss_dir = jnp.float32(0.0)
+        loss_mag = jnp.float32(0.0)
+        loss_dir_ponly_mean = jnp.float32(0.0)
+        loss_mag_ponly_mean = jnp.float32(0.0)
+        cos_dir = jnp.float32(0.0)
+        y_ab_norm_mean = jnp.float32(0.0)
+        y_ab_norm_min = jnp.float32(0.0)
+        y_ab_norm_max = jnp.float32(0.0)
+        delta_m_mae = jnp.float32(0.0)
+        delta_m_rmse = jnp.float32(0.0)
+        delta_m_ratio_error = jnp.float32(0.0)
+        delta_m_clip_rate = jnp.float32(0.0)
+        direct_gap = jnp.float32(0.0)
+        loss_boot = jnp.float32(0.0)
+        loss_boot_mag = jnp.float32(0.0)
+        cos_boot = jnp.float32(0.0)
+        boot_target_rms_metric = jnp.float32(0.0)
+        boot_pred_rms_metric = jnp.float32(0.0)
+        boot_rel_residual_rms_metric = jnp.float32(0.0)
 
-        boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
-        boot_source_u = directions[boot_a] if predictor_normalize_input else hidden_stack_f32[boot_a]
-        boot_source_m = log_magnitudes[boot_a]
-        boot_source_u = jax.lax.cond(
-            bootstrap_detach_source,
-            jax.lax.stop_gradient,
-            lambda z: z,
-            boot_source_u,
-        )
-        boot_source_m = jax.lax.cond(
-            bootstrap_detach_source,
-            jax.lax.stop_gradient,
-            lambda z: z,
-            boot_source_m,
-        )
-        y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
-            {"params": params["predictor"]},
-            boot_source_u,
-            boot_a,
-            boot_b,
-            dit_time_emb,
-            boot_source_m,
-            use_timestep_embed=predictor_use_timestep,
-        )
-        u_boot_ab = l2_normalize_tokens(y_boot_ab)
-        if shortcut_loss_mode == "direction_magnitude":
-            m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
-            boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
-        else:
-            m_boot_ab = jnp.log(jnp.linalg.norm(y_boot_ab.astype(jnp.float32), axis=-1, keepdims=True) + 1e-6)
-            boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
-        y_abc, delta_m_abc = state.predictor_apply_fn(
-            {"params": params["predictor"]},
-            boot_b_source,
-            boot_b,
-            boot_c,
-            dit_time_emb,
-            m_boot_ab,
-            use_timestep_embed=predictor_use_timestep,
-        )
-        u_abc = l2_normalize_tokens(y_abc)
-        y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
-            {"params": predictor_ema_params},
-            boot_source_u,
-            boot_a,
-            boot_c,
-            dit_time_emb,
-            boot_source_m,
-            use_timestep_embed=predictor_use_timestep,
-        )
-        u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
-        cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
-        loss_boot = 1.0 - cos_boot
-        if shortcut_loss_mode == "direction_magnitude":
-            target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
-            pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
-            loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
-        else:
-            y_ac_ema_target = jax.lax.stop_gradient(y_ac_ema)
-            boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(y_ac_ema_target))
-            boot_pred_rms = sample_activation_rms(y_abc)
-            boot_residual_norm = (y_abc - y_ac_ema_target) / boot_target_rms
-            loss_boot_mag = jnp.mean(
-                optax.huber_loss(
-                    boot_residual_norm,
-                    delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+        if not use_depth_time_resync:
+            if direct_pair_mode == "trunc_normal":
+                direct_as, direct_bs = sample_distinct_pairs_weighted(
+                    directions.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    direct_pair_rng,
+                    num_pairs=direct_num_pairs,
+                    gap2_bias=0.0,
                 )
+            elif direct_pair_mode == "trunc_normal_to_uniform":
+                direct_as, direct_bs = sample_distinct_pairs_weighted(
+                    directions.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    direct_pair_rng,
+                    num_pairs=direct_num_pairs,
+                    gap2_bias=0.0,
+                    uniform_mix=pair_uniform_mix,
+                )
+            else:
+                direct_as, direct_bs = sample_distinct_pairs_weighted(
+                    directions.shape[0],
+                    skip_in_loop_max_gap,
+                    skip_in_loop_gap_loc,
+                    skip_in_loop_gap_sigma,
+                    direct_pair_rng,
+                    num_pairs=direct_num_pairs,
+                    gap2_bias=2.0,
+                )
+            direct_joint_a = direct_as[0]
+            direct_joint_b = direct_bs[0]
+            joint_values = shortcut_direct_mag_loss_for_pair(
+                direct_joint_a,
+                direct_joint_b,
+                False,
             )
-        if shortcut_loss_mode == "direction_magnitude":
-            boot_target_rms_metric = jnp.float32(0.0)
-            boot_pred_rms_metric = jnp.float32(0.0)
-            boot_rel_residual_rms_metric = jnp.float32(0.0)
-        else:
-            boot_target_rms_metric = jnp.mean(boot_target_rms)
-            boot_pred_rms_metric = jnp.mean(boot_pred_rms)
-            boot_rel_residual_rms_metric = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
+            if direct_num_predictor_only_pairs >= 1:
+                direct_ponly_1_a = direct_as[1]
+                direct_ponly_1_b = direct_bs[1]
+                ponly_1_values = shortcut_direct_mag_loss_for_pair(
+                    direct_ponly_1_a,
+                    direct_ponly_1_b,
+                    True,
+                )
+            else:
+                ponly_1_values = tuple(jnp.float32(0.0) for _ in range(len(joint_values)))
+            if direct_num_pairs == 3:
+                direct_ponly_2_a = direct_as[2]
+                direct_ponly_2_b = direct_bs[2]
+                ponly_2_values = shortcut_direct_mag_loss_for_pair(
+                    direct_ponly_2_a,
+                    direct_ponly_2_b,
+                    True,
+                )
+            else:
+                ponly_2_values = tuple(jnp.float32(0.0) for _ in range(len(ponly_1_values)))
+            loss_direct_joint = joint_values[0]
+            loss_direct_ponly_1 = ponly_1_values[0]
+            loss_direct_ponly_2 = ponly_2_values[0]
+            loss_direct_3pair = (
+                loss_direct_joint
+                + jnp.asarray(direct_num_predictor_only_pairs >= 1, dtype=jnp.float32) * loss_direct_ponly_1
+                + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * loss_direct_ponly_2
+            ) / float(direct_num_pairs)
+            loss_dir = joint_values[1]
+            loss_mag = joint_values[2]
+            if direct_num_predictor_only_pairs > 0:
+                loss_dir_ponly_mean = (
+                    ponly_1_values[1]
+                    + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[1]
+                ) / float(direct_num_predictor_only_pairs)
+                loss_mag_ponly_mean = (
+                    ponly_1_values[2]
+                    + jnp.asarray(direct_num_pairs == 3, dtype=jnp.float32) * ponly_2_values[2]
+                ) / float(direct_num_predictor_only_pairs)
+            cos_dir = joint_values[3]
+            y_ab_norm_mean = joint_values[8]
+            y_ab_norm_min = joint_values[9]
+            y_ab_norm_max = joint_values[10]
+            delta_m_mae = joint_values[4]
+            delta_m_rmse = joint_values[5]
+            delta_m_ratio_error = joint_values[6]
+            delta_m_clip_rate = joint_values[7]
+            direct_gap = direct_joint_b - direct_joint_a
+
+            boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
+            boot_source_u = directions[boot_a] if predictor_normalize_input else hidden_stack_f32[boot_a]
+            boot_source_m = log_magnitudes[boot_a]
+            boot_source_u = jax.lax.cond(
+                bootstrap_detach_source,
+                jax.lax.stop_gradient,
+                lambda z: z,
+                boot_source_u,
+            )
+            boot_source_m = jax.lax.cond(
+                bootstrap_detach_source,
+                jax.lax.stop_gradient,
+                lambda z: z,
+                boot_source_m,
+            )
+            y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                boot_source_u,
+                boot_a,
+                boot_b,
+                dit_time_emb,
+                boot_source_m,
+                use_timestep_embed=predictor_use_timestep,
+            )
+            u_boot_ab = l2_normalize_tokens(y_boot_ab)
+            if shortcut_loss_mode == "direction_magnitude":
+                m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
+                boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
+            else:
+                m_boot_ab = jnp.log(jnp.linalg.norm(y_boot_ab.astype(jnp.float32), axis=-1, keepdims=True) + 1e-6)
+                boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
+            y_abc, delta_m_abc = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                boot_b_source,
+                boot_b,
+                boot_c,
+                dit_time_emb,
+                m_boot_ab,
+                use_timestep_embed=predictor_use_timestep,
+            )
+            u_abc = l2_normalize_tokens(y_abc)
+            y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
+                {"params": predictor_ema_params},
+                boot_source_u,
+                boot_a,
+                boot_c,
+                dit_time_emb,
+                boot_source_m,
+                use_timestep_embed=predictor_use_timestep,
+            )
+            u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
+            cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
+            loss_boot = 1.0 - cos_boot
+            if shortcut_loss_mode == "direction_magnitude":
+                target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
+                pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+                loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+            else:
+                y_ac_ema_target = jax.lax.stop_gradient(y_ac_ema)
+                boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(y_ac_ema_target))
+                boot_pred_rms = sample_activation_rms(y_abc)
+                boot_residual_norm = (y_abc - y_ac_ema_target) / boot_target_rms
+                loss_boot_mag = jnp.mean(
+                    optax.huber_loss(
+                        boot_residual_norm,
+                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                    )
+                )
+            if shortcut_loss_mode != "direction_magnitude":
+                boot_target_rms_metric = jnp.mean(boot_target_rms)
+                boot_pred_rms_metric = jnp.mean(boot_pred_rms)
+                boot_rel_residual_rms_metric = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
 
         def compute_debug_pair_metrics(_):
             def compute_pair_metrics(source_layer, target_layer):
@@ -1766,21 +1788,9 @@ def train_step(
                 hidden_stack_s_f32[dt_b],
             )
 
-            pred_ab, _, _ = predictor_transition(
-                params["predictor"],
-                hidden_stack_f32[dt_a],
-                dt_a,
-                dt_b,
-                dit_time_emb,
-                dit_time_emb,
-                h0_t,
-                q,
-                q,
-                False,
-            )
             pred_ab_bc, dm_ab_bc, ms_ab_bc = predictor_transition(
                 params["predictor"],
-                pred_ab,
+                pred_depth,
                 dt_b,
                 dt_c,
                 dit_time_emb,
@@ -1806,25 +1816,13 @@ def train_step(
                 pred_ab_bc,
                 dm_ab_bc,
                 ms_ab_bc,
-                pred_ab,
+                pred_depth,
                 jax.lax.stop_gradient(pred_ac_ema),
             )
 
-            pred_ts, _, _ = predictor_transition(
-                params["predictor"],
-                hidden_stack_f32[dt_a],
-                dt_a,
-                dt_a,
-                dit_time_emb,
-                dit_time_emb_s,
-                h0_s,
-                q,
-                q_s,
-                False,
-            )
             pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
                 params["predictor"],
-                pred_ts,
+                pred_time,
                 dt_a,
                 dt_a,
                 dit_time_emb_s,
@@ -1850,25 +1848,13 @@ def train_step(
                 pred_ts_sr,
                 dm_ts_sr,
                 ms_ts_sr,
-                pred_ts,
+                pred_time,
                 jax.lax.stop_gradient(pred_tr_ema),
             )
 
-            pred_as_bs, _, _ = predictor_transition(
-                params["predictor"],
-                hidden_stack_f32[dt_a],
-                dt_a,
-                dt_b,
-                dit_time_emb,
-                dit_time_emb_s,
-                h0_s,
-                q,
-                q_s,
-                False,
-            )
             pred_bs_cr, dm_bs_cr, ms_bs_cr = predictor_transition(
                 params["predictor"],
-                pred_as_bs,
+                pred_dt,
                 dt_b,
                 dt_c,
                 dit_time_emb_s,
@@ -1878,7 +1864,7 @@ def train_step(
                 q_r,
                 False,
             )
-            pred_at_cr_ema, _, _ = predictor_transition(
+            pred_at_cr_ema, dm_at_cr_ema, _ = predictor_transition(
                 predictor_ema_params,
                 jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
                 dt_a,
@@ -1894,9 +1880,44 @@ def train_step(
                 pred_bs_cr,
                 dm_bs_cr,
                 ms_bs_cr,
-                pred_as_bs,
+                pred_dt,
                 jax.lax.stop_gradient(pred_at_cr_ema),
             )
+
+            # Legacy mapping under depth-time-resync:
+            # - direct uses the same primitive as depth transition (a,t)->(b,t)
+            # - bootstrap uses dt-chain (a,t)->(b,s)->(c,r) against EMA teacher (a,t)->(c,r)
+            legacy_direct_from_resync = l_depth
+            legacy_cos_dir_from_resync = jnp.sum(
+                l2_normalize_tokens(pred_depth) * l2_normalize_tokens(jax.lax.stop_gradient(hidden_stack_f32[dt_b])),
+                axis=-1,
+            ).mean()
+            u_boot = l2_normalize_tokens(pred_bs_cr)
+            u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(pred_at_cr_ema))
+            cos_boot_from_resync = jnp.sum(u_boot * u_teacher, axis=-1).mean()
+            loss_boot_from_resync = 1.0 - cos_boot_from_resync
+            if shortcut_loss_mode == "direction_magnitude":
+                target_delta_m_ac = jax.lax.stop_gradient(dm_at_cr_ema)
+                pred_delta_m_ac = dm_dt + dm_bs_cr
+                loss_boot_mag_from_resync = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+            else:
+                teacher_target = jax.lax.stop_gradient(pred_at_cr_ema)
+                boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(teacher_target))
+                boot_pred_rms = sample_activation_rms(pred_bs_cr)
+                boot_residual_norm = (pred_bs_cr - teacher_target) / boot_target_rms
+                loss_boot_mag_from_resync = jnp.mean(
+                    optax.huber_loss(
+                        boot_residual_norm,
+                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                    )
+                )
+                boot_target_rms_metric_local = jnp.mean(boot_target_rms)
+                boot_pred_rms_metric_local = jnp.mean(boot_pred_rms)
+                boot_rel_residual_rms_metric_local = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
+            if shortcut_loss_mode == "direction_magnitude":
+                boot_target_rms_metric_local = jnp.float32(0.0)
+                boot_pred_rms_metric_local = jnp.float32(0.0)
+                boot_rel_residual_rms_metric_local = jnp.float32(0.0)
 
             u_dt_out = l2_normalize_tokens(pred_dt)
             if shortcut_loss_mode == "direction_magnitude":
@@ -1944,6 +1965,14 @@ def train_step(
                 e_time_cons,
                 e_dt_cons,
                 e_out_time,
+                legacy_direct_from_resync,
+                loss_boot_from_resync,
+                loss_boot_mag_from_resync,
+                legacy_cos_dir_from_resync,
+                cos_boot_from_resync,
+                boot_target_rms_metric_local,
+                boot_pred_rms_metric_local,
+                boot_rel_residual_rms_metric_local,
             )
 
         if use_depth_time_resync:
@@ -1962,7 +1991,30 @@ def train_step(
                 e_time_cons_dt,
                 e_dt_cons_dt,
                 e_out_time_dt,
+                legacy_direct_from_resync,
+                loss_boot_from_resync,
+                loss_boot_mag_from_resync,
+                cos_dir_from_resync,
+                cos_boot_from_resync,
+                boot_target_rms_from_resync,
+                boot_pred_rms_from_resync,
+                boot_rel_residual_rms_from_resync,
             ) = compute_depth_time_resync_losses()
+            loss_direct_joint = legacy_direct_from_resync
+            loss_direct_ponly_1 = jnp.float32(0.0)
+            loss_direct_ponly_2 = jnp.float32(0.0)
+            loss_direct_3pair = legacy_direct_from_resync
+            loss_dir = legacy_direct_from_resync
+            loss_mag = jnp.float32(0.0)
+            loss_dir_ponly_mean = jnp.float32(0.0)
+            loss_mag_ponly_mean = jnp.float32(0.0)
+            cos_dir = cos_dir_from_resync
+            loss_boot = loss_boot_from_resync
+            loss_boot_mag = loss_boot_mag_from_resync
+            cos_boot = cos_boot_from_resync
+            boot_target_rms_metric = boot_target_rms_from_resync
+            boot_pred_rms_metric = boot_pred_rms_from_resync
+            boot_rel_residual_rms_metric = boot_rel_residual_rms_from_resync
         else:
             (
                 loss_depth_dt,
@@ -1979,7 +2031,15 @@ def train_step(
                 e_time_cons_dt,
                 e_dt_cons_dt,
                 e_out_time_dt,
-            ) = (jnp.float32(0.0),) * 14
+                legacy_direct_from_resync,
+                loss_boot_from_resync,
+                loss_boot_mag_from_resync,
+                cos_dir_from_resync,
+                cos_boot_from_resync,
+                boot_target_rms_from_resync,
+                boot_pred_rms_from_resync,
+                boot_rel_residual_rms_from_resync,
+            ) = (jnp.float32(0.0),) * 22
         loss_depth_time_total = (
             lambda_depth * loss_depth_dt
             + lambda_time * loss_time_dt
@@ -2011,15 +2071,20 @@ def train_step(
             ),
             operand=None,
         )
-        legacy_shortcut_total = (
-            loss_direct_3pair
-            + lambda_boot * loss_boot
-            + lambda_boot_mag * loss_boot_mag
-            + loss_output_distill_weighted
+        legacy_direct_total = jnp.where(
+            jnp.asarray(use_legacy_direct_loss, dtype=jnp.bool_),
+            loss_direct_3pair,
+            jnp.float32(0.0),
         )
+        legacy_bootstrap_total = jnp.where(
+            jnp.asarray(use_legacy_bootstrap_loss, dtype=jnp.bool_),
+            lambda_boot * loss_boot + lambda_boot_mag * loss_boot_mag,
+            jnp.float32(0.0),
+        )
+        legacy_shortcut_total = legacy_direct_total + legacy_bootstrap_total + loss_output_distill_weighted
         loss_total = (
             loss_gen
-            + (jnp.float32(0.0) if use_depth_time_resync else legacy_shortcut_total)
+            + legacy_shortcut_total
             + loss_depth_time_total
             + lambda_private_eff * loss_private
         )
@@ -3648,6 +3713,24 @@ def main():
         help="Use zero-init AdaLN modulation/gates for deep shortcut predictor blocks.",
     )
     parser.add_argument("--use-depth-time-resync", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use-legacy-direct-loss",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable legacy direct shortcut loss (Ldirect). "
+            "Default: disabled when --use-depth-time-resync is enabled, enabled otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--use-legacy-bootstrap-loss",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable legacy bootstrap shortcut loss (Lboot). "
+            "Default: disabled when --use-depth-time-resync is enabled, enabled otherwise."
+        ),
+    )
     parser.add_argument("--use-depth-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-time-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-dt-loss", action=argparse.BooleanOptionalAction, default=True)
@@ -4068,6 +4151,76 @@ def main():
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"weight_decay={args.weight_decay} cfg_dropout_rate={args.cfg_dropout_rate}"
     )
+    use_legacy_direct_loss = (
+        bool(args.use_legacy_direct_loss)
+        if args.use_legacy_direct_loss is not None
+        else (not args.use_depth_time_resync)
+    )
+    use_legacy_bootstrap_loss = (
+        bool(args.use_legacy_bootstrap_loss)
+        if args.use_legacy_bootstrap_loss is not None
+        else (not args.use_depth_time_resync)
+    )
+    legacy_disabled_by_resync = bool(args.use_depth_time_resync) and (
+        (args.use_legacy_direct_loss is None and not use_legacy_direct_loss)
+        or (args.use_legacy_bootstrap_loss is None and not use_legacy_bootstrap_loss)
+    )
+    active_losses = ["Lgen"]
+    inactive_losses = []
+    if use_legacy_direct_loss:
+        active_losses.append("Ldirect")
+    else:
+        inactive_losses.append("Ldirect")
+    if use_legacy_bootstrap_loss:
+        active_losses.append("Lboot")
+    else:
+        inactive_losses.append("Lboot")
+    if args.output_distill:
+        active_losses.append("Loutput_distill")
+    else:
+        inactive_losses.append("Loutput_distill")
+    if args.use_depth_time_resync:
+        if args.use_depth_loss:
+            active_losses.append("Ldepth")
+        else:
+            inactive_losses.append("Ldepth")
+        if args.use_time_loss:
+            active_losses.append("Ltime")
+        else:
+            inactive_losses.append("Ltime")
+        if args.use_dt_loss:
+            active_losses.append("Ldt")
+        else:
+            inactive_losses.append("Ldt")
+        if args.use_depth_consistency:
+            active_losses.append("Ldepth_cons")
+        else:
+            inactive_losses.append("Ldepth_cons")
+        if args.use_time_consistency:
+            active_losses.append("Ltime_cons")
+        else:
+            inactive_losses.append("Ltime_cons")
+        if args.use_dt_consistency:
+            active_losses.append("Ldt_cons")
+        else:
+            inactive_losses.append("Ldt_cons")
+        if args.use_output_time_distill:
+            active_losses.append("Lout_time")
+        else:
+            inactive_losses.append("Lout_time")
+    else:
+        inactive_losses.extend(
+            ["Ldepth", "Ltime", "Ldt", "Ldepth_cons", "Ltime_cons", "Ldt_cons", "Lout_time"]
+        )
+    if args.shortcut_lambda_skip_fm > 0.0 and args.shortcut_skip_in_loop_prob > 0.0:
+        active_losses.append("Lskip_fm")
+    else:
+        inactive_losses.append("Lskip_fm")
+    if args.private_loss and args.lambda_private > 0.0:
+        active_losses.append("Lprivate")
+    else:
+        inactive_losses.append("Lprivate")
+
     log_stage(
         f"DepthShortcut: predictor={args.shortcut_predictor} "
         f"mode={args.shortcut_training_mode} "
@@ -4115,6 +4268,15 @@ def main():
         f"pred_attention_every={args.shortcut_predictor_attention_every} "
         f"pred_heads={args.shortcut_predictor_num_heads} "
         f"pred_adaln_zero={args.shortcut_predictor_adaln_zero}"
+    )
+    log_stage(
+        "LossSummary: "
+        f"active={','.join(active_losses)} "
+        f"inactive={','.join(inactive_losses)} "
+        f"use_depth_time_resync={args.use_depth_time_resync} "
+        f"use_legacy_direct_loss={use_legacy_direct_loss} "
+        f"use_legacy_bootstrap_loss={use_legacy_bootstrap_loss} "
+        f"legacy_disabled_by_resync_default={legacy_disabled_by_resync}"
     )
     log_stage(
         f"PrivateActivations: enabled={args.private_loss} lambda_private={args.lambda_private} "
@@ -4201,8 +4363,8 @@ def main():
     uses_magnitude_losses = True
     effective_lambda_mag = args.shortcut_lambda_mag
     effective_lambda_boot_mag = args.shortcut_lambda_boot_mag
-    effective_lambda_skip_fm = 0.0
-    effective_skip_prob = 0.0
+    effective_lambda_skip_fm = args.shortcut_lambda_skip_fm
+    effective_skip_prob = args.shortcut_skip_in_loop_prob if args.shortcut_lambda_skip_fm > 0.0 else 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
     shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
@@ -4278,6 +4440,8 @@ def main():
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
             use_depth_time_resync=args.use_depth_time_resync,
+            use_legacy_direct_loss=use_legacy_direct_loss,
+            use_legacy_bootstrap_loss=use_legacy_bootstrap_loss,
             use_depth_loss=args.use_depth_loss,
             use_time_loss=args.use_time_loss,
             use_dt_loss=args.use_dt_loss,
