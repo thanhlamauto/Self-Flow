@@ -498,6 +498,8 @@ def create_train_state(
     shortcut_mag_abs_center=5.5,
     shortcut_mag_abs_scale=1.5,
     predictor_config_overrides=None,
+    predictor_use_class_input=False,
+    predictor_class_fusion="add",
 ):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -533,6 +535,9 @@ def create_train_state(
         gamma_out_init=0.001 if shortcut_training_mode == "direction-magnitude" else 0.05,
         mag_abs_center=shortcut_mag_abs_center,
         mag_abs_scale=shortcut_mag_abs_scale,
+        num_classes=config["num_classes"],
+        class_cond_input=bool(predictor_use_class_input),
+        class_cond_fusion=predictor_class_fusion,
         **predictor_cfg,
     )
 
@@ -558,6 +563,7 @@ def create_train_state(
         jnp.asarray(1, dtype=jnp.int32),
         dummy_t_embed,
         dummy_m,
+        class_labels=dummy_vec,
     )
 
     params = {
@@ -987,6 +993,7 @@ def train_step(
     private_pair_mode="first",
     predictor_use_timestep=True,
     predictor_normalize_input=True,
+    predictor_use_class_input=False,
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
 ):
@@ -1104,6 +1111,7 @@ def train_step(
                 ma_condition,
                 detach_timestep_embed=source_detach,
                 use_timestep_embed=predictor_use_timestep,
+                class_labels=y,
             )
             u_pair = l2_normalize_tokens(y_pair)
             cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
@@ -1277,6 +1285,7 @@ def train_step(
             dit_time_emb,
             boot_source_m,
             use_timestep_embed=predictor_use_timestep,
+            class_labels=y,
         )
         u_boot_ab = l2_normalize_tokens(y_boot_ab)
         if shortcut_loss_mode == "direction_magnitude":
@@ -1293,6 +1302,7 @@ def train_step(
             dit_time_emb,
             m_boot_ab,
             use_timestep_embed=predictor_use_timestep,
+            class_labels=y,
         )
         u_abc = l2_normalize_tokens(y_abc)
         y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
@@ -1303,6 +1313,7 @@ def train_step(
             dit_time_emb,
             boot_source_m,
             use_timestep_embed=predictor_use_timestep,
+            class_labels=y,
         )
         u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
         cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
@@ -1345,6 +1356,7 @@ def train_step(
                     dit_time_emb,
                     pair_source_m,
                     use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
                 )
                 u_pair = l2_normalize_tokens(y_pair)
                 target_u_pair = jax.lax.stop_gradient(directions[target_layer])
@@ -1478,6 +1490,7 @@ def train_step(
                 m_source,
                 detach_timestep_embed=True,
                 use_timestep_embed=predictor_use_timestep,
+                class_labels=y[subset_idx],
             )
             u_pred = l2_normalize_tokens(y_pred)
             if shortcut_loss_mode == "direction_magnitude":
@@ -1819,6 +1832,7 @@ def train_step(
         ),
         "train/predictor_use_timestep": jnp.asarray(1.0 if predictor_use_timestep else 0.0, dtype=jnp.float32),
         "train/predictor_normalize_input": jnp.asarray(1.0 if predictor_normalize_input else 0.0, dtype=jnp.float32),
+        "train/predictor_use_class_input": jnp.asarray(1.0 if predictor_use_class_input else 0.0, dtype=jnp.float32),
         "train/y_ab_norm_mean": y_ab_norm_mean,
         "train/y_ab_norm_min": y_ab_norm_min,
         "train/y_ab_norm_max": y_ab_norm_max,
@@ -3086,6 +3100,19 @@ def main():
         help="Feed L2-normalized source hidden directions into the predictor. Disable to feed raw hidden activations.",
     )
     parser.add_argument(
+        "--shortcut-predictor-use-class-input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Feed image class labels as an additional shortcut predictor input. Default false.",
+    )
+    parser.add_argument(
+        "--shortcut-predictor-class-fusion",
+        type=str,
+        default="add",
+        choices=["add", "concat"],
+        help="How class input is fused with the predictor source tokens when class input is enabled.",
+    )
+    parser.add_argument(
         "--shortcut-predictor-arch",
         type=str,
         default="existing",
@@ -3466,6 +3493,8 @@ def main():
         "depth_shortcut_predictor_attention_every": args.shortcut_predictor_attention_every,
         "depth_shortcut_predictor_num_heads": args.shortcut_predictor_num_heads,
         "depth_shortcut_predictor_adaln_zero": args.shortcut_predictor_adaln_zero,
+        "depth_shortcut_predictor_use_class_input": args.shortcut_predictor_use_class_input,
+        "depth_shortcut_predictor_class_fusion": args.shortcut_predictor_class_fusion,
     }
     if args.shortcut_skip_in_loop_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
@@ -3531,6 +3560,8 @@ def main():
         f"pred_wd={args.shortcut_predictor_weight_decay} "
         f"pred_use_t={args.shortcut_predictor_use_timestep} "
         f"pred_norm_input={args.shortcut_predictor_normalize_input} "
+        f"pred_use_class_input={args.shortcut_predictor_use_class_input} "
+        f"pred_class_fusion={args.shortcut_predictor_class_fusion} "
         f"pred_arch={args.shortcut_predictor_arch} "
         f"pred_hidden={args.shortcut_predictor_hidden_size} "
         f"pred_depth={args.shortcut_predictor_depth} "
@@ -3588,6 +3619,8 @@ def main():
         shortcut_mag_abs_center=args.shortcut_mag_abs_center,
         shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
         predictor_config_overrides=shortcut_predictor_overrides,
+        predictor_use_class_input=args.shortcut_predictor_use_class_input,
+        predictor_class_fusion=args.shortcut_predictor_class_fusion,
     )
     predictor_param_count = count_tree_params(state.params["predictor"])
     backbone_param_count = count_tree_params(state.params["backbone"])
@@ -3698,6 +3731,7 @@ def main():
             private_pair_mode=args.private_pair_mode,
             predictor_use_timestep=args.shortcut_predictor_use_timestep,
             predictor_normalize_input=args.shortcut_predictor_normalize_input,
+            predictor_use_class_input=args.shortcut_predictor_use_class_input,
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
         ),

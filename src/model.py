@@ -341,6 +341,8 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_predictor_attention_every: Optional[int] = None,
         depth_shortcut_predictor_num_heads: Optional[int] = None,
         depth_shortcut_predictor_adaln_zero: Optional[bool] = None,
+        depth_shortcut_predictor_use_class_input: bool = False,
+        depth_shortcut_predictor_class_fusion: str = "add",
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -451,6 +453,9 @@ class SelfFlowDiT(nn.Module):
                 num_tokens=self.num_patches,
                 mag_abs_center=depth_shortcut_mag_abs_center,
                 mag_abs_scale=depth_shortcut_mag_abs_scale,
+                num_classes=self.num_classes,
+                class_cond_input=depth_shortcut_predictor_use_class_input,
+                class_cond_fusion=depth_shortcut_predictor_class_fusion,
                 **predictor_cfg,
             )
             # Training discretizes tau as q / (T - 1). Sampling uses continuous tau,
@@ -496,6 +501,7 @@ class SelfFlowDiT(nn.Module):
                     jnp.asarray(target_layer, dtype=jnp.int32),
                     t_emb,
                     m_source_short,
+                    class_labels=vector,
                 )
                 if depth_shortcut_predict_magnitude:
                     y_short, delta_m_short = pred_short

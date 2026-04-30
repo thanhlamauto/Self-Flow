@@ -416,6 +416,9 @@ class DepthShortcutPredictor(nn.Module):
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    num_classes: int = 1000
+    class_cond_input: bool = False
+    class_cond_fusion: str = "add"
 
     @property
     def grid_size(self) -> int:
@@ -431,9 +434,12 @@ class DepthShortcutPredictor(nn.Module):
         m_source: jax.Array | None = None,
         detach_timestep_embed: bool = True,
         use_timestep_embed: bool = True,
+        class_labels: jax.Array | None = None,
     ) -> jax.Array:
         batch_size = u_source.shape[0]
         cond_dim = int(self.cond_dim or self.width)
+        if self.class_cond_fusion not in {"add", "concat"}:
+            raise ValueError(f"Unknown class condition input fusion mode: {self.class_cond_fusion!r}")
         source_layer = jnp.asarray(source_layer, dtype=jnp.int32)
         target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
         delta = target_layer - source_layer
@@ -507,12 +513,38 @@ class DepthShortcutPredictor(nn.Module):
                 name="cond_mlp_1",
             )(c)
 
+        predictor_input = u_source
+        if self.class_cond_input:
+            if class_labels is None:
+                raise ValueError("class_labels must be provided when class_cond_input=True")
+            class_labels = jnp.asarray(class_labels, dtype=jnp.int32)
+            class_labels = jnp.clip(class_labels, 0, int(self.num_classes))
+            class_cond = nn.Embed(
+                num_embeddings=int(self.num_classes) + 1,
+                features=self.hidden_size,
+                embedding_init=NORMAL_002,
+                name="class_input_embed",
+            )(class_labels)
+            if class_cond.ndim == 1:
+                class_cond = jnp.broadcast_to(class_cond[None, None, :], predictor_input.shape)
+            else:
+                class_cond = jnp.broadcast_to(class_cond[:, None, :], predictor_input.shape)
+            if self.class_cond_fusion == "add":
+                predictor_input = predictor_input + class_cond
+            else:
+                predictor_input = nn.Dense(
+                    self.hidden_size,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                    name="class_input_concat_proj",
+                )(jnp.concatenate([predictor_input, class_cond], axis=-1))
+
         h = nn.Dense(
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
             name="in_proj",
-        )(u_source)
+        )(predictor_input)
         if self.arch == "dit2":
             if self.num_heads is None:
                 raise ValueError("dit2 predictor requires num_heads")
