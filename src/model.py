@@ -341,6 +341,9 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_predictor_attention_every: Optional[int] = None,
         depth_shortcut_predictor_num_heads: Optional[int] = None,
         depth_shortcut_predictor_adaln_zero: Optional[bool] = None,
+        depth_shortcut_dt_use_h0_target: bool = False,
+        depth_shortcut_dt_h0_fusion: str = "concat",
+        depth_shortcut_dt_cond_mode: str = "concat_mlp",
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -383,8 +386,10 @@ class SelfFlowDiT(nn.Module):
                 embed_dim=self.hidden_size,
             )(x)
             x = x + self.pos_embed_val
+            h0_tokens = x
         else:
             x = resume_hidden
+            h0_tokens = None
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
         y_embedder = LabelEmbedder(
@@ -451,6 +456,9 @@ class SelfFlowDiT(nn.Module):
                 num_tokens=self.num_patches,
                 mag_abs_center=depth_shortcut_mag_abs_center,
                 mag_abs_scale=depth_shortcut_mag_abs_scale,
+                dt_use_h0_target=depth_shortcut_dt_use_h0_target,
+                dt_h0_fusion=depth_shortcut_dt_h0_fusion,
+                dt_cond_mode=depth_shortcut_dt_cond_mode,
                 **predictor_cfg,
             )
             # Training discretizes tau as q / (T - 1). Sampling uses continuous tau,
@@ -496,6 +504,11 @@ class SelfFlowDiT(nn.Module):
                     jnp.asarray(target_layer, dtype=jnp.int32),
                     t_emb,
                     m_source_short,
+                    h0_tgt=h0_tokens,
+                    timestep_tgt_embed=t_emb,
+                    t_src_idx=shortcut_q,
+                    t_tgt_idx=shortcut_q,
+                    delta_t_idx=jnp.zeros_like(shortcut_q),
                 )
                 if depth_shortcut_predict_magnitude:
                     y_short, delta_m_short = pred_short

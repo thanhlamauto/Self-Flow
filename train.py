@@ -1145,26 +1145,75 @@ def train_step(
         directions = hidden_stack_f32 / (hidden_norms + 1e-6)
         log_magnitudes = jnp.log(hidden_norms + 1e-6)
 
-        pred_s, hidden_tuple_s, dit_time_emb_s = state.apply_fn(
-            {"params": params["backbone"]},
-            x_tau_s,
-            timesteps=tau_s,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-            return_hidden_states=True,
+        dt_layer_rng_1, dt_layer_rng_2, dt_layer_rng_3, dt_cons_do_rng = jax.random.split(dt_cons_rng, 4)
+        dt_cons_loss_requested = bool(
+            use_depth_time_resync
+            and (
+                use_depth_consistency
+                or use_time_consistency
+                or use_dt_consistency
+            )
+            and dt_consistency_prob > 0.0
         )
-        hidden_stack_s_f32 = jnp.stack(hidden_tuple_s, axis=0).astype(jnp.float32)
-        pred_r, hidden_tuple_r, dit_time_emb_r = state.apply_fn(
-            {"params": params["backbone"]},
-            x_tau_r,
-            timesteps=tau_r,
-            vector=y,
-            deterministic=False,
-            rngs={"dropout": drop_rng},
-            return_hidden_states=True,
+        dt_legacy_bootstrap_requested = bool(use_depth_time_resync and use_legacy_bootstrap_loss)
+        if dt_cons_loss_requested:
+            if dt_consistency_prob >= 1.0:
+                dt_cons_loss_active = jnp.asarray(True, dtype=jnp.bool_)
+            else:
+                dt_cons_loss_active = (
+                    jax.random.uniform(dt_cons_do_rng, ())
+                    < jnp.asarray(dt_consistency_prob, dtype=jnp.float32)
+                )
+        else:
+            dt_cons_loss_active = jnp.asarray(False, dtype=jnp.bool_)
+        dt_chain_active = jnp.logical_or(
+            dt_cons_loss_active,
+            jnp.asarray(dt_legacy_bootstrap_requested, dtype=jnp.bool_),
         )
-        hidden_stack_r_f32 = jnp.stack(hidden_tuple_r, axis=0).astype(jnp.float32)
+
+        if use_depth_time_resync:
+            pred_s, hidden_tuple_s, dit_time_emb_s = state.apply_fn(
+                {"params": params["backbone"]},
+                x_tau_s,
+                timesteps=tau_s,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+                return_hidden_states=True,
+            )
+            hidden_stack_s_f32 = jnp.stack(hidden_tuple_s, axis=0).astype(jnp.float32)
+        else:
+            pred_s = jnp.zeros_like(pred)
+            hidden_stack_s_f32 = jnp.zeros_like(hidden_stack_f32)
+            dit_time_emb_s = jnp.zeros_like(dit_time_emb)
+
+        def compute_r_states(_):
+            _, hidden_tuple_r, dit_time_emb_r_local = state.apply_fn(
+                {"params": params["backbone"]},
+                x_tau_r,
+                timesteps=tau_r,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": drop_rng},
+                return_hidden_states=True,
+            )
+            return jnp.stack(hidden_tuple_r, axis=0).astype(jnp.float32), dit_time_emb_r_local
+
+        def empty_r_states(_):
+            return jnp.zeros_like(hidden_stack_s_f32), jnp.zeros_like(dit_time_emb_s)
+
+        if dt_cons_loss_requested or dt_legacy_bootstrap_requested:
+            if dt_consistency_prob >= 1.0:
+                hidden_stack_r_f32, dit_time_emb_r = compute_r_states(None)
+            else:
+                hidden_stack_r_f32, dit_time_emb_r = jax.lax.cond(
+                    dt_chain_active,
+                    compute_r_states,
+                    empty_r_states,
+                    operand=None,
+                )
+        else:
+            hidden_stack_r_f32, dit_time_emb_r = empty_r_states(None)
         def predictor_transition(
             predictor_params,
             source_hidden,
@@ -1708,7 +1757,6 @@ def train_step(
         loss_output_distill_weighted = lambda_output_distill * loss_output_distill
 
         dt_layer_gap_choices = jnp.asarray(tuple(int(v) for v in dt_layer_gap_values), dtype=jnp.int32)
-        dt_layer_rng_1, dt_layer_rng_2, dt_layer_rng_3, dt_cons_do_rng = jax.random.split(dt_cons_rng, 4)
         if dt_layer_sampling_mode == "truncated_normal":
             dt_layer_offsets = (dt_layer_gap_choices.astype(jnp.float32) - 2.0) / 1.0
             dt_layer_gap_probs = jax.nn.softmax(-0.5 * jnp.square(dt_layer_offsets))
@@ -1721,13 +1769,11 @@ def train_step(
         dt_a = jax.random.randint(dt_layer_rng_3, (), 0, max_a_dt + 1, dtype=jnp.int32)
         dt_b = dt_a + dt_gap_l1
         dt_c = dt_b + dt_gap_l2
-        dt_cons_active = jax.random.uniform(dt_cons_do_rng, ()) < jnp.asarray(dt_consistency_prob, dtype=jnp.float32)
 
         def compute_depth_time_resync_losses():
             zero = jnp.float32(0.0)
             h0_t = hidden_stack_f32[0]
             h0_s = hidden_stack_s_f32[0]
-            h0_r = hidden_stack_r_f32[0]
 
             pred_depth, dm_depth, ms_depth = predictor_transition(
                 params["predictor"],
@@ -1789,168 +1835,207 @@ def train_step(
                 hidden_stack_s_f32[dt_b],
             )
 
-            pred_ab_bc, dm_ab_bc, ms_ab_bc = predictor_transition(
-                params["predictor"],
-                pred_depth,
-                dt_b,
-                dt_c,
-                dit_time_emb,
-                dit_time_emb,
-                h0_t,
-                q,
-                q,
-                False,
-            )
-            pred_ac_ema, _, _ = predictor_transition(
-                predictor_ema_params,
-                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
-                dt_a,
-                dt_c,
-                dit_time_emb,
-                dit_time_emb,
-                h0_t,
-                q,
-                q,
-                True,
-            )
-            l_depth_cons, e_depth_cons = transition_distance(
-                pred_ab_bc,
-                dm_ab_bc,
-                ms_ab_bc,
-                pred_depth,
-                jax.lax.stop_gradient(pred_ac_ema),
-            )
-
-            pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
-                params["predictor"],
-                pred_time,
-                dt_a,
-                dt_a,
-                dit_time_emb_s,
-                dit_time_emb_r,
-                h0_r,
-                q_s,
-                q_r,
-                False,
-            )
-            pred_tr_ema, _, _ = predictor_transition(
-                predictor_ema_params,
-                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
-                dt_a,
-                dt_a,
-                dit_time_emb,
-                dit_time_emb_r,
-                h0_r,
-                q,
-                q_r,
-                True,
-            )
-            l_time_cons, e_time_cons = transition_distance(
-                pred_ts_sr,
-                dm_ts_sr,
-                ms_ts_sr,
-                pred_time,
-                jax.lax.stop_gradient(pred_tr_ema),
-            )
-
-            pred_bs_cr, dm_bs_cr, ms_bs_cr = predictor_transition(
-                params["predictor"],
-                pred_dt,
-                dt_b,
-                dt_c,
-                dit_time_emb_s,
-                dit_time_emb_r,
-                h0_r,
-                q_s,
-                q_r,
-                False,
-            )
-            pred_at_cr_ema, dm_at_cr_ema, _ = predictor_transition(
-                predictor_ema_params,
-                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
-                dt_a,
-                dt_c,
-                dit_time_emb,
-                dit_time_emb_r,
-                h0_r,
-                q,
-                q_r,
-                True,
-            )
-            l_dt_cons, e_dt_cons = transition_distance(
-                pred_bs_cr,
-                dm_bs_cr,
-                ms_bs_cr,
-                pred_dt,
-                jax.lax.stop_gradient(pred_at_cr_ema),
-            )
-
-            # Legacy mapping under depth-time-resync:
-            # - direct uses the same primitive as depth transition (a,t)->(b,t)
-            # - bootstrap uses dt-chain (a,t)->(b,s)->(c,r) against EMA teacher (a,t)->(c,r)
             legacy_direct_from_resync = l_depth
             legacy_cos_dir_from_resync = jnp.sum(
                 l2_normalize_tokens(pred_depth) * l2_normalize_tokens(jax.lax.stop_gradient(hidden_stack_f32[dt_b])),
                 axis=-1,
             ).mean()
-            u_boot = l2_normalize_tokens(pred_bs_cr)
-            u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(pred_at_cr_ema))
-            cos_boot_from_resync = jnp.sum(u_boot * u_teacher, axis=-1).mean()
-            loss_boot_from_resync = 1.0 - cos_boot_from_resync
-            if shortcut_loss_mode == "direction_magnitude":
-                target_delta_m_ac = jax.lax.stop_gradient(dm_at_cr_ema)
-                pred_delta_m_ac = dm_dt + dm_bs_cr
-                loss_boot_mag_from_resync = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
-            else:
-                teacher_target = jax.lax.stop_gradient(pred_at_cr_ema)
-                boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(teacher_target))
-                boot_pred_rms = sample_activation_rms(pred_bs_cr)
-                boot_residual_norm = (pred_bs_cr - teacher_target) / boot_target_rms
-                loss_boot_mag_from_resync = jnp.mean(
-                    optax.huber_loss(
-                        boot_residual_norm,
-                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
-                    )
-                )
-                boot_target_rms_metric_local = jnp.mean(boot_target_rms)
-                boot_pred_rms_metric_local = jnp.mean(boot_pred_rms)
-                boot_rel_residual_rms_metric_local = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
-            if shortcut_loss_mode == "direction_magnitude":
-                boot_target_rms_metric_local = jnp.float32(0.0)
-                boot_pred_rms_metric_local = jnp.float32(0.0)
-                boot_rel_residual_rms_metric_local = jnp.float32(0.0)
 
-            u_dt_out = l2_normalize_tokens(pred_dt)
-            if shortcut_loss_mode == "direction_magnitude":
-                m_dt_out = jnp.clip(ms_dt + mag_scale * dm_dt, mag_clip_min, mag_clip_max)
-                z_hat_dt = jnp.exp(m_dt_out) * u_dt_out
+            def compute_consistency_terms(_):
+                h0_r = hidden_stack_r_f32[0]
+                pred_ab_bc, dm_ab_bc, ms_ab_bc = predictor_transition(
+                    params["predictor"],
+                    pred_depth,
+                    dt_b,
+                    dt_c,
+                    dit_time_emb,
+                    dit_time_emb,
+                    h0_t,
+                    q,
+                    q,
+                    False,
+                )
+                pred_ac_ema, _, _ = predictor_transition(
+                    predictor_ema_params,
+                    jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                    dt_a,
+                    dt_c,
+                    dit_time_emb,
+                    dit_time_emb,
+                    h0_t,
+                    q,
+                    q,
+                    True,
+                )
+                l_depth_cons_local, e_depth_cons_local = transition_distance(
+                    pred_ab_bc,
+                    dm_ab_bc,
+                    ms_ab_bc,
+                    pred_depth,
+                    jax.lax.stop_gradient(pred_ac_ema),
+                )
+
+                pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
+                    params["predictor"],
+                    pred_time,
+                    dt_a,
+                    dt_a,
+                    dit_time_emb_s,
+                    dit_time_emb_r,
+                    h0_r,
+                    q_s,
+                    q_r,
+                    False,
+                )
+                pred_tr_ema, _, _ = predictor_transition(
+                    predictor_ema_params,
+                    jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                    dt_a,
+                    dt_a,
+                    dit_time_emb,
+                    dit_time_emb_r,
+                    h0_r,
+                    q,
+                    q_r,
+                    True,
+                )
+                l_time_cons_local, e_time_cons_local = transition_distance(
+                    pred_ts_sr,
+                    dm_ts_sr,
+                    ms_ts_sr,
+                    pred_time,
+                    jax.lax.stop_gradient(pred_tr_ema),
+                )
+
+                pred_bs_cr, dm_bs_cr, ms_bs_cr = predictor_transition(
+                    params["predictor"],
+                    pred_dt,
+                    dt_b,
+                    dt_c,
+                    dit_time_emb_s,
+                    dit_time_emb_r,
+                    h0_r,
+                    q_s,
+                    q_r,
+                    False,
+                )
+                pred_at_cr_ema, dm_at_cr_ema, _ = predictor_transition(
+                    predictor_ema_params,
+                    jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                    dt_a,
+                    dt_c,
+                    dit_time_emb,
+                    dit_time_emb_r,
+                    h0_r,
+                    q,
+                    q_r,
+                    True,
+                )
+                l_dt_cons_local, e_dt_cons_local = transition_distance(
+                    pred_bs_cr,
+                    dm_bs_cr,
+                    ms_bs_cr,
+                    pred_dt,
+                    jax.lax.stop_gradient(pred_at_cr_ema),
+                )
+
+                u_boot = l2_normalize_tokens(pred_bs_cr)
+                u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(pred_at_cr_ema))
+                cos_boot_local = jnp.sum(u_boot * u_teacher, axis=-1).mean()
+                loss_boot_local = 1.0 - cos_boot_local
+                if shortcut_loss_mode == "direction_magnitude":
+                    target_delta_m_ac = jax.lax.stop_gradient(dm_at_cr_ema)
+                    pred_delta_m_ac = dm_dt + dm_bs_cr
+                    loss_boot_mag_local = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+                    boot_target_rms_local = zero
+                    boot_pred_rms_local = zero
+                    boot_rel_residual_rms_local = zero
+                else:
+                    teacher_target = jax.lax.stop_gradient(pred_at_cr_ema)
+                    boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(teacher_target))
+                    boot_pred_rms = sample_activation_rms(pred_bs_cr)
+                    boot_residual_norm = (pred_bs_cr - teacher_target) / boot_target_rms
+                    loss_boot_mag_local = jnp.mean(
+                        optax.huber_loss(
+                            boot_residual_norm,
+                            delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                        )
+                    )
+                    boot_target_rms_local = jnp.mean(boot_target_rms)
+                    boot_pred_rms_local = jnp.mean(boot_pred_rms)
+                    boot_rel_residual_rms_local = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
+                return (
+                    l_depth_cons_local,
+                    l_time_cons_local,
+                    l_dt_cons_local,
+                    e_depth_cons_local,
+                    e_time_cons_local,
+                    e_dt_cons_local,
+                    loss_boot_local,
+                    loss_boot_mag_local,
+                    cos_boot_local,
+                    boot_target_rms_local,
+                    boot_pred_rms_local,
+                    boot_rel_residual_rms_local,
+                )
+
+            def zero_consistency_terms(_):
+                return (zero,) * 12
+
+            (
+                l_depth_cons,
+                l_time_cons,
+                l_dt_cons,
+                e_depth_cons,
+                e_time_cons,
+                e_dt_cons,
+                loss_boot_from_resync,
+                loss_boot_mag_from_resync,
+                cos_boot_from_resync,
+                boot_target_rms_metric_local,
+                boot_pred_rms_metric_local,
+                boot_rel_residual_rms_metric_local,
+            ) = jax.lax.cond(
+                dt_chain_active,
+                compute_consistency_terms,
+                zero_consistency_terms,
+                operand=None,
+            )
+
+            if use_output_time_distill:
+                u_dt_out = l2_normalize_tokens(pred_dt)
+                if shortcut_loss_mode == "direction_magnitude":
+                    m_dt_out = jnp.clip(ms_dt + mag_scale * dm_dt, mag_clip_min, mag_clip_max)
+                    z_hat_dt = jnp.exp(m_dt_out) * u_dt_out
+                else:
+                    z_hat_dt = pred_dt.astype(jnp.float32)
+                tail_params = params["backbone"] if dt_outdistill_train_tail else jax.tree_util.tree_map(
+                    jax.lax.stop_gradient,
+                    params["backbone"],
+                )
+                y_hat_s = state.apply_fn(
+                    {"params": tail_params},
+                    x_tau_s,
+                    timesteps=tau_s,
+                    vector=y,
+                    deterministic=False,
+                    rngs={"dropout": output_resume_drop_rng},
+                    resume_hidden=z_hat_dt,
+                    resume_start_layer=dt_b + 1,
+                )
+                loss_out_time = jnp.mean(jnp.square(y_hat_s - jax.lax.stop_gradient(pred_s)))
+                e_out_time = jnp.sqrt(loss_out_time)
             else:
-                z_hat_dt = pred_dt.astype(jnp.float32)
-            tail_params = params["backbone"] if dt_outdistill_train_tail else jax.tree_util.tree_map(
-                jax.lax.stop_gradient,
-                params["backbone"],
-            )
-            y_hat_s = state.apply_fn(
-                {"params": tail_params},
-                x_tau_s,
-                timesteps=tau_s,
-                vector=y,
-                deterministic=False,
-                rngs={"dropout": output_resume_drop_rng},
-                resume_hidden=z_hat_dt,
-                resume_start_layer=dt_b + 1,
-            )
-            loss_out_time = jnp.mean(jnp.square(y_hat_s - jax.lax.stop_gradient(pred_s)))
-            e_out_time = jnp.sqrt(loss_out_time)
+                loss_out_time = zero
+                e_out_time = zero
 
             l_depth = jnp.where(use_depth_loss, l_depth, zero)
             l_time = jnp.where(use_time_loss, l_time, zero)
             l_dt = jnp.where(use_dt_loss, l_dt, zero)
-            cons_mask = dt_cons_active.astype(jnp.float32)
-            l_depth_cons = jnp.where(use_depth_consistency, l_depth_cons * cons_mask, zero)
-            l_time_cons = jnp.where(use_time_consistency, l_time_cons * cons_mask, zero)
-            l_dt_cons = jnp.where(use_dt_consistency, l_dt_cons * cons_mask, zero)
-            loss_out_time = jnp.where(use_output_time_distill, loss_out_time, zero)
+            cons_loss_mask = dt_cons_loss_active.astype(jnp.float32)
+            l_depth_cons = jnp.where(use_depth_consistency, l_depth_cons * cons_loss_mask, zero)
+            l_time_cons = jnp.where(use_time_consistency, l_time_cons * cons_loss_mask, zero)
+            l_dt_cons = jnp.where(use_dt_consistency, l_dt_cons * cons_loss_mask, zero)
             return (
                 l_depth,
                 l_time,
@@ -3390,6 +3475,9 @@ def make_sample_latents_timestep_skip_pmap_fn(
     )
     predictor_cfg = predictor_config_from_name(shortcut_predictor_variant, config["hidden_size"])
     raw_overrides = dict(depth_shortcut_predictor_overrides or {})
+    dt_use_h0_target = bool(raw_overrides.pop("depth_shortcut_dt_use_h0_target", False))
+    dt_h0_fusion = raw_overrides.pop("depth_shortcut_dt_h0_fusion", "concat")
+    dt_cond_mode = raw_overrides.pop("depth_shortcut_dt_cond_mode", "concat_mlp")
     # Accept either apply_predictor_config_overrides-style keys (arch, hidden_size, ...)
     # or SelfFlowDiT depth_shortcut-prefixed keys from call sites.
     if "depth_shortcut_predictor_arch" in raw_overrides:
@@ -3412,6 +3500,9 @@ def make_sample_latents_timestep_skip_pmap_fn(
         hidden_size=config["hidden_size"],
         depth=config["depth"],
         num_tokens=(config["input_size"] // config["patch_size"]) ** 2,
+        dt_use_h0_target=dt_use_h0_target,
+        dt_h0_fusion=dt_h0_fusion,
+        dt_cond_mode=dt_cond_mode,
         **predictor_cfg,
     )
     patch_size = config["patch_size"]
@@ -4366,6 +4457,9 @@ def main():
         "depth_shortcut_predictor_attention_every": args.shortcut_predictor_attention_every,
         "depth_shortcut_predictor_num_heads": args.shortcut_predictor_num_heads,
         "depth_shortcut_predictor_adaln_zero": args.shortcut_predictor_adaln_zero,
+        "depth_shortcut_dt_use_h0_target": args.dt_use_h0_target,
+        "depth_shortcut_dt_h0_fusion": args.dt_h0_fusion,
+        "depth_shortcut_dt_cond_mode": args.dt_cond_mode,
     }
     if args.shortcut_skip_in_loop_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
