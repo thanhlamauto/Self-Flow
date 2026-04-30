@@ -3389,7 +3389,25 @@ def make_sample_latents_timestep_skip_pmap_fn(
         per_token=False,
     )
     predictor_cfg = predictor_config_from_name(shortcut_predictor_variant, config["hidden_size"])
-    predictor_cfg = apply_predictor_config_overrides(predictor_cfg, **(depth_shortcut_predictor_overrides or {}))
+    raw_overrides = dict(depth_shortcut_predictor_overrides or {})
+    # Accept either apply_predictor_config_overrides-style keys (arch, hidden_size, ...)
+    # or SelfFlowDiT depth_shortcut-prefixed keys from call sites.
+    if "depth_shortcut_predictor_arch" in raw_overrides:
+        predictor_overrides = {
+            "arch": raw_overrides.get("depth_shortcut_predictor_arch"),
+            "hidden_size": raw_overrides.get("depth_shortcut_predictor_hidden_size"),
+            "depth": raw_overrides.get("depth_shortcut_predictor_depth"),
+            "mlp_ratio": raw_overrides.get("depth_shortcut_predictor_mlp_ratio"),
+            "dilation_cycle": raw_overrides.get("depth_shortcut_predictor_dilation_cycle"),
+            "grid_size": raw_overrides.get("depth_shortcut_predictor_grid_size"),
+            "residual_output": raw_overrides.get("depth_shortcut_predictor_residual_output"),
+            "attention_every": raw_overrides.get("depth_shortcut_predictor_attention_every"),
+            "num_heads": raw_overrides.get("depth_shortcut_predictor_num_heads"),
+            "adaln_zero": raw_overrides.get("depth_shortcut_predictor_adaln_zero"),
+        }
+    else:
+        predictor_overrides = raw_overrides
+    predictor_cfg = apply_predictor_config_overrides(predictor_cfg, **predictor_overrides)
     predictor = DepthShortcutPredictor(
         hidden_size=config["hidden_size"],
         depth=config["depth"],
