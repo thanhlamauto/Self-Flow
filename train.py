@@ -1002,8 +1002,12 @@ def train_step(
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
     use_depth_time_resync=True,
+    use_timestep_shortcut=False,
     use_legacy_direct_loss=True,
     use_legacy_bootstrap_loss=True,
+    use_timestep_direct_loss=True,
+    use_timestep_bootstrap_loss=True,
+    use_timestep_output_distill=True,
     use_depth_loss=True,
     use_time_loss=True,
     use_dt_loss=True,
@@ -1024,6 +1028,8 @@ def train_step(
     dt_layer_sampling_mode="uniform",
     dt_consistency_prob=1.0,
     dt_outdistill_train_tail=False,
+    timestep_shortcut_layer=5,
+    timestep_output_distill_train_tail=False,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -1100,9 +1106,17 @@ def train_step(
         ),
     )
 
+    timestep_direct_requested = bool(use_timestep_shortcut and use_timestep_direct_loss)
+    timestep_bootstrap_requested = bool(use_timestep_shortcut and use_timestep_bootstrap_loss)
+    timestep_output_requested = bool(use_timestep_shortcut and use_timestep_output_distill)
+    timestep_shortcut_requested = bool(
+        timestep_direct_requested or timestep_bootstrap_requested or timestep_output_requested
+    )
+    needs_ordered_timesteps = bool(use_depth_time_resync or timestep_shortcut_requested)
+
     max_dt_gap = int(max(tuple(dt_delta_t_values) or (1,)))
     q_max = shortcut_timesteps - 1 - jnp.asarray(
-        max_dt_gap * 2 if use_depth_time_resync else 0,
+        max_dt_gap * 2 if needs_ordered_timesteps else 0,
         dtype=jnp.int32,
     )
     q_max = jnp.maximum(q_max, 0)
@@ -1156,6 +1170,12 @@ def train_step(
             and dt_consistency_prob > 0.0
         )
         dt_legacy_bootstrap_requested = bool(use_depth_time_resync and use_legacy_bootstrap_loss)
+        needs_s_forward = bool(use_depth_time_resync or timestep_shortcut_requested)
+        needs_r_forward = bool(
+            dt_cons_loss_requested
+            or dt_legacy_bootstrap_requested
+            or timestep_bootstrap_requested
+        )
         if dt_cons_loss_requested:
             if dt_consistency_prob >= 1.0:
                 dt_cons_loss_active = jnp.asarray(True, dtype=jnp.bool_)
@@ -1167,11 +1187,14 @@ def train_step(
         else:
             dt_cons_loss_active = jnp.asarray(False, dtype=jnp.bool_)
         dt_chain_active = jnp.logical_or(
-            dt_cons_loss_active,
-            jnp.asarray(dt_legacy_bootstrap_requested, dtype=jnp.bool_),
+            jnp.logical_or(
+                dt_cons_loss_active,
+                jnp.asarray(dt_legacy_bootstrap_requested, dtype=jnp.bool_),
+            ),
+            jnp.asarray(timestep_bootstrap_requested, dtype=jnp.bool_),
         )
 
-        if use_depth_time_resync:
+        if needs_s_forward:
             pred_s, hidden_tuple_s, dit_time_emb_s = state.apply_fn(
                 {"params": params["backbone"]},
                 x_tau_s,
@@ -1202,7 +1225,7 @@ def train_step(
         def empty_r_states(_):
             return jnp.zeros_like(hidden_stack_s_f32), jnp.zeros_like(dit_time_emb_s)
 
-        if dt_cons_loss_requested or dt_legacy_bootstrap_requested:
+        if needs_r_forward:
             if dt_consistency_prob >= 1.0:
                 hidden_stack_r_f32, dit_time_emb_r = compute_r_states(None)
             else:
@@ -1249,7 +1272,7 @@ def train_step(
             )
             return y_pred, delta_m_pred, m_source
 
-        def transition_distance(y_pred, delta_m_pred, m_source, source_hidden, target_hidden):
+        def transition_components(y_pred, delta_m_pred, m_source, target_hidden):
             target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
             pred_u = l2_normalize_tokens(y_pred)
             target_u, target_m, _ = build_direction_and_norm_map(target_hidden)
@@ -1269,6 +1292,16 @@ def train_step(
                     )
                 )
                 error = jnp.sqrt(jnp.mean(jnp.square(residual_norm)))
+            return loss_dir_pred, loss_aux_pred, error
+
+        def transition_distance(y_pred, delta_m_pred, m_source, source_hidden, target_hidden):
+            del source_hidden
+            loss_dir_pred, loss_aux_pred, error = transition_components(
+                y_pred,
+                delta_m_pred,
+                m_source,
+                target_hidden,
+            )
             return lambda_dir * loss_dir_pred + lambda_mag * loss_aux_pred, error
 
         def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
@@ -2126,6 +2159,152 @@ def train_step(
                 boot_pred_rms_from_resync,
                 boot_rel_residual_rms_from_resync,
             ) = (jnp.float32(0.0),) * 22
+
+        def compute_timestep_shortcut_losses():
+            zero = jnp.float32(0.0)
+            ts_layer = jnp.asarray(
+                min(max(int(timestep_shortcut_layer), 0), int(hidden_stack_f32.shape[0]) - 1),
+                dtype=jnp.int32,
+            )
+            h0_s = hidden_stack_s_f32[0]
+            pred_ts, dm_ts, ms_ts = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[ts_layer],
+                ts_layer,
+                ts_layer,
+                dit_time_emb,
+                dit_time_emb_s,
+                h0_s,
+                q,
+                q_s,
+                False,
+            )
+            ts_direct_dir, ts_direct_aux, e_ts_direct = transition_components(
+                pred_ts,
+                dm_ts,
+                ms_ts,
+                hidden_stack_s_f32[ts_layer],
+            )
+            loss_ts_direct = lambda_dir * ts_direct_dir + lambda_mag * ts_direct_aux
+            loss_ts_direct = jnp.where(use_timestep_direct_loss, loss_ts_direct, zero)
+
+            if use_timestep_bootstrap_loss:
+                h0_r = hidden_stack_r_f32[0]
+                pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
+                    params["predictor"],
+                    pred_ts,
+                    ts_layer,
+                    ts_layer,
+                    dit_time_emb_s,
+                    dit_time_emb_r,
+                    h0_r,
+                    q_s,
+                    q_r,
+                    False,
+                )
+                pred_tr_ema, _, _ = predictor_transition(
+                    predictor_ema_params,
+                    jax.lax.stop_gradient(hidden_stack_f32[ts_layer]),
+                    ts_layer,
+                    ts_layer,
+                    dit_time_emb,
+                    dit_time_emb_r,
+                    h0_r,
+                    q,
+                    q_r,
+                    True,
+                )
+                ts_boot_dir, ts_boot_aux, e_ts_boot = transition_components(
+                    pred_ts_sr,
+                    dm_ts_sr,
+                    ms_ts_sr,
+                    jax.lax.stop_gradient(pred_tr_ema),
+                )
+                loss_ts_boot = lambda_boot * ts_boot_dir + lambda_boot_mag * ts_boot_aux
+            else:
+                ts_boot_dir = zero
+                ts_boot_aux = zero
+                e_ts_boot = zero
+                loss_ts_boot = zero
+
+            if use_timestep_output_distill:
+                u_ts_out = l2_normalize_tokens(pred_ts)
+                if shortcut_loss_mode == "direction_magnitude":
+                    m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
+                    z_hat_ts = jnp.exp(m_ts_out) * u_ts_out
+                else:
+                    z_hat_ts = pred_ts.astype(jnp.float32)
+                tail_params = params["backbone"] if timestep_output_distill_train_tail else jax.tree_util.tree_map(
+                    jax.lax.stop_gradient,
+                    params["backbone"],
+                )
+                y_hat_s = state.apply_fn(
+                    {"params": tail_params},
+                    x_tau_s,
+                    timesteps=tau_s,
+                    vector=y,
+                    deterministic=False,
+                    rngs={"dropout": output_resume_drop_rng},
+                    resume_hidden=z_hat_ts,
+                    resume_start_layer=ts_layer + 1,
+                )
+                reduce_axes = tuple(range(1, y_hat_s.ndim))
+                target_s = jax.lax.stop_gradient(pred_s)
+                numer = jnp.sum(jnp.square(y_hat_s - target_s), axis=reduce_axes)
+                denom = jnp.sum(jnp.square(target_s), axis=reduce_axes) + 1e-6
+                loss_ts_out = jnp.mean(numer / denom)
+                e_ts_out = jnp.sqrt(jnp.mean(jnp.square(y_hat_s - target_s)))
+            else:
+                loss_ts_out = zero
+                e_ts_out = zero
+
+            loss_ts_total = loss_ts_direct + loss_ts_boot + lambda_output_distill * loss_ts_out
+            return (
+                loss_ts_direct,
+                ts_direct_dir,
+                ts_direct_aux,
+                loss_ts_boot,
+                ts_boot_dir,
+                ts_boot_aux,
+                loss_ts_out,
+                loss_ts_total,
+                e_ts_direct,
+                e_ts_boot,
+                e_ts_out,
+                ts_layer.astype(jnp.float32),
+            )
+
+        if timestep_shortcut_requested:
+            (
+                loss_timestep_direct,
+                loss_timestep_direct_dir,
+                loss_timestep_direct_aux,
+                loss_timestep_boot,
+                loss_timestep_boot_dir,
+                loss_timestep_boot_aux,
+                loss_timestep_output,
+                loss_timestep_total,
+                e_timestep_direct,
+                e_timestep_boot,
+                e_timestep_output,
+                timestep_layer_metric,
+            ) = compute_timestep_shortcut_losses()
+        else:
+            (
+                loss_timestep_direct,
+                loss_timestep_direct_dir,
+                loss_timestep_direct_aux,
+                loss_timestep_boot,
+                loss_timestep_boot_dir,
+                loss_timestep_boot_aux,
+                loss_timestep_output,
+                loss_timestep_total,
+                e_timestep_direct,
+                e_timestep_boot,
+                e_timestep_output,
+                timestep_layer_metric,
+            ) = (jnp.float32(0.0),) * 12
+
         loss_depth_time_total = (
             lambda_depth * loss_depth_dt
             + lambda_time * loss_time_dt
@@ -2172,6 +2351,7 @@ def train_step(
             loss_gen
             + legacy_shortcut_total
             + loss_depth_time_total
+            + loss_timestep_total
             + lambda_private_eff * loss_private
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
@@ -2200,6 +2380,14 @@ def train_step(
             loss_dt_cons_dt,
             loss_out_time_dt,
             loss_depth_time_total,
+            loss_timestep_direct,
+            loss_timestep_direct_dir,
+            loss_timestep_direct_aux,
+            loss_timestep_boot,
+            loss_timestep_boot_dir,
+            loss_timestep_boot_aux,
+            loss_timestep_output,
+            loss_timestep_total,
             e_depth_dt,
             e_time_dt,
             e_dt_dt,
@@ -2207,6 +2395,10 @@ def train_step(
             e_time_cons_dt,
             e_dt_cons_dt,
             e_out_time_dt,
+            e_timestep_direct,
+            e_timestep_boot,
+            e_timestep_output,
+            timestep_layer_metric,
             dt_gap.astype(jnp.float32),
             dt_gap_l1.astype(jnp.float32),
             dt_a.astype(jnp.float32),
@@ -2283,6 +2475,14 @@ def train_step(
         loss_dt_cons_dt,
         loss_out_time_dt,
         loss_depth_time_total,
+        loss_timestep_direct,
+        loss_timestep_direct_dir,
+        loss_timestep_direct_aux,
+        loss_timestep_boot,
+        loss_timestep_boot_dir,
+        loss_timestep_boot_aux,
+        loss_timestep_output,
+        loss_timestep_total,
         e_depth_dt,
         e_time_dt,
         e_dt_dt,
@@ -2290,6 +2490,10 @@ def train_step(
         e_time_cons_dt,
         e_dt_cons_dt,
         e_out_time_dt,
+        e_timestep_direct,
+        e_timestep_boot,
+        e_timestep_output,
+        timestep_layer_metric,
         dt_gap_metric,
         dt_layer_gap_metric,
         dt_layer_a_metric,
@@ -2363,6 +2567,14 @@ def train_step(
     loss_dt_cons_dt = jax.lax.pmean(loss_dt_cons_dt, axis_name="batch")
     loss_out_time_dt = jax.lax.pmean(loss_out_time_dt, axis_name="batch")
     loss_depth_time_total = jax.lax.pmean(loss_depth_time_total, axis_name="batch")
+    loss_timestep_direct = jax.lax.pmean(loss_timestep_direct, axis_name="batch")
+    loss_timestep_direct_dir = jax.lax.pmean(loss_timestep_direct_dir, axis_name="batch")
+    loss_timestep_direct_aux = jax.lax.pmean(loss_timestep_direct_aux, axis_name="batch")
+    loss_timestep_boot = jax.lax.pmean(loss_timestep_boot, axis_name="batch")
+    loss_timestep_boot_dir = jax.lax.pmean(loss_timestep_boot_dir, axis_name="batch")
+    loss_timestep_boot_aux = jax.lax.pmean(loss_timestep_boot_aux, axis_name="batch")
+    loss_timestep_output = jax.lax.pmean(loss_timestep_output, axis_name="batch")
+    loss_timestep_total = jax.lax.pmean(loss_timestep_total, axis_name="batch")
     e_depth_dt = jax.lax.pmean(e_depth_dt, axis_name="batch")
     e_time_dt = jax.lax.pmean(e_time_dt, axis_name="batch")
     e_dt_dt = jax.lax.pmean(e_dt_dt, axis_name="batch")
@@ -2370,6 +2582,10 @@ def train_step(
     e_time_cons_dt = jax.lax.pmean(e_time_cons_dt, axis_name="batch")
     e_dt_cons_dt = jax.lax.pmean(e_dt_cons_dt, axis_name="batch")
     e_out_time_dt = jax.lax.pmean(e_out_time_dt, axis_name="batch")
+    e_timestep_direct = jax.lax.pmean(e_timestep_direct, axis_name="batch")
+    e_timestep_boot = jax.lax.pmean(e_timestep_boot, axis_name="batch")
+    e_timestep_output = jax.lax.pmean(e_timestep_output, axis_name="batch")
+    timestep_layer_metric = jax.lax.pmean(timestep_layer_metric, axis_name="batch")
     dt_gap_metric = jax.lax.pmean(dt_gap_metric, axis_name="batch")
     dt_layer_gap_metric = jax.lax.pmean(dt_layer_gap_metric, axis_name="batch")
     dt_layer_a_metric = jax.lax.pmean(dt_layer_a_metric, axis_name="batch")
@@ -2465,6 +2681,18 @@ def train_step(
         "train/L_out_time": loss_out_time_dt,
         "train/L_total": loss,
         "train/loss_depth_time_total": loss_depth_time_total,
+        "train/L_timestep_direct": loss_timestep_direct,
+        "train/L_timestep_direct_dir": loss_timestep_direct_dir,
+        "train/L_timestep_direct_aux": loss_timestep_direct_aux,
+        "train/L_timestep_boot": loss_timestep_boot,
+        "train/L_timestep_boot_dir": loss_timestep_boot_dir,
+        "train/L_timestep_boot_aux": loss_timestep_boot_aux,
+        "train/L_timestep_output": loss_timestep_output,
+        "train/loss_timestep_total": loss_timestep_total,
+        "metric/E_timestep_direct": e_timestep_direct,
+        "metric/E_timestep_boot": e_timestep_boot,
+        "metric/E_timestep_output": e_timestep_output,
+        "train/timestep_shortcut_layer": timestep_layer_metric,
         "metric/E_depth": e_depth_dt,
         "metric/E_time": e_time_dt,
         "metric/E_dt": e_dt_dt,
@@ -2796,6 +3024,8 @@ class WandbRunSummaryFile:
         "val/sFID",
         "val/FID_skip_3to7",
         "val/sFID_skip_3to7",
+        "val/FID_skip_timestep",
+        "val/sFID_skip_timestep",
         "val/FID_skip_timestep_l5_j2",
         "val/sFID_skip_timestep_l5_j2",
         "train/loss",
@@ -3441,6 +3671,7 @@ def make_sample_latents_timestep_skip_pmap_fn(
     skip_layer=5,
     skip_jump_steps=2,
     skip_every_steps=2,
+    skip_reference_num_steps=None,
 ):
     """Build a sharded sampler that does timestep jumping via layer predictor.
 
@@ -3458,6 +3689,9 @@ def make_sample_latents_timestep_skip_pmap_fn(
         raise ValueError(f"skip_jump_steps must be positive, got {skip_jump_steps}")
     if int(skip_every_steps) <= 0:
         raise ValueError(f"skip_every_steps must be positive, got {skip_every_steps}")
+    reference_num_steps = int(skip_reference_num_steps or num_steps)
+    if reference_num_steps <= 1:
+        raise ValueError(f"skip_reference_num_steps must be greater than 1, got {reference_num_steps}")
 
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -3540,13 +3774,16 @@ def make_sample_latents_timestep_skip_pmap_fn(
                 axis=0,
             )
 
-        t_scale = jnp.asarray(0.96 / float(max(int(num_steps) - 1, 1)), dtype=jnp.float32)
+        t_scale = jnp.asarray(0.96 / float(max(reference_num_steps - 1, 1)), dtype=jnp.float32)
 
         def model_fn(z_x, t):
             t_scalar = t[0] if t.ndim > 0 else t
-            step_idx = jnp.rint(t_scalar * float(num_steps - 1) / 0.96).astype(jnp.int32)
-            step_idx = jnp.clip(step_idx, 0, int(num_steps) - 1)
-            jump_idx = jnp.minimum(step_idx + jnp.asarray(int(skip_jump_steps), dtype=jnp.int32), int(num_steps) - 1)
+            step_idx = jnp.rint(t_scalar * float(reference_num_steps - 1) / 0.96).astype(jnp.int32)
+            step_idx = jnp.clip(step_idx, 0, reference_num_steps - 1)
+            jump_idx = jnp.minimum(
+                step_idx + jnp.asarray(int(skip_jump_steps), dtype=jnp.int32),
+                reference_num_steps - 1,
+            )
             can_jump = jump_idx > step_idx
             jump_now = jnp.logical_and((step_idx % int(skip_every_steps)) == 0, can_jump)
 
@@ -4029,12 +4266,36 @@ def main():
     )
     parser.add_argument("--use-depth-time-resync", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--use-timestep-shortcut",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train a fixed-layer timestep shortcut objective: direct t->s, "
+            "bootstrap t->s->r, and timestep output distillation."
+        ),
+    )
+    parser.add_argument(
+        "--timestep-shortcut-layer",
+        type=int,
+        default=5,
+        help="Layer index used for timestep-only shortcut losses. 0 means patch-embed tokens.",
+    )
+    parser.add_argument("--use-timestep-direct-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-timestep-bootstrap-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-timestep-output-distill", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--timestep-output-distill-train-tail",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow timestep output distillation gradients to update DiT tail layers. Default predictor-only tail.",
+    )
+    parser.add_argument(
         "--use-legacy-direct-loss",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
             "Enable legacy direct shortcut loss (Ldirect). "
-            "Default: disabled when --use-depth-time-resync is enabled, enabled otherwise."
+            "Default: disabled when --use-depth-time-resync or --use-timestep-shortcut is enabled, enabled otherwise."
         ),
     )
     parser.add_argument(
@@ -4043,7 +4304,7 @@ def main():
         default=None,
         help=(
             "Enable legacy bootstrap shortcut loss (Lboot). "
-            "Default: disabled when --use-depth-time-resync is enabled, enabled otherwise."
+            "Default: disabled when --use-depth-time-resync or --use-timestep-shortcut is enabled, enabled otherwise."
         ),
     )
     parser.add_argument("--use-depth-loss", action=argparse.BooleanOptionalAction, default=True)
@@ -4269,6 +4530,15 @@ def main():
     parser.add_argument("--fid-timestep-skip-layer", type=int, default=5)
     parser.add_argument("--fid-timestep-skip-jump", type=int, default=2)
     parser.add_argument("--fid-timestep-skip-every", type=int, default=2)
+    parser.add_argument(
+        "--fid-timestep-skip-num-steps",
+        type=int,
+        default=None,
+        help=(
+            "Denoising steps for timestep-skip FID only. Default uses --fid-num-steps. "
+            "Set to 2 with --fid-timestep-skip-jump 25 to evaluate a 50-step sampler collapsed to 2 steps."
+        ),
+    )
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
@@ -4304,6 +4574,8 @@ def main():
         raise ValueError("--fid-timestep-skip-jump must be > 0")
     if args.fid_timestep_skip_every <= 0:
         raise ValueError("--fid-timestep-skip-every must be > 0")
+    if args.fid_timestep_skip_num_steps is not None and args.fid_timestep_skip_num_steps <= 1:
+        raise ValueError("--fid-timestep-skip-num-steps must be > 1")
     if args.inception_score_splits <= 0:
         raise ValueError("--inception-score-splits must be greater than 0")
     if args.pr_k <= 0:
@@ -4465,6 +4737,8 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
     if args.shortcut_skip_in_loop_max_gap > depth:
         raise ValueError("--shortcut-skip-in-loop-max-gap must be <= model depth")
+    if args.timestep_shortcut_layer < 0 or args.timestep_shortcut_layer > depth:
+        raise ValueError(f"--timestep-shortcut-layer must be in [0, {depth}]")
     if args.private_loss and args.lambda_private <= 0.0:
         raise ValueError("--private-loss requires --lambda-private > 0")
     if args.lambda_private < 0.0:
@@ -4491,14 +4765,14 @@ def main():
     use_legacy_direct_loss = (
         bool(args.use_legacy_direct_loss)
         if args.use_legacy_direct_loss is not None
-        else (not args.use_depth_time_resync)
+        else (not args.use_depth_time_resync and not args.use_timestep_shortcut)
     )
     use_legacy_bootstrap_loss = (
         bool(args.use_legacy_bootstrap_loss)
         if args.use_legacy_bootstrap_loss is not None
-        else (not args.use_depth_time_resync)
+        else (not args.use_depth_time_resync and not args.use_timestep_shortcut)
     )
-    legacy_disabled_by_resync = bool(args.use_depth_time_resync) and (
+    legacy_disabled_by_resync = bool(args.use_depth_time_resync or args.use_timestep_shortcut) and (
         (args.use_legacy_direct_loss is None and not use_legacy_direct_loss)
         or (args.use_legacy_bootstrap_loss is None and not use_legacy_bootstrap_loss)
     )
@@ -4549,6 +4823,21 @@ def main():
         inactive_losses.extend(
             ["Ldepth", "Ltime", "Ldt", "Ldepth_cons", "Ltime_cons", "Ldt_cons", "Lout_time"]
         )
+    if args.use_timestep_shortcut:
+        if args.use_timestep_direct_loss:
+            active_losses.append("Ltimestep_direct")
+        else:
+            inactive_losses.append("Ltimestep_direct")
+        if args.use_timestep_bootstrap_loss:
+            active_losses.append("Ltimestep_boot")
+        else:
+            inactive_losses.append("Ltimestep_boot")
+        if args.use_timestep_output_distill:
+            active_losses.append("Ltimestep_output")
+        else:
+            inactive_losses.append("Ltimestep_output")
+    else:
+        inactive_losses.extend(["Ltimestep_direct", "Ltimestep_boot", "Ltimestep_output"])
     if args.shortcut_lambda_skip_fm > 0.0 and args.shortcut_skip_in_loop_prob > 0.0:
         active_losses.append("Lskip_fm")
     else:
@@ -4583,6 +4872,9 @@ def main():
         f"output_distill_update_mode={args.output_distill_update_mode} "
         f"output_distill_full_backbone_start_step={args.output_distill_full_backbone_start_step} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
+        f"timestep_shortcut={args.use_timestep_shortcut} "
+        f"timestep_layer={args.timestep_shortcut_layer} "
+        f"timestep_output_train_tail={args.timestep_output_distill_train_tail} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
@@ -4611,6 +4903,7 @@ def main():
         f"active={','.join(active_losses)} "
         f"inactive={','.join(inactive_losses)} "
         f"use_depth_time_resync={args.use_depth_time_resync} "
+        f"use_timestep_shortcut={args.use_timestep_shortcut} "
         f"use_legacy_direct_loss={use_legacy_direct_loss} "
         f"use_legacy_bootstrap_loss={use_legacy_bootstrap_loss} "
         f"legacy_disabled_by_resync_default={legacy_disabled_by_resync}"
@@ -4777,8 +5070,12 @@ def main():
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
             use_depth_time_resync=args.use_depth_time_resync,
+            use_timestep_shortcut=args.use_timestep_shortcut,
             use_legacy_direct_loss=use_legacy_direct_loss,
             use_legacy_bootstrap_loss=use_legacy_bootstrap_loss,
+            use_timestep_direct_loss=args.use_timestep_direct_loss,
+            use_timestep_bootstrap_loss=args.use_timestep_bootstrap_loss,
+            use_timestep_output_distill=args.use_timestep_output_distill,
             use_depth_loss=args.use_depth_loss,
             use_time_loss=args.use_time_loss,
             use_dt_loss=args.use_dt_loss,
@@ -4799,6 +5096,8 @@ def main():
             dt_layer_sampling_mode=args.dt_layer_sampling_mode,
             dt_consistency_prob=args.dt_consistency_prob,
             dt_outdistill_train_tail=args.dt_outdistill_train_tail,
+            timestep_shortcut_layer=args.timestep_shortcut_layer,
+            timestep_output_distill_train_tail=args.timestep_output_distill_train_tail,
         ),
         axis_name="batch",
     )
@@ -4866,10 +5165,11 @@ def main():
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
         )
     fid_sample_latents_timestep_skip_pmapped = None
+    fid_timestep_skip_num_steps = int(args.fid_timestep_skip_num_steps or args.fid_num_steps)
     if args.fid_timestep_skip_eval:
         fid_sample_latents_timestep_skip_pmapped = make_sample_latents_timestep_skip_pmap_fn(
             config,
-            num_steps=args.fid_num_steps,
+            num_steps=fid_timestep_skip_num_steps,
             cfg_scale=args.fid_cfg_scale,
             shortcut_predictor_variant=args.shortcut_predictor,
             shortcut_timesteps=args.shortcut_timesteps,
@@ -4882,6 +5182,7 @@ def main():
             skip_layer=args.fid_timestep_skip_layer,
             skip_jump_steps=args.fid_timestep_skip_jump,
             skip_every_steps=args.fid_timestep_skip_every,
+            skip_reference_num_steps=args.fid_num_steps,
         )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
@@ -5421,7 +5722,9 @@ def main():
         if args.fid_timestep_skip_eval and fid_sample_latents_timestep_skip_pmapped is not None:
             log_stage(
                 f"[EVAL] generating timestep-skip fake pool: {need} samples @ step {step} "
-                f"(layer={args.fid_timestep_skip_layer}, jump={args.fid_timestep_skip_jump}, every={args.fid_timestep_skip_every})…"
+                f"(steps={fid_timestep_skip_num_steps}, ref_steps={args.fid_num_steps}, "
+                f"layer={args.fid_timestep_skip_layer}, jump={args.fid_timestep_skip_jump}, "
+                f"every={args.fid_timestep_skip_every})..."
             )
             acc_tskip_pooled = init_gaussian_sums(2048)
             acc_tskip_spatial = init_gaussian_sums(2048)
@@ -5458,11 +5761,18 @@ def main():
 
             mu_tskip, cov_tskip, _ = finalize_gaussian_sums(acc_tskip_pooled)
             mu_tskip_s, cov_tskip_s, _ = finalize_gaussian_sums(acc_tskip_spatial)
-            metrics["val/FID_skip_timestep_l5_j2"] = fid_from_stats(mu_real, cov_real, mu_tskip, cov_tskip)
-            metrics["val/sFID_skip_timestep_l5_j2"] = fid_from_stats(mu_real_s, cov_real_s, mu_tskip_s, cov_tskip_s)
+            fid_tskip = fid_from_stats(mu_real, cov_real, mu_tskip, cov_tskip)
+            sfid_tskip = fid_from_stats(mu_real_s, cov_real_s, mu_tskip_s, cov_tskip_s)
+            metrics["val/FID_skip_timestep"] = fid_tskip
+            metrics["val/sFID_skip_timestep"] = sfid_tskip
+            if args.fid_timestep_skip_layer == 5 and args.fid_timestep_skip_jump == 2:
+                metrics["val/FID_skip_timestep_l5_j2"] = fid_tskip
+                metrics["val/sFID_skip_timestep_l5_j2"] = sfid_tskip
             metrics["val/FID_skip_timestep_layer"] = float(args.fid_timestep_skip_layer)
             metrics["val/FID_skip_timestep_jump"] = float(args.fid_timestep_skip_jump)
             metrics["val/FID_skip_timestep_every"] = float(args.fid_timestep_skip_every)
+            metrics["val/FID_skip_timestep_num_steps"] = float(fid_timestep_skip_num_steps)
+            metrics["val/FID_skip_timestep_ref_num_steps"] = float(args.fid_num_steps)
 
         if pr_enabled:
             pr_mode = real.get("pr", {}).get("mode", pr_mode)
@@ -5515,9 +5825,9 @@ def main():
         if "val/FID_skip_3to7" in metrics:
             summary_parts.append(f"FIDskip3to7={metrics['val/FID_skip_3to7']:.2f}")
             summary_parts.append(f"sFIDskip3to7={metrics['val/sFID_skip_3to7']:.2f}")
-        if "val/FID_skip_timestep_l5_j2" in metrics:
-            summary_parts.append(f"FIDskipT={metrics['val/FID_skip_timestep_l5_j2']:.2f}")
-            summary_parts.append(f"sFIDskipT={metrics['val/sFID_skip_timestep_l5_j2']:.2f}")
+        if "val/FID_skip_timestep" in metrics:
+            summary_parts.append(f"FIDskipT={metrics['val/FID_skip_timestep']:.2f}")
+            summary_parts.append(f"sFIDskipT={metrics['val/sFID_skip_timestep']:.2f}")
         if is_enabled and "val/InceptionScore" in metrics:
             summary_parts.append(f"IS={metrics['val/InceptionScore']:.2f}")
         if "val/Precision" in metrics and "val/Recall" in metrics:
