@@ -416,6 +416,10 @@ class DepthShortcutPredictor(nn.Module):
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    dt_use_h0_target: bool = False
+    dt_h0_fusion: str = "concat"
+    dt_cond_mode: str = "concat_mlp"
+    dt_max_time_bins: int = 4096
 
     @property
     def grid_size(self) -> int:
@@ -431,9 +435,18 @@ class DepthShortcutPredictor(nn.Module):
         m_source: jax.Array | None = None,
         detach_timestep_embed: bool = True,
         use_timestep_embed: bool = True,
+        h0_tgt: jax.Array | None = None,
+        timestep_tgt_embed: jax.Array | None = None,
+        t_src_idx: jax.Array | None = None,
+        t_tgt_idx: jax.Array | None = None,
+        delta_t_idx: jax.Array | None = None,
     ) -> jax.Array:
         batch_size = u_source.shape[0]
         cond_dim = int(self.cond_dim or self.width)
+        if self.dt_h0_fusion not in {"add", "concat"}:
+            raise ValueError(f"Unknown h0 fusion mode: {self.dt_h0_fusion!r}")
+        if self.dt_cond_mode not in {"sum", "concat_mlp", "factorized"}:
+            raise ValueError(f"Unknown depth-time conditioning mode: {self.dt_cond_mode!r}")
         source_layer = jnp.asarray(source_layer, dtype=jnp.int32)
         target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
         delta = target_layer - source_layer
@@ -442,6 +455,44 @@ class DepthShortcutPredictor(nn.Module):
             t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
         else:
             t_cond = jnp.zeros_like(timestep_embed)
+        if timestep_tgt_embed is None:
+            t_tgt_cond = t_cond
+        elif use_timestep_embed:
+            t_tgt_cond = jax.lax.stop_gradient(timestep_tgt_embed) if detach_timestep_embed else timestep_tgt_embed
+        else:
+            t_tgt_cond = jnp.zeros_like(timestep_embed)
+        t_delta_cond = t_cond - t_tgt_cond
+
+        def time_idx_embed(name: str, idx: jax.Array | None):
+            if idx is None:
+                return jnp.zeros((batch_size, cond_dim), dtype=t_cond.dtype)
+            idx = jnp.asarray(idx, dtype=jnp.int32)
+            idx = jnp.clip(idx, 0, int(self.dt_max_time_bins) - 1)
+            emb = nn.Embed(
+                num_embeddings=int(self.dt_max_time_bins),
+                features=cond_dim,
+                embedding_init=NORMAL_002,
+                name=name,
+            )(idx)
+            if emb.ndim == 1:
+                emb = jnp.broadcast_to(emb[None, :], (batch_size, cond_dim))
+            return emb
+
+        def cond_mlp(name: str, x: jax.Array, out_dim: int) -> jax.Array:
+            h_cond = nn.Dense(
+                out_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name=f"{name}_0",
+            )(x)
+            h_cond = nn.gelu(h_cond, approximate=True)
+            return nn.Dense(
+                out_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name=f"{name}_1",
+            )(h_cond)
+
         if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
             t_proj = nn.Dense(
                 cond_dim,
@@ -461,12 +512,52 @@ class DepthShortcutPredictor(nn.Module):
                 embedding_init=NORMAL_002,
                 name="cond_delta_embed",
             )
-            c = (
-                t_proj
-                + layer_embed(source_layer)
-                + layer_embed(target_layer)
-                + delta_embed(jnp.clip(delta - 1, 0, self.depth - 1))
-            )
+            e_a = layer_embed(source_layer)
+            e_b = layer_embed(target_layer)
+            e_delta_layer = delta_embed(jnp.clip(delta - 1, 0, self.depth - 1))
+            if e_a.ndim == 1:
+                e_a = jnp.broadcast_to(e_a[None, :], (batch_size, cond_dim))
+                e_b = jnp.broadcast_to(e_b[None, :], (batch_size, cond_dim))
+                e_delta_layer = jnp.broadcast_to(e_delta_layer[None, :], (batch_size, cond_dim))
+            e_t = t_proj + time_idx_embed("cond_t_src_idx_embed", t_src_idx)
+            e_s = nn.Dense(
+                cond_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_t_tgt_proj",
+            )(t_tgt_cond) + time_idx_embed("cond_t_tgt_idx_embed", t_tgt_idx)
+            e_delta_t = nn.Dense(
+                cond_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_t_delta_proj",
+            )(t_delta_cond) + time_idx_embed("cond_delta_t_idx_embed", delta_t_idx)
+            if self.dt_cond_mode == "sum":
+                c = e_a + e_b + e_delta_layer + e_t + e_s + e_delta_t
+            elif self.dt_cond_mode == "concat_mlp":
+                c = cond_mlp(
+                    "cond_concat_mlp",
+                    jnp.concatenate([e_a, e_b, e_delta_layer, e_t, e_s, e_delta_t], axis=-1),
+                    cond_dim,
+                )
+            else:
+                e_layer = cond_mlp(
+                    "cond_layer_mlp",
+                    jnp.concatenate([e_a, e_b, e_delta_layer], axis=-1),
+                    cond_dim,
+                )
+                e_time = cond_mlp(
+                    "cond_time_mlp",
+                    jnp.concatenate([e_t, e_s, e_delta_t], axis=-1),
+                    cond_dim,
+                )
+                c = (
+                    cond_mlp(
+                        "cond_factorized_fuse_mlp",
+                        jnp.concatenate([e_layer, e_time, e_layer * e_time], axis=-1),
+                        cond_dim,
+                    )
+                )
             c = nn.Dense(
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
@@ -487,12 +578,63 @@ class DepthShortcutPredictor(nn.Module):
                 name="delta_layer_proj",
             )
 
-            h_a = state_embed(jax.nn.one_hot(source_layer, self.depth + 1))
-            h_b = state_embed(jax.nn.one_hot(target_layer, self.depth + 1))
-            h_delta = delta_embed(jax.nn.one_hot(delta - 1, self.depth))
-            h_depth = jnp.concatenate([h_a, h_b, h_b - h_a, h_delta], axis=-1)
+            h_a_raw = state_embed(jax.nn.one_hot(source_layer, self.depth + 1))
+            h_b_raw = state_embed(jax.nn.one_hot(target_layer, self.depth + 1))
+            h_delta_raw = delta_embed(jax.nn.one_hot(delta - 1, self.depth))
+            h_depth = jnp.concatenate([h_a_raw, h_b_raw, h_b_raw - h_a_raw, h_delta_raw], axis=-1)
             h_depth = jnp.broadcast_to(h_depth[None, :], (batch_size, h_depth.shape[-1]))
-            c_in = jnp.concatenate([h_depth, t_cond], axis=-1)
+            e_a = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_layer_src_proj",
+            )(jnp.broadcast_to(h_a_raw[None, :], (batch_size, h_a_raw.shape[-1])))
+            e_b = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_layer_tgt_proj",
+            )(jnp.broadcast_to(h_b_raw[None, :], (batch_size, h_b_raw.shape[-1])))
+            e_delta_layer = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_layer_delta_proj",
+            )(jnp.broadcast_to(h_delta_raw[None, :], (batch_size, h_delta_raw.shape[-1])))
+            e_t = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_time_src_proj",
+            )(t_cond)
+            e_s = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_time_tgt_proj",
+            )(t_tgt_cond)
+            e_delta_t = nn.Dense(
+                self.cond_hidden_dim,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="cond_time_delta_proj",
+            )(t_delta_cond)
+            if self.dt_cond_mode == "sum":
+                c_in = e_a + e_b + e_delta_layer + e_t + e_s + e_delta_t
+            elif self.dt_cond_mode == "concat_mlp":
+                c_in = jnp.concatenate([e_a, e_b, e_delta_layer, e_t, e_s, e_delta_t], axis=-1)
+            else:
+                e_layer = cond_mlp(
+                    "cond_layer_mlp",
+                    jnp.concatenate([e_a, e_b, e_delta_layer], axis=-1),
+                    self.cond_hidden_dim,
+                )
+                e_time = cond_mlp(
+                    "cond_time_mlp",
+                    jnp.concatenate([e_t, e_s, e_delta_t], axis=-1),
+                    self.cond_hidden_dim,
+                )
+                c_in = jnp.concatenate([e_layer, e_time, e_layer * e_time], axis=-1)
             c = nn.Dense(
                 self.cond_hidden_dim,
                 kernel_init=XAVIER_UNIFORM,
@@ -507,12 +649,30 @@ class DepthShortcutPredictor(nn.Module):
                 name="cond_mlp_1",
             )(c)
 
+        predictor_input = u_source
+        if self.dt_use_h0_target and h0_tgt is not None:
+            h0_cond = nn.Dense(
+                self.hidden_size,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                name="h0_tgt_proj",
+            )(h0_tgt.astype(jnp.float32))
+            if self.dt_h0_fusion == "add":
+                predictor_input = predictor_input + h0_cond
+            else:
+                predictor_input = nn.Dense(
+                    self.hidden_size,
+                    kernel_init=XAVIER_UNIFORM,
+                    bias_init=ZERO_INIT,
+                    name="h0_concat_proj",
+                )(jnp.concatenate([predictor_input, h0_cond], axis=-1))
+
         h = nn.Dense(
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
             name="in_proj",
-        )(u_source)
+        )(predictor_input)
         if self.arch == "dit2":
             if self.num_heads is None:
                 raise ValueError("dit2 predictor requires num_heads")
@@ -825,6 +985,21 @@ PREDICTOR_VARIANTS = {
         "attention_every": 4,
         "adaln_zero": True,
     },
+    "hybrid_deep_30m": {
+        "arch": "hybrid_deep",
+        "width": 448,
+        "num_blocks": 12,
+        "expansion": 2,
+        "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2, 4, 1, 2, 4),
+        "attn_dim": None,
+        "num_heads": 7,
+        "mlp_ratio": 4.0,
+        "cond_dim": 64,
+        "grid_size_override": 16,
+        "residual_output": True,
+        "attention_every": 4,
+        "adaln_zero": True,
+    },
 }
 
 
@@ -855,6 +1030,8 @@ PREDICTOR_VARIANT_ALIASES = {
     "plarge": "convnext_large",
     "dit_large": "dit2_large",
     "dit_l": "dit2_large",
+    "hybrid_depth_10": "hybrid_deep_10",
+    "hybrid_depth_30m": "hybrid_deep_30m",
 }
 
 
@@ -877,7 +1054,7 @@ def canonical_predictor_variant_name(name: str) -> str:
 def predictor_size_bucket(name: str) -> str:
     """Return tiny/small/base/large for a predictor variant."""
     canonical = canonical_predictor_variant_name(name)
-    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10"}:
+    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10", "hybrid_deep_30m"}:
         return "large"
     if canonical in {"dit2_base_v2", "dit2_deep_256"}:
         return "base"

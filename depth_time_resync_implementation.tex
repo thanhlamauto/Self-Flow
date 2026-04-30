@@ -1,0 +1,312 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,columns=fullflexible}
+
+\title{Depth-Time ReSync: Compact Implementation Spec}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Recommended Run}
+
+This branch should use the depth-time objective directly. The legacy same-time
+\texttt{--output-distill} path is disabled to avoid extra compute; use
+\texttt{--use-output-time-distill} instead.
+
+\begin{lstlisting}[language=bash]
+python train.py \
+  --model-size B \
+  --batch-size 128 \
+  --epochs 400 \
+  --steps-per-epoch 1000 \
+  --learning-rate 1e-4 \
+  --predictor-learning-rate 1e-4 \
+  --vae-model /kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1 \
+  --data-path /kaggle/input/datasets/thaygiaodaysat/imagenet-vae-latents-ar-v2 \
+  --val-data-path /kaggle/input/datasets/thaygiaodaysat/imagenet-vae-latents-train-v3 \
+  --grad-clip 1.0 \
+  --log-freq 100 \
+  --eval-freq 1000 \
+  --sample-num-steps 50 \
+  --sample-cfg-scale 1.0 \
+  --fid-freq 25000 \
+  --num-fid-samples 4096 \
+  --fid-batch-size 256 \
+  --fid-eval-local-batch 32 \
+  --fid-num-steps 50 \
+  --fid-cfg-scale 1.0 \
+  --vae-decode-batch-size 256 \
+  --no-linear-probe \
+  --inception-score-weights /kaggle/input/models/ctlcmleon/inception-v3/pytorch/default/1/inception_v3_google-0cc3c7bd.pth \
+  --block-corr-freq 25000 \
+  --block-corr-batches 2 \
+  --wandb-project selfflow-jax \
+  --ema-decay 0.9999 \
+  --shortcut-predictor hybrid_deep_30m \
+  --shortcut-training-mode direction-magnitude \
+  --shortcut-lambda-dir 1.0 \
+  --shortcut-lambda-mag 0.5 \
+  --shortcut-lambda-boot 0.25 \
+  --shortcut-lambda-boot-mag 0.1875 \
+  --shortcut-mag-scale 3.0 \
+  --shortcut-mag-abs-center 5.5 \
+  --shortcut-mag-abs-scale 1.5 \
+  --shortcut-mag-clip-min 3.0 \
+  --shortcut-mag-clip-max 8.0 \
+  --shortcut-skip-in-loop-prob 0.0 \
+  --shortcut-lambda-skip-fm 0.0 \
+  --no-output-distill \
+  --use-depth-time-resync \
+  --lambda-depth 0.25 \
+  --lambda-time 0.25 \
+  --lambda-dt 0.15 \
+  --lambda-depth-cons 0.10 \
+  --lambda-time-cons 0.10 \
+  --lambda-dt-cons 0.10 \
+  --lambda-out-time 0.10 \
+  --dt-delta-t-values 1,2,4 \
+  --dt-sampling-mode uniform \
+  --dt-layer-gap-values 1,2,4 \
+  --dt-layer-sampling-mode uniform \
+  --dt-consistency-prob 1.0 \
+  --dt-use-h0-target \
+  --dt-h0-fusion concat \
+  --dt-cond-mode factorized \
+  --no-dt-outdistill-train-tail \
+  --direct-num-pairs 1 \
+  --direct-joint-pairs 1 \
+  --direct-predictor-only-pairs 0 \
+  --shortcut-bootstrap-detach-source \
+  --private-loss \
+  --lambda-private 1.0 \
+  --private-max-pairs 4 \
+  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-depth-time-resync-hybrid-deep-30m \
+  --shortcut-predictor-use-timestep \
+  --no-shortcut-predictor-normalize-input \
+  --private-use-residual \
+  --private-cosine-mode bnd \
+  --private-pair-mode random \
+  --fid-skip-timestep-mode alternate \
+  --weight-decay 0.1 \
+  --shortcut-predictor-weight-decay 0.1
+\end{lstlisting}
+
+The current \texttt{hybrid\_deep\_30m} is:
+\[
+\texttt{width}=448,\qquad \texttt{blocks}=12,\qquad \texttt{heads}=7,
+\]
+which gives about $30.08$M predictor parameters on DiT-B with
+\texttt{dt-cond-mode=factorized} and \texttt{dt-h0-fusion=concat}.
+
+\section{Current Implementation Check}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Factorized conditioning: implemented.}
+  \texttt{DepthShortcutPredictor.dt\_cond\_mode=factorized} computes
+  \[
+  e_{\mathrm{layer}}=\mathrm{MLP}([e_a,e_b,e_{\Delta l}]),\quad
+  e_{\mathrm{time}}=\mathrm{MLP}([e_t,e_s,e_{\Delta t}]),
+  \]
+  then fuses them with
+  \[
+  e_{\mathrm{cond}}=\mathrm{MLP}([e_{\mathrm{layer}},e_{\mathrm{time}},e_{\mathrm{layer}}\odot e_{\mathrm{time}}]).
+  \]
+
+  \item \textbf{FiLM/AdaLN injection: implemented for hybrid predictor.}
+  The fused condition vector is passed into \texttt{DeepDilatedShortcutBlock},
+  which uses AdaLN modulation and gated residual branches.
+
+  \item \textbf{Online source: implemented.}
+  Direct losses use $h_a^\theta(t)$ from the online backbone forward.
+
+  \item \textbf{Online DiT target: implemented.}
+  The same online forward passes at $t,s,r$ provide the direct depth/time/depth-time
+  targets and $y_s$. Targets are always wrapped in \(\mathrm{sg}(\cdot)\), so no
+  gradient flows through target hidden states or target outputs.
+
+  \item \textbf{Direction + magnitude distance: implemented.}
+  Direction is cosine. Magnitude is now L1 on predicted log-magnitude versus
+  stopped target log-magnitude.
+
+  \item \textbf{Full objective from the beginning: implemented.}
+  Depth, time, depth-time, consistency, and output-time distillation default on.
+
+  \item \textbf{Predictor EMA consistency target: implemented.}
+  Consistency uses $P_{\bar\psi}$ as no-gradient teacher.
+\end{itemize}
+
+\section{Predictor}
+
+The predictor is
+\[
+\widehat h_b(s)
+=
+P_\psi(h_a^\theta(t), h_0^\theta(s), a,b,\Delta l,t,s,\Delta t),
+\]
+with
+\[
+\Delta l=b-a,\qquad \Delta t=s-t.
+\]
+
+The code stores $\Delta t$ as a nonnegative index gap $|s-t|$ because timestep-gap
+embeddings are indexed. Since $e_t$ and $e_s$ are both present, the transition
+direction is explicit.
+
+\textbf{Important timestep convention.} In this repo, \(\tau=0\) is pure noise
+and \(\tau=1\) is clean data. Current sampling uses
+\[
+q_s = q_t + \Delta q,\qquad q_r=q_s+\Delta q,\qquad \tau_t < \tau_s < \tau_r.
+\]
+Therefore the time and depth-time targets are at \textbf{lower noise} / lighter
+noise than the source. The code samples \(q_t\) low enough that \(q_r\) remains
+valid.
+
+The default conditioning is factorized:
+\[
+e_{\mathrm{layer}}=\mathrm{MLP}([e_a,e_b,e_{\Delta l}]),\quad
+e_{\mathrm{time}}=\mathrm{MLP}([e_t,e_s,e_{\Delta t}]),
+\]
+\[
+e_{\mathrm{cond}}=\mathrm{MLP}([e_{\mathrm{layer}},e_{\mathrm{time}},e_{\mathrm{layer}}\odot e_{\mathrm{time}}]).
+\]
+
+\section{Distance}
+
+For a predicted hidden state $u$ and stopped online target $v$:
+\[
+d(u,v)
+=
+\lambda_{\mathrm{dir}}
+\left(1-\cos(u,v)\right)
++
+\lambda_{\mathrm{mag}}
+\left\|
+\log \|u\|_2
+-
+\mathrm{sg}(\log \|v\|_2)
+\right\|_1.
+\]
+
+Implementation detail: the predictor emits a direction-like hidden output and a
+bounded log-magnitude residual $\widehat{\Delta m}$. The predicted log magnitude is
+\[
+\widehat m = m_{\mathrm{source}} + \mathrm{mag\_scale}\cdot \widehat{\Delta m}.
+\]
+The magnitude loss is
+\[
+L_{\mathrm{mag}}
+=
+\|\widehat m-\mathrm{sg}(m_{\mathrm{target}})\|_1.
+\]
+
+Recommended:
+\[
+\lambda_{\mathrm{dir}}=1.0,\qquad \lambda_{\mathrm{mag}}=0.5.
+\]
+If magnitude drift dominates samples, increase \(\lambda_{\mathrm{mag}}\) to \(1.0\).
+
+\section{Losses}
+
+Let online hidden states be $h^\theta$. Targets are online activations with
+stop-gradient.
+
+\paragraph{Depth}
+\[
+L_{\mathrm{depth}}
+=
+d(P_\psi(h_a^\theta(t),h_0^\theta(t),a,b,b-a,t,t,0),
+\mathrm{sg}(h_b^\theta(t))).
+\]
+
+\paragraph{Time}
+\[
+L_{\mathrm{time}}
+=
+d(P_\psi(h_a^\theta(t),h_0^\theta(s),a,a,0,t,s,s-t),
+\mathrm{sg}(h_a^\theta(s))).
+\]
+
+\paragraph{Depth-time}
+\[
+L_{\mathrm{dt}}
+=
+d(P_\psi(h_a^\theta(t),h_0^\theta(s),a,b,b-a,t,s,s-t),
+\mathrm{sg}(h_b^\theta(s))).
+\]
+
+\paragraph{Consistency}
+\[
+L_{\mathrm{cons}}
+=
+d(
+P_\psi(P_\psi(h_a^\theta(t),h_0^\theta(s),a,b,b-a,t,s,s-t),
+h_0^\theta(r),b,c,c-b,s,r,r-s),
+\mathrm{sg}(P_{\bar\psi}(h_a^\theta(t),h_0^\theta(r),a,c,c-a,t,r,r-t))
+).
+\]
+
+The code keeps three consistency scalars:
+\[
+L_{\mathrm{depth\_cons}},\quad L_{\mathrm{time\_cons}},\quad L_{\mathrm{dt\_cons}},
+\]
+each defaulting to weight \(0.10\). This is equivalent to a decomposed
+regularization version of \(L_{\mathrm{cons}}\).
+
+\paragraph{Output distillation}
+\[
+L_{\mathrm{out}}
+=
+\|\widehat y_s-\mathrm{sg}(y_s^\theta)\|_2^2.
+\]
+
+The implementation resumes the DiT tail with
+\texttt{resume\_hidden=z\_hat\_dt} and \texttt{resume\_start\_layer=b+1}.
+
+\section{Total Objective}
+
+\[
+\begin{aligned}
+L
+=\;& L_{\mathrm{gen}}
++0.25L_{\mathrm{depth}}
++0.25L_{\mathrm{time}}
++0.15L_{\mathrm{dt}} \\
+&+0.10L_{\mathrm{depth\_cons}}
++0.10L_{\mathrm{time\_cons}}
++0.10L_{\mathrm{dt\_cons}}
++0.10L_{\mathrm{out}}.
+\end{aligned}
+\]
+
+If the regularization pulls generation too much, reduce in this order:
+\[
+\lambda_{\mathrm{out}},\quad
+\lambda_{\mathrm{dt\_cons}},\quad
+\lambda_{\mathrm{dt}}.
+\]
+
+\section{Code Pointers}
+
+\begin{itemize}[leftmargin=*]
+  \item Predictor architecture and conditioning:
+  \texttt{src/depth\_shortcut.py::DepthShortcutPredictor}.
+  \item 30M hybrid config:
+  \texttt{PREDICTOR\_VARIANTS["hybrid\_deep\_30m"]}.
+  \item Online target cache:
+  \texttt{train.py::train\_step}, the online forwards for $t,s,r$ with
+  \texttt{return\_hidden\_states=True}.
+  \item Unified predictor call:
+  nested \texttt{predictor\_transition}.
+  \item Direction+magnitude distance:
+  nested \texttt{transition\_distance}.
+  \item Depth/time/dt/consistency/output losses:
+  nested \texttt{compute\_depth\_time\_resync\_losses}.
+  \item Metrics:
+  \texttt{train/L\_*}, \texttt{metric/E\_*}, sampled layer and timestep gaps.
+\end{itemize}
+
+\end{document}

@@ -453,7 +453,7 @@ PREDICTOR_PARAM_TARGET_RANGES = {
     "tiny": (1_000_000, 4_000_000),
     "small": (3_000_000, 8_000_000),
     "base": (7_000_000, 19_000_000),
-    "large": (14_000_000, 30_000_000),
+    "large": (14_000_000, 45_000_000),
 }
 
 
@@ -498,6 +498,9 @@ def create_train_state(
     shortcut_mag_abs_center=5.5,
     shortcut_mag_abs_scale=1.5,
     predictor_config_overrides=None,
+    dt_use_h0_target=False,
+    dt_h0_fusion="concat",
+    dt_cond_mode="concat_mlp",
 ):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -533,6 +536,9 @@ def create_train_state(
         gamma_out_init=0.001 if shortcut_training_mode == "direction-magnitude" else 0.05,
         mag_abs_center=shortcut_mag_abs_center,
         mag_abs_scale=shortcut_mag_abs_scale,
+        dt_use_h0_target=dt_use_h0_target,
+        dt_h0_fusion=dt_h0_fusion,
+        dt_cond_mode=dt_cond_mode,
         **predictor_cfg,
     )
 
@@ -558,6 +564,11 @@ def create_train_state(
         jnp.asarray(1, dtype=jnp.int32),
         dummy_t_embed,
         dummy_m,
+        h0_tgt=dummy_u,
+        timestep_tgt_embed=dummy_t_embed,
+        t_src_idx=jnp.asarray(1, dtype=jnp.int32),
+        t_tgt_idx=jnp.asarray(0, dtype=jnp.int32),
+        delta_t_idx=jnp.asarray(1, dtype=jnp.int32),
     )
 
     params = {
@@ -989,6 +1000,27 @@ def train_step(
     predictor_normalize_input=True,
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
+    use_depth_time_resync=True,
+    use_depth_loss=True,
+    use_time_loss=True,
+    use_dt_loss=True,
+    use_depth_consistency=True,
+    use_time_consistency=True,
+    use_dt_consistency=True,
+    use_output_time_distill=True,
+    lambda_depth=0.25,
+    lambda_time=0.25,
+    lambda_dt=0.15,
+    lambda_depth_cons=0.10,
+    lambda_time_cons=0.10,
+    lambda_dt_cons=0.10,
+    lambda_out_time=0.10,
+    dt_delta_t_values=(1, 2, 4),
+    dt_layer_gap_values=(1, 2, 4),
+    dt_sampling_mode="uniform",
+    dt_layer_sampling_mode="uniform",
+    dt_consistency_prob=1.0,
+    dt_outdistill_train_tail=False,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -1024,6 +1056,10 @@ def train_step(
         raise ValueError(f"Unknown private cosine mode: {private_cosine_mode!r}")
     if private_pair_mode not in {"first", "random"}:
         raise ValueError(f"Unknown private pair mode: {private_pair_mode!r}")
+    if dt_sampling_mode not in {"uniform", "truncated_normal"}:
+        raise ValueError(f"Unknown depth-time timestep sampling mode: {dt_sampling_mode!r}")
+    if dt_layer_sampling_mode not in {"uniform", "truncated_normal"}:
+        raise ValueError(f"Unknown depth-time layer sampling mode: {dt_layer_sampling_mode!r}")
 
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
@@ -1039,7 +1075,9 @@ def train_step(
         output_pair_rng,
         output_resume_drop_rng,
         private_pair_rng,
-    ) = jax.random.split(rng, 10)
+        dt_delta_rng,
+        dt_cons_rng,
+    ) = jax.random.split(rng, 12)
     lambda_private_eff, private_warmup_scale = _scheduled_lambda(
         lambda_private,
         global_step,
@@ -1059,11 +1097,31 @@ def train_step(
         ),
     )
 
+    max_dt_gap = int(max(tuple(dt_delta_t_values) or (1,)))
+    q_max = shortcut_timesteps - 1 - jnp.asarray(
+        max_dt_gap * 2 if use_depth_time_resync else 0,
+        dtype=jnp.int32,
+    )
+    q_max = jnp.maximum(q_max, 0)
     q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
+    q = jnp.minimum(q, q_max)
     tau = q.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
+    dt_gap_choices = jnp.asarray(tuple(int(v) for v in dt_delta_t_values), dtype=jnp.int32)
+    if dt_sampling_mode == "truncated_normal":
+        dt_offsets = (dt_gap_choices.astype(jnp.float32) - 2.0) / 1.0
+        dt_gap_probs = jax.nn.softmax(-0.5 * jnp.square(dt_offsets))
+        dt_gap = jax.random.choice(dt_delta_rng, dt_gap_choices, p=dt_gap_probs)
+    else:
+        dt_gap = jax.random.choice(dt_delta_rng, dt_gap_choices)
+    q_s = jnp.minimum(q + dt_gap, shortcut_timesteps - 1)
+    q_r = jnp.minimum(q_s + dt_gap, shortcut_timesteps - 1)
+    tau_s = q_s.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
+    tau_r = q_r.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    x_tau_s = (1.0 - tau_s[:, None, None]) * x1 + tau_s[:, None, None] * x0
+    x_tau_r = (1.0 - tau_r[:, None, None]) * x1 + tau_r[:, None, None] * x0
     target = x0 - x1
 
     def loss_fn(params):
@@ -1083,6 +1141,83 @@ def train_step(
         hidden_norms = jnp.linalg.norm(hidden_stack_f32, axis=-1, keepdims=True)
         directions = hidden_stack_f32 / (hidden_norms + 1e-6)
         log_magnitudes = jnp.log(hidden_norms + 1e-6)
+
+        pred_s, hidden_tuple_s, dit_time_emb_s = state.apply_fn(
+            {"params": params["backbone"]},
+            x_tau_s,
+            timesteps=tau_s,
+            vector=y,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+            return_hidden_states=True,
+        )
+        hidden_stack_s_f32 = jnp.stack(hidden_tuple_s, axis=0).astype(jnp.float32)
+        pred_r, hidden_tuple_r, dit_time_emb_r = state.apply_fn(
+            {"params": params["backbone"]},
+            x_tau_r,
+            timesteps=tau_r,
+            vector=y,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+            return_hidden_states=True,
+        )
+        hidden_stack_r_f32 = jnp.stack(hidden_tuple_r, axis=0).astype(jnp.float32)
+        def predictor_transition(
+            predictor_params,
+            source_hidden,
+            source_layer,
+            target_layer,
+            src_time_emb,
+            tgt_time_emb,
+            h0_tgt,
+            q_src,
+            q_tgt,
+            source_detach,
+        ):
+            source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
+            predictor_source, m_source = build_predictor_source(
+                source_for_predictor,
+                normalize_input=predictor_normalize_input,
+            )
+            src_embed = jax.lax.stop_gradient(src_time_emb) if source_detach else src_time_emb
+            y_pred, delta_m_pred = state.predictor_apply_fn(
+                {"params": predictor_params},
+                predictor_source,
+                source_layer,
+                target_layer,
+                src_embed,
+                m_source,
+                detach_timestep_embed=source_detach,
+                use_timestep_embed=predictor_use_timestep,
+                h0_tgt=h0_tgt,
+                timestep_tgt_embed=tgt_time_emb,
+                t_src_idx=q_src,
+                t_tgt_idx=q_tgt,
+                delta_t_idx=jnp.abs(q_tgt - q_src),
+            )
+            return y_pred, delta_m_pred, m_source
+
+        def transition_distance(y_pred, delta_m_pred, m_source, source_hidden, target_hidden):
+            target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
+            pred_u = l2_normalize_tokens(y_pred)
+            target_u, target_m, _ = build_direction_and_norm_map(target_hidden)
+            cos = jnp.sum(pred_u * target_u, axis=-1).mean()
+            loss_dir_pred = 1.0 - cos
+            if shortcut_loss_mode == "direction_magnitude":
+                pred_m = m_source + mag_scale * delta_m_pred
+                loss_aux_pred = jnp.mean(jnp.abs(pred_m - jax.lax.stop_gradient(target_m)))
+                error = loss_dir_pred + loss_aux_pred
+            else:
+                target_rms = jax.lax.stop_gradient(sample_activation_rms(target_hidden))
+                residual_norm = (y_pred - target_hidden) / target_rms
+                loss_aux_pred = jnp.mean(
+                    optax.huber_loss(
+                        residual_norm,
+                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                    )
+                )
+                error = jnp.sqrt(jnp.mean(jnp.square(residual_norm)))
+            return lambda_dir * loss_dir_pred + lambda_mag * loss_aux_pred, error
 
         def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
             za = hidden_stack_f32[source_layer]
@@ -1549,6 +1684,312 @@ def train_step(
         )
         loss_output_distill_weighted = lambda_output_distill * loss_output_distill
 
+        dt_layer_gap_choices = jnp.asarray(tuple(int(v) for v in dt_layer_gap_values), dtype=jnp.int32)
+        dt_layer_rng_1, dt_layer_rng_2, dt_layer_rng_3, dt_cons_do_rng = jax.random.split(dt_cons_rng, 4)
+        if dt_layer_sampling_mode == "truncated_normal":
+            dt_layer_offsets = (dt_layer_gap_choices.astype(jnp.float32) - 2.0) / 1.0
+            dt_layer_gap_probs = jax.nn.softmax(-0.5 * jnp.square(dt_layer_offsets))
+            dt_gap_l1 = jax.random.choice(dt_layer_rng_1, dt_layer_gap_choices, p=dt_layer_gap_probs)
+            dt_gap_l2 = jax.random.choice(dt_layer_rng_2, dt_layer_gap_choices, p=dt_layer_gap_probs)
+        else:
+            dt_gap_l1 = jax.random.choice(dt_layer_rng_1, dt_layer_gap_choices)
+            dt_gap_l2 = jax.random.choice(dt_layer_rng_2, dt_layer_gap_choices)
+        max_a_dt = jnp.maximum(jnp.asarray(directions.shape[0] - 1, dtype=jnp.int32) - dt_gap_l1 - dt_gap_l2, 0)
+        dt_a = jax.random.randint(dt_layer_rng_3, (), 0, max_a_dt + 1, dtype=jnp.int32)
+        dt_b = dt_a + dt_gap_l1
+        dt_c = dt_b + dt_gap_l2
+        dt_cons_active = jax.random.uniform(dt_cons_do_rng, ()) < jnp.asarray(dt_consistency_prob, dtype=jnp.float32)
+
+        def compute_depth_time_resync_losses():
+            zero = jnp.float32(0.0)
+            h0_t = hidden_stack_f32[0]
+            h0_s = hidden_stack_s_f32[0]
+            h0_r = hidden_stack_r_f32[0]
+
+            pred_depth, dm_depth, ms_depth = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_b,
+                dit_time_emb,
+                dit_time_emb,
+                h0_t,
+                q,
+                q,
+                False,
+            )
+            l_depth, e_depth = transition_distance(
+                pred_depth,
+                dm_depth,
+                ms_depth,
+                hidden_stack_f32[dt_a],
+                hidden_stack_f32[dt_b],
+            )
+
+            pred_time, dm_time, ms_time = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_a,
+                dit_time_emb,
+                dit_time_emb_s,
+                h0_s,
+                q,
+                q_s,
+                False,
+            )
+            l_time, e_time = transition_distance(
+                pred_time,
+                dm_time,
+                ms_time,
+                hidden_stack_f32[dt_a],
+                hidden_stack_s_f32[dt_a],
+            )
+
+            pred_dt, dm_dt, ms_dt = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_b,
+                dit_time_emb,
+                dit_time_emb_s,
+                h0_s,
+                q,
+                q_s,
+                False,
+            )
+            l_dt, e_dt = transition_distance(
+                pred_dt,
+                dm_dt,
+                ms_dt,
+                hidden_stack_f32[dt_a],
+                hidden_stack_s_f32[dt_b],
+            )
+
+            pred_ab, _, _ = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_b,
+                dit_time_emb,
+                dit_time_emb,
+                h0_t,
+                q,
+                q,
+                False,
+            )
+            pred_ab_bc, dm_ab_bc, ms_ab_bc = predictor_transition(
+                params["predictor"],
+                pred_ab,
+                dt_b,
+                dt_c,
+                dit_time_emb,
+                dit_time_emb,
+                h0_t,
+                q,
+                q,
+                False,
+            )
+            pred_ac_ema, _, _ = predictor_transition(
+                predictor_ema_params,
+                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                dt_a,
+                dt_c,
+                dit_time_emb,
+                dit_time_emb,
+                h0_t,
+                q,
+                q,
+                True,
+            )
+            l_depth_cons, e_depth_cons = transition_distance(
+                pred_ab_bc,
+                dm_ab_bc,
+                ms_ab_bc,
+                pred_ab,
+                jax.lax.stop_gradient(pred_ac_ema),
+            )
+
+            pred_ts, _, _ = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_a,
+                dit_time_emb,
+                dit_time_emb_s,
+                h0_s,
+                q,
+                q_s,
+                False,
+            )
+            pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
+                params["predictor"],
+                pred_ts,
+                dt_a,
+                dt_a,
+                dit_time_emb_s,
+                dit_time_emb_r,
+                h0_r,
+                q_s,
+                q_r,
+                False,
+            )
+            pred_tr_ema, _, _ = predictor_transition(
+                predictor_ema_params,
+                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                dt_a,
+                dt_a,
+                dit_time_emb,
+                dit_time_emb_r,
+                h0_r,
+                q,
+                q_r,
+                True,
+            )
+            l_time_cons, e_time_cons = transition_distance(
+                pred_ts_sr,
+                dm_ts_sr,
+                ms_ts_sr,
+                pred_ts,
+                jax.lax.stop_gradient(pred_tr_ema),
+            )
+
+            pred_as_bs, _, _ = predictor_transition(
+                params["predictor"],
+                hidden_stack_f32[dt_a],
+                dt_a,
+                dt_b,
+                dit_time_emb,
+                dit_time_emb_s,
+                h0_s,
+                q,
+                q_s,
+                False,
+            )
+            pred_bs_cr, dm_bs_cr, ms_bs_cr = predictor_transition(
+                params["predictor"],
+                pred_as_bs,
+                dt_b,
+                dt_c,
+                dit_time_emb_s,
+                dit_time_emb_r,
+                h0_r,
+                q_s,
+                q_r,
+                False,
+            )
+            pred_at_cr_ema, _, _ = predictor_transition(
+                predictor_ema_params,
+                jax.lax.stop_gradient(hidden_stack_f32[dt_a]),
+                dt_a,
+                dt_c,
+                dit_time_emb,
+                dit_time_emb_r,
+                h0_r,
+                q,
+                q_r,
+                True,
+            )
+            l_dt_cons, e_dt_cons = transition_distance(
+                pred_bs_cr,
+                dm_bs_cr,
+                ms_bs_cr,
+                pred_as_bs,
+                jax.lax.stop_gradient(pred_at_cr_ema),
+            )
+
+            u_dt_out = l2_normalize_tokens(pred_dt)
+            if shortcut_loss_mode == "direction_magnitude":
+                m_dt_out = jnp.clip(ms_dt + mag_scale * dm_dt, mag_clip_min, mag_clip_max)
+                z_hat_dt = jnp.exp(m_dt_out) * u_dt_out
+            else:
+                z_hat_dt = pred_dt.astype(jnp.float32)
+            tail_params = params["backbone"] if dt_outdistill_train_tail else jax.tree_util.tree_map(
+                jax.lax.stop_gradient,
+                params["backbone"],
+            )
+            y_hat_s = state.apply_fn(
+                {"params": tail_params},
+                x_tau_s,
+                timesteps=tau_s,
+                vector=y,
+                deterministic=False,
+                rngs={"dropout": output_resume_drop_rng},
+                resume_hidden=z_hat_dt,
+                resume_start_layer=dt_b + 1,
+            )
+            loss_out_time = jnp.mean(jnp.square(y_hat_s - jax.lax.stop_gradient(pred_s)))
+            e_out_time = jnp.sqrt(loss_out_time)
+
+            l_depth = jnp.where(use_depth_loss, l_depth, zero)
+            l_time = jnp.where(use_time_loss, l_time, zero)
+            l_dt = jnp.where(use_dt_loss, l_dt, zero)
+            cons_mask = dt_cons_active.astype(jnp.float32)
+            l_depth_cons = jnp.where(use_depth_consistency, l_depth_cons * cons_mask, zero)
+            l_time_cons = jnp.where(use_time_consistency, l_time_cons * cons_mask, zero)
+            l_dt_cons = jnp.where(use_dt_consistency, l_dt_cons * cons_mask, zero)
+            loss_out_time = jnp.where(use_output_time_distill, loss_out_time, zero)
+            return (
+                l_depth,
+                l_time,
+                l_dt,
+                l_depth_cons,
+                l_time_cons,
+                l_dt_cons,
+                loss_out_time,
+                e_depth,
+                e_time,
+                e_dt,
+                e_depth_cons,
+                e_time_cons,
+                e_dt_cons,
+                e_out_time,
+            )
+
+        if use_depth_time_resync:
+            (
+                loss_depth_dt,
+                loss_time_dt,
+                loss_dt_dt,
+                loss_depth_cons_dt,
+                loss_time_cons_dt,
+                loss_dt_cons_dt,
+                loss_out_time_dt,
+                e_depth_dt,
+                e_time_dt,
+                e_dt_dt,
+                e_depth_cons_dt,
+                e_time_cons_dt,
+                e_dt_cons_dt,
+                e_out_time_dt,
+            ) = compute_depth_time_resync_losses()
+        else:
+            (
+                loss_depth_dt,
+                loss_time_dt,
+                loss_dt_dt,
+                loss_depth_cons_dt,
+                loss_time_cons_dt,
+                loss_dt_cons_dt,
+                loss_out_time_dt,
+                e_depth_dt,
+                e_time_dt,
+                e_dt_dt,
+                e_depth_cons_dt,
+                e_time_cons_dt,
+                e_dt_cons_dt,
+                e_out_time_dt,
+            ) = (jnp.float32(0.0),) * 14
+        loss_depth_time_total = (
+            lambda_depth * loss_depth_dt
+            + lambda_time * loss_time_dt
+            + lambda_dt * loss_dt_dt
+            + lambda_depth_cons * loss_depth_cons_dt
+            + lambda_time_cons * loss_time_cons_dt
+            + lambda_dt_cons * loss_dt_cons_dt
+            + lambda_out_time * loss_out_time_dt
+        )
+
         def compute_private_metrics(_):
             return private_activation_loss(
                 hidden_stack[1:],
@@ -1570,13 +2011,17 @@ def train_step(
             ),
             operand=None,
         )
-        loss_total = (
-            loss_gen
-            + loss_direct_3pair
+        legacy_shortcut_total = (
+            loss_direct_3pair
             + lambda_boot * loss_boot
             + lambda_boot_mag * loss_boot_mag
-            + lambda_private_eff * loss_private
             + loss_output_distill_weighted
+        )
+        loss_total = (
+            loss_gen
+            + (jnp.float32(0.0) if use_depth_time_resync else legacy_shortcut_total)
+            + loss_depth_time_total
+            + lambda_private_eff * loss_private
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -1596,6 +2041,26 @@ def train_step(
             loss_mag_ponly_mean,
             loss_output_distill,
             loss_output_distill_weighted,
+            loss_depth_dt,
+            loss_time_dt,
+            loss_dt_dt,
+            loss_depth_cons_dt,
+            loss_time_cons_dt,
+            loss_dt_cons_dt,
+            loss_out_time_dt,
+            loss_depth_time_total,
+            e_depth_dt,
+            e_time_dt,
+            e_dt_dt,
+            e_depth_cons_dt,
+            e_time_cons_dt,
+            e_dt_cons_dt,
+            e_out_time_dt,
+            dt_gap.astype(jnp.float32),
+            dt_gap_l1.astype(jnp.float32),
+            dt_a.astype(jnp.float32),
+            dt_b.astype(jnp.float32),
+            dt_c.astype(jnp.float32),
             loss_skip_fm,
             loss_private,
             cos_dir,
@@ -1659,6 +2124,26 @@ def train_step(
         loss_mag_ponly_mean,
         loss_output_distill,
         loss_output_distill_weighted,
+        loss_depth_dt,
+        loss_time_dt,
+        loss_dt_dt,
+        loss_depth_cons_dt,
+        loss_time_cons_dt,
+        loss_dt_cons_dt,
+        loss_out_time_dt,
+        loss_depth_time_total,
+        e_depth_dt,
+        e_time_dt,
+        e_dt_dt,
+        e_depth_cons_dt,
+        e_time_cons_dt,
+        e_dt_cons_dt,
+        e_out_time_dt,
+        dt_gap_metric,
+        dt_layer_gap_metric,
+        dt_layer_a_metric,
+        dt_layer_b_metric,
+        dt_layer_c_metric,
         loss_skip_fm,
         loss_private,
         cos_dir,
@@ -1719,6 +2204,26 @@ def train_step(
     loss_mag_ponly_mean = jax.lax.pmean(loss_mag_ponly_mean, axis_name="batch")
     loss_output_distill = jax.lax.pmean(loss_output_distill, axis_name="batch")
     loss_output_distill_weighted = jax.lax.pmean(loss_output_distill_weighted, axis_name="batch")
+    loss_depth_dt = jax.lax.pmean(loss_depth_dt, axis_name="batch")
+    loss_time_dt = jax.lax.pmean(loss_time_dt, axis_name="batch")
+    loss_dt_dt = jax.lax.pmean(loss_dt_dt, axis_name="batch")
+    loss_depth_cons_dt = jax.lax.pmean(loss_depth_cons_dt, axis_name="batch")
+    loss_time_cons_dt = jax.lax.pmean(loss_time_cons_dt, axis_name="batch")
+    loss_dt_cons_dt = jax.lax.pmean(loss_dt_cons_dt, axis_name="batch")
+    loss_out_time_dt = jax.lax.pmean(loss_out_time_dt, axis_name="batch")
+    loss_depth_time_total = jax.lax.pmean(loss_depth_time_total, axis_name="batch")
+    e_depth_dt = jax.lax.pmean(e_depth_dt, axis_name="batch")
+    e_time_dt = jax.lax.pmean(e_time_dt, axis_name="batch")
+    e_dt_dt = jax.lax.pmean(e_dt_dt, axis_name="batch")
+    e_depth_cons_dt = jax.lax.pmean(e_depth_cons_dt, axis_name="batch")
+    e_time_cons_dt = jax.lax.pmean(e_time_cons_dt, axis_name="batch")
+    e_dt_cons_dt = jax.lax.pmean(e_dt_cons_dt, axis_name="batch")
+    e_out_time_dt = jax.lax.pmean(e_out_time_dt, axis_name="batch")
+    dt_gap_metric = jax.lax.pmean(dt_gap_metric, axis_name="batch")
+    dt_layer_gap_metric = jax.lax.pmean(dt_layer_gap_metric, axis_name="batch")
+    dt_layer_a_metric = jax.lax.pmean(dt_layer_a_metric, axis_name="batch")
+    dt_layer_b_metric = jax.lax.pmean(dt_layer_b_metric, axis_name="batch")
+    dt_layer_c_metric = jax.lax.pmean(dt_layer_c_metric, axis_name="batch")
     loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
     loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
@@ -1799,6 +2304,32 @@ def train_step(
         "train/loss_direct_aux_ponly_mean": loss_mag_ponly_mean,
         "train/loss_output_distill": loss_output_distill,
         "train/loss_output_distill_weighted": loss_output_distill_weighted,
+        "train/L_gen": loss_gen,
+        "train/L_depth": loss_depth_dt,
+        "train/L_time": loss_time_dt,
+        "train/L_dt": loss_dt_dt,
+        "train/L_depth_cons": loss_depth_cons_dt,
+        "train/L_time_cons": loss_time_cons_dt,
+        "train/L_dt_cons": loss_dt_cons_dt,
+        "train/L_out_time": loss_out_time_dt,
+        "train/L_total": loss,
+        "train/loss_depth_time_total": loss_depth_time_total,
+        "metric/E_depth": e_depth_dt,
+        "metric/E_time": e_time_dt,
+        "metric/E_dt": e_dt_dt,
+        "metric/E_time_by_delta_t": e_time_dt,
+        "metric/E_depth_by_delta_l": e_depth_dt,
+        "metric/E_dt_by_delta_t_delta_l": e_dt_dt,
+        "metric/E_depth_cons": e_depth_cons_dt,
+        "metric/E_time_cons": e_time_cons_dt,
+        "metric/E_dt_cons": e_dt_cons_dt,
+        "metric/E_out_time": e_out_time_dt,
+        "metric/E_time_over_E_depth": e_time_dt / jnp.maximum(e_depth_dt, jnp.float32(1e-6)),
+        "train/sampled_delta_t": dt_gap_metric,
+        "train/sampled_delta_l": dt_layer_gap_metric,
+        "train/sampled_layer_a": dt_layer_a_metric,
+        "train/sampled_layer_b": dt_layer_b_metric,
+        "train/sampled_layer_c": dt_layer_c_metric,
         "train/loss_skip_fm": loss_skip_fm,
         "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
@@ -3116,6 +3647,30 @@ def main():
         default=None,
         help="Use zero-init AdaLN modulation/gates for deep shortcut predictor blocks.",
     )
+    parser.add_argument("--use-depth-time-resync", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-depth-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-time-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-dt-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-depth-consistency", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-time-consistency", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-dt-consistency", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-output-time-distill", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lambda-depth", type=float, default=0.25)
+    parser.add_argument("--lambda-time", type=float, default=0.25)
+    parser.add_argument("--lambda-dt", type=float, default=0.15)
+    parser.add_argument("--lambda-depth-cons", type=float, default=0.10)
+    parser.add_argument("--lambda-time-cons", type=float, default=0.10)
+    parser.add_argument("--lambda-dt-cons", type=float, default=0.10)
+    parser.add_argument("--lambda-out-time", type=float, default=0.10)
+    parser.add_argument("--dt-delta-t-values", type=str, default="1,2,4")
+    parser.add_argument("--dt-sampling-mode", type=str, default="uniform", choices=["uniform", "truncated_normal"])
+    parser.add_argument("--dt-layer-gap-values", type=str, default="1,2,4")
+    parser.add_argument("--dt-layer-sampling-mode", type=str, default="uniform", choices=["uniform", "truncated_normal"])
+    parser.add_argument("--dt-consistency-prob", type=float, default=1.0)
+    parser.add_argument("--dt-use-h0-target", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dt-h0-fusion", type=str, default="concat", choices=["add", "concat"])
+    parser.add_argument("--dt-cond-mode", type=str, default="concat_mlp", choices=["sum", "concat_mlp", "factorized"])
+    parser.add_argument("--dt-outdistill-train-tail", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--shortcut-l2-ema-alpha", type=float, default=0.01)
     parser.add_argument(
         "--private-loss",
@@ -3388,6 +3943,25 @@ def main():
     shortcut_predictor_dilation_cycle = parse_int_cycle(args.shortcut_predictor_dilation_cycle)
     if any(dilation <= 0 for dilation in shortcut_predictor_dilation_cycle):
         raise ValueError("--shortcut-predictor-dilation-cycle values must be positive")
+    dt_delta_t_values = parse_int_cycle(args.dt_delta_t_values)
+    dt_layer_gap_values = parse_int_cycle(args.dt_layer_gap_values)
+    if not dt_delta_t_values or any(gap <= 0 for gap in dt_delta_t_values):
+        raise ValueError("--dt-delta-t-values must contain positive integers")
+    if not dt_layer_gap_values or any(gap <= 0 for gap in dt_layer_gap_values):
+        raise ValueError("--dt-layer-gap-values must contain positive integers")
+    if not 0.0 <= args.dt_consistency_prob <= 1.0:
+        raise ValueError("--dt-consistency-prob must be between 0 and 1")
+    for name in (
+        "lambda_depth",
+        "lambda_time",
+        "lambda_dt",
+        "lambda_depth_cons",
+        "lambda_time_cons",
+        "lambda_dt_cons",
+        "lambda_out_time",
+    ):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
     if args.shortcut_predictor_grid_size is not None and args.shortcut_predictor_grid_size <= 0:
         raise ValueError("--shortcut-predictor-grid-size must be greater than 0")
     if args.shortcut_predictor_attention_every is not None and args.shortcut_predictor_attention_every < 0:
@@ -3588,6 +4162,9 @@ def main():
         shortcut_mag_abs_center=args.shortcut_mag_abs_center,
         shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
         predictor_config_overrides=shortcut_predictor_overrides,
+        dt_use_h0_target=args.dt_use_h0_target,
+        dt_h0_fusion=args.dt_h0_fusion,
+        dt_cond_mode=args.dt_cond_mode,
     )
     predictor_param_count = count_tree_params(state.params["predictor"])
     backbone_param_count = count_tree_params(state.params["backbone"])
@@ -3700,6 +4277,27 @@ def main():
             predictor_normalize_input=args.shortcut_predictor_normalize_input,
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
+            use_depth_time_resync=args.use_depth_time_resync,
+            use_depth_loss=args.use_depth_loss,
+            use_time_loss=args.use_time_loss,
+            use_dt_loss=args.use_dt_loss,
+            use_depth_consistency=args.use_depth_consistency,
+            use_time_consistency=args.use_time_consistency,
+            use_dt_consistency=args.use_dt_consistency,
+            use_output_time_distill=args.use_output_time_distill,
+            lambda_depth=args.lambda_depth,
+            lambda_time=args.lambda_time,
+            lambda_dt=args.lambda_dt,
+            lambda_depth_cons=args.lambda_depth_cons,
+            lambda_time_cons=args.lambda_time_cons,
+            lambda_dt_cons=args.lambda_dt_cons,
+            lambda_out_time=args.lambda_out_time,
+            dt_delta_t_values=dt_delta_t_values,
+            dt_layer_gap_values=dt_layer_gap_values,
+            dt_sampling_mode=args.dt_sampling_mode,
+            dt_layer_sampling_mode=args.dt_layer_sampling_mode,
+            dt_consistency_prob=args.dt_consistency_prob,
+            dt_outdistill_train_tail=args.dt_outdistill_train_tail,
         ),
         axis_name="batch",
     )
