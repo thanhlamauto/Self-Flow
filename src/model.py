@@ -272,6 +272,21 @@ class FinalLayer(nn.Module):
         return x
 
 
+class LayerSyncProjector(nn.Module):
+    """3-layer MLP projector for aligning weak-layer states to strong-layer states."""
+    hidden_dim: int = 2048
+    output_dim: int = 768
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.output_dim)(x)
+        return x
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -286,6 +301,8 @@ class SelfFlowDiT(nn.Module):
     compatibility_mode: bool = False
     per_token: bool = False
     class_dropout_prob: float = 0.1
+    layersync_project_weak: bool = False
+    layersync_proj_dim: int = 2048
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -294,6 +311,11 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        if self.layersync_project_weak:
+            self.layersync_projector = LayerSyncProjector(
+                hidden_dim=self.layersync_proj_dim,
+                output_dim=self.hidden_size,
+            )
 
     @nn.compact
     def __call__(
@@ -304,11 +326,13 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
+        return_layersync_features: Optional[Sequence[int]] = None,
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
         assert not (return_raw_features and return_features)
+        assert not (return_layersync_features and (return_raw_features or return_features))
         # return_block_summaries can be combined with either mode; callers must
         # handle the expanded return tuple shape.
 
@@ -333,6 +357,25 @@ class SelfFlowDiT(nn.Module):
                 raw_positions = {}
                 for idx, layer in enumerate(raw_layers):
                     raw_positions.setdefault(layer, []).append(idx)
+
+        layersync_layers = None
+        layersync_weak_z = None
+        layersync_strong_z = None
+        if return_layersync_features is not None:
+            layersync_layers = tuple(int(layer) for layer in return_layersync_features)
+            if len(layersync_layers) != 2:
+                raise ValueError(
+                    f"return_layersync_features expects exactly (weak_layer, strong_layer), got {layersync_layers}"
+                )
+            weak_layer, strong_layer = layersync_layers
+            if not (1 <= weak_layer <= self.depth and 1 <= strong_layer <= self.depth):
+                raise ValueError(
+                    f"LayerSync layers must be in [1, {self.depth}], got {layersync_layers}"
+                )
+            if weak_layer >= strong_layer:
+                raise ValueError(
+                    f"LayerSync weak layer must be < strong layer, got {layersync_layers}"
+                )
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
@@ -396,6 +439,15 @@ class SelfFlowDiT(nn.Module):
                 else:
                     for idx in raw_positions[i + 1]:
                         raw_zs[idx] = x
+            if layersync_layers is not None:
+                weak_layer, strong_layer = layersync_layers
+                if (i + 1) == weak_layer:
+                    if self.layersync_project_weak:
+                        layersync_weak_z = self.layersync_projector(x)
+                    else:
+                        layersync_weak_z = x
+                elif (i + 1) == strong_layer:
+                    layersync_strong_z = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -416,6 +468,11 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 return x, zs, block_summaries
             return x, zs
+        if layersync_layers is not None:
+            layersync_out = (layersync_weak_z, layersync_strong_z)
+            if return_block_summaries:
+                return x, layersync_out, block_summaries
+            return x, layersync_out
         if raw_layers:
             raw_out = zs if raw_single else tuple(raw_zs)
             if return_block_summaries:

@@ -392,6 +392,9 @@ def build_model_config(model_size):
         learn_sigma=True,
         compatibility_mode=True,
         class_dropout_prob=DEFAULT_CFG_DROPOUT_RATE,
+        layersync_project_weak=False,
+        layersync_proj_dim=2048,
+        layersync_capture_layers=None,
     )
 
 
@@ -454,6 +457,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
+        layersync_project_weak=config.get("layersync_project_weak", False),
+        layersync_proj_dim=config.get("layersync_proj_dim", 2048),
         per_token=False,
     )
 
@@ -471,6 +476,7 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         timesteps=dummy_t,
         vector=dummy_vec,
         deterministic=False,
+        return_layersync_features=config.get("layersync_capture_layers"),
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
@@ -595,7 +601,7 @@ def train_step(
                 vector=y,
                 deterministic=False,
                 rngs={"dropout": drop_rng},
-                return_raw_features=layersync_capture_layers,
+                return_layersync_features=layersync_capture_layers,
             )
             loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
         else:
@@ -679,7 +685,7 @@ def eval_step(
             timesteps=tau,
             vector=y,
             deterministic=True,
-            return_raw_features=layersync_capture_layers,
+            return_layersync_features=layersync_capture_layers,
         )
         loss_layersync, layersync_cosine = compute_layersync_loss(raw_features)
     else:
@@ -1237,6 +1243,12 @@ def main():
         default=DEFAULT_LAYERSYNC_STRONG_LAYER,
         help="1-based index of the deeper reference layer for LayerSync (paper default: 16).",
     )
+    parser.add_argument(
+        "--layersync-proj-dim",
+        type=int,
+        default=2048,
+        help="Hidden width of the 3-layer MLP projector applied to the weak LayerSync feature.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1385,6 +1397,8 @@ def main():
         raise ValueError("--vae-decode-batch-size must be greater than 0")
     if args.layersync_lambda < 0.0:
         raise ValueError("--layersync-lambda must be non-negative")
+    if args.layersync_proj_dim <= 0:
+        raise ValueError("--layersync-proj-dim must be positive")
     if not 0.0 <= args.cfg_dropout_rate < 1.0:
         raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
     if args.cfg_dropout_rate <= 0.0 and (args.sample_cfg_scale > 1.0 or args.fid_cfg_scale > 1.0):
@@ -1428,9 +1442,13 @@ def main():
     if layersync_enabled:
         weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = (weak_layer, strong_layer)
+        config["layersync_project_weak"] = True
+        config["layersync_proj_dim"] = int(args.layersync_proj_dim)
+        config["layersync_capture_layers"] = layersync_capture_layers
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
-            f"weak_layer={weak_layer} strong_layer={strong_layer}"
+            f"weak_layer={weak_layer} strong_layer={strong_layer} "
+            f"weak_projector=mlp3x hidden={args.layersync_proj_dim}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")
