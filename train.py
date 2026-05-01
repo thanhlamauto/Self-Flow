@@ -428,6 +428,26 @@ from flax import jax_utils
 from flax import struct
 from flax import traverse_util
 import numpy as np
+
+
+def _device_put_replicated_compat(tree, devices=None):
+    devices = devices or jax.local_devices()
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("replica",))
+
+    def replicate_leaf(x):
+        x = jnp.asarray(x)
+        replicated = jnp.broadcast_to(x, (len(devices),) + x.shape)
+        sharding = jax.sharding.NamedSharding(
+            mesh,
+            jax.sharding.PartitionSpec("replica", *((None,) * x.ndim)),
+        )
+        return jax.device_put(replicated, sharding)
+
+    return jax.tree_util.tree_map(replicate_leaf, tree)
+
+
+jax.device_put_replicated = _device_put_replicated_compat
+jax_utils.replicate = _device_put_replicated_compat
 try:
     import grain.python as grain
 except ImportError:
