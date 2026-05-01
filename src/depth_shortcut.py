@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -46,6 +48,8 @@ class AdaLNConvNeXtBlock(nn.Module):
     cond_dim: int
     expansion: int = 2
     dilation: int = 1
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, h: jax.Array, c: jax.Array) -> jax.Array:
@@ -53,11 +57,20 @@ class AdaLNConvNeXtBlock(nn.Module):
             2 * self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
 
-        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln")(h)
+        x = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="ln",
+        )(h)
         x = x * (1.0 + gamma[:, None, None, :]) + beta[:, None, None, :]
         x = nn.Conv(
             features=self.width,
@@ -67,12 +80,16 @@ class AdaLNConvNeXtBlock(nn.Module):
             kernel_dilation=(self.dilation, self.dilation),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="dwconv",
         )(x)
         x = nn.Dense(
             self.width * self.expansion,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -80,6 +97,8 @@ class AdaLNConvNeXtBlock(nn.Module):
             self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw2",
         )(x)
         return h + x
@@ -95,6 +114,8 @@ class AttentionHybridShortcutBlock(nn.Module):
     num_heads: int = 4
     dilation: int = 1
     attn_gamma_init: float = 0.05
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, h: jax.Array, c: jax.Array) -> jax.Array:
@@ -105,11 +126,20 @@ class AttentionHybridShortcutBlock(nn.Module):
             2 * self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
 
-        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln")(h)
+        x = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="ln",
+        )(h)
         x = x * (1.0 + gamma[:, None, None, :]) + beta[:, None, None, :]
         x = nn.Conv(
             features=self.width,
@@ -119,6 +149,8 @@ class AttentionHybridShortcutBlock(nn.Module):
             kernel_dilation=(self.dilation, self.dilation),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="dwconv",
         )(x)
 
@@ -130,18 +162,24 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="attn_q",
         )(tokens)
         k = nn.Dense(
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="attn_k",
         )(tokens)
         v = nn.Dense(
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="attn_v",
         )(tokens)
         q = q.reshape(batch_size, seq_len, self.num_heads, head_dim).transpose(0, 2, 1, 3)
@@ -155,6 +193,8 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="attn_out",
         )(attn_out)
         attn_out = attn_out.reshape(batch_size, height, grid_width, self.width)
@@ -169,6 +209,8 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width * self.expansion,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -176,6 +218,8 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw2",
         )(x)
         return h + x
@@ -188,6 +232,8 @@ class MagnitudeHead(nn.Module):
     cond_dim: int
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, h: jax.Array, m_source: jax.Array, c: jax.Array) -> jax.Array:
@@ -205,11 +251,20 @@ class MagnitudeHead(nn.Module):
             2 * mag_channels,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
 
-        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="ln")(x)
+        x = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="ln",
+        )(x)
         x = x * (1.0 + gamma[:, None, None, :]) + beta[:, None, None, :]
         x = nn.Conv(
             features=mag_channels,
@@ -218,12 +273,16 @@ class MagnitudeHead(nn.Module):
             feature_group_count=mag_channels,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="dwconv",
         )(x)
         x = nn.Dense(
             max(channels // 4, 1),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -231,9 +290,11 @@ class MagnitudeHead(nn.Module):
             1,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="pw2",
         )(x)
-        return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1)
+        return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1).astype(jnp.float32)
 
 
 class DepthShortcutPredictor(nn.Module):
@@ -256,6 +317,8 @@ class DepthShortcutPredictor(nn.Module):
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @property
     def grid_size(self) -> int:
@@ -301,6 +364,8 @@ class DepthShortcutPredictor(nn.Module):
             self.cond_hidden_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="cond_mlp_0",
         )(c_in)
         c = nn.gelu(c, approximate=True)
@@ -308,6 +373,8 @@ class DepthShortcutPredictor(nn.Module):
             cond_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="cond_mlp_1",
         )(c)
 
@@ -315,6 +382,8 @@ class DepthShortcutPredictor(nn.Module):
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="in_proj",
         )(u_source)
         h = h.reshape(batch_size, self.grid_size, self.grid_size, self.width)
@@ -329,6 +398,8 @@ class DepthShortcutPredictor(nn.Module):
                     cond_dim=cond_dim,
                     expansion=self.expansion,
                     dilation=dilation,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     name=f"blocks_{idx}",
                 )(h, c)
             elif self.arch == "attn_hybrid":
@@ -342,6 +413,8 @@ class DepthShortcutPredictor(nn.Module):
                     num_heads=int(self.num_heads),
                     dilation=dilation,
                     attn_gamma_init=self.attn_gamma_init,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                     name=f"blocks_{idx}",
                 )(h, c)
             else:
@@ -352,6 +425,8 @@ class DepthShortcutPredictor(nn.Module):
             self.hidden_size,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="out_proj",
         )(h)
         gamma_out = self.param(
@@ -360,6 +435,7 @@ class DepthShortcutPredictor(nn.Module):
             (),
         )
         y = u_source + gamma_out * delta_y
+        y = y.astype(jnp.float32)
         if m_source is None:
             return y
         delta_m = MagnitudeHead(
@@ -367,6 +443,8 @@ class DepthShortcutPredictor(nn.Module):
             cond_dim=cond_dim,
             mag_abs_center=self.mag_abs_center,
             mag_abs_scale=self.mag_abs_scale,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="mag_head",
         )(h_grid, m_source, c)
         return y, delta_m

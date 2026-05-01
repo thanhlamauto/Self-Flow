@@ -642,7 +642,7 @@ def sample_triplet_uniform(rng, depth):
 
 def update_l2_ema_5bins(l2_ema, hidden_states, timestep_indices, alpha=0.01):
     """Update per-layer/token L2 magnitude EMA across five 10-step bins."""
-    norms = jnp.linalg.norm(hidden_states, axis=-1)  # [L+1, B, P]
+    norms = jnp.linalg.norm(hidden_states.astype(jnp.float32), axis=-1)  # [L+1, B, P]
     bins = jnp.clip(timestep_indices // 10, 0, 4)
     bin_mask = jax.nn.one_hot(bins, 5, dtype=norms.dtype)  # [B, 5]
     sums = jnp.einsum("bt,lbp->ltp", bin_mask, norms)

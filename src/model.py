@@ -7,7 +7,7 @@ with per-token timestep conditioning for Self-Flow training, implemented in Flax
 
 import math
 from collections.abc import Sequence
-from typing import Optional
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +64,8 @@ class PatchedPatchEmbed(nn.Module):
     in_channels: int = 3
     embed_dim: int = 768
     bias: bool = True
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -72,6 +74,8 @@ class PatchedPatchEmbed(nn.Module):
             use_bias=self.bias,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="proj",
         )(x)
 
@@ -90,6 +94,8 @@ class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations."""
     hidden_size: int
     frequency_embedding_size: int = 256
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     def timestep_embedding(self, t, dim, max_period=10000.0):
         """Create sinusoidal timestep embeddings."""
@@ -108,12 +114,16 @@ class TimestepEmbedder(nn.Module):
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(t_freq)
         x = nn.swish(x)
         x = nn.Dense(
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )(x)
         return x
 
@@ -123,6 +133,8 @@ class LabelEmbedder(nn.Module):
     num_classes: int
     hidden_size: int
     dropout_prob: float
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
@@ -131,6 +143,8 @@ class LabelEmbedder(nn.Module):
             num_embeddings=self.num_classes + use_cfg_embedding,
             features=self.hidden_size,
             embedding_init=NORMAL_002,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
         use_dropout = self.dropout_prob > 0
@@ -151,11 +165,25 @@ class DiTBlock(nn.Module):
     num_heads: int
     mlp_ratio: float = 4.0
     per_token: bool = False
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x, c):
-        norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
+        norm1 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        norm2 = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
         
         if self.per_token:
@@ -165,6 +193,8 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
@@ -179,6 +209,8 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(x_norm, x_norm)
             x = x + gate_msa * attn
             
@@ -188,12 +220,16 @@ class DiTBlock(nn.Module):
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                 ),
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
@@ -202,6 +238,8 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(nn.swish(c))
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
@@ -214,6 +252,8 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
             
@@ -223,12 +263,16 @@ class DiTBlock(nn.Module):
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                 ),
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
@@ -242,14 +286,24 @@ class FinalLayer(nn.Module):
     patch_size: int
     out_channels: int
     per_token: bool = False
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x, c):
-        norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
+        norm_final = nn.LayerNorm(
+            epsilon=1e-6,
+            use_bias=False,
+            use_scale=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         linear = nn.Dense(
             self.patch_size * self.patch_size * self.out_channels,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
         
         if self.per_token:
@@ -259,6 +313,8 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
@@ -270,6 +326,8 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(nn.swish(c))
             shift, scale = jnp.split(modulation, 2, axis=1)
             
@@ -293,6 +351,8 @@ class SelfFlowDiT(nn.Module):
     compatibility_mode: bool = False
     per_token: bool = False
     class_dropout_prob: float = 0.1
+    dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -368,16 +428,24 @@ class SelfFlowDiT(nn.Module):
                 patch_size=self.patch_size,
                 in_channels=self.in_channels,
                 embed_dim=self.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )(x)
-            x = x + self.pos_embed_val
+            x = x + self.pos_embed_val.astype(x.dtype)
         else:
-            x = resume_hidden
+            x = resume_hidden.astype(self.dtype)
 
-        t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
+        t_embedder = TimestepEmbedder(
+            hidden_size=self.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         y_embedder = LabelEmbedder(
             num_classes=self.num_classes,
             hidden_size=self.hidden_size,
             dropout_prob=self.class_dropout_prob,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
         if self.per_token:
@@ -447,6 +515,8 @@ class SelfFlowDiT(nn.Module):
                 num_heads=self.num_heads, 
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
                 name=f"DiTBlock_{i}",
             )(x, c)
             if resume_hidden is None:
@@ -497,7 +567,7 @@ class SelfFlowDiT(nn.Module):
 
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
-                block_summaries.append(jnp.mean(x, axis=1))
+                block_summaries.append(jnp.mean(x.astype(jnp.float32), axis=1))
             
             if (i + 1) == return_features:
                 zs = x
@@ -513,6 +583,8 @@ class SelfFlowDiT(nn.Module):
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
             per_token=self.per_token,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name="FinalLayer_0",
         )(x, c)
 
@@ -520,6 +592,7 @@ class SelfFlowDiT(nn.Module):
         
         # PyTorch implementation negates the final prediction
         x = -x
+        x = x.astype(jnp.float32)
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
