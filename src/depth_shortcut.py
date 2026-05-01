@@ -58,6 +58,7 @@ class ShortcutDiTBlock(nn.Module):
             6 * self.hidden_size,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="adaLN_modulation",
         )(nn.swish(c))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
@@ -75,6 +76,7 @@ class ShortcutDiTBlock(nn.Module):
             out_kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
             out_bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="attn",
         )(x_norm, x_norm)
         x = x + gate_msa[:, None, :] * attn
@@ -85,6 +87,7 @@ class ShortcutDiTBlock(nn.Module):
             mlp_hidden_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="mlp_fc1",
         )(x_norm)
         x_mlp = nn.gelu(x_mlp, approximate=True)
@@ -92,6 +95,7 @@ class ShortcutDiTBlock(nn.Module):
             self.hidden_size,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="mlp_fc2",
         )(x_mlp)
         return x + gate_mlp[:, None, :] * x_mlp
@@ -111,6 +115,7 @@ class AdaLNConvNeXtBlock(nn.Module):
             2 * self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
@@ -125,12 +130,14 @@ class AdaLNConvNeXtBlock(nn.Module):
             kernel_dilation=(self.dilation, self.dilation),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="dwconv",
         )(x)
         x = nn.Dense(
             self.width * self.expansion,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -138,6 +145,7 @@ class AdaLNConvNeXtBlock(nn.Module):
             self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw2",
         )(x)
         return h + x
@@ -163,6 +171,7 @@ class AttentionHybridShortcutBlock(nn.Module):
             2 * self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
@@ -177,6 +186,7 @@ class AttentionHybridShortcutBlock(nn.Module):
             kernel_dilation=(self.dilation, self.dilation),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="dwconv",
         )(x)
 
@@ -188,18 +198,21 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="attn_q",
         )(tokens)
         k = nn.Dense(
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="attn_k",
         )(tokens)
         v = nn.Dense(
             self.attn_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="attn_v",
         )(tokens)
         q = q.reshape(batch_size, seq_len, self.num_heads, head_dim).transpose(0, 2, 1, 3)
@@ -213,6 +226,7 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="attn_out",
         )(attn_out)
         attn_out = attn_out.reshape(batch_size, height, grid_width, self.width)
@@ -227,6 +241,7 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width * self.expansion,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -234,6 +249,7 @@ class AttentionHybridShortcutBlock(nn.Module):
             self.width,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw2",
         )(x)
         return h + x
@@ -260,6 +276,7 @@ class DeepDilatedShortcutBlock(nn.Module):
                     3 * self.width,
                     kernel_init=mod_init,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                     name=name,
                 )(nn.silu(c)),
                 3,
@@ -282,12 +299,14 @@ class DeepDilatedShortcutBlock(nn.Module):
             kernel_dilation=(self.dilation, self.dilation),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="dwconv",
         )(x_grid)
         x_grid = nn.Dense(
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pwconv",
         )(x_grid)
         x = x_grid.reshape(batch_size, num_tokens, self.width)
@@ -310,6 +329,7 @@ class DeepDilatedShortcutBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="attn",
             )(x, x)
             h = h + gate_attn[:, None, :] * x_attn
@@ -324,6 +344,7 @@ class DeepDilatedShortcutBlock(nn.Module):
             int(self.width * self.mlp_ratio),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="mlp_fc1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -331,6 +352,7 @@ class DeepDilatedShortcutBlock(nn.Module):
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="mlp_fc2",
         )(x)
         return h + gate_mlp[:, None, :] * x
@@ -360,6 +382,7 @@ class MagnitudeHead(nn.Module):
             2 * mag_channels,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="adaln_mod",
         )(nn.gelu(c, approximate=True))
         gamma, beta = jnp.split(gamma_beta, 2, axis=-1)
@@ -373,12 +396,14 @@ class MagnitudeHead(nn.Module):
             feature_group_count=mag_channels,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="dwconv",
         )(x)
         x = nn.Dense(
             max(channels // 4, 1),
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
@@ -386,6 +411,7 @@ class MagnitudeHead(nn.Module):
             1,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="pw2",
         )(x)
         return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1)
@@ -473,6 +499,7 @@ class DepthShortcutPredictor(nn.Module):
                 num_embeddings=int(self.dt_max_time_bins),
                 features=cond_dim,
                 embedding_init=NORMAL_002,
+                dtype=jnp.bfloat16,
                 name=name,
             )(idx)
             if emb.ndim == 1:
@@ -484,6 +511,7 @@ class DepthShortcutPredictor(nn.Module):
                 out_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name=f"{name}_0",
             )(x)
             h_cond = nn.gelu(h_cond, approximate=True)
@@ -491,6 +519,7 @@ class DepthShortcutPredictor(nn.Module):
                 out_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name=f"{name}_1",
             )(h_cond)
 
@@ -499,18 +528,21 @@ class DepthShortcutPredictor(nn.Module):
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_t_proj",
             )(t_cond)
             layer_embed = nn.Embed(
                 num_embeddings=self.depth + 1,
                 features=cond_dim,
                 embedding_init=NORMAL_002,
+                dtype=jnp.bfloat16,
                 name="cond_layer_embed",
             )
             delta_embed = nn.Embed(
                 num_embeddings=self.depth,
                 features=cond_dim,
                 embedding_init=NORMAL_002,
+                dtype=jnp.bfloat16,
                 name="cond_delta_embed",
             )
             if self.dt_use_layer_cond:
@@ -530,12 +562,14 @@ class DepthShortcutPredictor(nn.Module):
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_t_tgt_proj",
             )(t_tgt_cond) + time_idx_embed("cond_t_tgt_idx_embed", t_tgt_idx)
             e_delta_t = nn.Dense(
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_t_delta_proj",
             )(t_delta_cond) + time_idx_embed("cond_delta_t_idx_embed", delta_t_idx)
             if self.dt_cond_mode == "sum":
@@ -568,6 +602,7 @@ class DepthShortcutPredictor(nn.Module):
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_out",
             )(nn.gelu(c, approximate=True))
         else:
@@ -575,12 +610,14 @@ class DepthShortcutPredictor(nn.Module):
                 self.layer_cond_dim,
                 use_bias=False,
                 kernel_init=NORMAL_002,
+                dtype=jnp.bfloat16,
                 name="state_layer_proj",
             )
             delta_embed = nn.Dense(
                 self.layer_cond_dim,
                 use_bias=False,
                 kernel_init=NORMAL_002,
+                dtype=jnp.bfloat16,
                 name="delta_layer_proj",
             )
 
@@ -592,18 +629,21 @@ class DepthShortcutPredictor(nn.Module):
                     self.cond_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                     name="cond_layer_src_proj",
                 )(jnp.broadcast_to(h_a_raw[None, :], (batch_size, h_a_raw.shape[-1])))
                 e_b = nn.Dense(
                     self.cond_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                     name="cond_layer_tgt_proj",
                 )(jnp.broadcast_to(h_b_raw[None, :], (batch_size, h_b_raw.shape[-1])))
                 e_delta_layer = nn.Dense(
                     self.cond_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                     name="cond_layer_delta_proj",
                 )(jnp.broadcast_to(h_delta_raw[None, :], (batch_size, h_delta_raw.shape[-1])))
             else:
@@ -614,18 +654,21 @@ class DepthShortcutPredictor(nn.Module):
                 self.cond_hidden_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_time_src_proj",
             )(t_cond)
             e_s = nn.Dense(
                 self.cond_hidden_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_time_tgt_proj",
             )(t_tgt_cond)
             e_delta_t = nn.Dense(
                 self.cond_hidden_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_time_delta_proj",
             )(t_delta_cond)
             if self.dt_cond_mode == "sum":
@@ -648,6 +691,7 @@ class DepthShortcutPredictor(nn.Module):
                 self.cond_hidden_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_mlp_0",
             )(c_in)
             c = nn.gelu(c, approximate=True)
@@ -655,6 +699,7 @@ class DepthShortcutPredictor(nn.Module):
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="cond_mlp_1",
             )(c)
 
@@ -664,8 +709,9 @@ class DepthShortcutPredictor(nn.Module):
                 self.hidden_size,
                 kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
                 name="h0_tgt_proj",
-            )(h0_tgt.astype(jnp.float32))
+            )(h0_tgt.astype(jnp.bfloat16))
             if self.dt_h0_fusion == "add":
                 predictor_input = predictor_input + h0_cond
             else:
@@ -673,6 +719,7 @@ class DepthShortcutPredictor(nn.Module):
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                     name="h0_concat_proj",
                 )(jnp.concatenate([predictor_input, h0_cond], axis=-1))
 
@@ -680,6 +727,7 @@ class DepthShortcutPredictor(nn.Module):
             self.width,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="in_proj",
         )(predictor_input)
         if self.arch == "dit2":
@@ -749,6 +797,7 @@ class DepthShortcutPredictor(nn.Module):
             self.hidden_size,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="out_proj",
         )(h)
         gamma_out = self.param(

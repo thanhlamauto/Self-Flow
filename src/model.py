@@ -73,6 +73,7 @@ class PatchedPatchEmbed(nn.Module):
             use_bias=self.bias,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="proj",
         )(x)
 
@@ -109,12 +110,14 @@ class TimestepEmbedder(nn.Module):
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )(t_freq)
         x = nn.swish(x)
         x = nn.Dense(
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )(x)
         return x
 
@@ -132,6 +135,7 @@ class LabelEmbedder(nn.Module):
             num_embeddings=self.num_classes + use_cfg_embedding,
             features=self.hidden_size,
             embedding_init=NORMAL_002,
+            dtype=jnp.bfloat16,
         )
 
         use_dropout = self.dropout_prob > 0
@@ -158,7 +162,7 @@ class DiTBlock(nn.Module):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
@@ -166,10 +170,11 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
-            
+
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
             # Self Attention
             attn = nn.MultiHeadDotProductAttention(
@@ -180,21 +185,24 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(x_norm, x_norm)
             x = x + gate_msa * attn
-            
+
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
                 nn.Dense(
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
@@ -203,9 +211,10 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c))
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
-            
+
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
             attn = nn.MultiHeadDotProductAttention(
                 num_heads=self.num_heads,
@@ -215,25 +224,28 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
-            
+
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
                 nn.Dense(
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
-            
+
         return x
 
 
@@ -251,8 +263,9 @@ class FinalLayer(nn.Module):
             self.patch_size * self.patch_size * self.out_channels,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
@@ -260,10 +273,11 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
-            
+
             x = modulate_per_token(norm_final(x), shift, scale)
             x = linear(x)
         else:
@@ -271,12 +285,13 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c))
             shift, scale = jnp.split(modulation, 2, axis=1)
-            
+
             x = modulate(norm_final(x), shift, scale)
             x = linear(x)
-            
+
         return x
 
 
@@ -299,7 +314,7 @@ class SelfFlowDiT(nn.Module):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
 
@@ -387,7 +402,7 @@ class SelfFlowDiT(nn.Module):
                 in_channels=self.in_channels,
                 embed_dim=self.hidden_size,
             )(x)
-            x = x + self.pos_embed_val
+            x = x + self.pos_embed_val.astype(jnp.bfloat16)
             h0_tokens = x
         else:
             x = resume_hidden
@@ -411,7 +426,7 @@ class SelfFlowDiT(nn.Module):
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
+
             y_emb = y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
@@ -483,8 +498,8 @@ class SelfFlowDiT(nn.Module):
                 continue
 
             block_out = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token,
                 name=f"DiTBlock_{i}",
@@ -546,7 +561,7 @@ class SelfFlowDiT(nn.Module):
             if return_block_summaries:
                 # Token-pooled summary per block: (B, D)
                 block_summaries.append(jnp.mean(x, axis=1))
-            
+
             if (i + 1) == return_features:
                 zs = x
             if raw_layers and ((i + 1) in raw_positions if raw_positions is not None else (i + 1) in raw_layers):
@@ -565,7 +580,7 @@ class SelfFlowDiT(nn.Module):
         )(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
