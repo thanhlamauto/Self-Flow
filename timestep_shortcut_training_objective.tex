@@ -1,0 +1,351 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{Paired Timestep-Shortcut Training Objective}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Active configuration}
+
+This document describes the intended training path for branch
+\texttt{feat/timestep-shortcut-output-distill} after the paired-batch update.
+The default timestep-shortcut setup is:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Switch & Value \\
+\midrule
+\texttt{--use-timestep-shortcut} & on \\
+\texttt{--timestep-paired-batch} & on \\
+\texttt{--timestep-shortcut-layer} & $k=9$ by default \\
+\texttt{--timestep-shortcut-loss-mode} & \texttt{activation\_huber} \\
+\texttt{--timestep-shortcut-use-layer-cond} & off by default \\
+\texttt{--shortcut-predictor} & \texttt{hybrid\_depth10} alias for \texttt{hybrid\_deep\_10} \\
+\texttt{--no-shortcut-predictor-normalize-input} & predictor receives raw layer-$k$ activations \\
+\texttt{--use-timestep-direct-loss} & on \\
+\texttt{--use-timestep-bootstrap-loss} & on \\
+\texttt{--use-timestep-output-distill} & on \\
+\texttt{--no-use-depth-time-resync} & depth-time losses inactive \\
+\texttt{--no-output-distill} & legacy depth output-distill inactive \\
+\texttt{--private-loss} & off by default; cosine-squared private loss inactive \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The direct and bootstrap timestep losses are Smooth-L1/Huber activation losses.
+They are not direction--magnitude losses in this mode.
+
+\section{Paired local batch}
+
+Let the global batch size be $B=128$. With paired timestep training, only
+$B/2=64$ distinct images are used per global step. Each image is materialized at
+two noise levels inside the same local device batch. If there are $D$ devices,
+the local batch size is $B_{\mathrm{loc}}=B/D$ and the local number of distinct
+images is
+\[
+  M_{\mathrm{loc}} = \frac{B_{\mathrm{loc}}}{2}.
+\]
+The implementation requires $B_{\mathrm{loc}}$ to be even.
+
+For local image $i\in\{1,\ldots,M_{\mathrm{loc}}\}$, draw one clean latent
+$x_{0,i}$, one Gaussian noise sample $x_{1,i}\sim\mathcal{N}(0,I)$, and three
+ordered timestep indices
+\[
+  q_a < q_b < q_c.
+\]
+The repo convention is that $\tau=0$ is pure noise and larger $\tau$ is cleaner.
+Thus $a$ is the heavier-noise state, $b$ is lighter, and $c$ is the lightest.
+With $T=50$ shortcut bins,
+\[
+  \tau_a=\frac{q_a}{T-1},\qquad
+  \tau_b=\frac{q_b}{T-1},\qquad
+  \tau_c=\frac{q_c}{T-1}.
+\]
+The noisy latents are
+\[
+  x_a=(1-\tau_a)x_1+\tau_a x_0,\qquad
+  x_b=(1-\tau_b)x_1+\tau_b x_0,\qquad
+  x_c=(1-\tau_c)x_1+\tau_c x_0.
+\]
+Only $x_a$ and $x_b$ are put through the full DiT backbone. $x_c$ is used only
+to form cheap input/timestep embeddings for the bootstrap target condition.
+
+\section{Backbone forward passes}
+
+The heavy and light states are concatenated inside each local batch:
+\[
+  X_{\mathrm{pair}} = [x_a; x_b],\qquad
+  \Tau_{\mathrm{pair}} = [\tau_a; \tau_b],\qquad
+  Y_{\mathrm{pair}}=[y;y].
+\]
+A single DiT apply over this paired batch is equivalent in cost to two half-batch
+backbone forwards:
+\[
+  \bigl(\hat v_a,\{Z_\ell^a\}_{\ell=0}^{L},e_a\bigr),
+  \bigl(\hat v_b,\{Z_\ell^b\}_{\ell=0}^{L},e_b\bigr)
+  =
+  F_\theta^{\mathrm{hidden}}([x_a;x_b],[\tau_a;\tau_b],[y;y]).
+\]
+Here $e_a,e_b$ are DiT timestep embeddings, $Z_0$ is the patch embedding, and
+$Z_k$ is the output of block/layer $k$. The default fixed shortcut layer is
+$k=9$.
+
+The third timestep is not fully forwarded through DiT. The code computes only
+\[
+  (Z_0^c,e_c)=F_\theta^{\mathrm{input\_emb}}(x_c,\tau_c,y),
+\]
+which gives the target patch embedding and timestep embedding needed by the
+predictor.
+
+\section{Base velocity loss}
+
+The normal flow-matching velocity target is independent of timestep:
+\[
+  v^\star=x_0-x_1.
+\]
+The base loss is evaluated on both paired noise levels:
+\[
+  \mathcal{L}_{\mathrm{gen}}
+  =
+  \frac{1}{2M_{\mathrm{loc}}}
+  \sum_i
+  \left(
+    \left\lVert \hat v_{a,i}-v_i^\star\right\rVert_2^2
+    +
+    \left\lVert \hat v_{b,i}-v_i^\star\right\rVert_2^2
+  \right).
+\]
+
+\section{Predictor interface}
+
+The timestep shortcut predictor is
+\[
+  P_\phi(S,e_{\mathrm{src}},e_{\mathrm{tgt}},Z_0^{\mathrm{tgt}},q_{\mathrm{src}},q_{\mathrm{tgt}})
+  \mapsto \widehat Z.
+\]
+For this paired timestep mode:
+\begin{itemize}
+\item $S$ is the raw source activation, not L2-normalized.
+\item the layer is fixed to $k$ globally, so source/target layer ids are not
+  active predictor conditions by default;
+\item the predictor still receives source and target timestep information
+  $(e_{\mathrm{src}},e_{\mathrm{tgt}},q_{\mathrm{src}},q_{\mathrm{tgt}})$;
+\item the target patch embedding $Z_0^{\mathrm{tgt}}$ can condition the
+  predictor.
+\end{itemize}
+
+\section{Smooth-L1 activation loss}
+
+For a predicted activation $\widehat Z$ and a target activation $Z$, define the
+per-sample RMS normalizer
+\[
+  r(Z)_i =
+  \sqrt{\mathrm{mean}_{n,d}\left(Z_{i,n,d}^2\right)+\epsilon}.
+\]
+The normalized residual is
+\[
+  \rho_i=\frac{\widehat Z_i-\mathrm{sg}(Z_i)}{\mathrm{sg}(r(Z)_i)}.
+\]
+The Smooth-L1/Huber activation loss is
+\[
+  \mathcal{H}_\delta(\widehat Z,Z)
+  =
+  \mathrm{mean}_{i,n,d}\left[
+  \begin{cases}
+    \frac{1}{2}\rho_{i,n,d}^2, & |\rho_{i,n,d}|\le \delta,\\
+    \delta\left(|\rho_{i,n,d}|-\frac{1}{2}\delta\right),
+      & |\rho_{i,n,d}|>\delta,
+  \end{cases}
+  \right],
+\]
+with default $\delta=1$.
+
+\section{Direct timestep loss}
+
+The heavy activation at layer $k$ predicts the light activation at the same
+layer:
+\[
+  \widehat Z_k^b
+  =
+  P_\phi(Z_k^a,e_a,e_b,Z_0^b,q_a,q_b).
+\]
+The direct loss is
+\[
+  \mathcal{L}_{\mathrm{direct}}
+  =
+  \lambda_{\mathrm{direct}}
+  \mathcal{H}_\delta(\widehat Z_k^b,Z_k^b),
+\]
+where the implementation uses \texttt{--shortcut-lambda-dir} as
+$\lambda_{\mathrm{direct}}$.
+
+\section{Bootstrap loss}
+
+The online two-hop prediction is
+\[
+  \widehat Z_k^{c,\mathrm{2hop}}
+  =
+  P_\phi(\widehat Z_k^b,e_b,e_c,Z_0^c,q_b,q_c).
+\]
+The EMA one-hop target is
+\[
+  \widehat Z_k^{c,\mathrm{ema}}
+  =
+  P_{\bar\phi}(\mathrm{sg}(Z_k^a),\mathrm{sg}(e_a),e_c,Z_0^c,q_a,q_c).
+\]
+The bootstrap equation is therefore
+\[
+  P_\phi(P_\phi(a,b),c)\approx P_{\bar\phi}(a,c).
+\]
+The bootstrap loss is
+\[
+  \mathcal{L}_{\mathrm{boot}}
+  =
+  \lambda_{\mathrm{boot}}
+  \mathcal{H}_\delta
+  \left(
+    \widehat Z_k^{c,\mathrm{2hop}},
+    \mathrm{sg}(\widehat Z_k^{c,\mathrm{ema}})
+  \right),
+\]
+where $\bar\phi$ is the predictor EMA.
+
+\section{Output distillation}
+
+The same direct prediction $\widehat Z_k^b$ is reused for output distillation.
+It is fed into the DiT tail from layer $k+1$ onward, but now with the light
+timestep and class condition:
+\[
+  \widehat v_b^{\mathrm{tail}}
+  =
+  F_\theta^{\mathrm{tail}}
+  (x_b,\tau_b,y;\ \mathrm{resume\_hidden}=\widehat Z_k^b,\ 
+   \mathrm{resume\_start}=k+1).
+\]
+The target is the full light-noise DiT prediction from the paired backbone
+forward:
+\[
+  v_b^{\mathrm{target}}=\mathrm{sg}(\hat v_b).
+\]
+The output distillation loss is the relative MSE
+\[
+  \mathcal{L}_{\mathrm{out}}
+  =
+  \frac{1}{M_{\mathrm{loc}}}
+  \sum_i
+  \frac{
+    \left\lVert \widehat v_{b,i}^{\mathrm{tail}}
+      - v_{b,i}^{\mathrm{target}}\right\rVert_2^2
+  }{
+    \left\lVert v_{b,i}^{\mathrm{target}}\right\rVert_2^2 + 10^{-6}
+  }.
+\]
+Unless \texttt{--timestep-output-distill-train-tail} is enabled, this branch
+updates the predictor while the DiT tail parameters are stop-gradient.
+
+\section{Inactive cosine-squared private loss}
+
+The cosine-squared private activation loss is off by default in this run. In
+command terms, do not pass \texttt{--private-loss}. Thus
+\[
+  \mathcal{L}_{\mathrm{private}}=0.
+\]
+
+\section{Total loss}
+
+With depth-time resync, legacy depth shortcut losses, legacy output distill,
+skip-FM, and cosine-squared private loss inactive, the optimized loss is
+\[
+\boxed{
+  \mathcal{L}_{\mathrm{total}}
+  =
+  \mathcal{L}_{\mathrm{gen}}
+  +
+  \mathcal{L}_{\mathrm{direct}}
+  +
+  \mathcal{L}_{\mathrm{boot}}
+  +
+  \lambda_{\mathrm{out}}\mathcal{L}_{\mathrm{out}}.
+}
+\]
+For the recommended command, $\lambda_{\mathrm{out}}=0.05$.
+
+\section{Compute summary}
+
+Per training step, the timestep losses require:
+\begin{itemize}
+\item one paired DiT forward over $[x_a;x_b]$, equivalent to two half-batch
+  backbone forwards and no larger than the original global batch cost;
+\item one cheap input/timestep embedding pass for $x_c$;
+\item three predictor calls:
+  \[
+    P_\phi(a,b),\qquad P_\phi(P_\phi(a,b),c),\qquad P_{\bar\phi}(a,c).
+  \]
+\end{itemize}
+
+\section{FID evaluation variants}
+
+Evaluation now reports three 4k-sample FID variants when
+\texttt{--num-fid-samples 4096}.
+
+\paragraph{1. Full DiT FID.}
+The standard sampler uses the full DiT at every denoise step:
+\[
+  \texttt{val/FID},\qquad \texttt{val/sFID}.
+\]
+
+\paragraph{2. One-step chained timestep shortcut FID.}
+At each denoise step $j$, the latent is run through the DiT prefix up to layer
+$k=9$, then the predictor maps the layer-$9$ activation from step $j$ to
+step $j+1$. The DiT tail then runs with the timestep embedding and class
+condition of step $j+1$:
+\[
+  Z_k^{j+1}=P_\phi(Z_k^j,e_j,e_{j+1},Z_0^{j+1},q_j,q_{j+1}),
+  \qquad
+  \hat v_{j+1}=F_\theta^{\mathrm{tail}}(Z_k^{j+1},e_{j+1},y).
+\]
+This is evaluated as
+\[
+  \texttt{val/FID\_timestep\_chain},\qquad
+  \texttt{val/sFID\_timestep\_chain}.
+\]
+The implementation avoids a full future-backbone pass; it only computes the
+target timestep/input embeddings before the predictor.
+
+\paragraph{3. One-prefix fanout timestep shortcut FID.}
+The fanout sampler runs the DiT prefix once at the first denoise step, then
+rolls the layer-$9$ activation forward through the predictor across the
+remaining reference timesteps:
+\[
+  Z_k^{j+1}=P_\phi(Z_k^j,e_j,e_{j+1},Z_0^{j+1},q_j,q_{j+1}),
+  \qquad j=0,\ldots,48.
+\]
+Each predicted $Z_k^{j+1}$ is passed through the DiT tail with the corresponding
+timestep embedding. To avoid OOM on TPU v5p-8, the predictor/tail rollout is
+implemented with \texttt{jax.lax.scan}; it does not materialize all 49 tail
+activations at once. This is evaluated as
+\[
+  \texttt{val/FID\_timestep\_fanout},\qquad
+  \texttt{val/sFID\_timestep\_fanout}.
+\]
+
+The full sampler still uses
+\[
+  \texttt{--fid-num-steps}=50.
+\]
+The older two-step skip-25 ablation remains available but is off by default:
+\[
+  \texttt{--fid-timestep-skip-num-steps}=2,\qquad
+  \texttt{--fid-timestep-skip-jump}=25,\qquad
+  \texttt{--fid-timestep-skip-every}=1.
+\]
+
+\end{document}

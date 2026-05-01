@@ -344,6 +344,8 @@ class SelfFlowDiT(nn.Module):
         depth_shortcut_dt_use_h0_target: bool = False,
         depth_shortcut_dt_h0_fusion: str = "concat",
         depth_shortcut_dt_cond_mode: str = "concat_mlp",
+        depth_shortcut_dt_use_layer_cond: bool = True,
+        return_input_embeddings_only: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -416,6 +418,9 @@ class SelfFlowDiT(nn.Module):
             t_emb = t_embedder(timesteps)
             y_emb = y_embedder(vector, deterministic=deterministic)
 
+        if return_input_embeddings_only:
+            return h0_tokens, t_emb
+
         c = t_emb + y_emb
 
         shortcut_single_jump = (
@@ -459,6 +464,7 @@ class SelfFlowDiT(nn.Module):
                 dt_use_h0_target=depth_shortcut_dt_use_h0_target,
                 dt_h0_fusion=depth_shortcut_dt_h0_fusion,
                 dt_cond_mode=depth_shortcut_dt_cond_mode,
+                dt_use_layer_cond=depth_shortcut_dt_use_layer_cond,
                 **predictor_cfg,
             )
             # Training discretizes tau as q / (T - 1). Sampling uses continuous tau,
