@@ -995,6 +995,7 @@ def train_step(
     direct_pair_mode="trunc_normal",
     shortcut_loss_mode="direction_magnitude",
     shortcut_activation_huber_delta=1.0,
+    bootstrap_reverse_stopgrad=False,
     debug_gap_log_freq=10000,
     private_use_residual=True,
     private_cosine_mode="bnd",
@@ -1231,6 +1232,10 @@ def train_step(
             )
             and dt_consistency_prob > 0.0
         )
+        legacy_shortcut_requested = bool(
+            (not use_depth_time_resync)
+            and (use_legacy_direct_loss or use_legacy_bootstrap_loss)
+        )
         dt_legacy_bootstrap_requested = bool(use_depth_time_resync and use_legacy_bootstrap_loss)
         needs_s_forward = bool(use_depth_time_resync or (timestep_shortcut_requested and not timestep_paired_batch))
         needs_r_forward = bool(
@@ -1383,6 +1388,33 @@ def train_step(
             error = jnp.sqrt(jnp.mean(jnp.square(residual_norm)))
             return loss_huber, error
 
+        def activation_dir_mag_components(y_pred, target_hidden):
+            target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
+            y_pred_f32 = y_pred.astype(jnp.float32)
+            pred_u = l2_normalize_tokens(y_pred_f32)
+            target_u, target_m, _ = build_direction_and_norm_map(target_hidden)
+            cos = jnp.sum(pred_u * target_u, axis=-1).mean()
+            loss_dir = 1.0 - cos
+            pred_m = jnp.log(jnp.linalg.norm(y_pred_f32, axis=-1, keepdims=True) + 1e-6)
+            loss_mag = jnp.mean(jnp.abs(pred_m - jax.lax.stop_gradient(target_m)))
+            target_rms = jax.lax.stop_gradient(sample_activation_rms(target_hidden))
+            residual_norm = (y_pred_f32 - target_hidden) / target_rms
+            error = jnp.sqrt(jnp.mean(jnp.square(residual_norm)))
+            return loss_dir, loss_mag, error
+
+        def timestep_dir_mag_components(y_pred, delta_m_pred, m_source, target_hidden):
+            target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
+            pred_u = l2_normalize_tokens(y_pred)
+            target_u, target_m, _ = build_direction_and_norm_map(target_hidden)
+            cos = jnp.sum(pred_u * target_u, axis=-1).mean()
+            loss_dir = 1.0 - cos
+            target_delta_m = jax.lax.stop_gradient(
+                jnp.clip((target_m - m_source) / mag_scale, -1.0, 1.0)
+            )
+            loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pred - target_delta_m))
+            error = loss_dir + loss_mag
+            return loss_dir, loss_mag, error
+
         def predictor_activation_transition(
             predictor_params,
             source_hidden,
@@ -1393,7 +1425,7 @@ def train_step(
             q_tgt,
             source_detach,
         ):
-            source_for_predictor = source_hidden
+            source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
             src_embed = jax.lax.stop_gradient(src_time_emb)
             tgt_embed = jax.lax.stop_gradient(tgt_time_emb)
             h0_cond = None if h0_tgt is None else jax.lax.stop_gradient(h0_tgt)
@@ -1522,7 +1554,7 @@ def train_step(
         boot_pred_rms_metric = jnp.float32(0.0)
         boot_rel_residual_rms_metric = jnp.float32(0.0)
 
-        if not use_depth_time_resync:
+        if legacy_shortcut_requested:
             if direct_pair_mode == "trunc_normal":
                 direct_as, direct_bs = sample_distinct_pairs_weighted(
                     directions.shape[0],
@@ -1650,9 +1682,9 @@ def train_step(
                 m_boot_ab,
                 use_timestep_embed=predictor_use_timestep,
             )
-            u_abc = l2_normalize_tokens(y_abc)
-            y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
-                {"params": predictor_ema_params},
+            ac_params = params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params
+            y_ac, delta_m_ac = state.predictor_apply_fn(
+                {"params": ac_params},
                 boot_source_u,
                 boot_a,
                 boot_c,
@@ -1660,18 +1692,28 @@ def train_step(
                 boot_source_m,
                 use_timestep_embed=predictor_use_timestep,
             )
-            u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
-            cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
+            if bootstrap_reverse_stopgrad:
+                u_boot = l2_normalize_tokens(y_ac)
+                u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_abc))
+            else:
+                u_boot = l2_normalize_tokens(y_abc)
+                u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_ac))
+            cos_boot = jnp.sum(u_boot * u_teacher, axis=-1).mean()
             loss_boot = 1.0 - cos_boot
             if shortcut_loss_mode == "direction_magnitude":
-                target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
-                pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+                if bootstrap_reverse_stopgrad:
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab + delta_m_abc)
+                    pred_delta_m_ac = delta_m_ac
+                else:
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac)
+                    pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
                 loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
             else:
-                y_ac_ema_target = jax.lax.stop_gradient(y_ac_ema)
+                y_ac_ema_target = jax.lax.stop_gradient(y_abc if bootstrap_reverse_stopgrad else y_ac)
+                y_boot_pred = y_ac if bootstrap_reverse_stopgrad else y_abc
                 boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(y_ac_ema_target))
-                boot_pred_rms = sample_activation_rms(y_abc)
-                boot_residual_norm = (y_abc - y_ac_ema_target) / boot_target_rms
+                boot_pred_rms = sample_activation_rms(y_boot_pred)
+                boot_residual_norm = (y_boot_pred - y_ac_ema_target) / boot_target_rms
                 loss_boot_mag = jnp.mean(
                     optax.huber_loss(
                         boot_residual_norm,
@@ -2279,9 +2321,11 @@ def train_step(
                 dtype=jnp.int32,
             )
             if timestep_paired_batch and timestep_shortcut_loss_mode == "activation_huber":
-                pred_ts = predictor_activation_transition(
+                pred_ts, dm_ts, ms_ts = predictor_transition(
                     params["predictor"],
                     hidden_stack_high_f32[ts_layer],
+                    ts_layer,
+                    ts_layer,
                     dit_time_emb_high,
                     dit_time_emb_light,
                     hidden_stack_light_f32[0],
@@ -2289,28 +2333,34 @@ def train_step(
                     q_s_base,
                     timestep_shortcut_detach_source,
                 )
-                ts_direct_huber, e_ts_direct = activation_huber_components(
-                    pred_ts,
+                ts_direct_dir, ts_direct_aux, e_ts_direct = timestep_dir_mag_components(
+                    pred_ts, dm_ts, ms_ts,
                     hidden_stack_light_f32[ts_layer],
                 )
-                ts_direct_dir = zero
-                ts_direct_aux = ts_direct_huber
-                loss_ts_direct = jnp.where(use_timestep_direct_loss, lambda_dir * ts_direct_huber, zero)
+                loss_ts_direct = jnp.where(
+                    use_timestep_direct_loss,
+                    lambda_dir * ts_direct_dir + lambda_mag * ts_direct_aux,
+                    zero,
+                )
 
                 if use_timestep_bootstrap_loss:
-                    pred_ts_sr = predictor_activation_transition(
+                    pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
                         params["predictor"],
                         pred_ts,
+                        ts_layer,
+                        ts_layer,
                         dit_time_emb_light,
                         dit_time_emb_r_embed,
                         h0_r_embed,
                         q_s_base,
                         q_r_base,
-                        False,
+                        bootstrap_detach_source,
                     )
-                    pred_tr_ema = predictor_activation_transition(
-                        predictor_ema_params,
+                    pred_tr, dm_tr, ms_tr = predictor_transition(
+                        params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params,
                         jax.lax.stop_gradient(hidden_stack_high_f32[ts_layer]),
+                        ts_layer,
+                        ts_layer,
                         dit_time_emb_high,
                         dit_time_emb_r_embed,
                         h0_r_embed,
@@ -2318,13 +2368,13 @@ def train_step(
                         q_r_base,
                         True,
                     )
-                    ts_boot_huber, e_ts_boot = activation_huber_components(
-                        pred_ts_sr,
-                        jax.lax.stop_gradient(pred_tr_ema),
+                    ts_boot_dir, ts_boot_aux, e_ts_boot = timestep_dir_mag_components(
+                        pred_tr if bootstrap_reverse_stopgrad else pred_ts_sr,
+                        dm_tr if bootstrap_reverse_stopgrad else dm_ts_sr,
+                        ms_tr if bootstrap_reverse_stopgrad else ms_ts_sr,
+                        jax.lax.stop_gradient(pred_ts_sr if bootstrap_reverse_stopgrad else pred_tr),
                     )
-                    ts_boot_dir = zero
-                    ts_boot_aux = ts_boot_huber
-                    loss_ts_boot = lambda_boot * ts_boot_huber
+                    loss_ts_boot = lambda_boot * ts_boot_dir + lambda_boot_mag * ts_boot_aux
                 else:
                     ts_boot_dir = zero
                     ts_boot_aux = zero
@@ -2332,7 +2382,8 @@ def train_step(
                     loss_ts_boot = zero
 
                 if use_timestep_output_distill:
-                    z_hat_ts = pred_ts.astype(jnp.float32)
+                    m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
+                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts)
                     tail_params = params["backbone"] if timestep_output_distill_train_tail else jax.tree_util.tree_map(
                         jax.lax.stop_gradient,
                         params["backbone"],
@@ -2370,10 +2421,8 @@ def train_step(
                     q_s,
                     False,
                 )
-                ts_direct_dir, ts_direct_aux, e_ts_direct = transition_components(
-                    pred_ts,
-                    dm_ts,
-                    ms_ts,
+                ts_direct_dir, ts_direct_aux, e_ts_direct = timestep_dir_mag_components(
+                    pred_ts, dm_ts, ms_ts,
                     hidden_stack_s_f32[ts_layer],
                 )
                 loss_ts_direct = lambda_dir * ts_direct_dir + lambda_mag * ts_direct_aux
@@ -2393,8 +2442,8 @@ def train_step(
                         q_r,
                         False,
                     )
-                    pred_tr_ema, _, _ = predictor_transition(
-                        predictor_ema_params,
+                    pred_tr, dm_tr, ms_tr = predictor_transition(
+                        params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params,
                         jax.lax.stop_gradient(hidden_stack_f32[ts_layer]),
                         ts_layer,
                         ts_layer,
@@ -2405,11 +2454,11 @@ def train_step(
                         q_r,
                         True,
                     )
-                    ts_boot_dir, ts_boot_aux, e_ts_boot = transition_components(
-                        pred_ts_sr,
-                        dm_ts_sr,
-                        ms_ts_sr,
-                        jax.lax.stop_gradient(pred_tr_ema),
+                    ts_boot_dir, ts_boot_aux, e_ts_boot = timestep_dir_mag_components(
+                        pred_tr if bootstrap_reverse_stopgrad else pred_ts_sr,
+                        dm_tr if bootstrap_reverse_stopgrad else dm_ts_sr,
+                        ms_tr if bootstrap_reverse_stopgrad else ms_ts_sr,
+                        jax.lax.stop_gradient(pred_ts_sr if bootstrap_reverse_stopgrad else pred_tr),
                     )
                     loss_ts_boot = lambda_boot * ts_boot_dir + lambda_boot_mag * ts_boot_aux
                 else:
@@ -2419,12 +2468,8 @@ def train_step(
                     loss_ts_boot = zero
 
                 if use_timestep_output_distill:
-                    u_ts_out = l2_normalize_tokens(pred_ts)
-                    if shortcut_loss_mode == "direction_magnitude":
-                        m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
-                        z_hat_ts = jnp.exp(m_ts_out) * u_ts_out
-                    else:
-                        z_hat_ts = pred_ts.astype(jnp.float32)
+                    m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
+                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts)
                     tail_params = params["backbone"] if timestep_output_distill_train_tail else jax.tree_util.tree_map(
                         jax.lax.stop_gradient,
                         params["backbone"],
@@ -2952,6 +2997,10 @@ def train_step(
         "train/direct_num_pairs": jnp.asarray(direct_num_pairs, dtype=jnp.float32),
         "train/shortcut_loss_mode": jnp.asarray(
             0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/bootstrap_reverse_stopgrad": jnp.asarray(
+            1.0 if bootstrap_reverse_stopgrad else 0.0,
             dtype=jnp.float32,
         ),
         "train/direct_loss_mode": jnp.asarray(
@@ -4736,6 +4785,15 @@ def main():
         default=False,
         help="Detach bootstrap source U_a and m_a so bootstrap losses update predictor only, not the DiT backbone through the source state.",
     )
+    parser.add_argument(
+        "--shortcut-bootstrap-reverse-stopgrad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reverse bootstrap teacher/student: stop-gradient the online two-hop P(P(a,b),c) "
+            "and train an online one-hop P(a,c) to match it. Default uses stop-gradient EMA P(a,c)."
+        ),
+    )
     parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
     parser.add_argument(
@@ -5594,6 +5652,7 @@ def main():
         f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
         f"bootstrap_detach_source={args.shortcut_bootstrap_detach_source} "
+        f"bootstrap_reverse_stopgrad={args.shortcut_bootstrap_reverse_stopgrad} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"debug_gap_log_freq={args.shortcut_debug_gap_log_freq} "
@@ -5808,6 +5867,7 @@ def main():
             direct_pair_mode=args.direct_pair_mode,
             shortcut_loss_mode=args.shortcut_loss_mode,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
+            bootstrap_reverse_stopgrad=args.shortcut_bootstrap_reverse_stopgrad,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,

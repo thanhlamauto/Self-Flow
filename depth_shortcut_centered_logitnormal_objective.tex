@@ -1,0 +1,532 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{Depth-Shortcut Training Objective with Centered Pair Sampling and Logit-Normal Timesteps}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Active configuration}
+
+This document describes the training path for the command using
+\texttt{hybrid\_deep\_10}, direction--magnitude shortcut prediction,
+centered pair sampling, logit-normal timestep sampling, output distillation,
+and private activation regularization.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Switch & Value \\
+\midrule
+\texttt{--shortcut-predictor} & \texttt{hybrid\_deep\_10} \\
+\texttt{--shortcut-training-mode} & \texttt{direction-magnitude} \\
+\texttt{--shortcut-predictor-use-timestep} & on \\
+\texttt{--shortcut-predictor-use-class-input} & on \\
+\texttt{--shortcut-predictor-class-fusion} & \texttt{add} \\
+\texttt{--no-shortcut-predictor-normalize-input} & raw source activations \\
+\texttt{--timestep-sampling-mode} & \texttt{logit\_normal} \\
+\texttt{--direct-pair-mode} & \texttt{trunc\_normal\_centered} \\
+\texttt{--output-distill-pair-mode} & \texttt{trunc\_normal\_centered} \\
+\texttt{--pair-center-sigma} & $2.0$ \\
+\texttt{--direct-num-pairs} & $1$ \\
+\texttt{--output-distill-ratio} & $0.10$ \\
+\texttt{--output-distill-update-mode} & \texttt{predictor\_plus\_all} \\
+\texttt{--private-loss} & on \\
+\texttt{--private-max-pairs} & $4$ \\
+\texttt{--private-cosine-mode} & \texttt{bnd} \\
+\texttt{--private-pair-mode} & \texttt{random} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This run is a depth-shortcut run. It does not enable the timestep-shortcut
+paired-batch objective and it does not enable depth-time resync.
+
+\section{Timestep sampling}
+
+Let the number of shortcut timestep bins be $T=50$. For each training example,
+sample
+\[
+  \epsilon \sim \mathcal{N}(0,1),
+  \qquad
+  u=\sigma(\epsilon),
+\]
+where $\sigma$ is the logistic sigmoid. The discrete timestep index is
+\[
+  q = \operatorname{round}\bigl((T-1)u\bigr),
+  \qquad
+  q\in\{0,\ldots,T-1\},
+\]
+and
+\[
+  \tau = \frac{q}{T-1}.
+\]
+Thus the training timestep mass is concentrated near $\tau=0.5$ while still
+covering both noisy and clean regions.
+
+The repo convention is
+\[
+  \tau=0 \text{ is pure noise}, \qquad \tau=1 \text{ is clean data}.
+\]
+For a clean latent $x_0$ and Gaussian noise $x_1\sim\mathcal{N}(0,I)$,
+\[
+  x_\tau = (1-\tau)x_1 + \tau x_0.
+\]
+The flow-matching velocity target is
+\[
+  v^\star = x_0 - x_1.
+\]
+
+\section{Backbone forward}
+
+The DiT backbone is evaluated once on the sampled noisy latent:
+\[
+  \left(
+    \hat v_\theta,\{Z_\ell\}_{\ell=0}^{L},e_\tau
+  \right)
+  =
+  F_\theta^{\mathrm{hidden}}(x_\tau,\tau,y),
+\]
+where $Z_0$ is the patch embedding and $Z_\ell$ for $\ell\ge1$ are block
+outputs. For DiT-B, $L=12$.
+
+The base velocity loss is
+\[
+  \mathcal{L}_{\mathrm{gen}}
+  =
+  \mathbb{E}\left[
+    \left\|\hat v_\theta - v^\star\right\|_2^2
+  \right].
+\]
+
+\section{Centered layer-pair sampling}
+
+A candidate depth pair is
+\[
+  (a,b), \qquad 0\le a < b \le L.
+\]
+Define the layer gap and midpoint
+\[
+  d=b-a,\qquad m=\frac{a+b}{2}.
+\]
+The command uses
+\[
+  d_{\max}=10,\qquad \mu_d=3,\qquad \sigma_d=2,
+  \qquad \mu_m=\frac{L}{2}=6,\qquad \sigma_m=2.
+\]
+Valid candidates satisfy $1\le d\le d_{\max}$.
+
+The gap weight is a truncated discrete normal:
+\[
+  w_{\mathrm{gap}}(d)
+  =
+  \exp\left[
+    -\frac{1}{2}
+    \left(\frac{d-\mu_d}{\sigma_d}\right)^2
+  \right].
+\]
+Within each gap, midpoint weights concentrate pairs around the middle of the
+network:
+\[
+  w_{\mathrm{center}}(a,b)
+  =
+  \exp\left[
+    -\frac{1}{2}
+    \left(\frac{m-\mu_m}{\sigma_m}\right)^2
+  \right].
+\]
+The implementation normalizes midpoint weights within each gap. Equivalently,
+the pair distribution is proportional to
+\[
+  p(a,b)
+  \propto
+  w_{\mathrm{gap}}(b-a)
+  \frac{
+    w_{\mathrm{center}}(a,b)
+  }{
+    \sum_{a':\,a'+d\le L} w_{\mathrm{center}}(a',a'+d)
+  }.
+\]
+
+\section{Shortcut predictor}
+
+The predictor receives raw source activations because
+\texttt{--no-shortcut-predictor-normalize-input} is set. For a sampled pair
+$(a,b)$:
+\[
+  S_a = Z_a.
+\]
+It also receives the source log magnitude
+\[
+  m_a = \log\left(\|Z_a\|_2+\varepsilon\right),
+\]
+the current timestep embedding $e_\tau$, the layer ids $(a,b)$, and class label
+conditioning. The predictor outputs a direction-like tensor and a normalized
+log-magnitude delta:
+\[
+  (Y_{ab},\Delta m_{ab})
+  =
+  P_\phi(S_a,a,b,e_\tau,m_a,y).
+\]
+
+\section{Direct depth-shortcut loss}
+
+For the sampled direct pair $(a,b)$, define the predicted direction
+\[
+  \hat u_b =
+  \frac{Y_{ab}}{\|Y_{ab}\|_2+\varepsilon},
+\]
+and the stopped target direction
+\[
+  u_b =
+  \frac{\operatorname{sg}(Z_b)}
+       {\|\operatorname{sg}(Z_b)\|_2+\varepsilon}.
+\]
+The direction loss is
+\[
+  \mathcal{L}_{\mathrm{dir}}
+  =
+  1-\mathbb{E}\left[\hat u_b\cdot u_b\right].
+\]
+
+The raw target log-magnitude delta is
+\[
+  \Delta m_{ab}^{\mathrm{raw}}
+  =
+  \log\left(\|\operatorname{sg}(Z_b)\|_2+\varepsilon\right)
+  -
+  \log\left(\|\operatorname{sg}(Z_a)\|_2+\varepsilon\right).
+\]
+With \texttt{--shortcut-mag-scale} equal to $3.0$, the normalized target is
+\[
+  \Delta m_{ab}^{\star}
+  =
+  \operatorname{clip}
+  \left(
+    \frac{\Delta m_{ab}^{\mathrm{raw}}}{3.0},
+    -1,1
+  \right).
+\]
+The magnitude loss is
+\[
+  \mathcal{L}_{\mathrm{mag}}
+  =
+  \frac{1}{2}
+  \mathbb{E}
+  \left[
+    \left\|
+      \Delta m_{ab}
+      -
+      \operatorname{sg}(\Delta m_{ab}^{\star})
+    \right\|_2^2
+  \right].
+\]
+
+The direct shortcut loss is
+\[
+  \mathcal{L}_{\mathrm{direct}}
+  =
+  1.0\,\mathcal{L}_{\mathrm{dir}}
+  +
+  0.375\,\mathcal{L}_{\mathrm{mag}}.
+\]
+
+\section{Bootstrap consistency loss}
+
+The bootstrap branch samples a triplet
+\[
+  a<b<c
+\]
+from uniformly sampled positive gaps satisfying $c\le L$.
+
+First, the online predictor maps $a\to b$:
+\[
+  (Y_{ab},\Delta m_{ab})
+  =
+  P_\phi(Z_a,a,b,e_\tau,m_a,y).
+\]
+Then it maps the predicted state $b\to c$:
+\[
+  (Y_{bc},\Delta m_{bc})
+  =
+  P_\phi(Y_{ab},b,c,e_\tau,m_b,y).
+\]
+The EMA predictor gives a stopped one-hop target:
+\[
+  (Y_{ac}^{\mathrm{ema}},\Delta m_{ac}^{\mathrm{ema}})
+  =
+  P_{\bar\phi}(\operatorname{sg}(Z_a),a,c,e_\tau,m_a,y).
+\]
+
+The direction bootstrap loss is
+\[
+  \mathcal{L}_{\mathrm{boot,dir}}
+  =
+  1-
+  \mathbb{E}
+  \left[
+    \frac{Y_{bc}}{\|Y_{bc}\|_2+\varepsilon}
+    \cdot
+    \operatorname{sg}
+    \left(
+      \frac{Y_{ac}^{\mathrm{ema}}}
+           {\|Y_{ac}^{\mathrm{ema}}\|_2+\varepsilon}
+    \right)
+  \right].
+\]
+The magnitude bootstrap loss is
+\[
+  \mathcal{L}_{\mathrm{boot,mag}}
+  =
+  \frac{1}{2}
+  \mathbb{E}
+  \left[
+    \left\|
+      \Delta m_{ab}+\Delta m_{bc}
+      -
+      \operatorname{sg}(\Delta m_{ac}^{\mathrm{ema}})
+    \right\|_2^2
+  \right].
+\]
+With the command weights,
+\[
+  \mathcal{L}_{\mathrm{boot}}
+  =
+  0.25\,\mathcal{L}_{\mathrm{boot,dir}}
+  +
+  0.1875\,\mathcal{L}_{\mathrm{boot,mag}}.
+\]
+Because \texttt{--shortcut-bootstrap-detach-source} is set, the bootstrap source
+activation and source magnitude are stop-gradient.
+
+\section{Output distillation}
+
+Output distillation is enabled with ratio $0.10$ and weight $0.05$. A subset of
+the local batch is sampled, and another centered layer pair $(a_o,b_o)$ is
+drawn. The predictor produces
+\[
+  (Y_{a_ob_o},\Delta m_{a_ob_o})
+  =
+  P_\phi(Z_{a_o},a_o,b_o,e_\tau,m_{a_o},y).
+\]
+The predicted target activation is reconstructed as
+\[
+  \hat Z_{b_o}
+  =
+  \exp
+  \left(
+    \operatorname{clip}
+    \left(
+      m_{a_o}+3.0\,\Delta m_{a_ob_o},
+      3.0,8.0
+    \right)
+  \right)
+  \frac{Y_{a_ob_o}}{\|Y_{a_ob_o}\|_2+\varepsilon}.
+\]
+The DiT tail is resumed from layer $b_o+1$:
+\[
+  \hat v^{\mathrm{tail}}
+  =
+  F_\theta^{\mathrm{tail}}
+  \left(
+    x_\tau,\tau,y;\,
+    \mathrm{resume\_hidden}=\hat Z_{b_o},
+    \mathrm{resume\_start}=b_o+1
+  \right).
+\]
+The teacher is the stopped full-backbone velocity already computed in the main
+forward:
+\[
+  v^{\mathrm{teacher}}=\operatorname{sg}(\hat v_\theta).
+\]
+The relative output distillation loss is
+\[
+  \mathcal{L}_{\mathrm{out}}
+  =
+  \mathbb{E}
+  \left[
+    \frac{
+      \|\hat v^{\mathrm{tail}}-v^{\mathrm{teacher}}\|_2^2
+    }{
+      \|v^{\mathrm{teacher}}\|_2^2+10^{-6}
+    }
+  \right].
+\]
+
+The update mode is \texttt{predictor\_plus\_all}. Therefore gradients from this
+branch can update the predictor, the DiT tail, and the source-hidden path in the
+backbone. The teacher velocity remains stop-gradient.
+
+\section{Private activation loss}
+
+Let post-block activations be
+\[
+  Z_1,\ldots,Z_L.
+\]
+With residual private loss enabled, normalize each layer activation and compute
+the common component
+\[
+  C=\frac{1}{L}\sum_{\ell=1}^{L}\operatorname{norm}(Z_\ell).
+\]
+The private residual is
+\[
+  R_\ell=\operatorname{norm}(Z_\ell)-\operatorname{sg}(C).
+\]
+In \texttt{bnd} mode, each $R_\ell$ is flattened over batch, tokens, and
+channels. A random set $\mathcal{P}$ of at most four upper-triangular layer pairs
+is selected. The loss is
+\[
+  \mathcal{L}_{\mathrm{private}}
+  =
+  \frac{1}{|\mathcal{P}|}
+  \sum_{(i,j)\in\mathcal{P}}
+  \cos^2(R_i,R_j).
+\]
+
+\section{Total objective}
+
+The optimized loss for this command is
+\[
+\boxed{
+  \mathcal{L}_{\mathrm{total}}
+  =
+  \mathcal{L}_{\mathrm{gen}}
+  +
+  \mathcal{L}_{\mathrm{direct}}
+  +
+  \mathcal{L}_{\mathrm{boot}}
+  +
+  0.05\,\mathcal{L}_{\mathrm{out}}
+  +
+  1.0\,\mathcal{L}_{\mathrm{private}}.
+}
+\]
+Equivalently,
+\[
+\begin{aligned}
+  \mathcal{L}_{\mathrm{total}}
+  &=
+  \mathcal{L}_{\mathrm{gen}}
+  +
+  \left(
+    1.0\,\mathcal{L}_{\mathrm{dir}}
+    +
+    0.375\,\mathcal{L}_{\mathrm{mag}}
+  \right) \\
+  &\quad+
+  \left(
+    0.25\,\mathcal{L}_{\mathrm{boot,dir}}
+    +
+    0.1875\,\mathcal{L}_{\mathrm{boot,mag}}
+  \right)
+  +
+  0.05\,\mathcal{L}_{\mathrm{out}}
+  +
+  \mathcal{L}_{\mathrm{private}}.
+\end{aligned}
+\]
+
+\section{Training procedure}
+
+Each training step performs:
+\begin{enumerate}
+\item Load a batch of clean VAE latents and labels $(x_0,y)$.
+\item Sample discrete timestep index $q$ from the logit-normal schedule.
+\item Convert $q$ to $\tau=q/(T-1)$.
+\item Sample noise $x_1\sim\mathcal{N}(0,I)$.
+\item Build $x_\tau=(1-\tau)x_1+\tau x_0$.
+\item Run a full DiT forward and collect velocity, timestep embedding, and all
+  hidden states.
+\item Compute $\mathcal{L}_{\mathrm{gen}}$.
+\item Sample one centered direct pair and compute
+  $\mathcal{L}_{\mathrm{direct}}$.
+\item Sample one bootstrap triplet and compute
+  $\mathcal{L}_{\mathrm{boot}}$ against the predictor EMA target.
+\item Sample an output-distillation subset and centered pair, predict the target
+  activation, resume the DiT tail, and compute $\mathcal{L}_{\mathrm{out}}$.
+\item Compute the private activation loss on post-block activations.
+\item Sum all active losses, backpropagate, and update online backbone and
+  predictor parameters.
+\item Update the backbone EMA with decay $0.9999$.
+\item Update the predictor EMA with the configured predictor EMA decay.
+\item Update the L2 magnitude EMA bins for skip-eval magnitude restoration and
+  monitoring.
+\end{enumerate}
+
+\section{FID sampling}
+
+The command uses
+\[
+  \texttt{--fid-num-steps}=50,\qquad
+  \texttt{--fid-cfg-scale}=1.0,\qquad
+  \texttt{--num-fid-samples}=4096.
+\]
+Sampling starts from Gaussian latent noise:
+\[
+  x_{\mathrm{init}}\sim\mathcal{N}(0,I).
+\]
+Class labels are sampled uniformly from ImageNet classes. The sampler runs the
+SDE denoising loop in the repo's forward convention from noisy to clean.
+
+\paragraph{Full FID.}
+The full sampler uses the EMA DiT at every denoising step:
+\[
+  \hat v_t = F_{\bar\theta}(x_t,t,y).
+\]
+The resulting latents are decoded with the VAE, Inception features are computed,
+and the run logs
+\[
+  \texttt{val/FID},\qquad \texttt{val/sFID}.
+\]
+
+\paragraph{Depth-shortcut FID.}
+The branch also evaluates the depth shortcut because \texttt{--fid-skip-eval}
+defaults to on. The shortcut is fixed to
+\[
+  3\to7.
+\]
+With
+\[
+  \texttt{--fid-skip-timestep-mode alternate},
+\]
+even denoising steps use the shortcut and odd steps use the full DiT.
+
+At a shortcut step, the EMA DiT runs until layer $3$, the predictor EMA maps
+\[
+  \hat Z_7
+  =
+  P_{\bar\phi}(Z_3,3,7,e_t,m_3,y),
+\]
+and the EMA DiT resumes from layer $8$:
+\[
+  \hat v_t
+  =
+  F_{\bar\theta}^{\mathrm{tail}}
+  \left(
+    x_t,t,y;\,
+    \mathrm{resume\_hidden}=\hat Z_7,
+    \mathrm{resume\_start}=8
+  \right).
+\]
+At a non-shortcut step,
+\[
+  \hat v_t=F_{\bar\theta}(x_t,t,y).
+\]
+This reports
+\[
+  \texttt{val/FID\_skip\_3to7},\qquad
+  \texttt{val/sFID\_skip\_3to7}.
+\]
+
+\paragraph{Important distinction.}
+This command does not enable the timestep-shortcut chain or fanout FID variants.
+It evaluates the normal full sampler and the depth shortcut $3\to7$ sampler.
+
+\end{document}
