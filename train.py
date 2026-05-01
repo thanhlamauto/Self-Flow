@@ -405,7 +405,23 @@ except Exception:
 
 import jax
 import jax.numpy as jnp
-import optax
+_jax_config_update = jax.config.update
+
+
+def _jax_config_update_compat(name, value):
+    try:
+        return _jax_config_update(name, value)
+    except AttributeError:
+        if name == "jax_pmap_shmap_merge":
+            return None
+        raise
+
+
+jax.config.update = _jax_config_update_compat
+try:
+    import optax
+finally:
+    jax.config.update = _jax_config_update
 import wandb
 from flax.training import train_state, checkpoints
 from flax import jax_utils
