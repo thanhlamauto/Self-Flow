@@ -1393,7 +1393,7 @@ def train_step(
             q_tgt,
             source_detach,
         ):
-            source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
+            source_for_predictor = source_hidden
             src_embed = jax.lax.stop_gradient(src_time_emb)
             tgt_embed = jax.lax.stop_gradient(tgt_time_emb)
             h0_cond = None if h0_tgt is None else jax.lax.stop_gradient(h0_tgt)
