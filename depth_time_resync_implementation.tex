@@ -138,9 +138,11 @@ with \texttt{dt-cond-mode=factorized}, \texttt{dt-h0-fusion=concat},
   targets and $y_s$. Targets are always wrapped in \(\mathrm{sg}(\cdot)\), so no
   gradient flows through target hidden states or target outputs.
 
-  \item \textbf{Direction + magnitude distance: implemented.}
-  Direction is cosine. Magnitude is now L1 on predicted log-magnitude versus
-  stopped target log-magnitude.
+  \item \textbf{Activation Smooth L1 transition distance: implemented.}
+  Direct and auxiliary magnitude slots both use Smooth L1/Huber between the
+  predicted activation and the stopped target activation. In
+  \texttt{direction\_magnitude} mode, the predicted activation is reconstructed
+  from predicted direction and log-magnitude before computing the loss.
 
   \item \textbf{Depth/time objective from the beginning: implemented.}
   Depth, time, depth consistency, time consistency, and output-time distillation

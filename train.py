@@ -1272,26 +1272,31 @@ def train_step(
             )
             return y_pred, delta_m_pred, m_source
 
-        def transition_distance(y_pred, delta_m_pred, m_source, source_hidden, target_hidden):
-            target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
-            pred_u = l2_normalize_tokens(y_pred)
-            target_u, target_m, _ = build_direction_and_norm_map(target_hidden)
-            cos = jnp.sum(pred_u * target_u, axis=-1).mean()
-            loss_dir_pred = 1.0 - cos
+        def predicted_activation_from_transition(y_pred, delta_m_pred, m_source):
             if shortcut_loss_mode == "direction_magnitude":
-                pred_m = m_source + mag_scale * delta_m_pred
-                loss_aux_pred = jnp.mean(jnp.abs(pred_m - jax.lax.stop_gradient(target_m)))
-                error = loss_dir_pred + loss_aux_pred
-            else:
-                target_rms = jax.lax.stop_gradient(sample_activation_rms(target_hidden))
-                residual_norm = (y_pred - target_hidden) / target_rms
-                loss_aux_pred = jnp.mean(
-                    optax.huber_loss(
-                        residual_norm,
-                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
-                    )
+                pred_u = l2_normalize_tokens(y_pred)
+                pred_m = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
+                return jnp.exp(pred_m) * pred_u
+            return y_pred.astype(jnp.float32)
+
+        def activation_smooth_l1_distance(pred_hidden, target_hidden):
+            target_hidden = jax.lax.stop_gradient(target_hidden.astype(jnp.float32))
+            residual = pred_hidden.astype(jnp.float32) - target_hidden
+            loss = jnp.mean(
+                optax.huber_loss(
+                    residual,
+                    delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
                 )
-                error = jnp.sqrt(jnp.mean(jnp.square(residual_norm)))
+            )
+            error = jnp.sqrt(jnp.mean(jnp.square(residual)))
+            return loss, error
+
+        def transition_distance(y_pred, delta_m_pred, m_source, source_hidden, target_hidden):
+            del source_hidden
+            pred_hidden = predicted_activation_from_transition(y_pred, delta_m_pred, m_source)
+            activation_loss, error = activation_smooth_l1_distance(pred_hidden, target_hidden)
+            loss_dir_pred = activation_loss
+            loss_aux_pred = activation_loss
             return lambda_dir * loss_dir_pred + lambda_mag * loss_aux_pred, error
 
         def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
@@ -1317,7 +1322,17 @@ def train_step(
             )
             u_pair = l2_normalize_tokens(y_pair)
             cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
-            loss_dir_pair = 1.0 - cos_pair
+            pred_activation_pair = predicted_activation_from_transition(
+                y_pair,
+                delta_m_pair,
+                ma_condition,
+            )
+            activation_loss_pair, activation_error_pair = activation_smooth_l1_distance(
+                pred_activation_pair,
+                zb_target,
+            )
+            loss_dir_pair = activation_loss_pair
+            loss_aux_pair = activation_loss_pair
 
             if shortcut_loss_mode == "direction_magnitude":
                 ma_target = jnp.log(
@@ -1332,8 +1347,6 @@ def train_step(
                 target_delta_m_pair = jax.lax.stop_gradient(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
                 )
-                loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
-                loss_aux_pair = loss_mag_pair
                 delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
                 delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
                 delta_m_mae_pair = jnp.mean(delta_m_abs_error_pair)
@@ -1343,17 +1356,10 @@ def train_step(
             else:
                 target_rms_pair = jax.lax.stop_gradient(sample_activation_rms(zb_target))
                 pred_rms_pair = sample_activation_rms(y_pair)
-                residual_norm_pair = (y_pair - zb_target) / target_rms_pair
-                loss_aux_pair = jnp.mean(
-                    optax.huber_loss(
-                        residual_norm_pair,
-                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
-                    )
-                )
                 delta_m_mae_pair = jnp.mean(target_rms_pair)
                 delta_m_rmse_pair = jnp.mean(pred_rms_pair)
                 delta_m_ratio_error_pair = jnp.float32(0.0)
-                delta_m_clip_rate_pair = jnp.sqrt(jnp.mean(jnp.square(residual_norm_pair)))
+                delta_m_clip_rate_pair = activation_error_pair
             pair_loss = lambda_dir * loss_dir_pair + lambda_mag * loss_aux_pair
             y_pair_norm = jnp.linalg.norm(y_pair, axis=-1)
             return (
@@ -1579,12 +1585,21 @@ def train_step(
                 u_pair = l2_normalize_tokens(y_pair)
                 target_u_pair = jax.lax.stop_gradient(directions[target_layer])
                 pair_cos = jnp.sum(u_pair * target_u_pair, axis=-1).mean()
-                pair_loss_dir = 1.0 - pair_cos
+                pair_pred_activation = predicted_activation_from_transition(
+                    y_pair,
+                    delta_m_pair,
+                    pair_source_m,
+                )
+                pair_target_activation = jax.lax.stop_gradient(hidden_stack_f32[target_layer])
+                pair_activation_loss, _ = activation_smooth_l1_distance(
+                    pair_pred_activation,
+                    pair_target_activation,
+                )
+                pair_loss_dir = pair_activation_loss
                 pair_target_delta_raw = jax.lax.stop_gradient(
                     log_magnitudes[target_layer] - log_magnitudes[source_layer]
                 )
-                pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
-                pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
+                pair_loss_mag = pair_activation_loss
                 pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair - pair_target_delta_raw))
                 return pair_loss_dir, pair_loss_mag, pair_cos, pair_delta_m_mae
 
