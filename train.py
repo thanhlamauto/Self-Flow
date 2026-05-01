@@ -1034,6 +1034,7 @@ def train_step(
     timestep_output_distill_train_tail=False,
     timestep_paired_batch=True,
     timestep_shortcut_loss_mode="activation_huber",
+    timestep_shortcut_detach_source=True,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -1393,7 +1394,9 @@ def train_step(
             source_detach,
         ):
             source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
-            src_embed = jax.lax.stop_gradient(src_time_emb) if source_detach else src_time_emb
+            src_embed = jax.lax.stop_gradient(src_time_emb)
+            tgt_embed = jax.lax.stop_gradient(tgt_time_emb)
+            h0_cond = None if h0_tgt is None else jax.lax.stop_gradient(h0_tgt)
             y_pred = state.predictor_apply_fn(
                 {"params": predictor_params},
                 source_for_predictor.astype(jnp.float32),
@@ -1403,8 +1406,8 @@ def train_step(
                 None,
                 detach_timestep_embed=source_detach,
                 use_timestep_embed=predictor_use_timestep,
-                h0_tgt=h0_tgt,
-                timestep_tgt_embed=tgt_time_emb,
+                h0_tgt=h0_cond,
+                timestep_tgt_embed=tgt_embed,
                 t_src_idx=q_src,
                 t_tgt_idx=q_tgt,
                 delta_t_idx=jnp.abs(q_tgt - q_src),
@@ -2284,7 +2287,7 @@ def train_step(
                     hidden_stack_light_f32[0],
                     q_base,
                     q_s_base,
-                    False,
+                    timestep_shortcut_detach_source,
                 )
                 ts_direct_huber, e_ts_direct = activation_huber_components(
                     pred_ts,
@@ -4713,6 +4716,15 @@ def main():
         help="Loss used by timestep direct/bootstrap. Default activation_huber is Smooth-L1 on activations.",
     )
     parser.add_argument(
+        "--timestep-shortcut-detach-source",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Detach timestep shortcut source hidden and backbone timestep/input conditions "
+            "so timestep auxiliary losses train the predictor by default."
+        ),
+    )
+    parser.add_argument(
         "--timestep-shortcut-use-layer-cond",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -5348,6 +5360,7 @@ def main():
         f"timestep_layer={args.timestep_shortcut_layer} "
         f"timestep_paired_batch={args.timestep_paired_batch} "
         f"timestep_loss_mode={args.timestep_shortcut_loss_mode} "
+        f"timestep_detach_source={args.timestep_shortcut_detach_source} "
         f"timestep_layer_cond={predictor_use_layer_cond} "
         f"timestep_output_train_tail={args.timestep_output_distill_train_tail} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
@@ -5576,6 +5589,7 @@ def main():
             timestep_output_distill_train_tail=args.timestep_output_distill_train_tail,
             timestep_paired_batch=args.timestep_paired_batch,
             timestep_shortcut_loss_mode=args.timestep_shortcut_loss_mode,
+            timestep_shortcut_detach_source=args.timestep_shortcut_detach_source,
         ),
         axis_name="batch",
     )
