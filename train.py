@@ -1096,6 +1096,7 @@ def train_step(
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
+    bootstrap_reverse_stopgrad=False,
     predictor_use_timestep=True,
     predictor_normalize_input=True,
     predictor_use_class_input=False,
@@ -1415,9 +1416,9 @@ def train_step(
             use_timestep_embed=predictor_use_timestep,
             class_labels=y,
         )
-        u_abc = l2_normalize_tokens(y_abc)
-        y_ac_ema, delta_m_ac_ema = state.predictor_apply_fn(
-            {"params": predictor_ema_params},
+        ac_params = params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params
+        y_ac, delta_m_ac = state.predictor_apply_fn(
+            {"params": ac_params},
             boot_source_u,
             boot_a,
             boot_c,
@@ -1426,18 +1427,29 @@ def train_step(
             use_timestep_embed=predictor_use_timestep,
             class_labels=y,
         )
-        u_ac_ema = jax.lax.stop_gradient(l2_normalize_tokens(y_ac_ema))
-        cos_boot = jnp.sum(u_abc * u_ac_ema, axis=-1).mean()
+        if bootstrap_reverse_stopgrad:
+            u_boot = l2_normalize_tokens(y_ac)
+            u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_abc))
+        else:
+            u_boot = l2_normalize_tokens(y_abc)
+            u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_ac))
+        cos_boot = jnp.sum(u_boot * u_teacher, axis=-1).mean()
         loss_boot = 1.0 - cos_boot
         if shortcut_loss_mode == "direction_magnitude":
-            target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_ema)
-            pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+            if bootstrap_reverse_stopgrad:
+                target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab + delta_m_abc)
+                pred_delta_m_ac = delta_m_ac
+            else:
+                target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac)
+                pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
             loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
         else:
-            y_ac_ema_target = jax.lax.stop_gradient(y_ac_ema)
+            y_ac_target_raw = y_abc if bootstrap_reverse_stopgrad else y_ac
+            y_boot_pred_raw = y_ac if bootstrap_reverse_stopgrad else y_abc
+            y_ac_ema_target = jax.lax.stop_gradient(y_ac_target_raw)
             boot_target_rms = jax.lax.stop_gradient(sample_activation_rms(y_ac_ema_target))
-            boot_pred_rms = sample_activation_rms(y_abc)
-            boot_residual_norm = (y_abc - y_ac_ema_target) / boot_target_rms
+            boot_pred_rms = sample_activation_rms(y_boot_pred_raw)
+            boot_residual_norm = (y_boot_pred_raw - y_ac_ema_target) / boot_target_rms
             loss_boot_mag = jnp.mean(
                 optax.huber_loss(
                     boot_residual_norm,
@@ -1930,6 +1942,10 @@ def train_step(
         ),
         "train/private_pair_mode": jnp.asarray(
             0.0 if private_pair_mode == "first" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/bootstrap_reverse_stopgrad": jnp.asarray(
+            1.0 if bootstrap_reverse_stopgrad else 0.0,
             dtype=jnp.float32,
         ),
         "train/predictor_use_timestep": jnp.asarray(1.0 if predictor_use_timestep else 0.0, dtype=jnp.float32),
@@ -3061,6 +3077,15 @@ def main():
         default=False,
         help="Detach bootstrap source U_a and m_a so bootstrap losses update predictor only, not the DiT backbone through the source state.",
     )
+    parser.add_argument(
+        "--shortcut-bootstrap-reverse-stopgrad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reverse bootstrap teacher/student: stop-gradient the online two-hop P(P(a,b),c) "
+            "and train an online one-hop P(a,c) to match it. Default uses stop-gradient EMA P(a,c)."
+        ),
+    )
     parser.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
     parser.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
     parser.add_argument(
@@ -3681,6 +3706,7 @@ def main():
         f"mode={args.shortcut_training_mode} "
         f"lambda_dir={args.shortcut_lambda_dir} lambda_boot={args.shortcut_lambda_boot} "
         f"bootstrap_detach_source={args.shortcut_bootstrap_detach_source} "
+        f"bootstrap_reverse_stopgrad={args.shortcut_bootstrap_reverse_stopgrad} "
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"debug_gap_log_freq={args.shortcut_debug_gap_log_freq} "
@@ -3885,6 +3911,7 @@ def main():
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,
+            bootstrap_reverse_stopgrad=args.shortcut_bootstrap_reverse_stopgrad,
             predictor_use_timestep=args.shortcut_predictor_use_timestep,
             predictor_normalize_input=args.shortcut_predictor_normalize_input,
             predictor_use_class_input=args.shortcut_predictor_use_class_input,
