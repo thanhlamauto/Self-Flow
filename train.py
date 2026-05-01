@@ -671,6 +671,28 @@ def pair_sampling_uniform_mix(global_step, anneal_start_step, anneal_steps):
     return jnp.clip(progress, 0.0, 1.0)
 
 
+def sample_timestep_indices(
+    rng,
+    batch_size,
+    shortcut_timesteps,
+    sampling_mode="uniform",
+    logit_mean=0.0,
+    logit_std=1.0,
+):
+    """Sample discrete training timestep indices in [0, shortcut_timesteps - 1]."""
+    if sampling_mode == "logit_normal":
+        max_idx = jnp.maximum(jnp.asarray(shortcut_timesteps, dtype=jnp.int32) - 1, 0)
+        logits = (
+            jnp.asarray(logit_mean, dtype=jnp.float32)
+            + jnp.asarray(logit_std, dtype=jnp.float32)
+            * jax.random.normal(rng, shape=(batch_size,))
+        )
+        t = jax.nn.sigmoid(logits)
+        q = jnp.rint(t * max_idx.astype(jnp.float32)).astype(jnp.int32)
+        return jnp.clip(q, 0, max_idx)
+    return jax.random.randint(rng, shape=(batch_size,), minval=0, maxval=shortcut_timesteps)
+
+
 def sample_layer_pair_trunc_normal_to_uniform(
     num_hidden,
     max_gap,
@@ -718,6 +740,8 @@ def sample_distinct_pairs_weighted(
     num_pairs=3,
     gap2_bias=0.0,
     uniform_mix=0.0,
+    center_loc=None,
+    center_sigma=None,
 ):
     depth = int(num_hidden) - 1
     candidates = tuple((a, b, b - a) for a in range(depth) for b in range(a + 1, depth + 1))
@@ -725,10 +749,28 @@ def sample_distinct_pairs_weighted(
     candidate_b = jnp.asarray([b for _, b, _ in candidates], dtype=jnp.int32)
     candidate_gap = jnp.asarray([d for _, _, d in candidates], dtype=jnp.int32)
     max_gap = jnp.minimum(jnp.asarray(max_gap, dtype=jnp.int32), jnp.asarray(depth, dtype=jnp.int32))
-    gap_sources = (jnp.asarray(depth, dtype=jnp.float32) - candidate_gap.astype(jnp.float32) + 1.0)
     offsets = (candidate_gap.astype(jnp.float32) - loc) / sigma
-    trunc_logits = -0.5 * jnp.square(offsets) - jnp.log(gap_sources)
+    center_sigma = float(center_sigma or 0.0)
+    if center_sigma > 0.0:
+        pair_midpoints = (candidate_a.astype(jnp.float32) + candidate_b.astype(jnp.float32)) * 0.5
+        center = float(depth) * 0.5 if center_loc is None else float(center_loc)
+        center_offsets = (pair_midpoints - jnp.asarray(center, dtype=jnp.float32)) / jnp.asarray(
+            center_sigma,
+            dtype=jnp.float32,
+        )
+        center_logits = -0.5 * jnp.square(center_offsets)
+        center_norm = jnp.zeros_like(center_logits)
+        for gap_value in range(1, depth + 1):
+            same_gap = candidate_gap == gap_value
+            gap_center_norm = jax.nn.logsumexp(jnp.where(same_gap, center_logits, -jnp.inf))
+            center_norm = jnp.where(same_gap, gap_center_norm, center_norm)
+    else:
+        gap_sources = jnp.asarray(depth, dtype=jnp.float32) - candidate_gap.astype(jnp.float32) + 1.0
+        center_logits = jnp.zeros_like(candidate_gap, dtype=jnp.float32)
+        center_norm = jnp.log(gap_sources)
+    trunc_logits = -0.5 * jnp.square(offsets) + center_logits - center_norm
     trunc_logits = trunc_logits + jnp.where(candidate_gap == 2, jnp.asarray(gap2_bias, dtype=jnp.float32), 0.0)
+    gap_sources = jnp.asarray(depth, dtype=jnp.float32) - candidate_gap.astype(jnp.float32) + 1.0
     uniform_gap_logits = -jnp.log(gap_sources)
     trunc_logits = jnp.where(candidate_gap <= max_gap, trunc_logits, -jnp.inf)
     uniform_gap_logits = jnp.where(candidate_gap <= max_gap, uniform_gap_logits, -jnp.inf)
@@ -759,6 +801,33 @@ def sample_layer_pair_gap2_biased(num_hidden, max_gap, loc, sigma, rng):
         gap2_bias=2.0,
     )
     return pair_as[0], pair_bs[0]
+
+
+def sample_pairs_for_mode(
+    num_hidden,
+    max_gap,
+    gap_loc,
+    gap_sigma,
+    rng,
+    num_pairs,
+    pair_mode,
+    uniform_mix=0.0,
+    center_loc=None,
+    center_sigma=0.0,
+):
+    centered = pair_mode in {"trunc_normal_centered", "trunc_normal_centered_to_uniform"}
+    return sample_distinct_pairs_weighted(
+        num_hidden,
+        max_gap,
+        gap_loc,
+        gap_sigma,
+        rng,
+        num_pairs=num_pairs,
+        gap2_bias=2.0 if pair_mode == "gap2_biased" else 0.0,
+        uniform_mix=uniform_mix if pair_mode in {"trunc_normal_to_uniform", "trunc_normal_centered_to_uniform"} else 0.0,
+        center_loc=center_loc if centered else None,
+        center_sigma=center_sigma if centered else 0.0,
+    )
 
 
 def stop_gradient_except_downstream_backbone_params(backbone_params, target_layer):
@@ -978,13 +1047,13 @@ def train_step(
     output_distill_every=1,
     output_distill_update_mode="predictor_plus_downstream",
     output_distill_full_backbone_start_step=0,
-    output_distill_pair_mode="trunc_normal",
+    output_distill_pair_mode="trunc_normal_centered",
     pair_uniform_anneal_start_step=0,
     pair_uniform_anneal_steps=100000,
     direct_num_pairs=3,
     direct_num_joint_pairs=1,
     direct_num_predictor_only_pairs=2,
-    direct_pair_mode="trunc_normal",
+    direct_pair_mode="trunc_normal_centered",
     shortcut_loss_mode="direction_magnitude",
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
@@ -996,6 +1065,11 @@ def train_step(
     predictor_use_class_input=False,
     learning_rate=1e-4,
     predictor_learning_rate=2e-4,
+    timestep_sampling_mode="uniform",
+    timestep_logit_mean=0.0,
+    timestep_logit_std=1.0,
+    pair_center_loc=None,
+    pair_center_sigma=0.0,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -1010,15 +1084,28 @@ def train_step(
         raise ValueError("direct_num_pairs must equal direct_num_joint_pairs + direct_num_predictor_only_pairs.")
     if direct_num_pairs not in {1, 2, 3}:
         raise ValueError("Direct shortcut training supports 1, 2, or 3 static pairs.")
-    if direct_pair_mode not in {"trunc_normal", "trunc_normal_to_uniform", "gap2_biased"}:
+    pair_modes = {
+        "trunc_normal",
+        "trunc_normal_to_uniform",
+        "trunc_normal_centered",
+        "trunc_normal_centered_to_uniform",
+        "gap2_biased",
+    }
+    if direct_pair_mode not in pair_modes:
         raise ValueError(f"Unknown direct pair mode: {direct_pair_mode!r}")
+    if timestep_sampling_mode not in {"uniform", "logit_normal"}:
+        raise ValueError(f"Unknown timestep sampling mode: {timestep_sampling_mode!r}")
+    if timestep_logit_std <= 0.0:
+        raise ValueError("timestep_logit_std must be positive.")
+    if pair_center_sigma < 0.0:
+        raise ValueError("pair_center_sigma must be non-negative.")
     if shortcut_loss_mode == "direction_activation_huber":
         shortcut_loss_mode = "direction_activation"
     if shortcut_loss_mode not in {"direction_magnitude", "direction_activation"}:
         raise ValueError(f"Unknown shortcut loss mode: {shortcut_loss_mode!r}")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
-    if output_distill_pair_mode not in {"trunc_normal", "trunc_normal_to_uniform", "gap2_biased"}:
+    if output_distill_pair_mode not in pair_modes:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
     if output_distill_update_mode not in {
         "predictor_only",
@@ -1066,7 +1153,14 @@ def train_step(
         ),
     )
 
-    q = jax.random.randint(tau_rng, shape=(local_batch,), minval=0, maxval=shortcut_timesteps)
+    q = sample_timestep_indices(
+        tau_rng,
+        local_batch,
+        shortcut_timesteps,
+        sampling_mode=timestep_sampling_mode,
+        logit_mean=timestep_logit_mean,
+        logit_std=timestep_logit_std,
+    )
     tau = q.astype(jnp.float32) / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
     x1 = jax.random.normal(noise_rng, x0.shape)  # [B, N, D]
 
@@ -1168,37 +1262,18 @@ def train_step(
                 jnp.max(y_pair_norm),
             )
 
-        if direct_pair_mode == "trunc_normal":
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=0.0,
-            )
-        elif direct_pair_mode == "trunc_normal_to_uniform":
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=0.0,
-                uniform_mix=pair_uniform_mix,
-            )
-        else:
-            direct_as, direct_bs = sample_distinct_pairs_weighted(
-                directions.shape[0],
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
-                direct_pair_rng,
-                num_pairs=direct_num_pairs,
-                gap2_bias=2.0,
-            )
+        direct_as, direct_bs = sample_pairs_for_mode(
+            directions.shape[0],
+            skip_in_loop_max_gap,
+            skip_in_loop_gap_loc,
+            skip_in_loop_gap_sigma,
+            direct_pair_rng,
+            direct_num_pairs,
+            direct_pair_mode,
+            uniform_mix=pair_uniform_mix,
+            center_loc=pair_center_loc,
+            center_sigma=pair_center_sigma,
+        )
         direct_joint_a = direct_as[0]
         direct_joint_b = direct_bs[0]
         joint_values = shortcut_direct_mag_loss_for_pair(
@@ -1440,31 +1515,20 @@ def train_step(
             v_teacher = jax.lax.stop_gradient(pred[subset_idx])
             t_emb_teacher = jax.lax.stop_gradient(dit_time_emb[subset_idx])
 
-            if output_distill_pair_mode == "trunc_normal":
-                output_a, output_b = sample_layer_pair_trunc_normal(
-                    hidden_stack_f32.shape[0],
-                    skip_in_loop_max_gap,
-                    skip_in_loop_gap_loc,
-                    skip_in_loop_gap_sigma,
-                    output_pair_rng,
-                )
-            elif output_distill_pair_mode == "trunc_normal_to_uniform":
-                output_a, output_b = sample_layer_pair_trunc_normal_to_uniform(
-                    hidden_stack_f32.shape[0],
-                    skip_in_loop_max_gap,
-                    skip_in_loop_gap_loc,
-                    skip_in_loop_gap_sigma,
-                    output_pair_rng,
-                    pair_uniform_mix,
-                )
-            else:
-                output_a, output_b = sample_layer_pair_gap2_biased(
-                    hidden_stack_f32.shape[0],
-                    skip_in_loop_max_gap,
-                    skip_in_loop_gap_loc,
-                    skip_in_loop_gap_sigma,
-                    output_pair_rng,
-                )
+            output_as, output_bs = sample_pairs_for_mode(
+                hidden_stack_f32.shape[0],
+                skip_in_loop_max_gap,
+                skip_in_loop_gap_loc,
+                skip_in_loop_gap_sigma,
+                output_pair_rng,
+                1,
+                output_distill_pair_mode,
+                uniform_mix=pair_uniform_mix,
+                center_loc=pair_center_loc,
+                center_sigma=pair_center_sigma,
+            )
+            output_a = output_as[0]
+            output_b = output_bs[0]
             z_source = hidden_stack_f32[output_a, subset_idx]
             if output_distill_update_mode == "predictor_plus_all":
                 pass
@@ -1776,6 +1840,8 @@ def train_step(
     output_distill_full_backbone_active = jax.lax.pmean(output_distill_full_backbone_active, axis_name="batch")
     debug_gap_logs_now = jax.lax.pmean(debug_gap_logs_now, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
+    sampled_timestep_q = jax.lax.pmean(jnp.mean(q.astype(jnp.float32)), axis_name="batch")
+    sampled_timestep_tau = sampled_timestep_q / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
     grads = jax.lax.pmean(grads, axis_name="batch")
 
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
@@ -1897,6 +1963,19 @@ def train_step(
         ),
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
         "train/pair_uniform_mix": pair_uniform_mix,
+        "train/pair_center_loc": jnp.asarray(
+            -1.0 if pair_center_loc is None else pair_center_loc,
+            dtype=jnp.float32,
+        ),
+        "train/pair_center_sigma": jnp.asarray(pair_center_sigma, dtype=jnp.float32),
+        "train/timestep_sampling_mode": jnp.asarray(
+            0.0 if timestep_sampling_mode == "uniform" else 1.0,
+            dtype=jnp.float32,
+        ),
+        "train/timestep_logit_mean": jnp.asarray(timestep_logit_mean, dtype=jnp.float32),
+        "train/timestep_logit_std": jnp.asarray(timestep_logit_std, dtype=jnp.float32),
+        "train/sampled_timestep_q": sampled_timestep_q,
+        "train/sampled_timestep_tau": sampled_timestep_tau,
         "train/pair_uniform_anneal_start_step": jnp.asarray(pair_uniform_anneal_start_step, dtype=jnp.float32),
         "train/pair_uniform_anneal_steps": jnp.asarray(pair_uniform_anneal_steps, dtype=jnp.float32),
         "train/lr_backbone": jnp.asarray(learning_rate, dtype=jnp.float32),
@@ -2988,6 +3067,15 @@ def main():
     parser.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
     parser.add_argument("--shortcut-timesteps", type=int, default=50)
     parser.add_argument(
+        "--timestep-sampling-mode",
+        type=str,
+        default="uniform",
+        choices=["uniform", "logit_normal", "logit-normal"],
+        help="Training timestep schedule. logit_normal samples sigmoid(N(mean, std)) then quantizes to shortcut timesteps.",
+    )
+    parser.add_argument("--timestep-logit-mean", type=float, default=0.0)
+    parser.add_argument("--timestep-logit-std", type=float, default=1.0)
+    parser.add_argument(
         "--shortcut-predictor-lr",
         "--predictor-learning-rate",
         dest="shortcut_predictor_lr",
@@ -3039,8 +3127,14 @@ def main():
     parser.add_argument(
         "--output-distill-pair-mode",
         type=str,
-        default="trunc_normal",
-        choices=["trunc_normal", "trunc_normal_to_uniform", "gap2_biased"],
+        default="trunc_normal_centered",
+        choices=[
+            "trunc_normal",
+            "trunc_normal_to_uniform",
+            "trunc_normal_centered",
+            "trunc_normal_centered_to_uniform",
+            "gap2_biased",
+        ],
     )
     parser.add_argument(
         "--pair-uniform-anneal-start-step",
@@ -3060,8 +3154,26 @@ def main():
     parser.add_argument(
         "--direct-pair-mode",
         type=str,
-        default="trunc_normal",
-        choices=["trunc_normal", "trunc_normal_to_uniform", "gap2_biased"],
+        default="trunc_normal_centered",
+        choices=[
+            "trunc_normal",
+            "trunc_normal_to_uniform",
+            "trunc_normal_centered",
+            "trunc_normal_centered_to_uniform",
+            "gap2_biased",
+        ],
+    )
+    parser.add_argument(
+        "--pair-center-loc",
+        type=float,
+        default=None,
+        help="Layer-index midpoint for centered pair sampling. Default is the middle of the model depth.",
+    )
+    parser.add_argument(
+        "--pair-center-sigma",
+        type=float,
+        default=2.0,
+        help="Stddev, in layer-index units, for centered pair sampling modes.",
     )
     parser.add_argument(
         "--shortcut-loss-mode",
@@ -3384,6 +3496,9 @@ def main():
             raise ValueError("--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
     if args.shortcut_timesteps <= 0:
         raise ValueError("--shortcut-timesteps must be greater than 0")
+    args.timestep_sampling_mode = args.timestep_sampling_mode.replace("-", "_")
+    if args.timestep_logit_std <= 0.0:
+        raise ValueError("--timestep-logit-std must be greater than 0")
     if args.shortcut_mag_scale <= 0:
         raise ValueError("--shortcut-mag-scale must be greater than 0")
     if args.shortcut_mag_abs_scale <= 0:
@@ -3433,6 +3548,8 @@ def main():
         raise ValueError("--pair-uniform-anneal-start-step must be non-negative")
     if args.pair_uniform_anneal_steps <= 0:
         raise ValueError("--pair-uniform-anneal-steps must be greater than 0")
+    if args.pair_center_sigma < 0.0:
+        raise ValueError("--pair-center-sigma must be non-negative")
     if args.direct_joint_pairs != 1 or args.direct_predictor_only_pairs not in {0, 1, 2}:
         raise ValueError("--direct-joint-pairs must be 1 and --direct-predictor-only-pairs must be 0, 1, or 2")
     if args.direct_num_pairs != args.direct_joint_pairs + args.direct_predictor_only_pairs:
@@ -3540,6 +3657,8 @@ def main():
         f"skip_gap_sigma={args.shortcut_skip_in_loop_gap_sigma} "
         f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
         f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
+        f"timestep_sampling={args.timestep_sampling_mode} "
+        f"timestep_logit=({args.timestep_logit_mean},{args.timestep_logit_std}) "
         f"output_distill={args.output_distill} "
         f"output_distill_ratio={args.output_distill_ratio} "
         f"output_distill_local_batch={output_distill_local_batch_size} "
@@ -3549,6 +3668,7 @@ def main():
         f"output_distill_full_backbone_start_step={args.output_distill_full_backbone_start_step} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
+        f"pair_center=({args.pair_center_loc},{args.pair_center_sigma}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
@@ -3734,6 +3854,11 @@ def main():
             predictor_use_class_input=args.shortcut_predictor_use_class_input,
             learning_rate=args.learning_rate,
             predictor_learning_rate=args.shortcut_predictor_lr,
+            timestep_sampling_mode=args.timestep_sampling_mode,
+            timestep_logit_mean=args.timestep_logit_mean,
+            timestep_logit_std=args.timestep_logit_std,
+            pair_center_loc=args.pair_center_loc,
+            pair_center_sigma=args.pair_center_sigma,
         ),
         axis_name="batch",
     )
