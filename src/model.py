@@ -273,18 +273,33 @@ class FinalLayer(nn.Module):
 
 
 class LayerSyncProjector(nn.Module):
-    """3-layer MLP projector for aligning weak-layer states to strong-layer states."""
+    """Projector for aligning weak-layer states to strong-layer states."""
     hidden_dim: int = 2048
     output_dim: int = 768
+    projector_kind: str = "mlp"
+    depth: int = 3
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.silu(x)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.silu(x)
-        x = nn.Dense(self.output_dim)(x)
-        return x
+        if self.projector_kind == "mlp":
+            h = x
+            for _ in range(max(int(self.depth) - 1, 0)):
+                h = nn.Dense(self.hidden_dim)(h)
+                h = nn.silu(h)
+            return nn.Dense(self.output_dim)(h)
+        if self.projector_kind == "residual_mlp":
+            h = nn.LayerNorm(epsilon=1e-6, name="ln")(x)
+            for idx in range(max(int(self.depth) - 1, 0)):
+                h = nn.Dense(self.hidden_dim, name=f"fc{idx + 1}")(h)
+                h = nn.silu(h)
+            delta = nn.Dense(
+                self.output_dim,
+                kernel_init=ZERO_INIT,
+                bias_init=ZERO_INIT,
+                name="out",
+            )(h)
+            return x + delta
+        raise ValueError(f"Unknown LayerSync projector kind: {self.projector_kind!r}")
 
 
 class SelfFlowDiT(nn.Module):
@@ -302,6 +317,8 @@ class SelfFlowDiT(nn.Module):
     per_token: bool = False
     class_dropout_prob: float = 0.1
     layersync_project_weak: bool = False
+    layersync_projector_kind: str = "mlp"
+    layersync_projector_depth: int = 3
     layersync_proj_dim: int = 2048
 
     def setup(self):
@@ -315,6 +332,8 @@ class SelfFlowDiT(nn.Module):
             self.layersync_projector = LayerSyncProjector(
                 hidden_dim=self.layersync_proj_dim,
                 output_dim=self.hidden_size,
+                projector_kind=self.layersync_projector_kind,
+                depth=self.layersync_projector_depth,
             )
 
     @nn.compact
