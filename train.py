@@ -2323,7 +2323,7 @@ def train_step(
             _tgt = _clamp(timestep_shortcut_layer)
             _asymmetric = timestep_shortcut_source_layer is not None
             _src = _clamp(timestep_shortcut_source_layer) if _asymmetric else _tgt
-            _out = _clamp(_tgt + 1) if _asymmetric else _tgt
+            _out = _tgt
             ts_tgt_layer = jnp.asarray(_tgt, dtype=jnp.int32)
             ts_src_layer = jnp.asarray(_src, dtype=jnp.int32)
             ts_out_layer = jnp.asarray(_out, dtype=jnp.int32)
