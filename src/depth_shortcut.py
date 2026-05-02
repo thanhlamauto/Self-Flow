@@ -962,7 +962,7 @@ def canonical_predictor_variant_name(name: str) -> str:
 def predictor_size_bucket(name: str) -> str:
     """Return tiny/small/base/large for a predictor variant."""
     canonical = canonical_predictor_variant_name(name)
-    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10"}:
+    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10", "hybrid_depth30m"}:
         return "large"
     if canonical in {"dit2_base_v2", "dit2_deep_256"}:
         return "base"
