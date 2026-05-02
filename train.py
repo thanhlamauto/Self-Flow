@@ -452,7 +452,7 @@ try:
     import grain.python as grain
 except ImportError:
     grain = None
-from src.model import SelfFlowDiT
+from src.model import SelfFlowDiT, apply_dit_tail_from_hidden
 from src.depth_shortcut import (
     DepthShortcutPredictor,
     apply_predictor_config_overrides,
@@ -1112,6 +1112,7 @@ def train_step(
     timestep_logit_std=1.0,
     pair_center_loc=None,
     pair_center_sigma=0.0,
+    model_config=None,
 ):
     """Vanilla SiT training step (global timestep; velocity prediction).
 
@@ -1247,7 +1248,7 @@ def train_step(
                 za,
                 normalize_input=predictor_normalize_input,
             )
-            ub, _, _ = build_direction_and_norm_map(zb_target)
+            ub, mb_target_cached, _ = build_direction_and_norm_map(zb_target)
             t_embed_pair = jax.lax.stop_gradient(dit_time_emb) if source_detach else dit_time_emb
             y_pair, delta_m_pair = state.predictor_apply_fn(
                 {"params": params["predictor"]},
@@ -1265,8 +1266,8 @@ def train_step(
             loss_dir_pair = 1.0 - cos_pair
 
             if shortcut_loss_mode == "direction_magnitude":
-                ma_target = jax.lax.stop_gradient(log_magnitude_for_layer(source_layer))
-                mb_target = jax.lax.stop_gradient(log_magnitude_for_layer(target_layer))
+                ma_target = jax.lax.stop_gradient(ma_condition)
+                mb_target = jax.lax.stop_gradient(mb_target_cached)
                 target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target - ma_target)
                 target_delta_m_pair = jax.lax.stop_gradient(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
@@ -1649,15 +1650,15 @@ def train_step(
                 pass
             else:
                 raise ValueError(f"Unknown output distill update mode: {output_distill_update_mode!r}")
-            v_skip = state.apply_fn(
-                {"params": resume_backbone_params},
-                x_out,
-                timesteps=t_out,
-                vector=y_out,
+            v_skip = apply_dit_tail_from_hidden(
+                resume_backbone_params,
+                z_hat_b,
+                t_out,
+                y_out,
+                output_resume_drop_rng,
+                output_b + 1,
+                model_config,
                 deterministic=False,
-                rngs={"dropout": output_resume_drop_rng},
-                resume_hidden=z_hat_b,
-                resume_start_layer=output_b + 1,
             )
             v_skip = v_skip.astype(jnp.float32)
             v_teacher = v_teacher.astype(jnp.float32)
@@ -1777,7 +1778,11 @@ def train_step(
             output_distill_full_backbone_active.astype(jnp.float32),
             debug_gap_logs_now.astype(jnp.float32),
             debug_pair_metrics,
-            hidden_stack,
+            (
+                jnp.zeros((1,), dtype=jnp.float32)
+                if shortcut_loss_mode == "direction_magnitude"
+                else jax.lax.stop_gradient(hidden_stack)
+            ),
         )
         return loss_total, aux
 
@@ -1910,7 +1915,8 @@ def train_step(
     grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
     param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
 
-    l2_ema = update_l2_ema_5bins(l2_ema, jax.lax.stop_gradient(hidden_stack), q, alpha=l2_ema_alpha)
+    if shortcut_loss_mode != "direction_magnitude":
+        l2_ema = update_l2_ema_5bins(l2_ema, hidden_stack, q, alpha=l2_ema_alpha)
     state = state.apply_gradients(grads=grads)
     ema_params = ema_update(ema_params, state.params["backbone"], ema_decay)
     predictor_ema_params = ema_update(
@@ -3945,6 +3951,7 @@ def main():
             timestep_logit_std=args.timestep_logit_std,
             pair_center_loc=args.pair_center_loc,
             pair_center_sigma=args.pair_center_sigma,
+            model_config=config,
         ),
         axis_name="batch",
     )

@@ -608,6 +608,93 @@ class SelfFlowDiT(nn.Module):
         return x
 
 
+def _shufflechannel_output(x: jax.Array, *, patch_size: int, out_channels: int, learn_sigma: bool) -> jax.Array:
+    x = rearrange(x, "b l (c p q) -> b l (c p q)", p=patch_size, q=patch_size, c=out_channels)
+    x = rearrange(x, "b l (p q c) -> b l (c p q)", p=patch_size, q=patch_size, c=out_channels)
+    if learn_sigma:
+        x, _ = jnp.split(x, 2, axis=2)
+    return x
+
+
+def apply_dit_tail_from_hidden(
+    backbone_params: dict,
+    resume_hidden: jax.Array,
+    timesteps: jax.Array,
+    labels: jax.Array,
+    dropout_rng: jax.Array,
+    resume_start_layer: jax.Array,
+    config: dict,
+    *,
+    deterministic: bool = False,
+) -> jax.Array:
+    """Apply only the DiT tail from a predicted hidden state.
+
+    `resume_start_layer` is 1-indexed and follows SelfFlowDiT.__call__'s
+    resume convention: layer b + 1 means the input is already the output of
+    block b, so only blocks b..depth-1 in zero-indexed module names run.
+    """
+    hidden_size = int(config["hidden_size"])
+    depth = int(config["depth"])
+    patch_size = int(config["patch_size"])
+    in_channels = int(config["in_channels"])
+    learn_sigma = bool(config["learn_sigma"])
+    out_channels = in_channels * 2 if learn_sigma else in_channels
+    per_token = bool(config.get("per_token", False))
+
+    timesteps = 1.0 - timesteps
+    t_embedder = TimestepEmbedder(hidden_size=hidden_size)
+    y_embedder = LabelEmbedder(
+        num_classes=int(config["num_classes"]),
+        hidden_size=hidden_size,
+        dropout_prob=float(config["class_dropout_prob"]),
+    )
+    t_emb = t_embedder.apply({"params": backbone_params["TimestepEmbedder_0"]}, timesteps)
+    y_emb = y_embedder.apply(
+        {"params": backbone_params["LabelEmbedder_0"]},
+        labels,
+        deterministic=deterministic,
+        rngs={"dropout": dropout_rng},
+    )
+    c = t_emb + y_emb
+
+    start_idx = jnp.clip(jnp.asarray(resume_start_layer, dtype=jnp.int32) - 1, 0, depth)
+
+    def final_from_hidden(x_tail: jax.Array) -> jax.Array:
+        x_tail = FinalLayer(
+            hidden_size=hidden_size,
+            patch_size=patch_size,
+            out_channels=out_channels,
+            per_token=per_token,
+        ).apply({"params": backbone_params["FinalLayer_0"]}, x_tail, c)
+        x_tail = _shufflechannel_output(
+            x_tail,
+            patch_size=patch_size,
+            out_channels=out_channels,
+            learn_sigma=learn_sigma,
+        )
+        return -x_tail
+
+    def make_tail_branch(start_block: int):
+        def branch(x_tail: jax.Array) -> jax.Array:
+            for block_idx in range(start_block, depth):
+                x_tail = DiTBlock(
+                    hidden_size=hidden_size,
+                    num_heads=int(config["num_heads"]),
+                    mlp_ratio=float(config["mlp_ratio"]),
+                    per_token=per_token,
+                ).apply(
+                    {"params": backbone_params[f"DiTBlock_{block_idx}"]},
+                    x_tail,
+                    c,
+                )
+            return final_from_hidden(x_tail)
+
+        return branch
+
+    branches = tuple(make_tail_branch(block_idx) for block_idx in range(depth + 1))
+    return jax.lax.switch(start_idx, branches, resume_hidden)
+
+
 class SelfFlowPerTokenDiT(SelfFlowDiT):
     """
     Self-Flow DiT with per-token timestep conditioning.
