@@ -2257,6 +2257,29 @@ def save_checkpoint_bundle(ckpt_dir, targets, step, *, keep=1, overwrite=False):
     )
 
 
+def load_checkpoint_bundle(bundle_dir, *, param_template, ema_template, predictor_ema_template, l2_ema_template):
+    """Load a checkpoint bundle written by save_checkpoint_bundle.
+
+    Returns (params, ema_params, predictor_ema_params, l2_ema, step) or None if
+    no checkpoint exists in bundle_dir.
+    """
+    latest = checkpoints.latest_checkpoint(bundle_dir)
+    if latest is None:
+        return None
+    resume_step = int(os.path.basename(latest).split("_")[-1])
+    params = checkpoints.restore_checkpoint(bundle_dir, target=param_template)
+    ema = checkpoints.restore_checkpoint(
+        os.path.join(bundle_dir, "ema"), target=ema_template
+    )
+    predictor_ema = checkpoints.restore_checkpoint(
+        os.path.join(bundle_dir, "predictor_ema"), target=predictor_ema_template
+    )
+    l2_raw = checkpoints.restore_checkpoint(
+        os.path.join(bundle_dir, "l2_ema"), target={"l2_ema": l2_ema_template}
+    )
+    return params, ema, predictor_ema, l2_raw["l2_ema"], resume_step
+
+
 def scalar_to_host_int(value) -> int:
     """Convert a scalar or replicated scalar JAX value to a Python int."""
     try:
@@ -3159,6 +3182,15 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume training from the latest checkpoint bundle in ckpt_dir/latest. "
+            "Restores online params, EMA, predictor EMA, l2_ema, and global step. "
+            "Note: optimizer state (Adam moments) is not restored."
+        ),
+    )
+    parser.add_argument(
         "--official-training-mode",
         action="store_true",
         help=(
@@ -4005,6 +4037,22 @@ def main():
             f"WARNING: predictor params {predictor_param_count:,} are outside "
             f"{predictor_bucket} target range [{predictor_range[0]:,}, {predictor_range[1]:,}]"
         )
+    if args.resume:
+        latest_bundle = os.path.join(args.ckpt_dir, "latest")
+        resume_result = load_checkpoint_bundle(
+            latest_bundle,
+            param_template=state.params,
+            ema_template=ema_params,
+            predictor_ema_template=predictor_ema_params,
+            l2_ema_template=l2_ema,
+        )
+        if resume_result is not None:
+            r_params, ema_params, predictor_ema_params, l2_ema, resume_step = resume_result
+            state = state.replace(params=r_params, step=resume_step)
+            log_stage(f"Resumed from step {resume_step} ({latest_bundle})")
+        else:
+            log_stage(f"--resume: no checkpoint found in {latest_bundle!r}, starting from scratch")
+
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     predictor_ema_params = jax_utils.replicate(predictor_ema_params)
@@ -4846,10 +4894,20 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     global_step = scalar_to_host_int(state.step)
+    start_epoch = global_step // args.steps_per_epoch
+    start_step_in_epoch = global_step % args.steps_per_epoch
+
+    if global_step > 0 and data_iterator is not None:
+        log_stage(f"Skipping {global_step} batches in data iterator to resume at step {global_step}...")
+        prefetched_train_batch = None  # discard preflight-fetched batch; iterator is at position 0
+        for _ in range(global_step):
+            next(data_iterator)
+        log_stage("Data iterator ready.")
+
     t0 = time.time()
 
-    for epoch in range(args.epochs):
-        for step in range(args.steps_per_epoch):
+    for epoch in range(start_epoch, args.epochs):
+        for step in range(start_step_in_epoch if epoch == start_epoch else 0, args.steps_per_epoch):
             if data_iterator is not None:
                 if prefetched_train_batch is not None:
                     batch = prefetched_train_batch
