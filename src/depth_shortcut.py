@@ -478,14 +478,25 @@ class DepthShortcutPredictor(nn.Module):
         target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
         delta = target_layer - source_layer
 
+        detach_timestep = jnp.asarray(detach_timestep_embed, dtype=jnp.bool_)
         if use_timestep_embed:
-            t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
+            t_cond = jax.lax.cond(
+                detach_timestep,
+                jax.lax.stop_gradient,
+                lambda x: x,
+                timestep_embed,
+            )
         else:
             t_cond = jnp.zeros_like(timestep_embed)
         if timestep_tgt_embed is None:
             t_tgt_cond = t_cond
         elif use_timestep_embed:
-            t_tgt_cond = jax.lax.stop_gradient(timestep_tgt_embed) if detach_timestep_embed else timestep_tgt_embed
+            t_tgt_cond = jax.lax.cond(
+                detach_timestep,
+                jax.lax.stop_gradient,
+                lambda x: x,
+                timestep_tgt_embed,
+            )
         else:
             t_tgt_cond = jnp.zeros_like(timestep_embed)
         t_delta_cond = t_cond - t_tgt_cond

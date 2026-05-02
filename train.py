@@ -1321,12 +1321,22 @@ def train_step(
             q_tgt,
             source_detach,
         ):
-            source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
+            source_for_predictor = jax.lax.cond(
+                jnp.asarray(source_detach, dtype=jnp.bool_),
+                jax.lax.stop_gradient,
+                lambda x: x,
+                source_hidden,
+            )
             predictor_source, m_source = build_predictor_source(
                 source_for_predictor,
                 normalize_input=predictor_normalize_input,
             )
-            src_embed = jax.lax.stop_gradient(src_time_emb) if source_detach else src_time_emb
+            src_embed = jax.lax.cond(
+                jnp.asarray(source_detach, dtype=jnp.bool_),
+                jax.lax.stop_gradient,
+                lambda x: x,
+                src_time_emb,
+            )
             y_pred, delta_m_pred = state.predictor_apply_fn(
                 {"params": predictor_params},
                 predictor_source,
@@ -1426,7 +1436,12 @@ def train_step(
             q_tgt,
             source_detach,
         ):
-            source_for_predictor = jax.lax.stop_gradient(source_hidden) if source_detach else source_hidden
+            source_for_predictor = jax.lax.cond(
+                jnp.asarray(source_detach, dtype=jnp.bool_),
+                jax.lax.stop_gradient,
+                lambda x: x,
+                source_hidden,
+            )
             src_embed = jax.lax.stop_gradient(src_time_emb)
             tgt_embed = jax.lax.stop_gradient(tgt_time_emb)
             h0_cond = None if h0_tgt is None else jax.lax.stop_gradient(h0_tgt)
