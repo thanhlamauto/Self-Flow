@@ -56,6 +56,7 @@ COMMON_ARGS=(
   --block-corr-freq 25000
   --block-corr-batches 2
   --wandb-project selfflow-jax
+  --official-training-mode
   --ema-decay 0.9999
   --shortcut-training-mode direction-magnitude
   --shortcut-lambda-dir 1

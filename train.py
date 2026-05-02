@@ -21,6 +21,25 @@ def log_stage(message):
     print(f"[train.py] {message}", file=sys.stderr, flush=True)
 
 
+def parse_step_list(value) -> frozenset[int]:
+    if value is None:
+        return frozenset()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = str(value).replace(";", ",").split(",")
+    steps = []
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item:
+            continue
+        step = int(item)
+        if step <= 0:
+            raise ValueError(f"Step values must be positive, got {step}")
+        steps.append(step)
+    return frozenset(steps)
+
+
 class _AbslDedupFilter(logging.Filter):
     def __init__(self):
         super().__init__()
@@ -2197,6 +2216,47 @@ def replicated_metrics_to_host(metrics):
     )
 
 
+def unreplicate_checkpoint_targets(state, ema_params, predictor_ema_params, l2_ema):
+    return {
+        "online": jax_utils.unreplicate(state.params),
+        "ema": jax_utils.unreplicate(ema_params),
+        "predictor_ema": jax_utils.unreplicate(predictor_ema_params),
+        "l2_ema": jax_utils.unreplicate(l2_ema),
+    }
+
+
+def save_checkpoint_bundle(ckpt_dir, targets, step, *, keep=1, overwrite=False):
+    os.makedirs(ckpt_dir, exist_ok=True)
+    checkpoints.save_checkpoint(
+        ckpt_dir=ckpt_dir,
+        target=targets["online"],
+        step=step,
+        keep=keep,
+        overwrite=overwrite,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(ckpt_dir, "ema"),
+        target=targets["ema"],
+        step=step,
+        keep=keep,
+        overwrite=overwrite,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(ckpt_dir, "predictor_ema"),
+        target=targets["predictor_ema"],
+        step=step,
+        keep=keep,
+        overwrite=overwrite,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(ckpt_dir, "l2_ema"),
+        target={"l2_ema": targets["l2_ema"]},
+        step=step,
+        keep=keep,
+        overwrite=overwrite,
+    )
+
+
 def scalar_to_host_int(value) -> int:
     """Convert a scalar or replicated scalar JAX value to a Python int."""
     try:
@@ -2215,6 +2275,41 @@ PRIVATE_TRAIN_METRIC_KEYS = {
     "train/private_avg_norm",
     "train/private_pairwise_cosine",
 }
+
+
+OFFICIAL_TRAIN_METRIC_KEYS = {
+    "train/step",
+    "train/loss",
+    "train/loss_total",
+    "train/loss_gen",
+    "train/loss_direct_3pair",
+    "train/loss_boot",
+    "train/loss_mag",
+    "train/loss_boot_mag",
+    "train/loss_output_distill",
+    "train/loss_output_distill_weighted",
+    "train/l_private",
+    "train/cos_dir",
+    "train/cos_boot",
+    "train/direct_gap",
+    "train/output_distill_gap",
+    "train/sampled_timestep_tau",
+    "train/grad_norm",
+    "train/param_norm",
+    "train/lr_backbone",
+    "train/lr_predictor",
+    "perf/train_step_time",
+    "perf/train_step_tflops",
+    "perf/accumulated_train_tflops",
+}
+
+
+def filter_official_train_metrics(metrics):
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key in OFFICIAL_TRAIN_METRIC_KEYS
+    }
 
 
 def filter_private_metrics(metrics):
@@ -3063,6 +3158,31 @@ def main():
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument(
+        "--official-training-mode",
+        action="store_true",
+        help=(
+            "Use low-overhead production-training monitoring: sparse train/val logs, "
+            "no samples/block-corr, latest checkpoint every 20k steps, and fixed-step FID."
+        ),
+    )
+    parser.add_argument(
+        "--no-official-training-overrides",
+        action="store_true",
+        help="Keep explicitly configured logging/eval cadences even when --official-training-mode is set.",
+    )
+    parser.add_argument(
+        "--ckpt-latest-freq",
+        type=int,
+        default=20000,
+        help="Save an overwrite-style latest checkpoint bundle every N training steps. 0 disables periodic latest checkpoints.",
+    )
+    parser.add_argument(
+        "--ckpt-keep-steps",
+        type=str,
+        default="400000,1000000,2000000",
+        help="Comma-separated training steps to save permanently under ckpt_dir/permanent/step_<N>. Empty disables.",
+    )
     # ── Vanilla SiT args ──────────────────────────────────────────────────────
     parser.add_argument(
         "--ema-decay",
@@ -3453,6 +3573,15 @@ def main():
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
                              "Default cadence is for TPU monitoring, not paper eval.")
+    parser.add_argument(
+        "--fid-steps",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated fixed training steps for FID/sFID and bundled IS/Precision/Recall. "
+            "When non-empty, --fid-freq is ignored. Example: 50000,20000000."
+        ),
+    )
     parser.add_argument("--num-fid-samples", type=int, default=4000,
                         help="Number of real/fake samples for FID. "
                              "TPU default: 4000 (monitoring). Paper: 50000.")
@@ -3549,15 +3678,31 @@ def main():
 
     if args.preflight_only:
         args.preflight_checks = True
+    if args.official_training_mode and not args.no_official_training_overrides:
+        args.log_freq = 1000
+        args.eval_freq = 20000
+        args.eval_batches = 1
+        args.sample_freq = 0
+        args.block_corr_freq = 0
+        args.shortcut_debug_gap_logs = False
+        args.fid_freq = 0
+        if not str(args.fid_steps).strip():
+            args.fid_steps = "50000,20000000"
+
+    ckpt_keep_steps = parse_step_list(args.ckpt_keep_steps)
+    fid_fixed_steps = parse_step_list(args.fid_steps)
+    fid_enabled = bool(fid_fixed_steps) or args.fid_freq > 0
 
     # ── Argument validation ───────────────────────────────────────────────────
+    if args.ckpt_latest_freq < 0:
+        raise ValueError("--ckpt-latest-freq must be >= 0")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
-    if args.fid_freq > 0 and args.num_fid_samples <= 0:
+    if fid_enabled and args.num_fid_samples <= 0:
         raise ValueError("--num-fid-samples must be greater than 0 when FID is enabled")
-    if args.fid_freq > 0 and args.fid_batch_size <= 0:
+    if fid_enabled and args.fid_batch_size <= 0:
         raise ValueError("--fid-batch-size must be greater than 0 when FID is enabled")
-    if args.fid_freq > 0 and args.fid_eval_local_batch <= 0:
+    if fid_enabled and args.fid_eval_local_batch <= 0:
         raise ValueError("--fid-eval-local-batch must be greater than 0 when FID is enabled")
     if args.inception_score_splits <= 0:
         raise ValueError("--inception-score-splits must be greater than 0")
@@ -3727,6 +3872,13 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"weight_decay={args.weight_decay} cfg_dropout_rate={args.cfg_dropout_rate}"
+    )
+    log_stage(
+        f"RunMode: official_training={args.official_training_mode} "
+        f"log_freq={args.log_freq} eval_freq={args.eval_freq} eval_batches={args.eval_batches} "
+        f"sample_freq={args.sample_freq} block_corr_freq={args.block_corr_freq} "
+        f"ckpt_latest_freq={args.ckpt_latest_freq} ckpt_keep_steps={sorted(ckpt_keep_steps)} "
+        f"fid_freq={args.fid_freq} fid_steps={sorted(fid_fixed_steps)}"
     )
     log_stage(
         f"DepthShortcut: predictor={args.shortcut_predictor} "
@@ -4767,6 +4919,8 @@ def main():
                 cpu_metrics["train/step"] = global_step
                 if not args.private_loss:
                     cpu_metrics = filter_private_metrics(cpu_metrics)
+                if args.official_training_mode:
+                    cpu_metrics = filter_official_train_metrics(cpu_metrics)
                 t0 = time.time()
                 logger.log(cpu_metrics, step=global_step)
 
@@ -4791,8 +4945,13 @@ def main():
                 averaged_val_metrics["train/step"] = global_step
                 logger.log(averaged_val_metrics, step=global_step)
 
-            # Synchronous FID (blocks training; see compute_fid docstring)
-            if args.fid_freq > 0 and global_step % args.fid_freq == 0:
+            # Synchronous FID bundle: FID/sFID plus optional IS/Precision/Recall.
+            fid_due = (
+                global_step in fid_fixed_steps
+                if fid_fixed_steps
+                else (args.fid_freq > 0 and global_step % args.fid_freq == 0)
+            )
+            if fid_due:
                 try:
                     val_iterator = compute_eval_metrics(global_step, val_iterator)
                 except Exception as exc:
@@ -4849,32 +5008,43 @@ def main():
                                  args=(latents_dev, latents_skip_dev, sample_classes, global_step),
                                  daemon=True).start()
 
+            latest_ckpt_due = args.ckpt_latest_freq > 0 and global_step % args.ckpt_latest_freq == 0
+            permanent_ckpt_due = global_step in ckpt_keep_steps
+            if latest_ckpt_due or permanent_ckpt_due:
+                checkpoint_targets = unreplicate_checkpoint_targets(
+                    state,
+                    ema_params,
+                    predictor_ema_params,
+                    l2_ema,
+                )
+                if latest_ckpt_due:
+                    latest_dir = os.path.join(args.ckpt_dir, "latest")
+                    log_stage(f"Step {global_step}: saving latest checkpoint bundle to {latest_dir}")
+                    save_checkpoint_bundle(
+                        latest_dir,
+                        checkpoint_targets,
+                        global_step,
+                        keep=1,
+                    )
+                if permanent_ckpt_due:
+                    permanent_dir = os.path.join(args.ckpt_dir, "permanent", f"step_{global_step}")
+                    log_stage(f"Step {global_step}: saving permanent checkpoint bundle to {permanent_dir}")
+                    save_checkpoint_bundle(
+                        permanent_dir,
+                        checkpoint_targets,
+                        global_step,
+                        keep=1,
+                        overwrite=True,
+                    )
+
     # ── Checkpoint save (online params + EMA params) ──────────────────────────
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
-    unreplicated_predictor_ema = jax_utils.unreplicate(predictor_ema_params)
-    unreplicated_l2_ema = jax_utils.unreplicate(l2_ema)
-    checkpoints.save_checkpoint(
-        ckpt_dir=args.ckpt_dir,
-        target=unreplicated_params,
-        step=global_step,
+    final_checkpoint_targets = unreplicate_checkpoint_targets(
+        state,
+        ema_params,
+        predictor_ema_params,
+        l2_ema,
     )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "predictor_ema"),
-        target=unreplicated_predictor_ema,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "l2_ema"),
-        target=unreplicated_l2_ema,
-        step=global_step,
-    )
+    save_checkpoint_bundle(args.ckpt_dir, final_checkpoint_targets, global_step, keep=1)
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
     if _is_worker[0] is not None:
