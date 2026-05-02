@@ -2219,6 +2219,7 @@ def replicated_metrics_to_host(metrics):
 def unreplicate_checkpoint_targets(state, ema_params, predictor_ema_params, l2_ema):
     return {
         "online": jax_utils.unreplicate(state.params),
+        "opt_state": jax_utils.unreplicate(state.opt_state),
         "ema": jax_utils.unreplicate(ema_params),
         "predictor_ema": jax_utils.unreplicate(predictor_ema_params),
         "l2_ema": jax_utils.unreplicate(l2_ema),
@@ -2230,6 +2231,13 @@ def save_checkpoint_bundle(ckpt_dir, targets, step, *, keep=1, overwrite=False):
     checkpoints.save_checkpoint(
         ckpt_dir=ckpt_dir,
         target=targets["online"],
+        step=step,
+        keep=keep,
+        overwrite=overwrite,
+    )
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.join(ckpt_dir, "opt_state"),
+        target=targets["opt_state"],
         step=step,
         keep=keep,
         overwrite=overwrite,
@@ -2257,17 +2265,28 @@ def save_checkpoint_bundle(ckpt_dir, targets, step, *, keep=1, overwrite=False):
     )
 
 
-def load_checkpoint_bundle(bundle_dir, *, param_template, ema_template, predictor_ema_template, l2_ema_template):
+def load_checkpoint_bundle(
+    bundle_dir,
+    *,
+    param_template,
+    opt_state_template,
+    ema_template,
+    predictor_ema_template,
+    l2_ema_template,
+):
     """Load a checkpoint bundle written by save_checkpoint_bundle.
 
-    Returns (params, ema_params, predictor_ema_params, l2_ema, step) or None if
-    no checkpoint exists in bundle_dir.
+    Returns (params, opt_state, ema_params, predictor_ema_params, l2_ema, step)
+    or None if no checkpoint exists in bundle_dir.
     """
     latest = checkpoints.latest_checkpoint(bundle_dir)
     if latest is None:
         return None
     resume_step = int(os.path.basename(latest).split("_")[-1])
     params = checkpoints.restore_checkpoint(bundle_dir, target=param_template)
+    opt_state = checkpoints.restore_checkpoint(
+        os.path.join(bundle_dir, "opt_state"), target=opt_state_template
+    )
     ema = checkpoints.restore_checkpoint(
         os.path.join(bundle_dir, "ema"), target=ema_template
     )
@@ -2277,7 +2296,7 @@ def load_checkpoint_bundle(bundle_dir, *, param_template, ema_template, predicto
     l2_raw = checkpoints.restore_checkpoint(
         os.path.join(bundle_dir, "l2_ema"), target={"l2_ema": l2_ema_template}
     )
-    return params, ema, predictor_ema, l2_raw["l2_ema"], resume_step
+    return params, opt_state, ema, predictor_ema, l2_raw["l2_ema"], resume_step
 
 
 def scalar_to_host_int(value) -> int:
@@ -4042,13 +4061,14 @@ def main():
         resume_result = load_checkpoint_bundle(
             latest_bundle,
             param_template=state.params,
+            opt_state_template=state.opt_state,
             ema_template=ema_params,
             predictor_ema_template=predictor_ema_params,
             l2_ema_template=l2_ema,
         )
         if resume_result is not None:
-            r_params, ema_params, predictor_ema_params, l2_ema, resume_step = resume_result
-            state = state.replace(params=r_params, step=resume_step)
+            r_params, r_opt_state, ema_params, predictor_ema_params, l2_ema, resume_step = resume_result
+            state = state.replace(params=r_params, opt_state=r_opt_state, step=resume_step)
             log_stage(f"Resumed from step {resume_step} ({latest_bundle})")
         else:
             log_stage(f"--resume: no checkpoint found in {latest_bundle!r}, starting from scratch")
