@@ -3234,6 +3234,16 @@ def main():
         default="400000,1000000,2000000",
         help="Comma-separated training steps to save permanently under ckpt_dir/permanent/step_<N>. Empty disables.",
     )
+    parser.add_argument(
+        "--ckpt-verify-step",
+        type=int,
+        default=1000,
+        help=(
+            "Save a checkpoint bundle to ckpt_dir/verify/ at this step and immediately "
+            "reload it to confirm the full save/load roundtrip works. "
+            "Raises an error and stops training if the check fails. 0 disables."
+        ),
+    )
     # ── Vanilla SiT args ──────────────────────────────────────────────────────
     parser.add_argument(
         "--ema-decay",
@@ -3747,6 +3757,8 @@ def main():
     # ── Argument validation ───────────────────────────────────────────────────
     if args.ckpt_latest_freq < 0:
         raise ValueError("--ckpt-latest-freq must be >= 0")
+    if args.ckpt_verify_step < 0:
+        raise ValueError("--ckpt-verify-step must be >= 0")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if fid_enabled and args.num_fid_samples <= 0:
@@ -5085,6 +5097,34 @@ def main():
                 threading.Thread(target=_bg_log,
                                  args=(latents_dev, latents_skip_dev, sample_classes, global_step),
                                  daemon=True).start()
+
+            verify_ckpt_due = args.ckpt_verify_step > 0 and global_step == args.ckpt_verify_step
+            if verify_ckpt_due:
+                verify_dir = os.path.join(args.ckpt_dir, "verify")
+                log_stage(f"Step {global_step}: running checkpoint save/load roundtrip check ({verify_dir})")
+                verify_targets = unreplicate_checkpoint_targets(state, ema_params, predictor_ema_params, l2_ema)
+                save_checkpoint_bundle(verify_dir, verify_targets, global_step, keep=1, overwrite=True)
+                verify_result = load_checkpoint_bundle(
+                    verify_dir,
+                    param_template=verify_targets["online"],
+                    opt_state_template=verify_targets["opt_state"],
+                    ema_template=verify_targets["ema"],
+                    predictor_ema_template=verify_targets["predictor_ema"],
+                    l2_ema_template=verify_targets["l2_ema"],
+                )
+                if verify_result is None:
+                    raise RuntimeError(
+                        f"Checkpoint verify failed at step {global_step}: "
+                        f"save succeeded but load_checkpoint_bundle returned None from {verify_dir!r}. "
+                        "Check disk permissions and available space."
+                    )
+                loaded_step = verify_result[-1]
+                if loaded_step != global_step:
+                    raise RuntimeError(
+                        f"Checkpoint verify failed at step {global_step}: "
+                        f"loaded step {loaded_step} does not match saved step {global_step}."
+                    )
+                log_stage(f"Step {global_step}: checkpoint roundtrip OK (step={loaded_step})")
 
             latest_ckpt_due = args.ckpt_latest_freq > 0 and global_step % args.ckpt_latest_freq == 0
             permanent_ckpt_due = global_step in ckpt_keep_steps
