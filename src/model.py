@@ -73,6 +73,7 @@ class PatchedPatchEmbed(nn.Module):
             use_bias=self.bias,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
             name="proj",
         )(x)
 
@@ -109,12 +110,14 @@ class TimestepEmbedder(nn.Module):
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )(t_freq)
         x = nn.swish(x)
         x = nn.Dense(
             self.hidden_size,
             kernel_init=NORMAL_002,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )(x)
         return x
 
@@ -132,6 +135,7 @@ class LabelEmbedder(nn.Module):
             num_embeddings=self.num_classes + use_cfg_embedding,
             features=self.hidden_size,
             embedding_init=NORMAL_002,
+            dtype=jnp.bfloat16,
         )
 
         use_dropout = self.dropout_prob > 0
@@ -166,6 +170,7 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
@@ -180,6 +185,7 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(x_norm, x_norm)
             x = x + gate_msa * attn
             
@@ -189,12 +195,14 @@ class DiTBlock(nn.Module):
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
@@ -203,6 +211,7 @@ class DiTBlock(nn.Module):
                 6 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c))
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
@@ -215,6 +224,7 @@ class DiTBlock(nn.Module):
                 out_kernel_init=XAVIER_UNIFORM,
                 bias_init=ZERO_INIT,
                 out_bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(x_norm, x_norm)
             x = x + gate_msa[:, None, :] * attn
             
@@ -224,12 +234,14 @@ class DiTBlock(nn.Module):
                     mlp_hidden_dim,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
                 lambda z: nn.gelu(z, approximate=True),
                 nn.Dense(
                     self.hidden_size,
                     kernel_init=XAVIER_UNIFORM,
                     bias_init=ZERO_INIT,
+                    dtype=jnp.bfloat16,
                 ),
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
@@ -251,6 +263,7 @@ class FinalLayer(nn.Module):
             self.patch_size * self.patch_size * self.out_channels,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
         )
         
         if self.per_token:
@@ -260,6 +273,7 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c_flat))
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
@@ -271,6 +285,7 @@ class FinalLayer(nn.Module):
                 2 * self.hidden_size,
                 kernel_init=ZERO_INIT,
                 bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
             )(nn.swish(c))
             shift, scale = jnp.split(modulation, 2, axis=1)
             
@@ -384,7 +399,7 @@ class SelfFlowDiT(nn.Module):
                 in_channels=self.in_channels,
                 embed_dim=self.hidden_size,
             )(x)
-            x = x + self.pos_embed_val
+            x = x + self.pos_embed_val.astype(jnp.bfloat16)
         else:
             x = resume_hidden
 
