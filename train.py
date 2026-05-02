@@ -1222,16 +1222,27 @@ def train_step(
         pred, hidden_tuple, dit_time_emb = pred
         loss_gen = jnp.mean((pred - target) ** 2)
         hidden_stack = jnp.stack(hidden_tuple, axis=0)
-        hidden_stack_f32 = hidden_stack.astype(jnp.float32)
-        hidden_norms = jnp.linalg.norm(hidden_stack_f32, axis=-1, keepdims=True)
-        directions = hidden_stack_f32 / (hidden_norms + 1e-6)
-        log_magnitudes = jnp.log(hidden_norms + 1e-6)
+        num_hidden_layers = hidden_stack.shape[0]
+
+        def hidden_layer_f32(layer):
+            return hidden_stack[layer].astype(jnp.float32)
+
+        def direction_and_log_magnitude_for_layer(layer):
+            hidden_f32 = hidden_layer_f32(layer)
+            norms = jnp.linalg.norm(hidden_f32, axis=-1, keepdims=True)
+            log_magnitudes = jnp.log(norms + 1e-6)
+            return hidden_f32 / (norms + 1e-6), log_magnitudes
+
+        def log_magnitude_for_layer(layer):
+            hidden_f32 = hidden_layer_f32(layer)
+            norms = jnp.linalg.norm(hidden_f32, axis=-1, keepdims=True)
+            return jnp.log(norms + 1e-6)
 
         def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
-            za = hidden_stack_f32[source_layer]
+            za = hidden_layer_f32(source_layer)
             if source_detach:
                 za = jax.lax.stop_gradient(za)
-            zb_target = jax.lax.stop_gradient(hidden_stack_f32[target_layer])
+            zb_target = jax.lax.stop_gradient(hidden_layer_f32(target_layer))
             predictor_source, ma_condition = build_predictor_source(
                 za,
                 normalize_input=predictor_normalize_input,
@@ -1254,14 +1265,8 @@ def train_step(
             loss_dir_pair = 1.0 - cos_pair
 
             if shortcut_loss_mode == "direction_magnitude":
-                ma_target = jnp.log(
-                    jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[source_layer]), axis=-1, keepdims=True)
-                    + 1e-6
-                )
-                mb_target = jnp.log(
-                    jnp.linalg.norm(jax.lax.stop_gradient(hidden_stack_f32[target_layer]), axis=-1, keepdims=True)
-                    + 1e-6
-                )
+                ma_target = jax.lax.stop_gradient(log_magnitude_for_layer(source_layer))
+                mb_target = jax.lax.stop_gradient(log_magnitude_for_layer(target_layer))
                 target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target - ma_target)
                 target_delta_m_pair = jax.lax.stop_gradient(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
@@ -1305,7 +1310,7 @@ def train_step(
             )
 
         direct_as, direct_bs = sample_pairs_for_mode(
-            directions.shape[0],
+            num_hidden_layers,
             skip_in_loop_max_gap,
             skip_in_loop_gap_loc,
             skip_in_loop_gap_sigma,
@@ -1380,9 +1385,9 @@ def train_step(
         delta_m_clip_rate = joint_values[7]
         direct_gap = direct_joint_b - direct_joint_a
 
-        boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, directions.shape[0] - 1)
-        boot_source_u = directions[boot_a] if predictor_normalize_input else hidden_stack_f32[boot_a]
-        boot_source_m = log_magnitudes[boot_a]
+        boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, num_hidden_layers - 1)
+        boot_source_direction, boot_source_m = direction_and_log_magnitude_for_layer(boot_a)
+        boot_source_u = boot_source_direction if predictor_normalize_input else hidden_layer_f32(boot_a)
         boot_source_u = jax.lax.cond(
             bootstrap_detach_source,
             jax.lax.stop_gradient,
@@ -1474,7 +1479,7 @@ def train_step(
         def compute_debug_pair_metrics(_):
             def compute_pair_metrics(source_layer, target_layer):
                 pair_source, pair_source_m = build_predictor_source(
-                    hidden_stack_f32[source_layer],
+                    hidden_layer_f32(source_layer),
                     normalize_input=predictor_normalize_input,
                 )
                 y_pair, delta_m_pair = state.predictor_apply_fn(
@@ -1488,11 +1493,13 @@ def train_step(
                     class_labels=y,
                 )
                 u_pair = l2_normalize_tokens(y_pair)
-                target_u_pair = jax.lax.stop_gradient(directions[target_layer])
+                target_u_pair, target_log_m = direction_and_log_magnitude_for_layer(target_layer)
+                source_log_m = log_magnitude_for_layer(source_layer)
+                target_u_pair = jax.lax.stop_gradient(target_u_pair)
                 pair_cos = jnp.sum(u_pair * target_u_pair, axis=-1).mean()
                 pair_loss_dir = 1.0 - pair_cos
                 pair_target_delta_raw = jax.lax.stop_gradient(
-                    log_magnitudes[target_layer] - log_magnitudes[source_layer]
+                    target_log_m - source_log_m
                 )
                 pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
                 pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
@@ -1501,13 +1508,13 @@ def train_step(
 
             values = []
             for pair_a, pair_b in PREDICTOR_DEBUG_PAIRS:
-                safe_pair_a = min(pair_a, directions.shape[0] - 1)
-                safe_pair_b = min(pair_b, directions.shape[0] - 1)
+                safe_pair_a = min(pair_a, num_hidden_layers - 1)
+                safe_pair_b = min(pair_b, num_hidden_layers - 1)
 
                 def compute_one_pair(_):
                     return compute_pair_metrics(safe_pair_a, safe_pair_b)
 
-                pair_is_valid = pair_b < directions.shape[0]
+                pair_is_valid = pair_b < num_hidden_layers
                 values.extend(
                     jax.lax.cond(
                         pair_is_valid,
@@ -1518,17 +1525,17 @@ def train_step(
                 )
             for gap in range(1, PREDICTOR_DEBUG_MAX_GAP + 1):
                 gap_values = []
-                gap_count = jnp.asarray(max(directions.shape[0] - gap, 0), dtype=jnp.float32)
+                gap_count = jnp.asarray(max(num_hidden_layers - gap, 0), dtype=jnp.float32)
                 for source_layer in range(0, 13 - gap):
                     target_layer = source_layer + gap
-                    safe_source_layer = min(source_layer, directions.shape[0] - 1)
-                    safe_target_layer = min(target_layer, directions.shape[0] - 1)
+                    safe_source_layer = min(source_layer, num_hidden_layers - 1)
+                    safe_target_layer = min(target_layer, num_hidden_layers - 1)
 
                     def compute_one_gap_pair(_):
                         return compute_pair_metrics(safe_source_layer, safe_target_layer)
 
                     pair_values = jax.lax.cond(
-                        target_layer < directions.shape[0],
+                        target_layer < num_hidden_layers,
                         compute_one_gap_pair,
                         lambda _: (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
                         operand=None,
@@ -1570,7 +1577,7 @@ def train_step(
             t_emb_teacher = jax.lax.stop_gradient(dit_time_emb[subset_idx])
 
             output_as, output_bs = sample_pairs_for_mode(
-                hidden_stack_f32.shape[0],
+                num_hidden_layers,
                 skip_in_loop_max_gap,
                 skip_in_loop_gap_loc,
                 skip_in_loop_gap_sigma,
@@ -1583,7 +1590,7 @@ def train_step(
             )
             output_a = output_as[0]
             output_b = output_bs[0]
-            z_source = hidden_stack_f32[output_a, subset_idx]
+            z_source = hidden_layer_f32(output_a)[subset_idx]
             if output_distill_update_mode == "predictor_plus_all":
                 pass
             elif output_distill_update_mode == "predictor_only_then_all":
