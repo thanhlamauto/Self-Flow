@@ -1032,6 +1032,7 @@ def train_step(
     dt_consistency_prob=1.0,
     dt_outdistill_train_tail=False,
     timestep_shortcut_layer=9,
+    timestep_shortcut_source_layer=None,
     timestep_output_distill_train_tail=False,
     timestep_paired_batch=True,
     timestep_shortcut_loss_mode="activation_huber",
@@ -2316,16 +2317,22 @@ def train_step(
 
         def compute_timestep_shortcut_losses():
             zero = jnp.float32(0.0)
-            ts_layer = jnp.asarray(
-                min(max(int(timestep_shortcut_layer), 0), int(hidden_stack_f32.shape[0]) - 1),
-                dtype=jnp.int32,
-            )
+            n_layers = int(hidden_stack_f32.shape[0])
+            def _clamp(v):
+                return min(max(int(v), 0), n_layers - 1)
+            _tgt = _clamp(timestep_shortcut_layer)
+            _asymmetric = timestep_shortcut_source_layer is not None
+            _src = _clamp(timestep_shortcut_source_layer) if _asymmetric else _tgt
+            _out = _clamp(_tgt + 1) if _asymmetric else _tgt
+            ts_tgt_layer = jnp.asarray(_tgt, dtype=jnp.int32)
+            ts_src_layer = jnp.asarray(_src, dtype=jnp.int32)
+            ts_out_layer = jnp.asarray(_out, dtype=jnp.int32)
             if timestep_paired_batch and timestep_shortcut_loss_mode == "activation_huber":
                 pred_ts, dm_ts, ms_ts = predictor_transition(
                     params["predictor"],
-                    hidden_stack_high_f32[ts_layer],
-                    ts_layer,
-                    ts_layer,
+                    hidden_stack_high_f32[ts_src_layer],
+                    ts_src_layer,
+                    ts_tgt_layer,
                     dit_time_emb_high,
                     dit_time_emb_light,
                     hidden_stack_light_f32[0],
@@ -2335,7 +2342,7 @@ def train_step(
                 )
                 ts_direct_dir, ts_direct_aux, e_ts_direct = timestep_dir_mag_components(
                     pred_ts, dm_ts, ms_ts,
-                    hidden_stack_light_f32[ts_layer],
+                    hidden_stack_light_f32[ts_tgt_layer],
                 )
                 loss_ts_direct = jnp.where(
                     use_timestep_direct_loss,
@@ -2347,8 +2354,8 @@ def train_step(
                     pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
                         params["predictor"],
                         pred_ts,
-                        ts_layer,
-                        ts_layer,
+                        ts_tgt_layer,
+                        ts_tgt_layer,
                         dit_time_emb_light,
                         dit_time_emb_r_embed,
                         h0_r_embed,
@@ -2358,9 +2365,9 @@ def train_step(
                     )
                     pred_tr, dm_tr, ms_tr = predictor_transition(
                         params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params,
-                        jax.lax.stop_gradient(hidden_stack_high_f32[ts_layer]),
-                        ts_layer,
-                        ts_layer,
+                        jax.lax.stop_gradient(hidden_stack_high_f32[ts_src_layer]),
+                        ts_src_layer,
+                        ts_tgt_layer,
                         dit_time_emb_high,
                         dit_time_emb_r_embed,
                         h0_r_embed,
@@ -2382,8 +2389,23 @@ def train_step(
                     loss_ts_boot = zero
 
                 if use_timestep_output_distill:
-                    m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
-                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts)
+                    if _asymmetric:
+                        pred_ts_od, dm_ts_od, ms_ts_od = predictor_transition(
+                            params["predictor"],
+                            jax.lax.stop_gradient(hidden_stack_high_f32[ts_src_layer]),
+                            ts_src_layer,
+                            ts_out_layer,
+                            dit_time_emb_high,
+                            dit_time_emb_light,
+                            hidden_stack_light_f32[0],
+                            q_base,
+                            q_s_base,
+                            True,
+                        )
+                    else:
+                        pred_ts_od, dm_ts_od, ms_ts_od = pred_ts, dm_ts, ms_ts
+                    m_ts_out = jnp.clip(ms_ts_od + mag_scale * dm_ts_od, mag_clip_min, mag_clip_max)
+                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts_od)
                     tail_params = params["backbone"] if timestep_output_distill_train_tail else jax.tree_util.tree_map(
                         jax.lax.stop_gradient,
                         params["backbone"],
@@ -2396,7 +2418,7 @@ def train_step(
                         deterministic=False,
                         rngs={"dropout": output_resume_drop_rng},
                         resume_hidden=z_hat_ts,
-                        resume_start_layer=ts_layer + 1,
+                        resume_start_layer=ts_out_layer + 1,
                     )
                     reduce_axes = tuple(range(1, y_hat_s.ndim))
                     target_s = jax.lax.stop_gradient(pred_light)
@@ -2411,9 +2433,9 @@ def train_step(
                 h0_s = hidden_stack_s_f32[0]
                 pred_ts, dm_ts, ms_ts = predictor_transition(
                     params["predictor"],
-                    hidden_stack_f32[ts_layer],
-                    ts_layer,
-                    ts_layer,
+                    hidden_stack_f32[ts_src_layer],
+                    ts_src_layer,
+                    ts_tgt_layer,
                     dit_time_emb,
                     dit_time_emb_s,
                     h0_s,
@@ -2423,7 +2445,7 @@ def train_step(
                 )
                 ts_direct_dir, ts_direct_aux, e_ts_direct = timestep_dir_mag_components(
                     pred_ts, dm_ts, ms_ts,
-                    hidden_stack_s_f32[ts_layer],
+                    hidden_stack_s_f32[ts_tgt_layer],
                 )
                 loss_ts_direct = lambda_dir * ts_direct_dir + lambda_mag * ts_direct_aux
                 loss_ts_direct = jnp.where(use_timestep_direct_loss, loss_ts_direct, zero)
@@ -2433,8 +2455,8 @@ def train_step(
                     pred_ts_sr, dm_ts_sr, ms_ts_sr = predictor_transition(
                         params["predictor"],
                         pred_ts,
-                        ts_layer,
-                        ts_layer,
+                        ts_tgt_layer,
+                        ts_tgt_layer,
                         dit_time_emb_s,
                         dit_time_emb_r,
                         h0_r,
@@ -2444,9 +2466,9 @@ def train_step(
                     )
                     pred_tr, dm_tr, ms_tr = predictor_transition(
                         params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params,
-                        jax.lax.stop_gradient(hidden_stack_f32[ts_layer]),
-                        ts_layer,
-                        ts_layer,
+                        jax.lax.stop_gradient(hidden_stack_f32[ts_src_layer]),
+                        ts_src_layer,
+                        ts_tgt_layer,
                         dit_time_emb,
                         dit_time_emb_r,
                         h0_r,
@@ -2468,8 +2490,23 @@ def train_step(
                     loss_ts_boot = zero
 
                 if use_timestep_output_distill:
-                    m_ts_out = jnp.clip(ms_ts + mag_scale * dm_ts, mag_clip_min, mag_clip_max)
-                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts)
+                    if _asymmetric:
+                        pred_ts_od, dm_ts_od, ms_ts_od = predictor_transition(
+                            params["predictor"],
+                            jax.lax.stop_gradient(hidden_stack_f32[ts_src_layer]),
+                            ts_src_layer,
+                            ts_out_layer,
+                            dit_time_emb,
+                            dit_time_emb_s,
+                            h0_s,
+                            q,
+                            q_s,
+                            True,
+                        )
+                    else:
+                        pred_ts_od, dm_ts_od, ms_ts_od = pred_ts, dm_ts, ms_ts
+                    m_ts_out = jnp.clip(ms_ts_od + mag_scale * dm_ts_od, mag_clip_min, mag_clip_max)
+                    z_hat_ts = jnp.exp(m_ts_out) * l2_normalize_tokens(pred_ts_od)
                     tail_params = params["backbone"] if timestep_output_distill_train_tail else jax.tree_util.tree_map(
                         jax.lax.stop_gradient,
                         params["backbone"],
@@ -2482,7 +2519,7 @@ def train_step(
                         deterministic=False,
                         rngs={"dropout": output_resume_drop_rng},
                         resume_hidden=z_hat_ts,
-                        resume_start_layer=ts_layer + 1,
+                        resume_start_layer=ts_out_layer + 1,
                     )
                     reduce_axes = tuple(range(1, y_hat_s.ndim))
                     target_s = jax.lax.stop_gradient(pred_s)
@@ -2507,7 +2544,7 @@ def train_step(
                 e_ts_direct,
                 e_ts_boot,
                 e_ts_out,
-                ts_layer.astype(jnp.float32),
+                ts_src_layer.astype(jnp.float32),
             )
 
         if timestep_shortcut_requested:
@@ -4363,6 +4400,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
     shortcut_timesteps=50,
     depth_shortcut_predictor_overrides=None,
     skip_layer=9,
+    source_layer=None,
     fanout_start_t=0.3,
 ):
     """Full backbone for t in [0, fanout_start_t), then predictor chain for the rest.
@@ -4378,6 +4416,8 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
         raise ValueError(f"num_steps must be > 1, got {num_steps}")
     if int(skip_layer) <= 0 or int(skip_layer) > int(config["depth"]):
         raise ValueError(f"skip_layer must be in [1, {int(config['depth'])}], got {skip_layer}")
+    _out_layer = int(skip_layer)
+    _src_layer = int(source_layer) if source_layer is not None else _out_layer
 
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -4501,7 +4541,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
             deterministic=True,
             return_hidden_states=True,
         )
-        hidden = jnp.stack(hidden_tuple, axis=0).astype(jnp.float32)[int(skip_layer)]
+        hidden = jnp.stack(hidden_tuple, axis=0).astype(jnp.float32)[_src_layer]
 
         # Phase 2: predictor chain for steps n_full .. num_steps-2.
         def fanout_step(carry, step_idx):
@@ -4526,11 +4566,11 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
                 jnp.minimum(step_idx + 1, int(shortcut_timesteps) - 1),
                 dtype=jnp.int32,
             )
-            hidden_next = predictor.apply(
+            pred_out = predictor.apply(
                 {"params": predictor_params_local},
                 hidden_cur,
-                jnp.asarray(int(skip_layer), dtype=jnp.int32),
-                jnp.asarray(int(skip_layer), dtype=jnp.int32),
+                jnp.asarray(_src_layer, dtype=jnp.int32),
+                jnp.asarray(_out_layer, dtype=jnp.int32),
                 t_emb_cur,
                 None,
                 use_timestep_embed=True,
@@ -4540,8 +4580,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
                 t_tgt_idx=q_tgt,
                 delta_t_idx=jnp.ones_like(q_src),
             )
-            if isinstance(hidden_next, tuple):
-                hidden_next = hidden_next[0]
+            hidden_next = pred_out[0] if isinstance(pred_out, tuple) else pred_out
             velocity = model.apply(
                 {"params": ema_params_local},
                 x_cur,
@@ -4549,7 +4588,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
                 vector=class_labels_local,
                 deterministic=True,
                 resume_hidden=hidden_next.astype(jnp.float32),
-                resume_start_layer=int(skip_layer) + 1,
+                resume_start_layer=_out_layer + 1,
             )
             rng_cur, step_rng = jax.random.split(rng_cur)
             diffusion = jnp.maximum(1.0 - t_next_scalar, 0.0)
@@ -4576,7 +4615,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
             vector=class_labels_local,
             deterministic=True,
             resume_hidden=hidden_last.astype(jnp.float32),
-            resume_start_layer=int(skip_layer) + 1,
+            resume_start_layer=_out_layer + 1,
         )
         samples = x_last + sde_drift(x_last, t_grid[-1], velocity_last) * jnp.float32(0.04)
 
@@ -4992,7 +5031,18 @@ def main():
         "--timestep-shortcut-layer",
         type=int,
         default=9,
-        help="Layer index used for timestep-only shortcut losses. 0 means patch-embed tokens.",
+        help="Target layer index for timestep shortcut loss and output distillation.",
+    )
+    parser.add_argument(
+        "--timestep-shortcut-source-layer",
+        type=int,
+        default=None,
+        help=(
+            "Source layer index for timestep shortcut (heavy-noise side). "
+            "When set, enables asymmetric mode: source at this layer, loss target at "
+            "--timestep-shortcut-layer, output distill predicts layer+1 and resumes from layer+2. "
+            "Default None uses the same layer for source and target (symmetric)."
+        ),
     )
     parser.add_argument("--use-timestep-direct-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-timestep-bootstrap-loss", action=argparse.BooleanOptionalAction, default=True)
@@ -5309,6 +5359,12 @@ def main():
     )
     parser.add_argument("--fid-timestep-late-fanout-layer", type=int, default=9)
     parser.add_argument(
+        "--fid-timestep-late-fanout-source-layer",
+        type=int,
+        default=None,
+        help="Source layer for late-fanout sampler. None = same as --fid-timestep-late-fanout-layer.",
+    )
+    parser.add_argument(
         "--fid-timestep-late-fanout-start",
         type=float,
         default=0.3,
@@ -5533,6 +5589,10 @@ def main():
         raise ValueError("--shortcut-skip-in-loop-max-gap must be <= model depth")
     if args.timestep_shortcut_layer < 0 or args.timestep_shortcut_layer > depth:
         raise ValueError(f"--timestep-shortcut-layer must be in [0, {depth}]")
+    if args.timestep_shortcut_source_layer is not None and (
+        args.timestep_shortcut_source_layer < 0 or args.timestep_shortcut_source_layer > depth
+    ):
+        raise ValueError(f"--timestep-shortcut-source-layer must be in [0, {depth}]")
     if args.fid_timestep_skip_layer > depth:
         raise ValueError(f"--fid-timestep-skip-layer must be <= model depth ({depth})")
     if args.fid_timestep_chain_layer > depth:
@@ -5675,6 +5735,7 @@ def main():
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"timestep_shortcut={args.use_timestep_shortcut} "
         f"timestep_layer={args.timestep_shortcut_layer} "
+        f"timestep_source_layer={args.timestep_shortcut_source_layer} "
         f"timestep_paired_batch={args.timestep_paired_batch} "
         f"timestep_loss_mode={args.timestep_shortcut_loss_mode} "
         f"timestep_detach_source={args.timestep_shortcut_detach_source} "
@@ -5904,6 +5965,7 @@ def main():
             dt_consistency_prob=args.dt_consistency_prob,
             dt_outdistill_train_tail=args.dt_outdistill_train_tail,
             timestep_shortcut_layer=args.timestep_shortcut_layer,
+            timestep_shortcut_source_layer=args.timestep_shortcut_source_layer,
             timestep_output_distill_train_tail=args.timestep_output_distill_train_tail,
             timestep_paired_batch=args.timestep_paired_batch,
             timestep_shortcut_loss_mode=args.timestep_shortcut_loss_mode,
@@ -6036,6 +6098,7 @@ def main():
             shortcut_timesteps=args.shortcut_timesteps,
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
             skip_layer=args.fid_timestep_late_fanout_layer,
+            source_layer=args.fid_timestep_late_fanout_source_layer,
             fanout_start_t=args.fid_timestep_late_fanout_start,
         )
 
