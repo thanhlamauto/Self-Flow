@@ -1659,6 +1659,8 @@ def train_step(
                 resume_hidden=z_hat_b,
                 resume_start_layer=output_b + 1,
             )
+            v_skip = v_skip.astype(jnp.float32)
+            v_teacher = v_teacher.astype(jnp.float32)
             reduce_axes = tuple(range(1, v_skip.ndim))
             numer = jnp.sum(jnp.square(v_skip - v_teacher), axis=reduce_axes)
             denom = jnp.sum(jnp.square(v_teacher), axis=reduce_axes) + 1e-6
