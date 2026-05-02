@@ -327,6 +327,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
+        return_raw_features_only: bool = False,
         return_block_summaries: bool = False,
         return_hidden_states: bool = False,
         resume_hidden: Optional[jax.Array] = None,
@@ -389,6 +390,8 @@ class SelfFlowDiT(nn.Module):
                 raw_positions = {}
                 for idx, layer in enumerate(raw_layers):
                     raw_positions.setdefault(layer, []).append(idx)
+        elif return_raw_features_only:
+            raise ValueError("return_raw_features_only requires return_raw_features to specify at least one layer")
 
         original_timesteps = timesteps
         # PyTorch implementation explicitly negates timesteps
@@ -570,6 +573,8 @@ class SelfFlowDiT(nn.Module):
                 else:
                     for idx in raw_positions[i + 1]:
                         raw_zs[idx] = x
+                if return_raw_features_only and (i + 1) >= max(raw_layers):
+                    return zs if raw_single else tuple(raw_zs)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,

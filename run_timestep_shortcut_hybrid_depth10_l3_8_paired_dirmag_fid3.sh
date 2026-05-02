@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python train.py \
+  --model-size B \
+  --batch-size 128 \
+  --epochs 400 \
+  --steps-per-epoch 1000 \
+  --learning-rate 1e-4 \
+  --predictor-learning-rate 1e-4 \
+  --vae-model /home/nguyenthanhlam/kaggle_downloads/models/sdvae-ema-flax-default-1 \
+  --data-path /home/nguyenthanhlam/kaggle_downloads/imagenet-vae-latents-ar-v2 \
+  --val-data-path /home/nguyenthanhlam/kaggle_downloads/imagenet-vae-latents-train-v3 \
+  --grad-clip 1.0 \
+  --log-freq 100 \
+  --eval-freq 1000 \
+  --sample-num-steps 50 \
+  --sample-cfg-scale 1.0 \
+  --fid-freq 25000 \
+  --num-fid-samples 4096 \
+  --fid-batch-size 256 \
+  --fid-eval-local-batch 32 \
+  --fid-num-steps 50 \
+  --fid-cfg-scale 1.0 \
+  --fid-timestep-chain-eval \
+  --fid-timestep-chain-source-layer 3 \
+  --fid-timestep-chain-layer 8 \
+  --fid-timestep-fanout-eval \
+  --fid-timestep-fanout-source-layer 3 \
+  --fid-timestep-fanout-layer 8 \
+  --fid-timestep-late-fanout-eval \
+  --fid-timestep-late-fanout-source-layer 3 \
+  --fid-timestep-late-fanout-layer 8 \
+  --fid-timestep-late-fanout-start 0.3 \
+  --no-fid-skip-eval \
+  --no-fid-timestep-skip-eval \
+  --vae-decode-batch-size 256 \
+  --no-linear-probe \
+  --inception-score-weights /home/nguyenthanhlam/kaggle_downloads/models/inception-v3-pytorch-default-1/inception_v3_google-0cc3c7bd.pth \
+  --block-corr-freq 25000 \
+  --block-corr-batches 2 \
+  --wandb-project selfflow-jax \
+  --ema-decay 0.9999 \
+  --shortcut-predictor hybrid_depth10 \
+  --shortcut-training-mode direction-magnitude \
+  --shortcut-lambda-dir 1.0 \
+  --shortcut-lambda-boot 0.25 \
+  --lambda-output-distill 0.05 \
+  --shortcut-skip-in-loop-prob 0.0 \
+  --shortcut-lambda-skip-fm 0.0 \
+  --no-use-depth-time-resync \
+  --use-timestep-shortcut \
+  --timestep-paired-batch \
+  --timestep-shortcut-source-layer 3 \
+  --timestep-shortcut-layer 8 \
+  --timestep-shortcut-loss-mode activation_huber \
+  --no-timestep-shortcut-use-layer-cond \
+  --use-timestep-direct-loss \
+  --use-timestep-bootstrap-loss \
+  --use-timestep-output-distill \
+  --no-timestep-output-distill-train-tail \
+  --no-output-distill \
+  --no-private-loss \
+  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-timestep-shortcut-hybrid-depth10-l3-8-paired-dirmag-fid3 \
+  --shortcut-bootstrap-detach-source \
+  --shortcut-predictor-use-timestep \
+  --no-shortcut-predictor-normalize-input \
+  --weight-decay 0.1 \
+  --shortcut-predictor-weight-decay 0.1

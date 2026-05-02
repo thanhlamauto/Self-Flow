@@ -3954,6 +3954,7 @@ def make_sample_latents_timestep_skip_pmap_fn(
     skip_every_steps=2,
     skip_reference_num_steps=None,
     eval_mode="jump",
+    source_layer=None,
 ):
     """Build a sharded sampler that does timestep jumping via layer predictor.
 
@@ -3965,8 +3966,12 @@ def make_sample_latents_timestep_skip_pmap_fn(
             "CFG sampling requires an unconditional label embedding. "
             "Use --cfg-dropout-rate > 0 for training, or keep cfg scale at 1.0."
         )
-    if int(skip_layer) <= 0 or int(skip_layer) > int(config["depth"]):
+    target_layer = int(skip_layer)
+    source_layer = target_layer if source_layer is None else int(source_layer)
+    if target_layer <= 0 or target_layer > int(config["depth"]):
         raise ValueError(f"skip_layer must be in [1, {int(config['depth'])}], got {skip_layer}")
+    if source_layer <= 0 or source_layer > target_layer:
+        raise ValueError(f"source_layer must be in [1, {target_layer}], got {source_layer}")
     if int(skip_jump_steps) <= 0:
         raise ValueError(f"skip_jump_steps must be positive, got {skip_jump_steps}")
     if int(skip_every_steps) <= 0:
@@ -4071,7 +4076,11 @@ def make_sample_latents_timestep_skip_pmap_fn(
                 reference_num_steps - 1,
             )
             can_jump = jump_idx > step_idx
-            jump_now = jnp.logical_and((step_idx % int(skip_every_steps)) == 0, can_jump)
+            jump_now = (
+                jnp.asarray(True, dtype=jnp.bool_)
+                if eval_mode == "chain"
+                else jnp.logical_and((step_idx % int(skip_every_steps)) == 0, can_jump)
+            )
 
             def apply_full(_):
                 return model.apply(
@@ -4085,22 +4094,30 @@ def make_sample_latents_timestep_skip_pmap_fn(
             def apply_timestep_jump(_):
                 t_future_scalar = jump_idx.astype(jnp.float32) * t_scale
                 t_future = jnp.full_like(t, t_future_scalar)
+                t_tgt = t if eval_mode == "chain" else t_future
 
-                _, hidden_now, t_emb_now = model.apply(
+                _, t_emb_now = model.apply(
                     {"params": ema_params_local},
                     z_x,
                     timesteps=t,
                     vector=class_labels_local,
                     deterministic=True,
-                    return_hidden_states=True,
+                    return_input_embeddings_only=True,
                 )
-                h_now = jnp.stack(hidden_now, axis=0).astype(jnp.float32)
-                src_hidden = h_now[int(skip_layer)]
+                src_hidden = model.apply(
+                    {"params": ema_params_local},
+                    z_x,
+                    timesteps=t,
+                    vector=class_labels_local,
+                    deterministic=True,
+                    return_raw_features=source_layer,
+                    return_raw_features_only=True,
+                ).astype(jnp.float32)
                 if eval_mode == "chain":
                     h0_tgt, t_emb_future = model.apply(
                         {"params": ema_params_local},
                         z_x,
-                        timesteps=t_future,
+                        timesteps=t_tgt,
                         vector=class_labels_local,
                         deterministic=True,
                         return_input_embeddings_only=True,
@@ -4111,7 +4128,7 @@ def make_sample_latents_timestep_skip_pmap_fn(
                     _, hidden_future, t_emb_future = model.apply(
                         {"params": ema_params_local},
                         z_x,
-                        timesteps=t_future,
+                        timesteps=t_tgt,
                         vector=class_labels_local,
                         deterministic=True,
                         return_hidden_states=True,
@@ -4121,12 +4138,12 @@ def make_sample_latents_timestep_skip_pmap_fn(
                     pred_input = l2_normalize_tokens(src_hidden) if depth_shortcut_normalize_input else src_hidden
                     m_source = log_token_magnitudes(src_hidden)
                 q_src = jnp.rint(t * jnp.float32(max(int(shortcut_timesteps) - 1, 1))).astype(jnp.int32)
-                q_tgt = jnp.rint(t_future * jnp.float32(max(int(shortcut_timesteps) - 1, 1))).astype(jnp.int32)
+                q_tgt = jnp.rint(t_tgt * jnp.float32(max(int(shortcut_timesteps) - 1, 1))).astype(jnp.int32)
                 pred_out = predictor.apply(
                     {"params": predictor_params_local},
                     pred_input,
-                    jnp.asarray(int(skip_layer), dtype=jnp.int32),
-                    jnp.asarray(int(skip_layer), dtype=jnp.int32),
+                    jnp.asarray(source_layer, dtype=jnp.int32),
+                    jnp.asarray(target_layer, dtype=jnp.int32),
                     t_emb_now,
                     m_source,
                     use_timestep_embed=True,
@@ -4153,11 +4170,11 @@ def make_sample_latents_timestep_skip_pmap_fn(
                 return model.apply(
                     {"params": ema_params_local},
                     z_x,
-                    timesteps=t_future,
+                    timesteps=t_tgt,
                     vector=class_labels_local,
                     deterministic=True,
                     resume_hidden=z_hat,
-                    resume_start_layer=int(skip_layer) + 1,
+                    resume_start_layer=target_layer + 1,
                 )
 
             return jax.lax.cond(jump_now, apply_timestep_jump, apply_full, operand=None)
@@ -4199,21 +4216,26 @@ def make_sample_latents_timestep_fanout_pmap_fn(
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
     depth_shortcut_predictor_overrides=None,
-    skip_layer=9,
+    skip_layer=8,
+    source_layer=3,
 ):
     """Build a low-memory one-prefix timestep fanout sampler for FID.
 
-    The sampler runs DiT to `skip_layer` once at the first denoise timestep,
-    rolls that layer activation through the predictor across the remaining
-    reference timesteps, and scans the DiT tail plus SDE update sequentially.
-    The scan deliberately does not materialize all 49 tail activations at once.
+    The sampler runs DiT to `source_layer` once at the first denoise timestep,
+    predicts `skip_layer` for each denoise timestep from that fixed source, and
+    scans the DiT tail plus SDE update sequentially. The scan deliberately does
+    not materialize all tail activations at once.
     """
     if cfg_scale is not None and cfg_scale > 1.0:
         raise ValueError("Timestep fanout FID currently supports cfg_scale <= 1.0 to keep memory bounded.")
     if int(num_steps) <= 1:
         raise ValueError(f"num_steps must be greater than 1, got {num_steps}")
-    if int(skip_layer) <= 0 or int(skip_layer) > int(config["depth"]):
+    target_layer = int(skip_layer)
+    source_layer = int(source_layer)
+    if target_layer <= 0 or target_layer > int(config["depth"]):
         raise ValueError(f"skip_layer must be in [1, {int(config['depth'])}], got {skip_layer}")
+    if source_layer <= 0 or source_layer > target_layer:
+        raise ValueError(f"source_layer must be in [1, {target_layer}], got {source_layer}")
 
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -4285,97 +4307,80 @@ def make_sample_latents_timestep_fanout_pmap_fn(
         ).astype(jnp.float32)
 
         t_grid = jnp.linspace(jnp.float32(0.0), jnp.float32(0.96), int(num_steps), dtype=jnp.float32)
-        dt = t_grid[1] - t_grid[0]
+        t0_idx = jnp.zeros((batch_size,), dtype=jnp.int32)
         t0 = jnp.full((batch_size,), t_grid[0], dtype=jnp.float32)
-        _, hidden_tuple, t_emb = model.apply(
+        _, t_emb_source = model.apply(
             {"params": ema_params_local},
             x,
             timesteps=t0,
             vector=class_labels_local,
             deterministic=True,
-            return_hidden_states=True,
+            return_input_embeddings_only=True,
         )
-        hidden = jnp.stack(hidden_tuple, axis=0).astype(jnp.float32)[int(skip_layer)]
+        hidden_source = model.apply(
+            {"params": ema_params_local},
+            x,
+            timesteps=t0,
+            vector=class_labels_local,
+            deterministic=True,
+            return_raw_features=source_layer,
+            return_raw_features_only=True,
+        ).astype(jnp.float32)
 
-        def sde_drift(x_cur, t_scalar, velocity):
-            t_view = jnp.reshape(t_scalar, (1,) * x_cur.ndim)
-            return (1.0 + t_view) * velocity - x_cur
-
-        def scan_step(carry, step_idx):
-            x_cur, hidden_cur, t_emb_cur, rng_cur = carry
-            t_next_scalar = t_grid[step_idx + 1]
-            t_next = jnp.full((batch_size,), t_next_scalar, dtype=jnp.float32)
+        def model_fn(z_x, t):
             h0_tgt, t_emb_next = model.apply(
                 {"params": ema_params_local},
-                x_cur,
-                timesteps=t_next,
+                z_x,
+                timesteps=t,
                 vector=class_labels_local,
                 deterministic=True,
                 return_input_embeddings_only=True,
             )
+            q_tgt = jnp.rint(t * jnp.float32(float(int(num_steps) - 1) / 0.96)).astype(jnp.int32)
+            q_tgt = jnp.clip(q_tgt, 0, int(shortcut_timesteps) - 1)
             q_src = jnp.full(
                 (batch_size,),
-                jnp.minimum(step_idx, int(shortcut_timesteps) - 1),
-                dtype=jnp.int32,
-            )
-            q_tgt = jnp.full(
-                (batch_size,),
-                jnp.minimum(step_idx + 1, int(shortcut_timesteps) - 1),
+                0,
                 dtype=jnp.int32,
             )
             hidden_next = predictor.apply(
                 {"params": predictor_params_local},
-                hidden_cur,
-                jnp.asarray(int(skip_layer), dtype=jnp.int32),
-                jnp.asarray(int(skip_layer), dtype=jnp.int32),
-                t_emb_cur,
+                hidden_source,
+                jnp.asarray(source_layer, dtype=jnp.int32),
+                jnp.asarray(target_layer, dtype=jnp.int32),
+                t_emb_source,
                 None,
                 use_timestep_embed=True,
                 h0_tgt=h0_tgt,
                 timestep_tgt_embed=t_emb_next,
                 t_src_idx=q_src,
                 t_tgt_idx=q_tgt,
-                delta_t_idx=jnp.ones_like(q_src),
+                delta_t_idx=jnp.maximum(q_tgt - t0_idx, 0),
             )
             if isinstance(hidden_next, tuple):
                 hidden_next = hidden_next[0]
-            velocity = model.apply(
+            return model.apply(
                 {"params": ema_params_local},
-                x_cur,
-                timesteps=t_next,
+                z_x,
+                timesteps=t,
                 vector=class_labels_local,
                 deterministic=True,
                 resume_hidden=hidden_next.astype(jnp.float32),
-                resume_start_layer=int(skip_layer) + 1,
+                resume_start_layer=target_layer + 1,
             )
-            rng_cur, step_rng = jax.random.split(rng_cur)
-            diffusion = jnp.maximum(1.0 - t_next_scalar, 0.0)
-            noise_step = jax.random.normal(step_rng, x_cur.shape, dtype=jnp.float32)
-            x_next = (
-                x_cur
-                + sde_drift(x_cur, t_next_scalar, velocity) * dt
-                + jnp.sqrt(jnp.float32(2.0) * diffusion * dt) * noise_step
-            )
-            return (x_next, hidden_next.astype(jnp.float32), t_emb_next, rng_cur), None
 
         rng_local, denoise_rng = jax.random.split(rng_local)
-        init_carry = (x, hidden, t_emb, denoise_rng)
-        (x_last, hidden_last, _, _), _ = jax.lax.scan(
-            scan_step,
-            init_carry,
-            jnp.arange(0, int(num_steps) - 1, dtype=jnp.int32),
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=None,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+            reverse=False,
         )
-        t_last = jnp.full((batch_size,), t_grid[-1], dtype=jnp.float32)
-        velocity_last = model.apply(
-            {"params": ema_params_local},
-            x_last,
-            timesteps=t_last,
-            vector=class_labels_local,
-            deterministic=True,
-            resume_hidden=hidden_last.astype(jnp.float32),
-            resume_start_layer=int(skip_layer) + 1,
-        )
-        samples = x_last + sde_drift(x_last, t_grid[-1], velocity_last) * jnp.float32(0.04)
 
         samples = rearrange(
             samples,
@@ -4399,15 +4404,15 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
     shortcut_predictor_variant="tiny",
     shortcut_timesteps=50,
     depth_shortcut_predictor_overrides=None,
-    skip_layer=9,
-    source_layer=None,
+    skip_layer=8,
+    source_layer=3,
     fanout_start_t=0.3,
 ):
     """Full backbone for t in [0, fanout_start_t), then predictor chain for the rest.
 
     Runs the backbone once per full step during the high-noise phase, then at
-    fanout_start_t extracts hidden[skip_layer] and hands off to the predictor
-    chain (same as the fanout sampler) for the remaining denoising steps.
+    fanout_start_t extracts hidden[source_layer] and uses it as a fixed
+    predictor source for hidden[skip_layer] over the remaining denoising steps.
     fanout_start_t is in the same tau scale as t_grid: 0 = pure noise, 0.96 = nearly clean.
     """
     if cfg_scale is not None and cfg_scale > 1.0:
@@ -4417,7 +4422,9 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
     if int(skip_layer) <= 0 or int(skip_layer) > int(config["depth"]):
         raise ValueError(f"skip_layer must be in [1, {int(config['depth'])}], got {skip_layer}")
     _out_layer = int(skip_layer)
-    _src_layer = int(source_layer) if source_layer is not None else _out_layer
+    _src_layer = int(source_layer)
+    if _src_layer <= 0 or _src_layer > _out_layer:
+        raise ValueError(f"source_layer must be in [1, {_out_layer}], got {source_layer}")
 
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -4530,22 +4537,35 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
             jnp.arange(0, n_full, dtype=jnp.int32),
         )
 
-        # Transition: extract hidden[skip_layer] at the fanout start step.
+        # Transition: extract hidden[source_layer] at the fanout start step.
         t_fanout_scalar = t_grid[n_full]
         t_fanout = jnp.full((batch_size,), t_fanout_scalar, dtype=jnp.float32)
-        _, hidden_tuple, t_emb = model.apply(
+        _, t_emb_source = model.apply(
             {"params": ema_params_local},
             x_transition,
             timesteps=t_fanout,
             vector=class_labels_local,
             deterministic=True,
-            return_hidden_states=True,
+            return_input_embeddings_only=True,
         )
-        hidden = jnp.stack(hidden_tuple, axis=0).astype(jnp.float32)[_src_layer]
+        hidden_source = model.apply(
+            {"params": ema_params_local},
+            x_transition,
+            timesteps=t_fanout,
+            vector=class_labels_local,
+            deterministic=True,
+            return_raw_features=_src_layer,
+            return_raw_features_only=True,
+        ).astype(jnp.float32)
+        q_source = jnp.full(
+            (batch_size,),
+            jnp.minimum(n_full, int(shortcut_timesteps) - 1),
+            dtype=jnp.int32,
+        )
 
-        # Phase 2: predictor chain for steps n_full .. num_steps-2.
+        # Phase 2: fixed-source predictor fanout for steps n_full .. num_steps-2.
         def fanout_step(carry, step_idx):
-            x_cur, hidden_cur, t_emb_cur, rng_cur = carry
+            x_cur, hidden_last, rng_cur = carry
             t_next_scalar = t_grid[step_idx + 1]
             t_next = jnp.full((batch_size,), t_next_scalar, dtype=jnp.float32)
             h0_tgt, t_emb_next = model.apply(
@@ -4558,7 +4578,7 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
             )
             q_src = jnp.full(
                 (batch_size,),
-                jnp.minimum(step_idx, int(shortcut_timesteps) - 1),
+                jnp.minimum(n_full, int(shortcut_timesteps) - 1),
                 dtype=jnp.int32,
             )
             q_tgt = jnp.full(
@@ -4568,17 +4588,17 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
             )
             pred_out = predictor.apply(
                 {"params": predictor_params_local},
-                hidden_cur,
+                hidden_source,
                 jnp.asarray(_src_layer, dtype=jnp.int32),
                 jnp.asarray(_out_layer, dtype=jnp.int32),
-                t_emb_cur,
+                t_emb_source,
                 None,
                 use_timestep_embed=True,
                 h0_tgt=h0_tgt,
                 timestep_tgt_embed=t_emb_next,
                 t_src_idx=q_src,
                 t_tgt_idx=q_tgt,
-                delta_t_idx=jnp.ones_like(q_src),
+                delta_t_idx=jnp.maximum(q_tgt - q_source, 0),
             )
             hidden_next = pred_out[0] if isinstance(pred_out, tuple) else pred_out
             velocity = model.apply(
@@ -4598,10 +4618,11 @@ def make_sample_latents_timestep_late_fanout_pmap_fn(
                 + sde_drift(x_cur, t_next_scalar, velocity) * dt
                 + jnp.sqrt(jnp.float32(2.0) * diffusion * dt) * noise_step
             )
-            return (x_next, hidden_next.astype(jnp.float32), t_emb_next, rng_cur), None
+            return (x_next, hidden_next.astype(jnp.float32), rng_cur), None
 
-        init_carry = (x_transition, hidden, t_emb, denoise_rng)
-        (x_last, hidden_last, _, _), _ = jax.lax.scan(
+        init_hidden = jnp.zeros_like(hidden_source)
+        init_carry = (x_transition, init_hidden, denoise_rng)
+        (x_last, hidden_last, _), _ = jax.lax.scan(
             fanout_step,
             init_carry,
             jnp.arange(n_full, n_full + n_fanout, dtype=jnp.int32),
@@ -5341,7 +5362,8 @@ def main():
         default=False,
         help="Compute FID/sFID for one-step chained timestep shortcut sampling.",
     )
-    parser.add_argument("--fid-timestep-chain-layer", type=int, default=9)
+    parser.add_argument("--fid-timestep-chain-layer", type=int, default=8)
+    parser.add_argument("--fid-timestep-chain-source-layer", type=int, default=3)
     parser.add_argument(
         "--fid-timestep-fanout-eval",
         dest="fid_timestep_fanout_eval",
@@ -5349,20 +5371,21 @@ def main():
         default=True,
         help="Compute FID/sFID for one-prefix fanout timestep shortcut sampling.",
     )
-    parser.add_argument("--fid-timestep-fanout-layer", type=int, default=9)
+    parser.add_argument("--fid-timestep-fanout-layer", type=int, default=8)
+    parser.add_argument("--fid-timestep-fanout-source-layer", type=int, default=3)
     parser.add_argument(
         "--fid-timestep-late-fanout-eval",
         dest="fid_timestep_late_fanout_eval",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Compute FID/sFID for late-start fanout: full backbone until --fid-timestep-late-fanout-start, then predictor chain.",
+        help="Compute FID/sFID for late-start fanout: full backbone until --fid-timestep-late-fanout-start, then fixed-source predictor fanout.",
     )
-    parser.add_argument("--fid-timestep-late-fanout-layer", type=int, default=9)
+    parser.add_argument("--fid-timestep-late-fanout-layer", type=int, default=8)
     parser.add_argument(
         "--fid-timestep-late-fanout-source-layer",
         type=int,
-        default=None,
-        help="Source layer for late-fanout sampler. None = same as --fid-timestep-late-fanout-layer.",
+        default=3,
+        help="Source layer for late-fanout sampler.",
     )
     parser.add_argument(
         "--fid-timestep-late-fanout-start",
@@ -5409,10 +5432,16 @@ def main():
         raise ValueError("--fid-timestep-skip-num-steps must be > 1")
     if args.fid_timestep_chain_layer <= 0:
         raise ValueError("--fid-timestep-chain-layer must be > 0")
+    if args.fid_timestep_chain_source_layer <= 0:
+        raise ValueError("--fid-timestep-chain-source-layer must be > 0")
     if args.fid_timestep_fanout_layer <= 0:
         raise ValueError("--fid-timestep-fanout-layer must be > 0")
+    if args.fid_timestep_fanout_source_layer <= 0:
+        raise ValueError("--fid-timestep-fanout-source-layer must be > 0")
     if args.fid_timestep_late_fanout_layer <= 0:
         raise ValueError("--fid-timestep-late-fanout-layer must be > 0")
+    if args.fid_timestep_late_fanout_source_layer <= 0:
+        raise ValueError("--fid-timestep-late-fanout-source-layer must be > 0")
     if not (0.0 < args.fid_timestep_late_fanout_start < 0.96):
         raise ValueError("--fid-timestep-late-fanout-start must be in (0, 0.96)")
     if args.inception_score_splits <= 0:
@@ -5597,8 +5626,16 @@ def main():
         raise ValueError(f"--fid-timestep-skip-layer must be <= model depth ({depth})")
     if args.fid_timestep_chain_layer > depth:
         raise ValueError(f"--fid-timestep-chain-layer must be <= model depth ({depth})")
+    if args.fid_timestep_chain_source_layer > args.fid_timestep_chain_layer:
+        raise ValueError("--fid-timestep-chain-source-layer must be <= --fid-timestep-chain-layer")
     if args.fid_timestep_fanout_layer > depth:
         raise ValueError(f"--fid-timestep-fanout-layer must be <= model depth ({depth})")
+    if args.fid_timestep_fanout_source_layer > args.fid_timestep_fanout_layer:
+        raise ValueError("--fid-timestep-fanout-source-layer must be <= --fid-timestep-fanout-layer")
+    if args.fid_timestep_late_fanout_layer > depth:
+        raise ValueError(f"--fid-timestep-late-fanout-layer must be <= model depth ({depth})")
+    if args.fid_timestep_late_fanout_source_layer > args.fid_timestep_late_fanout_layer:
+        raise ValueError("--fid-timestep-late-fanout-source-layer must be <= --fid-timestep-late-fanout-layer")
     if args.private_loss and args.lambda_private <= 0.0:
         raise ValueError("--private-loss requires --lambda-private > 0")
     if args.lambda_private < 0.0:
@@ -6071,6 +6108,7 @@ def main():
             depth_shortcut_mag_clip_max=args.shortcut_mag_clip_max,
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
             skip_layer=args.fid_timestep_chain_layer,
+            source_layer=args.fid_timestep_chain_source_layer,
             skip_jump_steps=1,
             skip_every_steps=1,
             skip_reference_num_steps=args.fid_num_steps,
@@ -6086,6 +6124,7 @@ def main():
             shortcut_timesteps=args.shortcut_timesteps,
             depth_shortcut_predictor_overrides=depth_shortcut_predictor_overrides,
             skip_layer=args.fid_timestep_fanout_layer,
+            source_layer=args.fid_timestep_fanout_source_layer,
         )
 
     fid_sample_latents_timestep_late_fanout_pmapped = None
@@ -6694,7 +6733,9 @@ def main():
         if args.fid_timestep_chain_eval and fid_sample_latents_timestep_chain_pmapped is not None:
             log_stage(
                 f"[EVAL] generating timestep-chain fake pool: {need} samples @ step {step} "
-                f"(steps={args.fid_num_steps}, layer={args.fid_timestep_chain_layer}, jump=1)..."
+                f"(steps={args.fid_num_steps}, "
+                f"source_layer={args.fid_timestep_chain_source_layer}, "
+                f"target_layer={args.fid_timestep_chain_layer})..."
             )
             acc_chain_pooled = init_gaussian_sums(2048)
             acc_chain_spatial = init_gaussian_sums(2048)
@@ -6734,11 +6775,14 @@ def main():
             metrics["val/FID_timestep_chain"] = fid_from_stats(mu_real, cov_real, mu_chain, cov_chain)
             metrics["val/sFID_timestep_chain"] = fid_from_stats(mu_real_s, cov_real_s, mu_chain_s, cov_chain_s)
             metrics["val/FID_timestep_chain_layer"] = float(args.fid_timestep_chain_layer)
+            metrics["val/FID_timestep_chain_source_layer"] = float(args.fid_timestep_chain_source_layer)
 
         if args.fid_timestep_fanout_eval and fid_sample_latents_timestep_fanout_pmapped is not None:
             log_stage(
                 f"[EVAL] generating timestep-fanout fake pool: {need} samples @ step {step} "
-                f"(steps={args.fid_num_steps}, layer={args.fid_timestep_fanout_layer}, scan=low_mem)..."
+                f"(steps={args.fid_num_steps}, "
+                f"source_layer={args.fid_timestep_fanout_source_layer}, "
+                f"target_layer={args.fid_timestep_fanout_layer}, scan=low_mem)..."
             )
             acc_fanout_pooled = init_gaussian_sums(2048)
             acc_fanout_spatial = init_gaussian_sums(2048)
@@ -6778,11 +6822,14 @@ def main():
             metrics["val/FID_timestep_fanout"] = fid_from_stats(mu_real, cov_real, mu_fanout, cov_fanout)
             metrics["val/sFID_timestep_fanout"] = fid_from_stats(mu_real_s, cov_real_s, mu_fanout_s, cov_fanout_s)
             metrics["val/FID_timestep_fanout_layer"] = float(args.fid_timestep_fanout_layer)
+            metrics["val/FID_timestep_fanout_source_layer"] = float(args.fid_timestep_fanout_source_layer)
 
         if args.fid_timestep_late_fanout_eval and fid_sample_latents_timestep_late_fanout_pmapped is not None:
             log_stage(
                 f"[EVAL] generating timestep-late-fanout fake pool: {need} samples @ step {step} "
-                f"(steps={args.fid_num_steps}, layer={args.fid_timestep_late_fanout_layer}, "
+                f"(steps={args.fid_num_steps}, "
+                f"source_layer={args.fid_timestep_late_fanout_source_layer}, "
+                f"target_layer={args.fid_timestep_late_fanout_layer}, "
                 f"start_t={args.fid_timestep_late_fanout_start})..."
             )
             acc_late_fanout_pooled = init_gaussian_sums(2048)
@@ -6823,6 +6870,7 @@ def main():
             metrics["val/FID_timestep_late_fanout"] = fid_from_stats(mu_real, cov_real, mu_lf, cov_lf)
             metrics["val/sFID_timestep_late_fanout"] = fid_from_stats(mu_real_s, cov_real_s, mu_lf_s, cov_lf_s)
             metrics["val/FID_timestep_late_fanout_layer"] = float(args.fid_timestep_late_fanout_layer)
+            metrics["val/FID_timestep_late_fanout_source_layer"] = float(args.fid_timestep_late_fanout_source_layer)
             metrics["val/FID_timestep_late_fanout_start_t"] = float(args.fid_timestep_late_fanout_start)
 
         if pr_enabled:
