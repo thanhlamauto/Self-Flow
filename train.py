@@ -1917,9 +1917,11 @@ def train_step(
                 resume_start_layer=output_b + 1,
             )
             reduce_axes = tuple(range(1, v_skip.ndim))
-            numer = jnp.sum(jnp.square(v_skip - v_teacher), axis=reduce_axes)
-            denom = jnp.sum(jnp.square(v_teacher), axis=reduce_axes) + 1e-6
-            loss_out = jnp.mean(numer / denom)
+            residual = v_skip.astype(jnp.float32) - v_teacher.astype(jnp.float32)
+            target = v_teacher.astype(jnp.float32)
+            numer = jnp.sum(jnp.square(residual), axis=reduce_axes)
+            denom = jnp.sum(jnp.square(target), axis=reduce_axes) + jnp.float32(1e-6)
+            loss_out = jnp.mean(numer / denom).astype(jnp.float32)
             return (
                 loss_out,
                 output_a.astype(jnp.float32),
@@ -2153,18 +2155,18 @@ def train_step(
                     boot_pred_rms_local = jnp.mean(boot_pred_rms)
                     boot_rel_residual_rms_local = jnp.sqrt(jnp.mean(jnp.square(boot_residual_norm)))
                 return (
-                    l_depth_cons_local,
-                    l_time_cons_local,
-                    l_dt_cons_local,
-                    e_depth_cons_local,
-                    e_time_cons_local,
-                    e_dt_cons_local,
-                    loss_boot_local,
-                    loss_boot_mag_local,
-                    cos_boot_local,
-                    boot_target_rms_local,
-                    boot_pred_rms_local,
-                    boot_rel_residual_rms_local,
+                    l_depth_cons_local.astype(jnp.float32),
+                    l_time_cons_local.astype(jnp.float32),
+                    l_dt_cons_local.astype(jnp.float32),
+                    e_depth_cons_local.astype(jnp.float32),
+                    e_time_cons_local.astype(jnp.float32),
+                    e_dt_cons_local.astype(jnp.float32),
+                    loss_boot_local.astype(jnp.float32),
+                    loss_boot_mag_local.astype(jnp.float32),
+                    cos_boot_local.astype(jnp.float32),
+                    boot_target_rms_local.astype(jnp.float32),
+                    boot_pred_rms_local.astype(jnp.float32),
+                    boot_rel_residual_rms_local.astype(jnp.float32),
                 )
 
             def zero_consistency_terms(_):
@@ -2211,8 +2213,9 @@ def train_step(
                     resume_hidden=z_hat_dt,
                     resume_start_layer=dt_b + 1,
                 )
-                loss_out_time = jnp.mean(jnp.square(y_hat_s - jax.lax.stop_gradient(pred_s)))
-                e_out_time = jnp.sqrt(loss_out_time)
+                out_residual = y_hat_s.astype(jnp.float32) - jax.lax.stop_gradient(pred_s).astype(jnp.float32)
+                loss_out_time = jnp.mean(jnp.square(out_residual)).astype(jnp.float32)
+                e_out_time = jnp.sqrt(loss_out_time).astype(jnp.float32)
             else:
                 loss_out_time = zero
                 e_out_time = zero
@@ -2422,10 +2425,11 @@ def train_step(
                     )
                     reduce_axes = tuple(range(1, y_hat_s.ndim))
                     target_s = jax.lax.stop_gradient(pred_light)
-                    numer = jnp.sum(jnp.square(y_hat_s - target_s), axis=reduce_axes)
-                    denom = jnp.sum(jnp.square(target_s), axis=reduce_axes) + 1e-6
-                    loss_ts_out = jnp.mean(numer / denom)
-                    e_ts_out = jnp.sqrt(jnp.mean(jnp.square(y_hat_s - target_s)))
+                    residual = y_hat_s.astype(jnp.float32) - target_s.astype(jnp.float32)
+                    numer = jnp.sum(jnp.square(residual), axis=reduce_axes)
+                    denom = jnp.sum(jnp.square(target_s.astype(jnp.float32)), axis=reduce_axes) + jnp.float32(1e-6)
+                    loss_ts_out = jnp.mean(numer / denom).astype(jnp.float32)
+                    e_ts_out = jnp.sqrt(jnp.mean(jnp.square(residual))).astype(jnp.float32)
                 else:
                     loss_ts_out = zero
                     e_ts_out = zero
@@ -2523,10 +2527,11 @@ def train_step(
                     )
                     reduce_axes = tuple(range(1, y_hat_s.ndim))
                     target_s = jax.lax.stop_gradient(pred_s)
-                    numer = jnp.sum(jnp.square(y_hat_s - target_s), axis=reduce_axes)
-                    denom = jnp.sum(jnp.square(target_s), axis=reduce_axes) + 1e-6
-                    loss_ts_out = jnp.mean(numer / denom)
-                    e_ts_out = jnp.sqrt(jnp.mean(jnp.square(y_hat_s - target_s)))
+                    residual = y_hat_s.astype(jnp.float32) - target_s.astype(jnp.float32)
+                    numer = jnp.sum(jnp.square(residual), axis=reduce_axes)
+                    denom = jnp.sum(jnp.square(target_s.astype(jnp.float32)), axis=reduce_axes) + jnp.float32(1e-6)
+                    loss_ts_out = jnp.mean(numer / denom).astype(jnp.float32)
+                    e_ts_out = jnp.sqrt(jnp.mean(jnp.square(residual))).astype(jnp.float32)
                 else:
                     loss_ts_out = zero
                     e_ts_out = zero
