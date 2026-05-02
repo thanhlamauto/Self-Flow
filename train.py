@@ -778,9 +778,11 @@ def sample_distinct_pairs_weighted(
     uniform_mix=0.0,
     center_loc=None,
     center_sigma=None,
+    allow_identity_pairs=False,
 ):
     depth = int(num_hidden) - 1
-    candidates = tuple((a, b, b - a) for a in range(depth) for b in range(a + 1, depth + 1))
+    min_gap = 0 if allow_identity_pairs else 1
+    candidates = tuple((a, b, b - a) for a in range(depth + 1) for b in range(a + min_gap, depth + 1))
     candidate_a = jnp.asarray([a for a, _, _ in candidates], dtype=jnp.int32)
     candidate_b = jnp.asarray([b for _, b, _ in candidates], dtype=jnp.int32)
     candidate_gap = jnp.asarray([d for _, _, d in candidates], dtype=jnp.int32)
@@ -796,7 +798,7 @@ def sample_distinct_pairs_weighted(
         )
         center_logits = -0.5 * jnp.square(center_offsets)
         center_norm = jnp.zeros_like(center_logits)
-        for gap_value in range(1, depth + 1):
+        for gap_value in range(min_gap, depth + 1):
             same_gap = candidate_gap == gap_value
             gap_center_norm = jax.nn.logsumexp(jnp.where(same_gap, center_logits, -jnp.inf))
             center_norm = jnp.where(same_gap, gap_center_norm, center_norm)
@@ -850,6 +852,7 @@ def sample_pairs_for_mode(
     uniform_mix=0.0,
     center_loc=None,
     center_sigma=0.0,
+    allow_identity_pairs=False,
 ):
     centered = pair_mode in {"trunc_normal_centered", "trunc_normal_centered_to_uniform"}
     return sample_distinct_pairs_weighted(
@@ -863,6 +866,7 @@ def sample_pairs_for_mode(
         uniform_mix=uniform_mix if pair_mode in {"trunc_normal_to_uniform", "trunc_normal_centered_to_uniform"} else 0.0,
         center_loc=center_loc if centered else None,
         center_sigma=center_sigma if centered else 0.0,
+        allow_identity_pairs=allow_identity_pairs,
     )
 
 
@@ -1090,6 +1094,7 @@ def train_step(
     direct_num_joint_pairs=1,
     direct_num_predictor_only_pairs=2,
     direct_pair_mode="trunc_normal_centered",
+    direct_allow_identity_pairs=False,
     shortcut_loss_mode="direction_magnitude",
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
@@ -1310,6 +1315,7 @@ def train_step(
             uniform_mix=pair_uniform_mix,
             center_loc=pair_center_loc,
             center_sigma=pair_center_sigma,
+            allow_identity_pairs=direct_allow_identity_pairs,
         )
         direct_joint_a = direct_as[0]
         direct_joint_b = direct_bs[0]
@@ -3225,6 +3231,12 @@ def main():
         ],
     )
     parser.add_argument(
+        "--direct-allow-identity-pairs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow direct shortcut layer sampling to include identity pairs (a, a).",
+    )
+    parser.add_argument(
         "--pair-center-loc",
         type=float,
         default=None,
@@ -3733,6 +3745,7 @@ def main():
         f"pair_center=({args.pair_center_loc},{args.pair_center_sigma}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
         f"direct_pair_mode={args.direct_pair_mode} "
+        f"direct_allow_identity_pairs={args.direct_allow_identity_pairs} "
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
         f"shortcut_activation_huber_delta={args.shortcut_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
@@ -3905,6 +3918,7 @@ def main():
             direct_num_joint_pairs=args.direct_joint_pairs,
             direct_num_predictor_only_pairs=args.direct_predictor_only_pairs,
             direct_pair_mode=args.direct_pair_mode,
+            direct_allow_identity_pairs=args.direct_allow_identity_pairs,
             shortcut_loss_mode=args.shortcut_loss_mode,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
