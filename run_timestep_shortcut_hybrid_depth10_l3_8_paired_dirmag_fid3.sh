@@ -45,15 +45,22 @@ python train.py \
   --shortcut-training-mode direction-magnitude \
   --shortcut-lambda-dir 1.0 \
   --shortcut-lambda-boot 0.25 \
-  --lambda-output-distill 0.05 \
+  --lambda-output-distill 0.10 \
   --shortcut-skip-in-loop-prob 0.0 \
   --shortcut-lambda-skip-fm 0.0 \
+  --direct-pair-mode trunc_normal_centered_to_uniform \
+  --output-distill-pair-mode trunc_normal_centered_to_uniform \
+  --pair-center-sigma 3.0 \
   --no-use-depth-time-resync \
   --use-timestep-shortcut \
   --timestep-paired-batch \
   --timestep-shortcut-source-layer 3 \
   --timestep-shortcut-layer 8 \
   --timestep-shortcut-loss-mode activation_huber \
+  --timestep-sampling-mode logit_normal \
+  --timestep-logit-mean 0.0 \
+  --timestep-logit-std 1.0 \
+  --timestep-pair-sampling-mode target_uniform \
   --no-timestep-shortcut-use-layer-cond \
   --use-timestep-direct-loss \
   --use-timestep-bootstrap-loss \
@@ -61,7 +68,7 @@ python train.py \
   --no-timestep-output-distill-train-tail \
   --no-output-distill \
   --no-private-loss \
-  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-timestep-shortcut-hybrid-depth10-l3-8-paired-dirmag-fid3 \
+  --ckpt-dir /home/nguyenthanhlam/Self-Flow/checkpoints-timestep-shortcut-hybrid-depth10-l3-8-paired-dirmag-fid3-v2 \
   --shortcut-bootstrap-detach-source \
   --shortcut-predictor-use-timestep \
   --no-shortcut-predictor-normalize-input \
