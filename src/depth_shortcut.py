@@ -1054,6 +1054,21 @@ PREDICTOR_VARIANTS = {
         "attention_every": 4,
         "adaln_zero": True,
     },
+    "hybrid_deep_12pct": {
+        "arch": "hybrid_deep",
+        "width": 180,
+        "num_blocks": 6,
+        "expansion": 2,
+        "dilation_schedule": (1, 2, 4, 1, 2, 4),
+        "attn_dim": None,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+        "cond_dim": 32,
+        "grid_size_override": 16,
+        "residual_output": True,
+        "attention_every": 4,
+        "adaln_zero": True,
+    },
     "hybrid_deep_30m": {
         "arch": "hybrid_deep",
         "width": 448,
@@ -1101,6 +1116,8 @@ PREDICTOR_VARIANT_ALIASES = {
     "dit_l": "dit2_large",
     "hybrid_depth10": "hybrid_deep_10",
     "hybrid_depth_10": "hybrid_deep_10",
+    "hybrid_depth12pct": "hybrid_deep_12pct",
+    "hybrid_depth_12pct": "hybrid_deep_12pct",
     "hybrid_depth30m": "hybrid_deep_30m",
     "hybrid_depth_30m": "hybrid_deep_30m",
 }
@@ -1125,7 +1142,7 @@ def canonical_predictor_variant_name(name: str) -> str:
 def predictor_size_bucket(name: str) -> str:
     """Return tiny/small/base/large for a predictor variant."""
     canonical = canonical_predictor_variant_name(name)
-    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10", "hybrid_deep_30m"}:
+    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10", "hybrid_deep_12pct", "hybrid_deep_30m"}:
         return "large"
     if canonical in {"dit2_base_v2", "dit2_deep_256"}:
         return "base"
