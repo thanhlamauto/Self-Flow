@@ -50,6 +50,8 @@ def predictor_config_from_name(name, hidden_size):
     normalized = str(name).lower().replace("-", "_")
     if normalized in {"none", "off", "false", "0"}:
         return None
+    if normalized in {"hybrid_deep_12pct", "hybrid_deep_mdm_12pct"}:
+        return PredictorConfig(width=160, num_blocks=8, mlp_ratio=4.0)
     if normalized == "hybrid_deep_10":
         return PredictorConfig(width=hidden_size, num_blocks=10, mlp_ratio=4.0)
     if normalized == "hybrid_deep":
