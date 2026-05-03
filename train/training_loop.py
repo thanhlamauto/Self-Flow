@@ -43,6 +43,8 @@ class TrainLoop:
         self.model_avg = None
         if self.args.use_ema:
             self.model_avg = copy.deepcopy(self.model)
+        self.shortcut_enabled = getattr(self.model, 'shortcut_enabled', False)
+        self.predictor_avg = copy.deepcopy(self.model.depth_shortcut_predictor) if self.shortcut_enabled else None
         self.model_for_eval = self.model_avg if self.args.use_ema else self.model
         if args.gen_guidance_param != 1:
             self.model_for_eval = ClassifierFreeSampleModel(self.model_for_eval)   # wrapping model with the classifier-free sampler
@@ -78,7 +80,25 @@ class TrainLoop:
         self.save_dir = args.save_dir
         self.overwrite = args.overwrite
 
-        if self.args.use_ema:
+        if self.shortcut_enabled:
+            backbone_params = self.model.backbone_parameters_wo_clip()
+            predictor_params = self.model.shortcut_predictor_parameters()
+            self.opt = AdamW(
+                [
+                    {
+                        'params': backbone_params,
+                        'lr': self.lr,
+                        'weight_decay': self.weight_decay,
+                    },
+                    {
+                        'params': predictor_params,
+                        'lr': self.args.shortcut_predictor_lr,
+                        'weight_decay': self.args.shortcut_predictor_weight_decay,
+                    },
+                ],
+                betas=(0.9, self.args.adam_beta2),
+            )
+        elif self.args.use_ema:
             self.opt = AdamW(
                 # with amp, we don't need to use the mp_trainer's master_params
                 (self.model.parameters()
@@ -169,6 +189,10 @@ class TrainLoop:
             state_dict = dist_util.load_state_dict(
                 opt_checkpoint, map_location=dist_util.dev()
             )
+            if isinstance(state_dict, dict) and 'predictor_avg' in state_dict:
+                if self.predictor_avg is not None:
+                    self.predictor_avg.load_state_dict(state_dict['predictor_avg'], strict=False)
+                state_dict = state_dict['opt']
 
             if self.use_fp16:
                 if 'scaler' not in state_dict:
@@ -308,6 +332,11 @@ class TrainLoop:
                 # avg = alpha * avg + param * (1 - alpha)
                 avg_param.data.mul_(self.args.avg_model_beta).add_(
                     param.data, alpha=1 - self.args.avg_model_beta)
+        if self.predictor_avg is not None:
+            beta = float(self.args.shortcut_predictor_ema_decay)
+            for param, avg_param in zip(self.model.depth_shortcut_predictor.parameters(),
+                                        self.predictor_avg.parameters()):
+                avg_param.data.mul_(beta).add_(param.data, alpha=1 - beta)
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
@@ -318,7 +347,14 @@ class TrainLoop:
             micro = batch
             micro_cond = cond
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            if getattr(self.args, 'timestep_sampling_mode', 'uniform') == 'logit_normal':
+                logits = torch.randn(micro.shape[0], device=dist_util.dev()) * self.args.timestep_logit_std
+                logits = logits + self.args.timestep_logit_mean
+                u = torch.sigmoid(logits)
+                t = torch.clamp((u * self.diffusion.num_timesteps).long(), 0, self.diffusion.num_timesteps - 1)
+                weights = torch.ones_like(t, dtype=torch.float32)
+            else:
+                t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
@@ -326,7 +362,10 @@ class TrainLoop:
                 micro,  # [bs, ch, image_size, image_size]
                 t,  # [bs](int) sampled timesteps
                 model_kwargs=micro_cond,
-                dataset=self.data.dataset
+                dataset=self.data.dataset,
+                train_args=self.args,
+                predictor_ema=self.predictor_avg,
+                global_step=self.total_step(),
             )
 
             if last_batch or not self.use_ddp:
@@ -351,8 +390,9 @@ class TrainLoop:
             return
         frac_done = self.total_step() / self.lr_anneal_steps
         lr = self.lr * (1 - frac_done)
-        for param_group in self.opt.param_groups:
-            param_group["lr"] = lr
+        for idx, param_group in enumerate(self.opt.param_groups):
+            base_lr = self.args.shortcut_predictor_lr if self.shortcut_enabled and idx == 1 else self.lr
+            param_group["lr"] = base_lr * (1 - frac_done)
 
     def log_step(self):
         logger.logkv("step", self.total_step())
@@ -434,6 +474,11 @@ class TrainLoop:
             "wb",
         ) as f:
             opt_state = self.opt.state_dict()
+            if self.predictor_avg is not None:
+                opt_state = {
+                    'opt': opt_state,
+                    'predictor_avg': self.predictor_avg.state_dict(),
+                }
             if self.use_fp16:
                 # with fp16 we also save the state dict
                 opt_state = {

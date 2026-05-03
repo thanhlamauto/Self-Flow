@@ -8,11 +8,16 @@ from data_loaders.humanml_utils import HML_EE_JOINT_NAMES
 def load_model_wo_clip(model, state_dict):
     # assert (state_dict['sequence_pos_encoder.pe'][:model.sequence_pos_encoder.pe.shape[0]] == model.sequence_pos_encoder.pe).all()  # TEST
     # assert (state_dict['embed_timestep.sequence_pos_encoder.pe'][:model.embed_timestep.sequence_pos_encoder.pe.shape[0]] == model.embed_timestep.sequence_pos_encoder.pe).all()  # TEST
-    del state_dict['sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
-    del state_dict['embed_timestep.sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
+    state_dict.pop('sequence_pos_encoder.pe', None)  # no need to load it (fixed), and causes size mismatch for older models
+    state_dict.pop('embed_timestep.sequence_pos_encoder.pe', None)  # no need to load it (fixed), and causes size mismatch for older models
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') or 'sequence_pos_encoder' in k for k in missing_keys])
+    assert all([
+        k.startswith('clip_model.')
+        or 'sequence_pos_encoder' in k
+        or k.startswith('depth_shortcut_predictor.')
+        for k in missing_keys
+    ])
 
 
 def create_model_and_diffusion(args, data):
@@ -68,6 +73,11 @@ def get_model_args(args, data):
             'pos_embed_max_len': args.pos_embed_max_len, 'mask_frames': args.mask_frames,
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
+            'shortcut_predictor': getattr(args, 'shortcut_predictor', 'none'),
+            'shortcut_training_mode': getattr(args, 'shortcut_training_mode', 'direction-magnitude'),
+            'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 2.9),
+            'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 0.6),
+            'shortcut_predictor_use_timestep': getattr(args, 'shortcut_predictor_use_timestep', True),
             }
 
 

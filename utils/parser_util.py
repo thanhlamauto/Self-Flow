@@ -191,6 +191,67 @@ def add_training_options(parser):
     group.add_argument("--autoregressive_init", default='data', type=str, choices=['data', 'isaac'], 
                         help="Sets the source of the init frames, either from the dataset or isaac init poses.")
 
+    group = parser.add_argument_group('depth shortcut')
+    group.add_argument("--shortcut_predictor", "--shortcut-predictor", default='none', type=str,
+                       help="Enable depth shortcut training with a predictor variant, e.g. hybrid_deep_10.")
+    group.add_argument("--shortcut_predictor_lr", "--shortcut-predictor-learning-rate", "--predictor-learning-rate",
+                       default=1e-4, type=float, help="Learning rate for the depth shortcut predictor parameter group.")
+    group.add_argument("--shortcut_predictor_weight_decay", "--shortcut-predictor-weight-decay",
+                       default=0.1, type=float, help="AdamW weight decay for the shortcut predictor parameter group.")
+    group.add_argument("--shortcut_training_mode", "--shortcut-training-mode", default='direction-magnitude',
+                       choices=['direction-magnitude', 'direction_magnitude'], type=str)
+    group.add_argument("--shortcut_lambda_dir", "--shortcut-lambda-dir", default=1.0, type=float)
+    group.add_argument("--shortcut_lambda_boot", "--shortcut-lambda-boot", default=0.25, type=float)
+    group.add_argument("--shortcut_lambda_mag", "--shortcut-lambda-mag", default=0.375, type=float)
+    group.add_argument("--shortcut_lambda_boot_mag", "--shortcut-lambda-boot-mag", default=0.1875, type=float)
+    group.add_argument("--shortcut_mag_scale", "--shortcut-mag-scale", default=2.2, type=float)
+    group.add_argument("--shortcut_mag_abs_center", "--shortcut-mag-abs-center", default=2.9, type=float)
+    group.add_argument("--shortcut_mag_abs_scale", "--shortcut-mag-abs-scale", default=0.6, type=float)
+    group.add_argument("--shortcut_mag_clip_min", "--shortcut-mag-clip-min", default=0.8, type=float)
+    group.add_argument("--shortcut_mag_clip_max", "--shortcut-mag-clip-max", default=3.5, type=float)
+    group.add_argument("--shortcut_skip_in_loop_max_gap", "--shortcut-skip-in-loop-max-gap", default=7, type=int)
+    group.add_argument("--shortcut_skip_in_loop_gap_loc", "--shortcut-skip-in-loop-gap-loc", default=2.0, type=float)
+    group.add_argument("--shortcut_skip_in_loop_gap_sigma", "--shortcut-skip-in-loop-gap-sigma", default=1.5, type=float)
+    group.add_argument("--shortcut_bootstrap_detach_source", "--shortcut-bootstrap-detach-source", action='store_true')
+    group.add_argument("--shortcut_predictor_use_timestep", "--shortcut-predictor-use-timestep", action='store_true', default=True)
+    group.add_argument("--no_shortcut_predictor_use_timestep", "--no-shortcut-predictor-use-timestep",
+                       action='store_false', dest='shortcut_predictor_use_timestep')
+    group.add_argument("--shortcut_predictor_normalize_input", "--shortcut-predictor-normalize-input",
+                       action='store_true', default=True)
+    group.add_argument("--no_shortcut_predictor_normalize_input", "--no-shortcut-predictor-normalize-input",
+                       action='store_false', dest='shortcut_predictor_normalize_input')
+    group.add_argument("--shortcut_predictor_use_class_input", "--shortcut-predictor-use-class-input",
+                       action='store_true', help="Accepted for CLI compatibility; MDM has no ImageNet class token.")
+    group.add_argument("--shortcut_predictor_class_fusion", "--shortcut-predictor-class-fusion", default='add', type=str)
+    group.add_argument("--shortcut_predictor_ema_decay", "--shortcut-predictor-ema-decay", default=0.999, type=float)
+    group.add_argument("--timestep_sampling_mode", "--timestep-sampling-mode", default='uniform',
+                       choices=['uniform', 'logit_normal'], type=str)
+    group.add_argument("--timestep_logit_mean", "--timestep-logit-mean", default=0.0, type=float)
+    group.add_argument("--timestep_logit_std", "--timestep-logit-std", default=1.0, type=float)
+    group.add_argument("--output_distill", "--output-distill", action='store_true')
+    group.add_argument("--output_distill_ratio", "--output-distill-ratio", default=0.10, type=float)
+    group.add_argument("--lambda_output_distill", "--lambda-output-distill", default=0.05, type=float)
+    group.add_argument("--output_distill_every", "--output-distill-every", default=1, type=int)
+    group.add_argument("--output_distill_update_mode", "--output-distill-update-mode", default='predictor_plus_all',
+                       choices=['predictor_only', 'predictor_plus_downstream', 'predictor_plus_all',
+                                'predictor_only_then_all'], type=str)
+    group.add_argument("--output_distill_pair_mode", "--output-distill-pair-mode", default='trunc_normal_centered', type=str)
+    group.add_argument("--direct_pair_mode", "--direct-pair-mode", default='trunc_normal_centered', type=str)
+    group.add_argument("--pair_center_sigma", "--pair-center-sigma", default=1.3, type=float)
+    group.add_argument("--direct_num_pairs", "--direct-num-pairs", default=1, type=int)
+    group.add_argument("--direct_joint_pairs", "--direct-joint-pairs", default=1, type=int)
+    group.add_argument("--direct_predictor_only_pairs", "--direct-predictor-only-pairs", default=0, type=int)
+    group.add_argument("--private_loss", "--private-loss", action='store_true')
+    group.add_argument("--lambda_private", "--lambda-private", default=1.0, type=float)
+    group.add_argument("--private_max_pairs", "--private-max-pairs", default=4, type=int)
+    group.add_argument("--private_use_residual", "--private-use-residual", action='store_true', default=True)
+    group.add_argument("--no_private_use_residual", "--no-private-use-residual", action='store_false',
+                       dest='private_use_residual')
+    group.add_argument("--private_cosine_mode", "--private-cosine-mode", default='bnd',
+                       choices=['bnd', 'nd', 'token'], type=str)
+    group.add_argument("--private_pair_mode", "--private-pair-mode", default='random',
+                       choices=['first', 'random'], type=str)
+
 
 def add_sampling_options(parser):
     group = parser.add_argument_group('sampling')

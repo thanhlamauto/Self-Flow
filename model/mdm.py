@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import clip
+from model.depth_shortcut import DepthShortcutPredictor
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
 from utils.misc import WeightedSum
@@ -42,6 +43,8 @@ class MDM(nn.Module):
         self.input_feats = self.njoints * self.nfeats
 
         self.normalize_output = kargs.get('normalize_encoder_output', False)
+        self.shortcut_predictor_name = kargs.get('shortcut_predictor', 'none')
+        self.shortcut_enabled = str(self.shortcut_predictor_name).lower() not in {'none', 'off', 'false', '0'}
 
         self.cond_mode = kargs.get('cond_mode', 'no_cond')
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
@@ -131,11 +134,36 @@ class MDM(nn.Module):
 
         self.output_process = OutputProcess(self.data_rep, self.input_feats, self.latent_dim, self.njoints,
                                             self.nfeats)
+        if self.shortcut_enabled:
+            if self.arch != 'trans_enc':
+                raise ValueError('Depth shortcut training currently supports MDM trans_enc backbones only.')
+            self.depth_shortcut_predictor = DepthShortcutPredictor(
+                hidden_size=self.latent_dim,
+                depth=self.num_layers,
+                variant=self.shortcut_predictor_name,
+                gamma_out_init=0.001 if kargs.get('shortcut_training_mode', 'direction-magnitude') == 'direction-magnitude' else 0.05,
+                mag_abs_center=kargs.get('shortcut_mag_abs_center', 2.9),
+                mag_abs_scale=kargs.get('shortcut_mag_abs_scale', 0.6),
+                use_timestep=kargs.get('shortcut_predictor_use_timestep', True),
+            )
 
         self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
 
     def parameters_wo_clip(self):
         return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
+
+    def shortcut_predictor_parameters(self):
+        if not self.shortcut_enabled:
+            return []
+        return list(self.depth_shortcut_predictor.parameters())
+
+    def backbone_parameters_wo_clip(self):
+        if not self.shortcut_enabled:
+            return self.parameters_wo_clip()
+        return [
+            p for name, p in self.named_parameters()
+            if not name.startswith('clip_model.') and not name.startswith('depth_shortcut_predictor.')
+        ]
 
     def load_and_freeze_clip(self, clip_version):
         clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
@@ -186,11 +214,13 @@ class MDM(nn.Module):
         mask = ~mask  # mask: True means no token there, we invert since the meaning of mask for transformer is inverted  https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html
         return enc_text, mask
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, y=None, return_hidden=False, resume_hidden=None, resume_start_layer=0):
         """
         x: [batch_size, njoints, nfeats, max_frames], denoted x_t in the paper
         timesteps: [batch_size] (int)
         """
+        if (return_hidden or resume_hidden is not None) and self.arch != 'trans_enc':
+            raise ValueError('return_hidden/resume_hidden are implemented for trans_enc only.')
         bs, njoints, nfeats, nframes = x.shape
         time_emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
@@ -250,7 +280,20 @@ class MDM(nn.Module):
             # adding the timestep embed
             xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
-            output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+            hidden_states = [] if return_hidden else None
+            if return_hidden or resume_hidden is not None:
+                start_layer = int(resume_start_layer)
+                for layer_idx, layer in enumerate(self.seqTransEncoder.layers):
+                    xseq = layer(xseq, src_key_padding_mask=frames_mask)
+                    if resume_hidden is not None and layer_idx == start_layer - 1:
+                        xseq = torch.cat((xseq[:1], resume_hidden), dim=0)
+                    if return_hidden:
+                        hidden_states.append(xseq[1:])
+                if self.seqTransEncoder.norm is not None:
+                    xseq = self.seqTransEncoder.norm(xseq)
+                output = xseq[1:]
+            else:
+                output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
 
         elif self.arch == 'trans_dec':
             if self.emb_trans_dec:
@@ -280,6 +323,8 @@ class MDM(nn.Module):
             y['mask'] = y['mask'][..., self.context_len:]
         
         output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
+        if return_hidden:
+            return output, tuple(hidden_states), time_emb
         return output
 
 
