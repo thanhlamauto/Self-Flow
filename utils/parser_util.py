@@ -193,7 +193,7 @@ def add_training_options(parser):
 
     group = parser.add_argument_group('depth shortcut')
     group.add_argument("--shortcut_predictor", "--shortcut-predictor", default='none', type=str,
-                       help="Enable depth shortcut training with a predictor variant, e.g. hybrid_deep_10.")
+                       help="Enable depth shortcut training with a predictor variant, e.g. hybrid_deep_12pct.")
     group.add_argument("--shortcut_predictor_lr", "--shortcut-predictor-learning-rate", "--predictor-learning-rate",
                        default=1e-4, type=float, help="Learning rate for the depth shortcut predictor parameter group.")
     group.add_argument("--shortcut_predictor_weight_decay", "--shortcut-predictor-weight-decay",
