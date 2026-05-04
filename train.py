@@ -1122,6 +1122,7 @@ def train_step(
     output_distill_update_mode="predictor_plus_downstream",
     output_distill_full_backbone_start_step=0,
     output_distill_pair_mode="trunc_normal_centered",
+    output_distill_target_mode="model_output",
     pair_uniform_anneal_start_step=0,
     pair_uniform_anneal_steps=100000,
     use_legacy_direct_loss=True,
@@ -1189,6 +1190,8 @@ def train_step(
         raise ValueError("shortcut_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in pair_modes:
         raise ValueError(f"Unknown output distill pair mode: {output_distill_pair_mode!r}")
+    if output_distill_target_mode not in {"model_output", "ground_truth"}:
+        raise ValueError(f"Unknown output distill target mode: {output_distill_target_mode!r}")
     if output_distill_update_mode not in {
         "predictor_only",
         "predictor_plus_downstream",
@@ -1635,7 +1638,12 @@ def train_step(
             x_out = x_tau[subset_idx]
             t_out = tau[subset_idx]
             y_out = y[subset_idx]
-            v_teacher = jax.lax.stop_gradient(pred[subset_idx])
+            if output_distill_target_mode == "model_output":
+                v_distill_target = jax.lax.stop_gradient(pred[subset_idx])
+            elif output_distill_target_mode == "ground_truth":
+                v_distill_target = jax.lax.stop_gradient(target[subset_idx])
+            else:
+                raise ValueError(f"Unknown output distill target mode: {output_distill_target_mode!r}")
             t_emb_teacher = jax.lax.stop_gradient(dit_time_emb[subset_idx])
 
             output_as, output_bs = sample_pairs_for_mode(
@@ -1722,10 +1730,10 @@ def train_step(
                 deterministic=False,
             )
             v_skip = v_skip.astype(jnp.float32)
-            v_teacher = v_teacher.astype(jnp.float32)
+            v_distill_target = v_distill_target.astype(jnp.float32)
             reduce_axes = tuple(range(1, v_skip.ndim))
-            numer = jnp.sum(jnp.square(v_skip - v_teacher), axis=reduce_axes)
-            denom = jnp.sum(jnp.square(v_teacher), axis=reduce_axes) + 1e-6
+            numer = jnp.sum(jnp.square(v_skip - v_distill_target), axis=reduce_axes)
+            denom = jnp.sum(jnp.square(v_distill_target), axis=reduce_axes) + 1e-6
             loss_out = jnp.mean(numer / denom)
             return (
                 loss_out,
@@ -3449,6 +3457,16 @@ def main():
         ],
     )
     parser.add_argument(
+        "--output-distill-target-mode",
+        type=str,
+        default="model_output",
+        choices=["model_output", "ground_truth"],
+        help=(
+            "Target for output distillation. model_output keeps the old teacher target pred(x_tau); "
+            "ground_truth trains the resumed tail against the FM velocity target x0 - x1."
+        ),
+    )
+    parser.add_argument(
         "--pair-uniform-anneal-start-step",
         type=int,
         default=0,
@@ -4061,6 +4079,7 @@ def main():
         f"output_distill_update_mode={args.output_distill_update_mode} "
         f"output_distill_full_backbone_start_step={args.output_distill_full_backbone_start_step} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
+        f"output_distill_target_mode={args.output_distill_target_mode} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
         f"pair_center=({args.pair_center_loc},{args.pair_center_sigma}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
@@ -4258,6 +4277,7 @@ def main():
             output_distill_update_mode=args.output_distill_update_mode,
             output_distill_full_backbone_start_step=args.output_distill_full_backbone_start_step,
             output_distill_pair_mode=args.output_distill_pair_mode,
+            output_distill_target_mode=args.output_distill_target_mode,
             pair_uniform_anneal_start_step=args.pair_uniform_anneal_start_step,
             pair_uniform_anneal_steps=args.pair_uniform_anneal_steps,
             use_legacy_direct_loss=effective_use_legacy_direct_loss,
