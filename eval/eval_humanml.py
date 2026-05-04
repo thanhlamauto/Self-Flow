@@ -136,14 +136,47 @@ def get_metric_statistics(values, replication_times):
     return mean, conf_interval
 
 
+def normalize_eval_metrics(metric_names, file=None):
+    aliases = {
+        'matching': 'Matching Score',
+        'matching_score': 'Matching Score',
+        'r_precision': 'R_precision',
+        'r-precision': 'R_precision',
+        'precision': 'R_precision',
+        'fid': 'FID',
+        'diversity': 'Diversity',
+        'multimodality': 'MultiModality',
+        'multi_modality': 'MultiModality',
+    }
+    unsupported = {'sfid', 's_fid', 'inception_score', 'is', 'recall'}
+    if not metric_names or 'all' in metric_names:
+        return ['Matching Score', 'R_precision', 'FID', 'Diversity', 'MultiModality']
+
+    metrics = []
+    for name in metric_names:
+        key = str(name).strip().lower().replace(' ', '_')
+        if key in aliases:
+            metric = aliases[key]
+            if metric not in metrics:
+                metrics.append(metric)
+        elif key in unsupported:
+            msg = f"Skipping unsupported MDM validation metric '{name}'."
+            print(msg)
+            if file is not None:
+                print(msg, file=file, flush=True)
+        else:
+            msg = f"Skipping unknown validation metric '{name}'."
+            print(msg)
+            if file is not None:
+                print(msg, file=file, flush=True)
+    return metrics
+
+
 def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times, 
-               diversity_times, mm_num_times, run_mm=False, eval_platform=None):
+               diversity_times, mm_num_times, run_mm=False, eval_platform=None, metric_names=None):
     with open(log_file, 'w') as f:
-        all_metrics = OrderedDict({'Matching Score': OrderedDict({}),
-                                   'R_precision': OrderedDict({}),
-                                   'FID': OrderedDict({}),
-                                   'Diversity': OrderedDict({}),
-                                   'MultiModality': OrderedDict({})})
+        requested_metrics = normalize_eval_metrics(metric_names, file=f)
+        all_metrics = OrderedDict((metric, OrderedDict({})) for metric in requested_metrics)
         for replication in range(replication_times):
             motion_loaders = {}
             mm_motion_loaders = {}
@@ -157,17 +190,21 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
             print(f'==================== Replication {replication} ====================', file=f, flush=True)
             print(f'Time: {datetime.now()}')
             print(f'Time: {datetime.now()}', file=f, flush=True)
-            mat_score_dict, R_precision_dict, acti_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
+            acti_dict = None
+            if any(metric in requested_metrics for metric in ['Matching Score', 'R_precision', 'FID', 'Diversity', 'MultiModality']):
+                mat_score_dict, R_precision_dict, acti_dict = evaluate_matching_score(eval_wrapper, motion_loaders, f)
 
-            print(f'Time: {datetime.now()}')
-            print(f'Time: {datetime.now()}', file=f, flush=True)
-            fid_score_dict = evaluate_fid(eval_wrapper, gt_loader, acti_dict, f)
+            if 'FID' in requested_metrics:
+                print(f'Time: {datetime.now()}')
+                print(f'Time: {datetime.now()}', file=f, flush=True)
+                fid_score_dict = evaluate_fid(eval_wrapper, gt_loader, acti_dict, f)
 
-            print(f'Time: {datetime.now()}')
-            print(f'Time: {datetime.now()}', file=f, flush=True)
-            div_score_dict = evaluate_diversity(acti_dict, f, diversity_times)
+            if 'Diversity' in requested_metrics:
+                print(f'Time: {datetime.now()}')
+                print(f'Time: {datetime.now()}', file=f, flush=True)
+                div_score_dict = evaluate_diversity(acti_dict, f, diversity_times)
 
-            if run_mm:
+            if run_mm and 'MultiModality' in requested_metrics:
                 print(f'Time: {datetime.now()}')
                 print(f'Time: {datetime.now()}', file=f, flush=True)
                 mm_score_dict = evaluate_multimodality(eval_wrapper, mm_motion_loaders, f, mm_num_times)
@@ -175,30 +212,34 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
             print(f'!!! DONE !!!')
             print(f'!!! DONE !!!', file=f, flush=True)
 
-            for key, item in mat_score_dict.items():
-                if key not in all_metrics['Matching Score']:
-                    all_metrics['Matching Score'][key] = [item]
-                else:
-                    all_metrics['Matching Score'][key] += [item]
+            if 'Matching Score' in requested_metrics:
+                for key, item in mat_score_dict.items():
+                    if key not in all_metrics['Matching Score']:
+                        all_metrics['Matching Score'][key] = [item]
+                    else:
+                        all_metrics['Matching Score'][key] += [item]
 
-            for key, item in R_precision_dict.items():
-                if key not in all_metrics['R_precision']:
-                    all_metrics['R_precision'][key] = [item]
-                else:
-                    all_metrics['R_precision'][key] += [item]
+            if 'R_precision' in requested_metrics:
+                for key, item in R_precision_dict.items():
+                    if key not in all_metrics['R_precision']:
+                        all_metrics['R_precision'][key] = [item]
+                    else:
+                        all_metrics['R_precision'][key] += [item]
 
-            for key, item in fid_score_dict.items():
-                if key not in all_metrics['FID']:
-                    all_metrics['FID'][key] = [item]
-                else:
-                    all_metrics['FID'][key] += [item]
+            if 'FID' in requested_metrics:
+                for key, item in fid_score_dict.items():
+                    if key not in all_metrics['FID']:
+                        all_metrics['FID'][key] = [item]
+                    else:
+                        all_metrics['FID'][key] += [item]
 
-            for key, item in div_score_dict.items():
-                if key not in all_metrics['Diversity']:
-                    all_metrics['Diversity'][key] = [item]
-                else:
-                    all_metrics['Diversity'][key] += [item]
-            if run_mm:
+            if 'Diversity' in requested_metrics:
+                for key, item in div_score_dict.items():
+                    if key not in all_metrics['Diversity']:
+                        all_metrics['Diversity'][key] = [item]
+                    else:
+                        all_metrics['Diversity'][key] += [item]
+            if run_mm and 'MultiModality' in requested_metrics:
                 for key, item in mm_score_dict.items():
                     if key not in all_metrics['MultiModality']:
                         all_metrics['MultiModality'][key] = [item]
