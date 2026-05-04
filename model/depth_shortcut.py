@@ -102,11 +102,19 @@ class DeepHybridShortcutBlock(nn.Module):
             return h
         return h.masked_fill(key_padding_mask[:, :, None].to(device=h.device), 0.0)
 
+    def _temporal_conv(self, x):
+        if x.shape[1] <= 1:
+            return x
+        cond_token = x[:, :1]
+        motion_tokens = x[:, 1:]
+        motion_tokens = self.dwconv(motion_tokens.transpose(1, 2)).transpose(1, 2)
+        return torch.cat([cond_token, motion_tokens], dim=1)
+
     def forward(self, h, cond, key_padding_mask=None):
         h = self._zero_padded_tokens(h, key_padding_mask)
         shift, scale, gate = self._adaln(self.conv_adaln, cond)
         x = modulate(self.conv_ln(h), shift, scale)
-        x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
+        x = self._temporal_conv(x)
         x = self.pwconv(x)
         h = h + gate[:, None, :] * x
         h = self._zero_padded_tokens(h, key_padding_mask)

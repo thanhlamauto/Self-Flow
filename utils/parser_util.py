@@ -311,11 +311,11 @@ def add_training_options(parser):
     group.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
     group.add_argument("--shortcut-bootstrap-detach-source", action='store_true', default=True)
     group.add_argument("--no-shortcut-bootstrap-detach-source", dest="shortcut_bootstrap_detach_source", action='store_false')
-    group.add_argument("--shortcut-mag-scale", type=float, default=3.0)
-    group.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
-    group.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
-    group.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
-    group.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
+    group.add_argument("--shortcut-mag-scale", type=float, default=2.2)
+    group.add_argument("--shortcut-mag-abs-center", type=float, default=2.9)
+    group.add_argument("--shortcut-mag-abs-scale", type=float, default=0.6)
+    group.add_argument("--shortcut-mag-clip-min", type=float, default=0.8)
+    group.add_argument("--shortcut-mag-clip-max", type=float, default=3.5)
     group.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0,
                        help="Compatibility flag from the JAX shortcut run. MDM keeps skip-FM disabled.")
     group.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0,

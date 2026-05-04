@@ -75,8 +75,8 @@ def get_model_args(args, data):
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
             'use_depth_shortcut': getattr(args, 'use_depth_shortcut', False),
             'shortcut_predictor': getattr(args, 'shortcut_predictor', 'hybrid_mdm_10'),
-            'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 5.5),
-            'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 1.5),
+            'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 2.9),
+            'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 0.6),
             }
 
 
@@ -132,9 +132,9 @@ def create_gaussian_diffusion(args):
         shortcut_lambda_mag=getattr(args, 'shortcut_lambda_mag', 0.375),
         shortcut_lambda_boot_mag=getattr(args, 'shortcut_lambda_boot_mag', 0.1875),
         shortcut_bootstrap_detach_source=getattr(args, 'shortcut_bootstrap_detach_source', True),
-        shortcut_mag_scale=getattr(args, 'shortcut_mag_scale', 3.0),
-        shortcut_mag_clip_min=getattr(args, 'shortcut_mag_clip_min', 3.0),
-        shortcut_mag_clip_max=getattr(args, 'shortcut_mag_clip_max', 8.0),
+        shortcut_mag_scale=getattr(args, 'shortcut_mag_scale', 2.2),
+        shortcut_mag_clip_min=getattr(args, 'shortcut_mag_clip_min', 0.8),
+        shortcut_mag_clip_max=getattr(args, 'shortcut_mag_clip_max', 3.5),
         shortcut_predictor_normalize_input=getattr(args, 'shortcut_predictor_normalize_input', False),
         shortcut_predictor_use_timestep=getattr(args, 'shortcut_predictor_use_timestep', True),
         shortcut_skip_in_loop_max_gap=getattr(args, 'shortcut_skip_in_loop_max_gap', 10),
