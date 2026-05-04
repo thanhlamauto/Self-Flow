@@ -5,7 +5,7 @@ set -euo pipefail
 # Global batch = 4 GPUs * local batch 16 = 64, matching the reference run.
 
 DATA_DIR="${DATA_DIR:-$PWD/dataset/HumanML3D}"
-SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill}"
+SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_predictor_only_private02_p1}"
 NPROC="${NPROC:-4}"
 
 torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
@@ -51,7 +51,7 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --output-distill-ratio 0.10 \
   --lambda-output-distill 0.05 \
   --output-distill-every 1 \
-  --output-distill-update-mode predictor_plus_all \
+  --output-distill-update-mode predictor_only \
   --output-distill-pair-mode trunc_normal_centered \
   --direct-pair-mode trunc_normal_centered \
   --pair-center-sigma 1.3 \
@@ -59,8 +59,8 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --direct-joint-pairs 1 \
   --direct-predictor-only-pairs 0 \
   --private-loss \
-  --lambda-private 1.0 \
-  --private-max-pairs 2 \
+  --lambda-private 0.2 \
+  --private-max-pairs 1 \
   --private-use-residual \
   --private-cosine-mode bnd \
   --private-pair-mode random \
