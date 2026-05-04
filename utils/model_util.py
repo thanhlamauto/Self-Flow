@@ -8,14 +8,14 @@ from data_loaders.humanml_utils import HML_EE_JOINT_NAMES
 def load_model_wo_clip(model, state_dict):
     # assert (state_dict['sequence_pos_encoder.pe'][:model.sequence_pos_encoder.pe.shape[0]] == model.sequence_pos_encoder.pe).all()  # TEST
     # assert (state_dict['embed_timestep.sequence_pos_encoder.pe'][:model.embed_timestep.sequence_pos_encoder.pe.shape[0]] == model.embed_timestep.sequence_pos_encoder.pe).all()  # TEST
-    state_dict.pop('sequence_pos_encoder.pe', None)  # no need to load it (fixed), and causes size mismatch for older models
-    state_dict.pop('embed_timestep.sequence_pos_encoder.pe', None)  # no need to load it (fixed), and causes size mismatch for older models
+    del state_dict['sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
+    del state_dict['embed_timestep.sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     assert len(unexpected_keys) == 0
     assert all([
         k.startswith('clip_model.')
-        or 'sequence_pos_encoder' in k
         or k.startswith('depth_shortcut_predictor.')
+        or 'sequence_pos_encoder' in k
         for k in missing_keys
     ])
 
@@ -73,11 +73,10 @@ def get_model_args(args, data):
             'pos_embed_max_len': args.pos_embed_max_len, 'mask_frames': args.mask_frames,
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
-            'shortcut_predictor': getattr(args, 'shortcut_predictor', 'none'),
-            'shortcut_training_mode': getattr(args, 'shortcut_training_mode', 'direction-magnitude'),
-            'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 2.9),
-            'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 0.6),
-            'shortcut_predictor_use_timestep': getattr(args, 'shortcut_predictor_use_timestep', True),
+            'use_depth_shortcut': getattr(args, 'use_depth_shortcut', False),
+            'shortcut_predictor': getattr(args, 'shortcut_predictor', 'hybrid_mdm_10'),
+            'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 5.5),
+            'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 1.5),
             }
 
 
@@ -123,6 +122,41 @@ def create_gaussian_diffusion(args):
         lambda_rcxyz=args.lambda_rcxyz,
         lambda_fc=args.lambda_fc,
         lambda_target_loc=lambda_target_loc,
+        lambda_layersync=args.lambda_layersync,
+        layersync_weak_layer=args.layersync_weak_layer,
+        layersync_strong_layer=args.layersync_strong_layer,
+        use_depth_shortcut=getattr(args, 'use_depth_shortcut', False),
+        shortcut_training_mode=getattr(args, 'shortcut_training_mode', 'direction-magnitude'),
+        shortcut_lambda_dir=getattr(args, 'shortcut_lambda_dir', 1.0),
+        shortcut_lambda_boot=getattr(args, 'shortcut_lambda_boot', 0.25),
+        shortcut_lambda_mag=getattr(args, 'shortcut_lambda_mag', 0.375),
+        shortcut_lambda_boot_mag=getattr(args, 'shortcut_lambda_boot_mag', 0.1875),
+        shortcut_bootstrap_detach_source=getattr(args, 'shortcut_bootstrap_detach_source', True),
+        shortcut_mag_scale=getattr(args, 'shortcut_mag_scale', 3.0),
+        shortcut_mag_clip_min=getattr(args, 'shortcut_mag_clip_min', 3.0),
+        shortcut_mag_clip_max=getattr(args, 'shortcut_mag_clip_max', 8.0),
+        shortcut_predictor_normalize_input=getattr(args, 'shortcut_predictor_normalize_input', False),
+        shortcut_predictor_use_timestep=getattr(args, 'shortcut_predictor_use_timestep', True),
+        shortcut_skip_in_loop_max_gap=getattr(args, 'shortcut_skip_in_loop_max_gap', 10),
+        shortcut_skip_in_loop_gap_loc=getattr(args, 'shortcut_skip_in_loop_gap_loc', 3.0),
+        shortcut_skip_in_loop_gap_sigma=getattr(args, 'shortcut_skip_in_loop_gap_sigma', 2.0),
+        output_distill=getattr(args, 'output_distill', True),
+        output_distill_ratio=getattr(args, 'output_distill_ratio', 0.10),
+        lambda_output_distill=getattr(args, 'lambda_output_distill', 0.05),
+        output_distill_every=getattr(args, 'output_distill_every', 1),
+        output_distill_update_mode=getattr(args, 'output_distill_update_mode', 'predictor_plus_all'),
+        output_distill_pair_mode=getattr(args, 'output_distill_pair_mode', 'trunc_normal'),
+        direct_pair_mode=getattr(args, 'direct_pair_mode', 'trunc_normal'),
+        pair_center_sigma=getattr(args, 'pair_center_sigma', 0.0),
+        direct_num_pairs=getattr(args, 'direct_num_pairs', 1),
+        direct_joint_pairs=getattr(args, 'direct_joint_pairs', 1),
+        direct_predictor_only_pairs=getattr(args, 'direct_predictor_only_pairs', 0),
+        private_loss=getattr(args, 'private_loss', True),
+        lambda_private=getattr(args, 'lambda_private', 1.0),
+        private_max_pairs=getattr(args, 'private_max_pairs', 4),
+        private_use_residual=getattr(args, 'private_use_residual', True),
+        private_cosine_mode=getattr(args, 'private_cosine_mode', 'bnd'),
+        private_pair_mode=getattr(args, 'private_pair_mode', 'random'),
     )
 
 def load_saved_model(model, model_path, use_avg: bool=False):  # use_avg_model

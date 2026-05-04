@@ -3,9 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import clip
-from model.depth_shortcut import DepthShortcutPredictor
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
+from model.depth_shortcut import (
+    DepthShortcutPredictor,
+    build_predictor_source,
+    l2_normalize_tokens,
+    predictor_config_from_name,
+)
 from utils.misc import WeightedSum
 
 
@@ -43,8 +48,7 @@ class MDM(nn.Module):
         self.input_feats = self.njoints * self.nfeats
 
         self.normalize_output = kargs.get('normalize_encoder_output', False)
-        self.shortcut_predictor_name = kargs.get('shortcut_predictor', 'none')
-        self.shortcut_enabled = str(self.shortcut_predictor_name).lower() not in {'none', 'off', 'false', '0'}
+        self.use_depth_shortcut = kargs.get('use_depth_shortcut', False)
 
         self.cond_mode = kargs.get('cond_mode', 'no_cond')
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
@@ -134,36 +138,24 @@ class MDM(nn.Module):
 
         self.output_process = OutputProcess(self.data_rep, self.input_feats, self.latent_dim, self.njoints,
                                             self.nfeats)
-        if self.shortcut_enabled:
-            if self.arch != 'trans_enc':
-                raise ValueError('Depth shortcut training currently supports MDM trans_enc backbones only.')
+        if self.use_depth_shortcut:
+            shortcut_predictor = kargs.get('shortcut_predictor', 'hybrid_mdm_10')
+            shortcut_cfg = predictor_config_from_name(shortcut_predictor, self.latent_dim)
             self.depth_shortcut_predictor = DepthShortcutPredictor(
                 hidden_size=self.latent_dim,
                 depth=self.num_layers,
-                variant=self.shortcut_predictor_name,
-                gamma_out_init=0.001 if kargs.get('shortcut_training_mode', 'direction-magnitude') == 'direction-magnitude' else 0.05,
-                mag_abs_center=kargs.get('shortcut_mag_abs_center', 2.9),
-                mag_abs_scale=kargs.get('shortcut_mag_abs_scale', 0.6),
-                use_timestep=kargs.get('shortcut_predictor_use_timestep', True),
+                gamma_out_init=0.001,
+                mag_abs_center=kargs.get('shortcut_mag_abs_center', 5.5),
+                mag_abs_scale=kargs.get('shortcut_mag_abs_scale', 1.5),
+                **shortcut_cfg,
             )
+        else:
+            self.depth_shortcut_predictor = None
 
         self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
 
     def parameters_wo_clip(self):
         return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]
-
-    def shortcut_predictor_parameters(self):
-        if not self.shortcut_enabled:
-            return []
-        return list(self.depth_shortcut_predictor.parameters())
-
-    def backbone_parameters_wo_clip(self):
-        if not self.shortcut_enabled:
-            return self.parameters_wo_clip()
-        return [
-            p for name, p in self.named_parameters()
-            if not name.startswith('clip_model.') and not name.startswith('depth_shortcut_predictor.')
-        ]
 
     def load_and_freeze_clip(self, clip_version):
         clip_model, clip_preprocess = clip.load(clip_version, device='cpu',
@@ -214,14 +206,36 @@ class MDM(nn.Module):
         mask = ~mask  # mask: True means no token there, we invert since the meaning of mask for transformer is inverted  https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html
         return enc_text, mask
 
-    def forward(self, x, timesteps, y=None, return_hidden=False, resume_hidden=None, resume_start_layer=0):
+    def forward(
+        self,
+        x,
+        timesteps,
+        y=None,
+        return_layersync_features=None,
+        return_hidden_states=False,
+        resume_hidden=None,
+        resume_start_layer=None,
+        depth_shortcut_skip=False,
+        depth_shortcut_skip_source_layer=3,
+        depth_shortcut_skip_target_layer=7,
+        depth_shortcut_predict_magnitude=True,
+        depth_shortcut_mag_scale=3.0,
+        depth_shortcut_mag_clip_min=3.0,
+        depth_shortcut_mag_clip_max=8.0,
+        depth_shortcut_normalize_input=False,
+        depth_shortcut_use_timestep=True,
+    ):
         """
         x: [batch_size, njoints, nfeats, max_frames], denoted x_t in the paper
         timesteps: [batch_size] (int)
         """
-        if (return_hidden or resume_hidden is not None) and self.arch != 'trans_enc':
-            raise ValueError('return_hidden/resume_hidden are implemented for trans_enc only.')
+        if y is None:
+            y = {}
         bs, njoints, nfeats, nframes = x.shape
+        if return_hidden_states and self.arch != 'trans_enc':
+            raise ValueError('Depth shortcut hidden-state training currently supports trans_enc MDM only.')
+        layersync_layers = self._validate_layersync_layers(return_layersync_features)
+        layersync_features = None
         time_emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
         if 'target_cond' in y.keys():
@@ -278,22 +292,50 @@ class MDM(nn.Module):
 
         if self.arch == 'trans_enc':
             # adding the timestep embed
-            xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
-            xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
-            hidden_states = [] if return_hidden else None
-            if return_hidden or resume_hidden is not None:
-                start_layer = int(resume_start_layer)
-                for layer_idx, layer in enumerate(self.seqTransEncoder.layers):
-                    xseq = layer(xseq, src_key_padding_mask=frames_mask)
-                    if resume_hidden is not None and layer_idx == start_layer - 1:
-                        xseq = torch.cat((xseq[:1], resume_hidden), dim=0)
-                    if return_hidden:
-                        hidden_states.append(xseq[1:])
-                if self.seqTransEncoder.norm is not None:
-                    xseq = self.seqTransEncoder.norm(xseq)
-                output = xseq[1:]
+            if resume_hidden is None:
+                xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
+                xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
             else:
-                output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+                if resume_hidden.dim() != 3:
+                    raise ValueError('resume_hidden must have shape [bs, seq, dim] or [seq, bs, dim].')
+                if resume_hidden.shape[0] == bs:
+                    xseq = resume_hidden.transpose(0, 1).contiguous()
+                else:
+                    xseq = resume_hidden
+            if layersync_layers is None:
+                if (
+                    return_hidden_states
+                    or resume_hidden is not None
+                    or depth_shortcut_skip
+                ):
+                    output, hidden_states = self._forward_encoder_depth_shortcut(
+                        xseq,
+                        src_key_padding_mask=frames_mask,
+                        time_emb=time_emb.squeeze(0),
+                        return_hidden_states=return_hidden_states,
+                        resume_start_layer=resume_start_layer,
+                        depth_shortcut_skip=depth_shortcut_skip,
+                        depth_shortcut_skip_source_layer=depth_shortcut_skip_source_layer,
+                        depth_shortcut_skip_target_layer=depth_shortcut_skip_target_layer,
+                        depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
+                        depth_shortcut_mag_scale=depth_shortcut_mag_scale,
+                        depth_shortcut_mag_clip_min=depth_shortcut_mag_clip_min,
+                        depth_shortcut_mag_clip_max=depth_shortcut_mag_clip_max,
+                        depth_shortcut_normalize_input=depth_shortcut_normalize_input,
+                        depth_shortcut_use_timestep=depth_shortcut_use_timestep,
+                    )
+                    output = output[1:]
+                else:
+                    output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+                    hidden_states = None
+            else:
+                output, layersync_features = self._forward_encoder_layersync(
+                    xseq,
+                    src_key_padding_mask=frames_mask,
+                    layersync_layers=layersync_layers,
+                )
+                output = output[1:]
+                layersync_features = tuple(feature[1:] for feature in layersync_features)
 
         elif self.arch == 'trans_dec':
             if self.emb_trans_dec:
@@ -303,16 +345,37 @@ class MDM(nn.Module):
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
 
             if self.text_encoder_type == 'clip':
-                output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
+                if layersync_layers is None:
+                    output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
+                else:
+                    output, layersync_features = self._forward_decoder_layersync(
+                        xseq,
+                        memory=emb,
+                        tgt_key_padding_mask=frames_mask,
+                        layersync_layers=layersync_layers,
+                    )
             elif self.text_encoder_type == 'bert':
-                output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
+                if layersync_layers is None:
+                    output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
+                else:
+                    output, layersync_features = self._forward_decoder_layersync(
+                        xseq,
+                        memory=emb,
+                        memory_key_padding_mask=text_mask,
+                        tgt_key_padding_mask=frames_mask,
+                        layersync_layers=layersync_layers,
+                    )
             else:
                 raise ValueError()
 
             if self.emb_trans_dec:
                 output = output[1:] # [seqlen, bs, d]
+                if layersync_features is not None:
+                    layersync_features = tuple(feature[1:] for feature in layersync_features)
 
         elif self.arch == 'gru':
+            if layersync_layers is not None:
+                raise ValueError('LayerSync is only supported for transformer MDM architectures.')
             xseq = x
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen, bs, d]
             output, _ = self.gru(xseq)
@@ -320,12 +383,172 @@ class MDM(nn.Module):
         # Extract completed suffix
         if self.is_prefix_comp:
             output = output[self.context_len:]
+            if layersync_features is not None:
+                layersync_features = tuple(feature[self.context_len:] for feature in layersync_features)
             y['mask'] = y['mask'][..., self.context_len:]
         
         output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
-        if return_hidden:
-            return output, tuple(hidden_states), time_emb
+        if return_hidden_states:
+            hidden_states = tuple(hidden_states)
+            return output, hidden_states, time_emb.squeeze(0)
+        if layersync_features is not None:
+            layersync_features = tuple(feature.permute(1, 0, 2).contiguous() for feature in layersync_features)
+            return output, layersync_features
         return output
+
+    def _forward_encoder_depth_shortcut(
+        self,
+        xseq,
+        src_key_padding_mask,
+        time_emb,
+        return_hidden_states=False,
+        resume_start_layer=None,
+        depth_shortcut_skip=False,
+        depth_shortcut_skip_source_layer=3,
+        depth_shortcut_skip_target_layer=7,
+        depth_shortcut_predict_magnitude=True,
+        depth_shortcut_mag_scale=3.0,
+        depth_shortcut_mag_clip_min=3.0,
+        depth_shortcut_mag_clip_max=8.0,
+        depth_shortcut_normalize_input=False,
+        depth_shortcut_use_timestep=True,
+    ):
+        hidden = xseq
+        start_layer = int(resume_start_layer or 1)
+        hidden_states = []
+        if return_hidden_states and start_layer == 1:
+            hidden_states.append(hidden.permute(1, 0, 2).contiguous())
+
+        layer_idx = start_layer
+        while layer_idx <= self.num_layers:
+            prev_layer = layer_idx - 1
+            can_skip = (
+                depth_shortcut_skip
+                and self.depth_shortcut_predictor is not None
+                and int(depth_shortcut_skip_source_layer) == prev_layer
+                and int(depth_shortcut_skip_target_layer) > int(depth_shortcut_skip_source_layer)
+                and int(depth_shortcut_skip_target_layer) <= self.num_layers
+            )
+            if can_skip:
+                hidden = self._predict_depth_shortcut_hidden(
+                    hidden,
+                    int(depth_shortcut_skip_source_layer),
+                    int(depth_shortcut_skip_target_layer),
+                    time_emb,
+                    src_key_padding_mask,
+                    depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
+                    depth_shortcut_mag_scale=depth_shortcut_mag_scale,
+                    depth_shortcut_mag_clip_min=depth_shortcut_mag_clip_min,
+                    depth_shortcut_mag_clip_max=depth_shortcut_mag_clip_max,
+                    depth_shortcut_normalize_input=depth_shortcut_normalize_input,
+                    depth_shortcut_use_timestep=depth_shortcut_use_timestep,
+                )
+                layer_idx = int(depth_shortcut_skip_target_layer) + 1
+                continue
+
+            hidden = self.seqTransEncoder.layers[layer_idx - 1](
+                hidden,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+            if return_hidden_states:
+                hidden_states.append(hidden.permute(1, 0, 2).contiguous())
+            layer_idx += 1
+
+        if self.seqTransEncoder.norm is not None:
+            hidden = self.seqTransEncoder.norm(hidden)
+        return hidden, hidden_states
+
+    def _predict_depth_shortcut_hidden(
+        self,
+        hidden,
+        source_layer,
+        target_layer,
+        time_emb,
+        key_padding_mask,
+        depth_shortcut_predict_magnitude=True,
+        depth_shortcut_mag_scale=3.0,
+        depth_shortcut_mag_clip_min=3.0,
+        depth_shortcut_mag_clip_max=8.0,
+        depth_shortcut_normalize_input=False,
+        depth_shortcut_use_timestep=True,
+    ):
+        if self.depth_shortcut_predictor is None:
+            raise ValueError('Depth shortcut predictor is not initialized.')
+        source = hidden.permute(1, 0, 2).contiguous()
+        predictor_source, m_source = build_predictor_source(
+            source,
+            normalize_input=depth_shortcut_normalize_input,
+        )
+        y_pred, delta_m = self.depth_shortcut_predictor(
+            predictor_source,
+            source_layer,
+            target_layer,
+            time_emb,
+            m_source if depth_shortcut_predict_magnitude else None,
+            use_timestep_embed=depth_shortcut_use_timestep,
+            key_padding_mask=key_padding_mask,
+        )
+        if depth_shortcut_predict_magnitude:
+            u_pred = l2_normalize_tokens(y_pred)
+            m_pred = torch.clamp(
+                m_source + float(depth_shortcut_mag_scale) * delta_m,
+                min=float(depth_shortcut_mag_clip_min),
+                max=float(depth_shortcut_mag_clip_max),
+            )
+            target_hidden = torch.exp(m_pred) * u_pred
+        else:
+            target_hidden = y_pred.float()
+        return target_hidden.transpose(0, 1).contiguous()
+
+    def _validate_layersync_layers(self, layers):
+        if layers is None:
+            return None
+        if len(layers) != 2:
+            raise ValueError(f'LayerSync expects exactly two layers, got {layers}')
+        weak_layer, strong_layer = (int(layers[0]), int(layers[1]))
+        if not (1 <= weak_layer <= self.num_layers and 1 <= strong_layer <= self.num_layers):
+            raise ValueError(
+                f'LayerSync layers must be in [1, {self.num_layers}], got {(weak_layer, strong_layer)}'
+            )
+        if weak_layer >= strong_layer:
+            raise ValueError(
+                f'LayerSync weak layer must be smaller than strong layer, got {(weak_layer, strong_layer)}'
+            )
+        return weak_layer, strong_layer
+
+    def _forward_encoder_layersync(self, xseq, src_key_padding_mask, layersync_layers):
+        hidden = xseq
+        captured = {}
+        for layer_idx, layer in enumerate(self.seqTransEncoder.layers, start=1):
+            hidden = layer(hidden, src_key_padding_mask=src_key_padding_mask)
+            if layer_idx in layersync_layers:
+                captured[layer_idx] = hidden
+        if self.seqTransEncoder.norm is not None:
+            hidden = self.seqTransEncoder.norm(hidden)
+        return hidden, tuple(captured[layer_idx] for layer_idx in layersync_layers)
+
+    def _forward_decoder_layersync(
+        self,
+        xseq,
+        memory,
+        layersync_layers,
+        memory_key_padding_mask=None,
+        tgt_key_padding_mask=None,
+    ):
+        hidden = xseq
+        captured = {}
+        for layer_idx, layer in enumerate(self.seqTransDecoder.layers, start=1):
+            hidden = layer(
+                hidden,
+                memory,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+            )
+            if layer_idx in layersync_layers:
+                captured[layer_idx] = hidden
+        if self.seqTransDecoder.norm is not None:
+            hidden = self.seqTransDecoder.norm(hidden)
+        return hidden, tuple(captured[layer_idx] for layer_idx in layersync_layers)
 
 
     def _apply(self, fn):

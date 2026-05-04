@@ -12,6 +12,7 @@ import math
 import numpy as np
 import torch
 import torch as th
+import torch.nn.functional as F
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood
@@ -19,189 +20,13 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 from model.depth_shortcut import (
+    build_predictor_source,
     l2_normalize_tokens,
     log_token_magnitudes,
     private_activation_loss,
-    sample_layer_pairs,
+    sample_distinct_pairs,
+    sample_triplet,
 )
-
-
-def _loss_vec(value, ref):
-    if not torch.is_tensor(value):
-        value = ref.new_tensor(float(value))
-    if value.dim() == 0:
-        return value.expand_as(ref)
-    return value
-
-
-def _subset_model_kwargs(model_kwargs, idx):
-    if model_kwargs is None:
-        return None
-    out = {}
-    for key, value in model_kwargs.items():
-        if key == 'y' and isinstance(value, dict):
-            y = {}
-            for y_key, y_value in value.items():
-                if torch.is_tensor(y_value) and y_value.dim() > 0 and y_value.shape[0] >= int(idx.max().item()) + 1:
-                    y[y_key] = y_value.index_select(0, idx)
-                elif isinstance(y_value, list) and len(y_value) >= int(idx.max().item()) + 1:
-                    y[y_key] = [y_value[int(i)] for i in idx.detach().cpu().tolist()]
-                else:
-                    y[y_key] = y_value
-            out[key] = y
-        else:
-            out[key] = value
-    return out
-
-
-def _direction_magnitude_loss(predictor, source, target, source_layer, target_layer,
-                              time_emb, args, detach_source=False):
-    if detach_source:
-        source = source.detach()
-        time_emb = None if time_emb is None else time_emb.detach()
-    source_for_pred = l2_normalize_tokens(source) if args.shortcut_predictor_normalize_input else source
-    source_mag = log_token_magnitudes(source.detach())
-    pred, delta_mag = predictor(source_for_pred, source_layer, target_layer, time_emb, source_mag)
-    target_detached = target.detach()
-    pred_u = l2_normalize_tokens(pred)
-    target_u = l2_normalize_tokens(target_detached)
-    cos = (pred_u * target_u).sum(dim=-1).mean()
-    loss_dir = 1.0 - cos
-    target_delta = (log_token_magnitudes(target_detached) - log_token_magnitudes(source.detach()))
-    target_delta = torch.clamp(target_delta / max(float(args.shortcut_mag_scale), 1e-6), -1.0, 1.0)
-    loss_mag = 0.5 * (delta_mag - target_delta).square().mean()
-    weighted = args.shortcut_lambda_dir * loss_dir + args.shortcut_lambda_mag * loss_mag
-    metrics = {
-        "shortcut_dir": loss_dir,
-        "shortcut_mag": loss_mag,
-        "shortcut_cos": cos,
-        "shortcut_delta_mag_mae": (float(args.shortcut_mag_scale) * delta_mag - target_delta * float(args.shortcut_mag_scale)).abs().mean(),
-    }
-    return weighted, pred, delta_mag, source_mag, metrics
-
-
-def _depth_shortcut_training_losses(model, x_t, scaled_t, model_kwargs, model_output,
-                                    hidden_states, time_emb, args, predictor_ema,
-                                    global_step):
-    ref = model_output.new_tensor(0.0)
-    hidden = torch.stack(hidden_states, dim=0).float()
-    num_layers = hidden.shape[0]
-    predictor = model.depth_shortcut_predictor
-    losses = {}
-    total = ref
-
-    pair_count = max(int(getattr(args, 'direct_num_pairs', 1)), 1)
-    pairs = sample_layer_pairs(
-        num_layers,
-        num_pairs=pair_count,
-        max_gap=getattr(args, 'shortcut_skip_in_loop_max_gap', num_layers - 1),
-        gap_loc=getattr(args, 'shortcut_skip_in_loop_gap_loc', 2.0),
-        gap_sigma=getattr(args, 'pair_center_sigma', getattr(args, 'shortcut_skip_in_loop_gap_sigma', 1.5)),
-        mode=getattr(args, 'direct_pair_mode', 'trunc_normal_centered'),
-        device=hidden.device,
-    )
-    direct_values = []
-    direct_metrics = None
-    predictor_only = int(getattr(args, 'direct_predictor_only_pairs', 0))
-    for pair_idx, (src, tgt) in enumerate(pairs):
-        detach_source = pair_idx >= int(getattr(args, 'direct_joint_pairs', 1))
-        if pair_idx > 0 and pair_idx <= predictor_only:
-            detach_source = True
-        direct_loss, _, _, _, metrics = _direction_magnitude_loss(
-            predictor, hidden[src], hidden[tgt], src, tgt, time_emb, args,
-            detach_source=detach_source,
-        )
-        direct_values.append(direct_loss)
-        if direct_metrics is None:
-            direct_metrics = metrics
-            direct_metrics["shortcut_direct_gap"] = ref.new_tensor(float(tgt - src))
-    if direct_values:
-        loss_direct = torch.stack(direct_values).mean()
-        total = total + loss_direct
-        losses["shortcut_direct"] = loss_direct
-        losses.update(direct_metrics or {})
-
-    if num_layers >= 3 and (getattr(args, 'shortcut_lambda_boot', 0.0) > 0 or getattr(args, 'shortcut_lambda_boot_mag', 0.0) > 0):
-        a = int(torch.randint(0, num_layers - 2, (), device=hidden.device).item())
-        b = int(torch.randint(a + 1, num_layers - 1, (), device=hidden.device).item())
-        c = int(torch.randint(b + 1, num_layers, (), device=hidden.device).item())
-        boot_source = hidden[a]
-        if getattr(args, 'shortcut_bootstrap_detach_source', False):
-            boot_source = boot_source.detach()
-        boot_input = l2_normalize_tokens(boot_source) if args.shortcut_predictor_normalize_input else boot_source
-        boot_mag = log_token_magnitudes(boot_source.detach())
-        pred_ab, dm_ab = predictor(boot_input, a, b, time_emb, boot_mag)
-        pred_ab_input = l2_normalize_tokens(pred_ab)
-        mag_ab = boot_mag + float(args.shortcut_mag_scale) * dm_ab
-        pred_bc, dm_bc = predictor(pred_ab_input, b, c, time_emb, mag_ab.detach())
-        teacher_predictor = predictor_ema if predictor_ema is not None else predictor
-        with torch.no_grad():
-            pred_ac, dm_ac = teacher_predictor(boot_input.detach(), a, c, None if time_emb is None else time_emb.detach(), boot_mag)
-        boot_cos = (l2_normalize_tokens(pred_bc) * l2_normalize_tokens(pred_ac)).sum(dim=-1).mean()
-        loss_boot = 1.0 - boot_cos
-        loss_boot_mag = 0.5 * (dm_ab + dm_bc - dm_ac.detach()).square().mean()
-        total = total + float(args.shortcut_lambda_boot) * loss_boot + float(args.shortcut_lambda_boot_mag) * loss_boot_mag
-        losses["shortcut_boot"] = loss_boot
-        losses["shortcut_boot_mag"] = loss_boot_mag
-        losses["shortcut_boot_cos"] = boot_cos
-
-    if getattr(args, 'output_distill', False) and (int(global_step) % max(int(args.output_distill_every), 1) == 0):
-        subset_size = max(1, int(math.ceil(x_t.shape[0] * float(args.output_distill_ratio))))
-        subset_size = min(subset_size, x_t.shape[0])
-        idx = torch.randperm(x_t.shape[0], device=x_t.device)[:subset_size]
-        out_pair = sample_layer_pairs(
-            num_layers,
-            num_pairs=1,
-            max_gap=getattr(args, 'shortcut_skip_in_loop_max_gap', num_layers - 1),
-            gap_loc=getattr(args, 'shortcut_skip_in_loop_gap_loc', 2.0),
-            gap_sigma=getattr(args, 'pair_center_sigma', getattr(args, 'shortcut_skip_in_loop_gap_sigma', 1.5)),
-            mode=getattr(args, 'output_distill_pair_mode', 'trunc_normal_centered'),
-            device=hidden.device,
-        )[0]
-        src, tgt = out_pair
-        source = hidden[src].index_select(1, idx)
-        source_for_pred = l2_normalize_tokens(source) if args.shortcut_predictor_normalize_input else source
-        source_mag = log_token_magnitudes(source.detach())
-        te = None if time_emb is None else time_emb.index_select(1, idx)
-        pred, delta_mag = predictor(source_for_pred, src, tgt, te, source_mag)
-        pred_mag = torch.clamp(
-            source_mag + float(args.shortcut_mag_scale) * delta_mag,
-            float(args.shortcut_mag_clip_min),
-            float(args.shortcut_mag_clip_max),
-        )
-        z_hat = pred_mag.exp() * l2_normalize_tokens(pred)
-        y_skip = model(
-            x_t.index_select(0, idx),
-            scaled_t.index_select(0, idx),
-            **_subset_model_kwargs(model_kwargs, idx),
-            resume_hidden=z_hat,
-            resume_start_layer=tgt + 1,
-        )
-        teacher = model_output.detach().index_select(0, idx)
-        reduce_dims = tuple(range(1, y_skip.dim()))
-        numer = (y_skip - teacher).square().sum(dim=reduce_dims)
-        denom = teacher.square().sum(dim=reduce_dims).clamp_min(1e-6)
-        loss_out = (numer / denom).mean()
-        total = total + float(args.lambda_output_distill) * loss_out
-        losses["shortcut_output_distill"] = loss_out
-        losses["shortcut_output_distill_gap"] = ref.new_tensor(float(tgt - src))
-
-    if getattr(args, 'private_loss', False):
-        loss_private, common_norm, private_norm, private_cos = private_activation_loss(
-            hidden,
-            max_pairs=getattr(args, 'private_max_pairs', 4),
-            use_residual=getattr(args, 'private_use_residual', True),
-            cosine_mode=getattr(args, 'private_cosine_mode', 'bnd'),
-            pair_mode=getattr(args, 'private_pair_mode', 'random'),
-        )
-        total = total + float(args.lambda_private) * loss_private
-        losses["private_loss"] = loss_private
-        losses["private_common_norm"] = common_norm
-        losses["private_avg_norm"] = private_norm
-        losses["private_pairwise_cosine"] = private_cos
-
-    losses["shortcut_total"] = total
-    return total, losses
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -321,6 +146,41 @@ class GaussianDiffusion:
         lambda_vel_rcxyz=0.,
         lambda_fc=0.,
         lambda_target_loc=0.,
+        lambda_layersync=0.,
+        layersync_weak_layer=3,
+        layersync_strong_layer=6,
+        use_depth_shortcut=False,
+        shortcut_training_mode="direction-magnitude",
+        shortcut_lambda_dir=1.0,
+        shortcut_lambda_boot=0.25,
+        shortcut_lambda_mag=0.375,
+        shortcut_lambda_boot_mag=0.1875,
+        shortcut_bootstrap_detach_source=True,
+        shortcut_mag_scale=3.0,
+        shortcut_mag_clip_min=3.0,
+        shortcut_mag_clip_max=8.0,
+        shortcut_predictor_normalize_input=False,
+        shortcut_predictor_use_timestep=True,
+        shortcut_skip_in_loop_max_gap=10,
+        shortcut_skip_in_loop_gap_loc=3.0,
+        shortcut_skip_in_loop_gap_sigma=2.0,
+        output_distill=True,
+        output_distill_ratio=0.10,
+        lambda_output_distill=0.05,
+        output_distill_every=1,
+        output_distill_update_mode="predictor_plus_all",
+        output_distill_pair_mode="trunc_normal",
+        direct_pair_mode="trunc_normal",
+        pair_center_sigma=0.0,
+        direct_num_pairs=1,
+        direct_joint_pairs=1,
+        direct_predictor_only_pairs=0,
+        private_loss=True,
+        lambda_private=1.0,
+        private_max_pairs=4,
+        private_use_residual=True,
+        private_cosine_mode="bnd",
+        private_pair_mode="random",
         **kargs,
     ):
         self.model_mean_type = model_mean_type
@@ -341,9 +201,44 @@ class GaussianDiffusion:
         self.lambda_root_vel = lambda_root_vel
         self.lambda_vel_rcxyz = lambda_vel_rcxyz
         self.lambda_fc = lambda_fc
+        self.lambda_layersync = lambda_layersync
+        self.layersync_layers = (int(layersync_weak_layer), int(layersync_strong_layer))
+        self.use_depth_shortcut = bool(use_depth_shortcut)
+        self.shortcut_training_mode = shortcut_training_mode
+        self.shortcut_lambda_dir = float(shortcut_lambda_dir)
+        self.shortcut_lambda_boot = float(shortcut_lambda_boot)
+        self.shortcut_lambda_mag = float(shortcut_lambda_mag)
+        self.shortcut_lambda_boot_mag = float(shortcut_lambda_boot_mag)
+        self.shortcut_bootstrap_detach_source = bool(shortcut_bootstrap_detach_source)
+        self.shortcut_mag_scale = float(shortcut_mag_scale)
+        self.shortcut_mag_clip_min = float(shortcut_mag_clip_min)
+        self.shortcut_mag_clip_max = float(shortcut_mag_clip_max)
+        self.shortcut_predictor_normalize_input = bool(shortcut_predictor_normalize_input)
+        self.shortcut_predictor_use_timestep = bool(shortcut_predictor_use_timestep)
+        self.shortcut_skip_in_loop_max_gap = int(shortcut_skip_in_loop_max_gap)
+        self.shortcut_skip_in_loop_gap_loc = float(shortcut_skip_in_loop_gap_loc)
+        self.shortcut_skip_in_loop_gap_sigma = float(shortcut_skip_in_loop_gap_sigma)
+        self.output_distill = bool(output_distill)
+        self.output_distill_ratio = float(output_distill_ratio)
+        self.lambda_output_distill = float(lambda_output_distill)
+        self.output_distill_every = int(output_distill_every)
+        self.output_distill_update_mode = output_distill_update_mode
+        self.output_distill_pair_mode = output_distill_pair_mode
+        self.direct_pair_mode = direct_pair_mode
+        self.pair_center_sigma = float(pair_center_sigma)
+        self.direct_num_pairs = int(direct_num_pairs)
+        self.direct_joint_pairs = int(direct_joint_pairs)
+        self.direct_predictor_only_pairs = int(direct_predictor_only_pairs)
+        self.private_loss_enabled = bool(private_loss)
+        self.lambda_private = float(lambda_private)
+        self.private_max_pairs = int(private_max_pairs)
+        self.private_use_residual = bool(private_use_residual)
+        self.private_cosine_mode = private_cosine_mode
+        self.private_pair_mode = private_pair_mode
 
         if self.lambda_rcxyz > 0. or self.lambda_vel > 0. or self.lambda_root_vel > 0. or \
-                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0.:
+                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0. or \
+                self.lambda_layersync > 0.:
             assert self.loss_type == LossType.MSE, 'Geometric losses are supported by MSE loss type only!'
 
         # Use float64 for accuracy.
@@ -387,6 +282,25 @@ class GaussianDiffusion:
 
         # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
+
+    def layersync_loss(self, raw_features, mask=None):
+        weak, strong = raw_features
+        strong = strong.detach()
+        weak = th.nn.functional.normalize(weak.float(), dim=-1, eps=1e-8)
+        strong = th.nn.functional.normalize(strong.float(), dim=-1, eps=1e-8)
+        cosine = (weak * strong).sum(dim=-1)
+
+        if mask is not None:
+            token_mask = mask.squeeze(1).squeeze(1).float()
+            if token_mask.shape[-1] != cosine.shape[-1]:
+                token_mask = token_mask[..., -cosine.shape[-1]:]
+            token_mask = token_mask.to(device=cosine.device, dtype=cosine.dtype)
+            denom = token_mask.sum(dim=-1).clamp_min(1.0)
+            mean_cosine = (cosine * token_mask).sum(dim=-1) / denom
+        else:
+            mean_cosine = cosine.mean(dim=-1)
+
+        return -mean_cosine, mean_cosine
 
 
 
@@ -1405,8 +1319,255 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None,
-                        train_args=None, predictor_ema=None, global_step=0):
+    def _subset_model_kwargs(self, model_kwargs, idx):
+        subset = {}
+        for key, value in model_kwargs.items():
+            if key != 'y':
+                subset[key] = value
+                continue
+            subset_y = {}
+            for y_key, y_value in value.items():
+                if (
+                    torch.is_tensor(y_value)
+                    and y_value.ndim > 0
+                    and y_value.shape[0] >= int(idx.max().item()) + 1
+                ):
+                    subset_y[y_key] = y_value[idx]
+                elif isinstance(y_value, (list, tuple)) and len(y_value) >= int(idx.max().item()) + 1:
+                    subset_y[y_key] = [y_value[int(i)] for i in idx.detach().cpu().tolist()]
+                else:
+                    subset_y[y_key] = y_value
+            subset['y'] = subset_y
+        return subset
+
+    def _predict_shortcut_hidden(self, predictor, z_source, source_layer, target_layer, time_emb):
+        predictor_source, m_source = build_predictor_source(
+            z_source,
+            normalize_input=self.shortcut_predictor_normalize_input,
+        )
+        y_pred, delta_m = predictor(
+            predictor_source,
+            source_layer,
+            target_layer,
+            time_emb,
+            m_source,
+            use_timestep_embed=self.shortcut_predictor_use_timestep,
+        )
+        if self.shortcut_training_mode == "direction":
+            return y_pred.float(), delta_m, m_source
+        u_pred = l2_normalize_tokens(y_pred)
+        m_pred = torch.clamp(
+            m_source + self.shortcut_mag_scale * delta_m,
+            min=self.shortcut_mag_clip_min,
+            max=self.shortcut_mag_clip_max,
+        )
+        return torch.exp(m_pred) * u_pred, delta_m, m_source
+
+    def _hidden_token_mask(self, model_kwargs, hidden_stack):
+        mask = model_kwargs.get('y', {}).get('mask')
+        if mask is None:
+            return None
+        mask = mask.squeeze(1).squeeze(1).float()
+        seq_len = hidden_stack.shape[2]
+        if mask.shape[-1] == seq_len - 1:
+            step_mask = torch.ones(mask.shape[0], 1, device=mask.device, dtype=mask.dtype)
+            mask = torch.cat([step_mask, mask], dim=1)
+        elif mask.shape[-1] != seq_len:
+            mask = mask[..., -seq_len:]
+        return mask.to(device=hidden_stack.device, dtype=hidden_stack.dtype)
+
+    def _masked_token_mean(self, values, token_mask=None):
+        if token_mask is None:
+            return values.mean()
+        while token_mask.ndim < values.ndim:
+            token_mask = token_mask.unsqueeze(-1)
+        token_mask = token_mask.to(device=values.device, dtype=values.dtype)
+        return (values * token_mask).sum() / token_mask.sum().clamp_min(1.0)
+
+    def _depth_shortcut_losses(
+        self,
+        model,
+        x_t,
+        t,
+        model_kwargs,
+        model_output,
+        hidden_states,
+        time_emb,
+        shortcut_predictor_ema=None,
+        global_step=0,
+    ):
+        terms = {}
+        actual_model = getattr(model, 'module', model)
+        predictor = getattr(actual_model, 'depth_shortcut_predictor', None)
+        if predictor is None:
+            return terms
+
+        hidden_stack = torch.stack(hidden_states, dim=0).float()  # [L+1, B, S, D]
+        num_hidden = hidden_stack.shape[0]
+        token_mask = self._hidden_token_mask(model_kwargs, hidden_stack)
+        pairs = sample_distinct_pairs(
+            num_hidden,
+            self.shortcut_skip_in_loop_max_gap,
+            self.shortcut_skip_in_loop_gap_loc,
+            self.shortcut_skip_in_loop_gap_sigma,
+            max(self.direct_num_pairs, 1),
+            pair_mode=self.direct_pair_mode,
+            center_sigma=self.pair_center_sigma,
+        )
+
+        pair_losses = []
+        direct_dir = []
+        direct_mag = []
+        for pair_idx, (source_layer, target_layer) in enumerate(pairs):
+            source = hidden_stack[source_layer]
+            if pair_idx >= self.direct_joint_pairs:
+                source = source.detach()
+            target = hidden_stack[target_layer].detach()
+            pred_hidden, delta_m, m_source = self._predict_shortcut_hidden(
+                predictor,
+                source,
+                source_layer,
+                target_layer,
+                time_emb.detach() if pair_idx >= self.direct_joint_pairs else time_emb,
+            )
+            u_pred = l2_normalize_tokens(pred_hidden)
+            u_target = l2_normalize_tokens(target)
+            loss_dir = 1.0 - self._masked_token_mean((u_pred * u_target).sum(dim=-1), token_mask)
+            target_delta_m = (
+                log_token_magnitudes(target)
+                - log_token_magnitudes(hidden_stack[source_layer].detach())
+            )
+            target_delta_m = torch.clamp(target_delta_m / self.shortcut_mag_scale, -1.0, 1.0)
+            loss_mag = 0.5 * self._masked_token_mean((delta_m - target_delta_m).square(), token_mask)
+            pair_losses.append(self.shortcut_lambda_dir * loss_dir + self.shortcut_lambda_mag * loss_mag)
+            direct_dir.append(loss_dir.detach())
+            direct_mag.append(loss_mag.detach())
+
+        terms["shortcut_direct"] = torch.stack(pair_losses).mean()
+        terms["shortcut_dir"] = torch.stack(direct_dir).mean()
+        terms["shortcut_mag"] = torch.stack(direct_mag).mean()
+
+        boot_a, boot_b, boot_c = sample_triplet(num_hidden - 1)
+        boot_source = hidden_stack[boot_a]
+        if self.shortcut_bootstrap_detach_source:
+            boot_source = boot_source.detach()
+        z_ab, delta_m_ab, _ = self._predict_shortcut_hidden(
+            predictor,
+            boot_source,
+            boot_a,
+            boot_b,
+            time_emb,
+        )
+        z_abc, delta_m_abc, _ = self._predict_shortcut_hidden(
+            predictor,
+            l2_normalize_tokens(z_ab) if self.shortcut_predictor_normalize_input else z_ab,
+            boot_b,
+            boot_c,
+            time_emb,
+        )
+        teacher_predictor = shortcut_predictor_ema if shortcut_predictor_ema is not None else predictor
+        with torch.no_grad():
+            z_ac, delta_m_ac, _ = self._predict_shortcut_hidden(
+                teacher_predictor,
+                boot_source.detach(),
+                boot_a,
+                boot_c,
+                time_emb.detach(),
+            )
+        terms["shortcut_boot"] = 1.0 - self._masked_token_mean(
+            (l2_normalize_tokens(z_abc) * l2_normalize_tokens(z_ac.detach())).sum(dim=-1),
+            token_mask,
+        )
+        terms["shortcut_boot_mag"] = 0.5 * self._masked_token_mean(
+            (delta_m_ab + delta_m_abc - delta_m_ac.detach()).square(),
+            token_mask,
+        )
+
+        if (
+            self.output_distill
+            and self.lambda_output_distill > 0
+            and (int(global_step) % max(self.output_distill_every, 1)) == 0
+        ):
+            batch_size = x_t.shape[0]
+            out_batch = max(1, min(batch_size, int(round(batch_size * self.output_distill_ratio))))
+            idx = torch.randperm(batch_size, device=x_t.device)[:out_batch]
+            out_pair = sample_distinct_pairs(
+                num_hidden,
+                self.shortcut_skip_in_loop_max_gap,
+                self.shortcut_skip_in_loop_gap_loc,
+                self.shortcut_skip_in_loop_gap_sigma,
+                1,
+                pair_mode=self.output_distill_pair_mode,
+                center_sigma=self.pair_center_sigma,
+            )[0]
+            output_a, output_b = out_pair
+            z_source = hidden_stack[output_a, idx]
+            if self.output_distill_update_mode == "predictor_only":
+                z_source = z_source.detach()
+            z_hat, _, _ = self._predict_shortcut_hidden(
+                predictor,
+                z_source,
+                output_a,
+                output_b,
+                time_emb[idx].detach(),
+            )
+            subset_kwargs = self._subset_model_kwargs(model_kwargs, idx)
+            v_skip = model(
+                x_t[idx],
+                self._scale_timesteps(t[idx]),
+                resume_hidden=z_hat,
+                resume_start_layer=output_b + 1,
+                **subset_kwargs,
+            )
+            v_teacher = model_output[idx].detach()
+            reduce_dims = tuple(range(1, v_skip.ndim))
+            out_mask = subset_kwargs.get('y', {}).get('mask')
+            if out_mask is not None:
+                out_mask = out_mask.to(device=v_skip.device, dtype=v_skip.dtype)
+                numer = torch.sum(((v_skip - v_teacher) ** 2) * out_mask, dim=reduce_dims)
+                denom = torch.sum((v_teacher ** 2) * out_mask, dim=reduce_dims).clamp_min(1e-6)
+            else:
+                numer = torch.sum((v_skip - v_teacher) ** 2, dim=reduce_dims)
+                denom = torch.sum(v_teacher ** 2, dim=reduce_dims).clamp_min(1e-6)
+            terms["output_distill"] = (numer / denom).mean()
+            terms["output_distill_weighted"] = self.lambda_output_distill * terms["output_distill"]
+        else:
+            terms["output_distill"] = model_output.new_tensor(0.0)
+            terms["output_distill_weighted"] = model_output.new_tensor(0.0)
+
+        if self.private_loss_enabled and self.lambda_private > 0:
+            private_terms = private_activation_loss(
+                hidden_stack[1:],
+                max_pairs=self.private_max_pairs,
+                use_residual=self.private_use_residual,
+                cosine_mode=self.private_cosine_mode,
+                pair_mode=self.private_pair_mode,
+                token_mask=token_mask,
+            )
+            terms["private"], terms["private_common_norm"], terms["private_avg_norm"], terms["private_pairwise_cosine"] = private_terms
+        else:
+            terms["private"] = model_output.new_tensor(0.0)
+
+        terms["shortcut_loss"] = (
+            terms["shortcut_direct"]
+            + self.shortcut_lambda_boot * terms["shortcut_boot"]
+            + self.shortcut_lambda_boot_mag * terms["shortcut_boot_mag"]
+            + terms["output_distill_weighted"]
+            + self.lambda_private * terms["private"]
+        )
+        return terms
+
+    def training_losses(
+        self,
+        model,
+        x_start,
+        t,
+        model_kwargs=None,
+        noise=None,
+        dataset=None,
+        shortcut_predictor_ema=None,
+        global_step=0,
+    ):
         """
         Compute training losses for a single timestep.
 
@@ -1420,15 +1581,18 @@ class GaussianDiffusion:
                  Some mean or variance settings may also have other keys.
         """
 
-        if model_kwargs is None:
-            model_kwargs = {}
-        enc = getattr(model, 'model', model)
+        # enc = model.model._modules['module']
+        model_module = getattr(model, 'module', model)
+        enc = getattr(model_module, 'model', model_module)
         mask = model_kwargs['y']['mask']
         get_xyz = lambda sample: enc.rot2xyz(sample, mask=None, pose_rep=enc.pose_rep, translation=enc.translation,
                                              glob=enc.glob,
                                              # jointstype='vertices',  # 3.4 iter/sec # USED ALSO IN MotionCLIP
                                              jointstype='smpl',  # 3.4 iter/sec
                                              vertstrans=False)
+
+        if model_kwargs is None:
+            model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
@@ -1447,22 +1611,41 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            scaled_t = self._scale_timesteps(t)
-            shortcut_enabled = bool(
-                train_args is not None
-                and getattr(enc, 'shortcut_enabled', False)
-                and str(getattr(train_args, 'shortcut_predictor', 'none')).lower() not in {'none', 'off', 'false', '0'}
-            )
-            if shortcut_enabled:
+            hidden_states = None
+            time_emb = None
+            if self.use_depth_shortcut and getattr(model_module, 'depth_shortcut_predictor', None) is not None:
                 model_output, hidden_states, time_emb = model(
                     x_t,
-                    scaled_t,
+                    self._scale_timesteps(t),
+                    return_hidden_states=True,
                     **model_kwargs,
-                    return_hidden=True,
+                )
+                terms.update(
+                    self._depth_shortcut_losses(
+                        model,
+                        x_t,
+                        t,
+                        model_kwargs,
+                        model_output,
+                        hidden_states,
+                        time_emb,
+                        shortcut_predictor_ema=shortcut_predictor_ema,
+                        global_step=global_step,
+                    )
+                )
+            elif self.lambda_layersync > 0.:
+                model_output, layersync_features = model(
+                    x_t,
+                    self._scale_timesteps(t),
+                    return_layersync_features=self.layersync_layers,
+                    **model_kwargs,
+                )
+                terms["layersync"], terms["layersync_cosine"] = self.layersync_loss(
+                    layersync_features,
+                    model_kwargs['y'].get('mask'),
                 )
             else:
-                model_output = model(x_t, scaled_t, **model_kwargs)
-                hidden_states, time_emb = None, None
+                model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1549,24 +1732,9 @@ class GaussianDiffusion:
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
                             (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
                             (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
-                            (self.lambda_fc * terms.get('fc', 0.))
-
-            if shortcut_enabled:
-                shortcut_total, shortcut_terms = _depth_shortcut_training_losses(
-                    enc,
-                    x_t,
-                    scaled_t,
-                    model_kwargs,
-                    model_output,
-                    hidden_states,
-                    time_emb,
-                    train_args,
-                    predictor_ema,
-                    global_step,
-                )
-                terms["loss"] = terms["loss"] + shortcut_total
-                for name, value in shortcut_terms.items():
-                    terms[name] = _loss_vec(value, terms["rot_mse"])
+                            (self.lambda_fc * terms.get('fc', 0.)) + \
+                            (self.lambda_layersync * terms.get('layersync', 0.)) + \
+                            terms.get('shortcut_loss', 0.)
 
         else:
             raise NotImplementedError(self.loss_type)

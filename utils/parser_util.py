@@ -4,6 +4,31 @@ import os
 import json
 
 
+def _parse_csv_ints(value):
+    if value in [None, '']:
+        return []
+    if isinstance(value, list):
+        return value
+    steps = []
+    for item in value.split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item.endswith('k'):
+            steps.append(int(float(item[:-1]) * 1000))
+        else:
+            steps.append(int(item))
+    return steps
+
+
+def _parse_csv_strings(value):
+    if value in [None, '']:
+        return []
+    if isinstance(value, list):
+        return value
+    return [item.strip().lower() for item in value.split(',') if item.strip()]
+
+
 def parse_and_load_from_model(parser):
     # args according to the loaded model
     # do not try to specify them from cmd line since they will be overwritten
@@ -47,10 +72,59 @@ def apply_rules(args):
     # For prefix completion
     if args.pred_len == 0:
         args.pred_len = args.context_len
+    if hasattr(args, 'model_size') and args.model_size:
+        if args.model_size.upper() == 'B':
+            args.latent_dim = 512
+            args.layers = 8
+        else:
+            raise ValueError(f'Unsupported --model-size for MDM: {args.model_size}')
+    if hasattr(args, 'epochs') and args.epochs is not None and hasattr(args, 'steps_per_epoch') and args.steps_per_epoch is not None:
+        args.num_steps = int(args.epochs) * int(args.steps_per_epoch)
 
     # For target conditioning
     if args.lambda_target_loc > 0.:
         args.multi_target_cond = True
+    if hasattr(args, 'lambda_layersync'):
+        if args.lambda_layersync < 0.:
+            raise ValueError('--lambda_layersync must be non-negative.')
+        if args.layersync_weak_layer <= 0 or args.layersync_strong_layer <= 0:
+            raise ValueError('--layersync_weak_layer and --layersync_strong_layer must be positive.')
+        if args.layersync_weak_layer >= args.layersync_strong_layer:
+            raise ValueError('--layersync_weak_layer must be smaller than --layersync_strong_layer.')
+        if hasattr(args, 'layers') and args.layersync_strong_layer > args.layers:
+            raise ValueError('--layersync_strong_layer must be <= --layers.')
+    if hasattr(args, 'eval_steps'):
+        args.eval_steps = _parse_csv_ints(args.eval_steps)
+        if any(step <= 0 for step in args.eval_steps):
+            raise ValueError('--eval_steps must contain positive training steps.')
+    if hasattr(args, 'eval_metrics'):
+        args.eval_metrics = _parse_csv_strings(args.eval_metrics)
+    if hasattr(args, 'shortcut_predictor'):
+        args.shortcut_predictor = args.shortcut_predictor.replace("-", "_")
+        if args.shortcut_predictor not in {"hybrid_mdm_10", "default"}:
+            args.use_depth_shortcut = True
+    if hasattr(args, 'shortcut_mag_scale') and args.shortcut_mag_scale <= 0:
+        raise ValueError('--shortcut-mag-scale must be positive.')
+    if hasattr(args, 'shortcut_mag_abs_scale') and args.shortcut_mag_abs_scale <= 0:
+        raise ValueError('--shortcut-mag-abs-scale must be positive.')
+    if hasattr(args, 'shortcut_mag_clip_min') and args.shortcut_mag_clip_min >= args.shortcut_mag_clip_max:
+        raise ValueError('--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max.')
+    if hasattr(args, 'shortcut_skip_in_loop_gap_sigma') and args.shortcut_skip_in_loop_gap_sigma <= 0:
+        raise ValueError('--shortcut-skip-in-loop-gap-sigma must be positive.')
+    if hasattr(args, 'timestep_logit_std') and args.timestep_logit_std <= 0:
+        raise ValueError('--timestep-logit-std must be positive.')
+    if hasattr(args, 'pair_center_sigma') and args.pair_center_sigma < 0:
+        raise ValueError('--pair-center-sigma must be non-negative.')
+    if hasattr(args, 'output_distill_ratio') and not 0.0 <= args.output_distill_ratio <= 1.0:
+        raise ValueError('--output-distill-ratio must be between 0 and 1.')
+    if hasattr(args, 'lambda_output_distill') and args.lambda_output_distill < 0:
+        raise ValueError('--lambda-output-distill must be non-negative.')
+    if hasattr(args, 'output_distill_every') and args.output_distill_every <= 0:
+        raise ValueError('--output-distill-every must be positive.')
+    if hasattr(args, 'direct_num_pairs') and args.direct_num_pairs != args.direct_joint_pairs + args.direct_predictor_only_pairs:
+        raise ValueError('--direct-num-pairs must equal --direct-joint-pairs + --direct-predictor-only-pairs.')
+    if hasattr(args, 'private_loss') and args.private_loss and args.lambda_private <= 0:
+        raise ValueError('--private-loss requires --lambda-private > 0.')
     return args
 
 
@@ -76,7 +150,7 @@ def add_base_options(parser):
     group.add_argument("--cuda", default=True, type=bool, help="Use cuda device, otherwise use CPU.")
     group.add_argument("--device", default=0, type=int, help="Device id to use.")
     group.add_argument("--seed", default=10, type=int, help="For fixing random seed.")
-    group.add_argument("--batch_size", default=64, type=int, help="Batch size during training.")
+    group.add_argument("--batch_size", "--batch-size", default=64, type=int, help="Batch size during training.")
     group.add_argument("--train_platform_type", default='NoPlatform', choices=['NoPlatform', 'ClearmlPlatform', 'TensorboardPlatform', 'WandBPlatform'], type=str,
                        help="Choose platform to log results. NoPlatform means no logging.")
     group.add_argument("--external_mode", default=False, type=bool, help="For backward cometability, do not change or delete.")
@@ -105,6 +179,8 @@ def add_model_options(parser):
                        help="Number of layers.")
     group.add_argument("--latent_dim", default=512, type=int,
                        help="Transformer/GRU width.")
+    group.add_argument("--model-size", dest="model_size", default=None,
+                       help="Compatibility alias for Self-Flow settings. Currently B maps to latent_dim=512,layers=8.")
     group.add_argument("--cond_mask_prob", default=.1, type=float,
                        help="The probability of masking the condition during training."
                             " For classifier-free guidance learning.")
@@ -113,6 +189,12 @@ def add_model_options(parser):
     group.add_argument("--lambda_vel", default=0.0, type=float, help="Joint velocity loss.")
     group.add_argument("--lambda_fc", default=0.0, type=float, help="Foot contact loss.")
     group.add_argument("--lambda_target_loc", default=0.0, type=float, help="For HumanML only, when . L2 with target location.")
+    group.add_argument("--lambda_layersync", default=0.0, type=float,
+                       help="Weight for direct LayerSync cosine alignment between intermediate transformer layers.")
+    group.add_argument("--layersync_weak_layer", default=3, type=int,
+                       help="1-based shallow transformer layer used by LayerSync.")
+    group.add_argument("--layersync_strong_layer", default=6, type=int,
+                       help="1-based deeper transformer layer used by LayerSync.")
     group.add_argument("--unconstrained", action='store_true',
                        help="Model is trained unconditionally. That is, it is constrained by neither text nor action. "
                             "Currently tested on HumanAct12 only.")
@@ -120,6 +202,24 @@ def add_model_options(parser):
                        help="Pose embedding max length.")
     group.add_argument("--use_ema", action='store_true',
                     help="If True, will use EMA model averaging.")
+    group.add_argument("--use_depth_shortcut", "--use-depth-shortcut", dest="use_depth_shortcut",
+                       action='store_true', default=False,
+                       help="Enable MDM depth shortcut predictor and auxiliary training losses.")
+    group.add_argument("--no-use-depth-shortcut", dest="use_depth_shortcut", action='store_false',
+                       help="Disable MDM depth shortcut predictor.")
+    group.add_argument("--shortcut-predictor", dest="shortcut_predictor", default="hybrid_mdm_10",
+                       choices=["hybrid_mdm_10", "hybrid-mdm-10", "hybrid_mdm_8", "hybrid-mdm-8", "hybrid_deep_10", "hybrid-deep-10", "hybrid_deep_12pct", "hybrid-deep-12pct", "hybrid", "default"],
+                       help="Depth shortcut predictor variant. Default is a hybrid 1D MDM predictor sized around 10-12%% of MDM-B.")
+    group.add_argument("--shortcut-predictor-use-timestep", dest="shortcut_predictor_use_timestep",
+                       action='store_true', default=True,
+                       help="Condition the shortcut predictor on the MDM timestep embedding.")
+    group.add_argument("--no-shortcut-predictor-use-timestep", dest="shortcut_predictor_use_timestep",
+                       action='store_false')
+    group.add_argument("--shortcut-predictor-normalize-input", dest="shortcut_predictor_normalize_input",
+                       action='store_true', default=False,
+                       help="Feed normalized hidden directions into the shortcut predictor.")
+    group.add_argument("--no-shortcut-predictor-normalize-input", dest="shortcut_predictor_normalize_input",
+                       action='store_false')
     
 
     group.add_argument("--multi_target_cond", action='store_true', help="If true, enable multi-target conditioning (aka Sigal's model).")
@@ -144,12 +244,12 @@ def add_data_options(parser):
 
 def add_training_options(parser):
     group = parser.add_argument_group('training')
-    group.add_argument("--save_dir", required=True, type=str,
+    group.add_argument("--save_dir", "--save-dir", "--ckpt-dir", dest="save_dir", required=True, type=str,
                        help="Path to save checkpoints and results.")
     group.add_argument("--overwrite", action='store_true',
                        help="If True, will enable to use an already existing save_dir.")
-    group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
-    group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
+    group.add_argument("--lr", "--learning-rate", dest="lr", default=1e-4, type=float, help="Learning rate.")
+    group.add_argument("--weight_decay", "--weight-decay", dest="weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
     group.add_argument("--lr_anneal_steps", default=0, type=int, help="Number of learning rate anneal steps.")
     group.add_argument("--eval_batch_size", default=32, type=int,
                        help="Batch size during evaluation loop. Do not change this unless you know what you are doing. "
@@ -162,15 +262,27 @@ def add_training_options(parser):
                        help="Number of repetitions for evaluation loop during training.")
     group.add_argument("--eval_num_samples", default=1_000, type=int,
                        help="If -1, will use all samples in the specified split.")
-    group.add_argument("--log_interval", default=1_000, type=int,
+    group.add_argument("--eval_steps", default="", type=str,
+                       help="Comma-separated exact training steps to run validation, e.g. 50000,100000,200000.")
+    group.add_argument("--eval_metrics", default="all", type=str,
+                       help=(
+                           "Comma-separated validation metrics. For MDM, supported metrics are fid and precision "
+                           "(HumanML/KIT precision maps to R_precision). Image metrics sfid, inception_score, "
+                           "and recall are accepted but skipped because MDM has no native implementation."
+                       ))
+    group.add_argument("--log_interval", "--log-freq", dest="log_interval", default=1_000, type=int,
                        help="Log losses each N steps")
-    group.add_argument("--save_interval", default=50_000, type=int,
+    group.add_argument("--save_interval", "--eval-freq", dest="save_interval", default=50_000, type=int,
                        help="Save checkpoints and run evaluation each N steps")
     group.add_argument("--num_steps", default=600_000, type=int,
                        help="Training will stop after the specified number of steps.")
+    group.add_argument("--epochs", default=None, type=int,
+                       help="Compatibility alias: with --steps-per-epoch, sets --num_steps.")
+    group.add_argument("--steps-per-epoch", dest="steps_per_epoch", default=None, type=int,
+                       help="Compatibility alias: with --epochs, sets --num_steps.")
     group.add_argument("--num_frames", default=60, type=int,
                        help="Limit for the maximal number of frames. In HumanML3D and KIT this field is ignored.")
-    group.add_argument("--resume_checkpoint", default="", type=str,
+    group.add_argument("--resume_checkpoint", default="", nargs='?', const="", type=str,
                        help="If not empty, will start from the specified checkpoint (path to model###.pt file).")
     
     group.add_argument("--gen_during_training", action='store_true',
@@ -184,73 +296,59 @@ def add_training_options(parser):
     
     group.add_argument("--avg_model_beta", default=0.9999, type=float, help="Average model beta (for EMA).")
     group.add_argument("--adam_beta2", default=0.999, type=float, help="Adam beta2.")
+    group.add_argument("--shortcut-training-mode", default="direction-magnitude",
+                       choices=["direction", "direction-magnitude"],
+                       help="Depth shortcut loss preset. direction-magnitude is the default.")
+    group.add_argument("--shortcut-lambda-dir", type=float, default=1.0)
+    group.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
+    group.add_argument("--shortcut-lambda-mag", type=float, default=0.375)
+    group.add_argument("--shortcut-lambda-boot-mag", type=float, default=0.1875)
+    group.add_argument("--shortcut-bootstrap-detach-source", action='store_true', default=True)
+    group.add_argument("--no-shortcut-bootstrap-detach-source", dest="shortcut_bootstrap_detach_source", action='store_false')
+    group.add_argument("--shortcut-mag-scale", type=float, default=3.0)
+    group.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
+    group.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
+    group.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
+    group.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
+    group.add_argument("--shortcut-skip-in-loop-max-gap", type=int, default=10)
+    group.add_argument("--shortcut-skip-in-loop-gap-loc", type=float, default=3.0)
+    group.add_argument("--shortcut-skip-in-loop-gap-sigma", type=float, default=2.0)
+    group.add_argument("--timestep-sampling-mode", default="uniform", choices=["uniform", "logit_normal"])
+    group.add_argument("--timestep-logit-mean", type=float, default=0.0)
+    group.add_argument("--timestep-logit-std", type=float, default=1.0)
+    group.add_argument("--predictor-learning-rate", "--shortcut-predictor-lr", dest="shortcut_predictor_lr",
+                       default=1e-4, type=float)
+    group.add_argument("--shortcut-predictor-weight-decay", default=0.1, type=float)
+    group.add_argument("--shortcut-predictor-ema-decay", default=0.999, type=float)
+    group.add_argument("--output-distill", dest="output_distill", action='store_true', default=True)
+    group.add_argument("--no-output-distill", dest="output_distill", action='store_false')
+    group.add_argument("--output-distill-ratio", type=float, default=0.10)
+    group.add_argument("--lambda-output-distill", type=float, default=0.05)
+    group.add_argument("--output-distill-every", type=int, default=1)
+    group.add_argument("--output-distill-update-mode", default="predictor_plus_all",
+                       choices=["predictor_plus_all", "predictor_only"])
+    group.add_argument("--output-distill-pair-mode", default="trunc_normal",
+                       choices=["trunc_normal", "trunc_normal_centered", "uniform", "random"])
+    group.add_argument("--direct-pair-mode", default="trunc_normal",
+                       choices=["trunc_normal", "trunc_normal_centered", "uniform", "random"])
+    group.add_argument("--pair-center-sigma", type=float, default=0.0)
+    group.add_argument("--direct-num-pairs", type=int, default=1)
+    group.add_argument("--direct-joint-pairs", type=int, default=1)
+    group.add_argument("--direct-predictor-only-pairs", type=int, default=0)
+    group.add_argument("--private-loss", dest="private_loss", action='store_true', default=True)
+    group.add_argument("--no-private-loss", dest="private_loss", action='store_false')
+    group.add_argument("--lambda-private", type=float, default=1.0)
+    group.add_argument("--private-max-pairs", type=int, default=4)
+    group.add_argument("--private-use-residual", dest="private_use_residual", action='store_true', default=True)
+    group.add_argument("--no-private-use-residual", dest="private_use_residual", action='store_false')
+    group.add_argument("--private-cosine-mode", default="bnd", choices=["bnd", "nd", "token"])
+    group.add_argument("--private-pair-mode", default="random", choices=["first", "random"])
     
     group.add_argument("--target_joint_names", default='DIMP_FINAL', type=str, help="Force single joint configuration by specifing the joints (coma separated). If None - will use the random mode for all end effectors.")
     group.add_argument("--autoregressive", action='store_true', help="If true, and we use a prefix model will generate motions in an autoregressive loop.")
     group.add_argument("--autoregressive_include_prefix", action='store_true', help="If true, include the init prefix in the output, otherwise, will drop it.")
     group.add_argument("--autoregressive_init", default='data', type=str, choices=['data', 'isaac'], 
                         help="Sets the source of the init frames, either from the dataset or isaac init poses.")
-
-    group = parser.add_argument_group('depth shortcut')
-    group.add_argument("--shortcut_predictor", "--shortcut-predictor", default='none', type=str,
-                       help="Enable depth shortcut training with a predictor variant, e.g. hybrid_deep_12pct.")
-    group.add_argument("--shortcut_predictor_lr", "--shortcut-predictor-learning-rate", "--predictor-learning-rate",
-                       default=1e-4, type=float, help="Learning rate for the depth shortcut predictor parameter group.")
-    group.add_argument("--shortcut_predictor_weight_decay", "--shortcut-predictor-weight-decay",
-                       default=0.1, type=float, help="AdamW weight decay for the shortcut predictor parameter group.")
-    group.add_argument("--shortcut_training_mode", "--shortcut-training-mode", default='direction-magnitude',
-                       choices=['direction-magnitude', 'direction_magnitude'], type=str)
-    group.add_argument("--shortcut_lambda_dir", "--shortcut-lambda-dir", default=1.0, type=float)
-    group.add_argument("--shortcut_lambda_boot", "--shortcut-lambda-boot", default=0.25, type=float)
-    group.add_argument("--shortcut_lambda_mag", "--shortcut-lambda-mag", default=0.375, type=float)
-    group.add_argument("--shortcut_lambda_boot_mag", "--shortcut-lambda-boot-mag", default=0.1875, type=float)
-    group.add_argument("--shortcut_mag_scale", "--shortcut-mag-scale", default=2.2, type=float)
-    group.add_argument("--shortcut_mag_abs_center", "--shortcut-mag-abs-center", default=2.9, type=float)
-    group.add_argument("--shortcut_mag_abs_scale", "--shortcut-mag-abs-scale", default=0.6, type=float)
-    group.add_argument("--shortcut_mag_clip_min", "--shortcut-mag-clip-min", default=0.8, type=float)
-    group.add_argument("--shortcut_mag_clip_max", "--shortcut-mag-clip-max", default=3.5, type=float)
-    group.add_argument("--shortcut_skip_in_loop_max_gap", "--shortcut-skip-in-loop-max-gap", default=7, type=int)
-    group.add_argument("--shortcut_skip_in_loop_gap_loc", "--shortcut-skip-in-loop-gap-loc", default=2.0, type=float)
-    group.add_argument("--shortcut_skip_in_loop_gap_sigma", "--shortcut-skip-in-loop-gap-sigma", default=1.5, type=float)
-    group.add_argument("--shortcut_bootstrap_detach_source", "--shortcut-bootstrap-detach-source", action='store_true')
-    group.add_argument("--shortcut_predictor_use_timestep", "--shortcut-predictor-use-timestep", action='store_true', default=True)
-    group.add_argument("--no_shortcut_predictor_use_timestep", "--no-shortcut-predictor-use-timestep",
-                       action='store_false', dest='shortcut_predictor_use_timestep')
-    group.add_argument("--shortcut_predictor_normalize_input", "--shortcut-predictor-normalize-input",
-                       action='store_true', default=True)
-    group.add_argument("--no_shortcut_predictor_normalize_input", "--no-shortcut-predictor-normalize-input",
-                       action='store_false', dest='shortcut_predictor_normalize_input')
-    group.add_argument("--shortcut_predictor_use_class_input", "--shortcut-predictor-use-class-input",
-                       action='store_true', help="Accepted for CLI compatibility; MDM has no ImageNet class token.")
-    group.add_argument("--shortcut_predictor_class_fusion", "--shortcut-predictor-class-fusion", default='add', type=str)
-    group.add_argument("--shortcut_predictor_ema_decay", "--shortcut-predictor-ema-decay", default=0.999, type=float)
-    group.add_argument("--timestep_sampling_mode", "--timestep-sampling-mode", default='uniform',
-                       choices=['uniform', 'logit_normal'], type=str)
-    group.add_argument("--timestep_logit_mean", "--timestep-logit-mean", default=0.0, type=float)
-    group.add_argument("--timestep_logit_std", "--timestep-logit-std", default=1.0, type=float)
-    group.add_argument("--output_distill", "--output-distill", action='store_true')
-    group.add_argument("--output_distill_ratio", "--output-distill-ratio", default=0.10, type=float)
-    group.add_argument("--lambda_output_distill", "--lambda-output-distill", default=0.05, type=float)
-    group.add_argument("--output_distill_every", "--output-distill-every", default=1, type=int)
-    group.add_argument("--output_distill_update_mode", "--output-distill-update-mode", default='predictor_plus_all',
-                       choices=['predictor_only', 'predictor_plus_downstream', 'predictor_plus_all',
-                                'predictor_only_then_all'], type=str)
-    group.add_argument("--output_distill_pair_mode", "--output-distill-pair-mode", default='trunc_normal_centered', type=str)
-    group.add_argument("--direct_pair_mode", "--direct-pair-mode", default='trunc_normal_centered', type=str)
-    group.add_argument("--pair_center_sigma", "--pair-center-sigma", default=1.3, type=float)
-    group.add_argument("--direct_num_pairs", "--direct-num-pairs", default=1, type=int)
-    group.add_argument("--direct_joint_pairs", "--direct-joint-pairs", default=1, type=int)
-    group.add_argument("--direct_predictor_only_pairs", "--direct-predictor-only-pairs", default=0, type=int)
-    group.add_argument("--private_loss", "--private-loss", action='store_true')
-    group.add_argument("--lambda_private", "--lambda-private", default=1.0, type=float)
-    group.add_argument("--private_max_pairs", "--private-max-pairs", default=4, type=int)
-    group.add_argument("--private_use_residual", "--private-use-residual", action='store_true', default=True)
-    group.add_argument("--no_private_use_residual", "--no-private-use-residual", action='store_false',
-                       dest='private_use_residual')
-    group.add_argument("--private_cosine_mode", "--private-cosine-mode", default='bnd',
-                       choices=['bnd', 'nd', 'token'], type=str)
-    group.add_argument("--private_pair_mode", "--private-pair-mode", default='random',
-                       choices=['first', 'random'], type=str)
 
 
 def add_sampling_options(parser):

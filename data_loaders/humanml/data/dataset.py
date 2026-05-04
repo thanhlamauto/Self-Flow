@@ -771,6 +771,12 @@ class HumanML3D(data.Dataset):
         opt.data_root = pjoin(abs_base_path, opt.data_root)
         opt.save_root = pjoin(abs_base_path, opt.save_root)
         opt.meta_dir = pjoin(abs_base_path, './dataset')
+        data_dir = kwargs.get('data_dir', '')
+        if data_dir:
+            data_dir = data_dir if os.path.isabs(data_dir) else pjoin(abs_base_path, data_dir)
+            opt.data_root = data_dir
+            opt.motion_dir = pjoin(data_dir, 'new_joint_vecs')
+            opt.text_dir = pjoin(data_dir, 'texts')
         opt.use_cache = kwargs.get('use_cache', True)
         opt.fixed_len = kwargs.get('fixed_len', 0)
         if opt.fixed_len > 0:

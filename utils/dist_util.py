@@ -3,6 +3,7 @@ Helpers for distributed training.
 """
 
 import socket
+import os
 
 import torch as th
 import torch.distributed as dist
@@ -20,9 +21,18 @@ def setup_dist(device=0):
     Setup a distributed process group.
     """
     global used_device
-    used_device = device
     if dist.is_initialized():
         return
+    if "LOCAL_RANK" in os.environ:
+        used_device = int(os.environ["LOCAL_RANK"])
+        if th.cuda.is_available():
+            th.cuda.set_device(used_device)
+        backend = "nccl" if th.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+    else:
+        used_device = device
+        if th.cuda.is_available() and used_device >= 0:
+            th.cuda.set_device(used_device)
     # os.environ["CUDA_VISIBLE_DEVICES"] = str(device) # f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
 
     # comm = MPI.COMM_WORLD
@@ -49,6 +59,31 @@ def dev():
     if th.cuda.is_available() and used_device>=0:
         return th.device(f"cuda:{used_device}")
     return th.device("cpu")
+
+
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def barrier():
+    if is_dist_avail_and_initialized():
+        dist.barrier()
 
 
 def load_state_dict(path, **kwargs):
