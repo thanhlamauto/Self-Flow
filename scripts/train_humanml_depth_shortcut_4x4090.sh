@@ -36,6 +36,9 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --shortcut-mag-abs-scale 0.6 \
   --shortcut-mag-clip-min 0.8 \
   --shortcut-mag-clip-max 3.5 \
+  --shortcut-skip-in-loop-prob 0.0 \
+  --shortcut-lambda-skip-fm 0.0 \
+  --shortcut-skip-in-loop-gap-mode truncated-normal \
   --shortcut-skip-in-loop-max-gap 7 \
   --shortcut-skip-in-loop-gap-loc 2.0 \
   --shortcut-skip-in-loop-gap-sigma 1.5 \
@@ -61,6 +64,7 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --private-use-residual \
   --private-cosine-mode bnd \
   --private-pair-mode random \
+  --fid-skip-timestep-mode alternate \
   --timestep-sampling-mode logit_normal \
   --timestep-logit-mean 0.0 \
   --timestep-logit-std 1.0 \

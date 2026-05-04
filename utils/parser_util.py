@@ -109,6 +109,12 @@ def apply_rules(args):
         raise ValueError('--shortcut-mag-abs-scale must be positive.')
     if hasattr(args, 'shortcut_mag_clip_min') and args.shortcut_mag_clip_min >= args.shortcut_mag_clip_max:
         raise ValueError('--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max.')
+    if hasattr(args, 'shortcut_lambda_skip_fm') and args.shortcut_lambda_skip_fm < 0:
+        raise ValueError('--shortcut-lambda-skip-fm must be non-negative.')
+    if hasattr(args, 'shortcut_skip_in_loop_prob') and not 0.0 <= args.shortcut_skip_in_loop_prob <= 1.0:
+        raise ValueError('--shortcut-skip-in-loop-prob must be between 0 and 1.')
+    if hasattr(args, 'shortcut_skip_in_loop_gap_mode') and args.shortcut_skip_in_loop_gap_mode == 'trunc_normal':
+        args.shortcut_skip_in_loop_gap_mode = 'truncated-normal'
     if hasattr(args, 'shortcut_skip_in_loop_gap_sigma') and args.shortcut_skip_in_loop_gap_sigma <= 0:
         raise ValueError('--shortcut-skip-in-loop-gap-sigma must be positive.')
     if hasattr(args, 'timestep_logit_std') and args.timestep_logit_std <= 0:
@@ -310,6 +316,13 @@ def add_training_options(parser):
     group.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
     group.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
     group.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
+    group.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0,
+                       help="Compatibility flag from the JAX shortcut run. MDM keeps skip-FM disabled.")
+    group.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0,
+                       help="Compatibility flag from the JAX shortcut run. MDM keeps skip-FM disabled.")
+    group.add_argument("--shortcut-skip-in-loop-gap-mode", default="truncated-normal",
+                       choices=["fixed", "truncated-normal", "trunc_normal"],
+                       help="Compatibility flag for disabled skip-FM scheduling.")
     group.add_argument("--shortcut-skip-in-loop-max-gap", type=int, default=10)
     group.add_argument("--shortcut-skip-in-loop-gap-loc", type=float, default=3.0)
     group.add_argument("--shortcut-skip-in-loop-gap-sigma", type=float, default=2.0)
@@ -343,6 +356,12 @@ def add_training_options(parser):
     group.add_argument("--no-private-use-residual", dest="private_use_residual", action='store_false')
     group.add_argument("--private-cosine-mode", default="bnd", choices=["bnd", "nd", "token"])
     group.add_argument("--private-pair-mode", default="random", choices=["first", "random"])
+    group.add_argument("--fid-skip-timestep-mode", default="alternate", choices=["alternate", "all"],
+                       help="Accepted for ImageNet shortcut command compatibility; HumanML eval ignores it.")
+    group.add_argument("--shortcut-predictor-use-class-input", action='store_true', default=False,
+                       help="Accepted for ImageNet shortcut command compatibility; ignored by text-conditioned MDM.")
+    group.add_argument("--shortcut-predictor-class-fusion", default="add", choices=["add", "concat"],
+                       help="Accepted for ImageNet shortcut command compatibility; ignored by text-conditioned MDM.")
     
     group.add_argument("--target_joint_names", default='DIMP_FINAL', type=str, help="Force single joint configuration by specifing the joints (coma separated). If None - will use the random mode for all end effectors.")
     group.add_argument("--autoregressive", action='store_true', help="If true, and we use a prefix model will generate motions in an autoregressive loop.")
