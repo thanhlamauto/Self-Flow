@@ -210,6 +210,10 @@ class MixedPrecisionTrainer:
         grad_norm, param_norm = self._compute_norms()
         logger.logkv_mean("grad_norm", grad_norm)
         logger.logkv_mean("param_norm", param_norm)
+        if check_overflow(grad_norm) or check_overflow(param_norm):
+            logger.log("Found NaN/Inf in gradients or parameters; skipping optimizer step.")
+            zero_master_grads(self.master_params)
+            return False
         opt.step()
         return True
 

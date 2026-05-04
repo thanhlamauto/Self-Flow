@@ -1541,29 +1541,47 @@ class GaussianDiffusion:
                 time_emb[idx].detach(),
                 key_padding_mask=subset_key_padding_mask,
             )
-            subset_kwargs = self._subset_model_kwargs(model_kwargs, idx)
-            v_skip = model(
-                x_t[idx],
-                self._scale_timesteps(t[idx]),
-                resume_hidden=z_hat,
-                resume_start_layer=output_b + 1,
-                **subset_kwargs,
-            )
-            v_teacher = model_output[idx].detach()
-            reduce_dims = tuple(range(1, v_skip.ndim))
-            out_mask = subset_kwargs.get('y', {}).get('mask')
-            if out_mask is not None:
-                out_mask = out_mask.to(device=v_skip.device, dtype=v_skip.dtype)
-                numer = torch.sum(((v_skip - v_teacher) ** 2) * out_mask, dim=reduce_dims)
-                denom = torch.sum((v_teacher ** 2) * out_mask, dim=reduce_dims).clamp_min(1e-6)
+            if not torch.isfinite(z_hat).all().item():
+                terms["output_distill"] = model_output.new_tensor(0.0)
+                terms["output_distill_weighted"] = model_output.new_tensor(0.0)
+                terms["output_distill_nonfinite"] = model_output.new_tensor(1.0)
             else:
-                numer = torch.sum((v_skip - v_teacher) ** 2, dim=reduce_dims)
-                denom = torch.sum(v_teacher ** 2, dim=reduce_dims).clamp_min(1e-6)
-            terms["output_distill"] = (numer / denom).mean()
-            terms["output_distill_weighted"] = self.lambda_output_distill * terms["output_distill"]
+                subset_kwargs = self._subset_model_kwargs(model_kwargs, idx)
+                v_skip = model(
+                    x_t[idx],
+                    self._scale_timesteps(t[idx]),
+                    resume_hidden=z_hat,
+                    resume_start_layer=output_b + 1,
+                    **subset_kwargs,
+                )
+                v_teacher = model_output[idx].detach()
+                if not torch.isfinite(v_skip).all().item() or not torch.isfinite(v_teacher).all().item():
+                    terms["output_distill"] = model_output.new_tensor(0.0)
+                    terms["output_distill_weighted"] = model_output.new_tensor(0.0)
+                    terms["output_distill_nonfinite"] = model_output.new_tensor(1.0)
+                else:
+                    reduce_dims = tuple(range(1, v_skip.ndim))
+                    out_mask = subset_kwargs.get('y', {}).get('mask')
+                    if out_mask is not None:
+                        out_mask = out_mask.to(device=v_skip.device, dtype=v_skip.dtype)
+                        numer = torch.sum(((v_skip - v_teacher) ** 2) * out_mask, dim=reduce_dims)
+                        denom = torch.sum((v_teacher ** 2) * out_mask, dim=reduce_dims).clamp_min(1e-6)
+                    else:
+                        numer = torch.sum((v_skip - v_teacher) ** 2, dim=reduce_dims)
+                        denom = torch.sum(v_teacher ** 2, dim=reduce_dims).clamp_min(1e-6)
+                    output_distill = (numer / denom).mean()
+                    if not torch.isfinite(output_distill).item():
+                        terms["output_distill"] = model_output.new_tensor(0.0)
+                        terms["output_distill_weighted"] = model_output.new_tensor(0.0)
+                        terms["output_distill_nonfinite"] = model_output.new_tensor(1.0)
+                    else:
+                        terms["output_distill"] = output_distill
+                        terms["output_distill_weighted"] = self.lambda_output_distill * output_distill
+                        terms["output_distill_nonfinite"] = model_output.new_tensor(0.0)
         else:
             terms["output_distill"] = model_output.new_tensor(0.0)
             terms["output_distill_weighted"] = model_output.new_tensor(0.0)
+            terms["output_distill_nonfinite"] = model_output.new_tensor(0.0)
 
         if self.private_loss_enabled and self.lambda_private > 0:
             private_token_mask = self._motion_token_mask(token_mask, hidden_stack)

@@ -70,6 +70,7 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --timestep-logit-std 1.0 \
   --batch_size 16 \
   --lr 1e-4 \
+  --grad-clip 1.0 \
   --weight_decay 0.1 \
   --lr_anneal_steps 0 \
   --num_steps 200000 \

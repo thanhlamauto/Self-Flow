@@ -64,6 +64,7 @@ class TrainLoop:
         self.use_fp16 = False  # deprecating this option
         self.fp16_scale_growth = 1e-3  # deprecating this option
         self.weight_decay = args.weight_decay
+        self.grad_clip = float(getattr(args, 'grad_clip', 1.0))
         self.lr_anneal_steps = args.lr_anneal_steps
 
         self.step = 0
@@ -345,8 +346,21 @@ class TrainLoop:
 
 
     def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
-        self.mp_trainer.optimize(self.opt)
+        did_backward = self.forward_backward(batch, cond)
+        if not did_backward:
+            self.mp_trainer.zero_grad()
+            self.log_step()
+            return
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.mp_trainer.master_params,
+                self.grad_clip,
+                error_if_nonfinite=False,
+            )
+        stepped = self.mp_trainer.optimize(self.opt)
+        if not stepped:
+            self.log_step()
+            return
         self.update_average_model()
         self._anneal_lr()
         self.log_step()
@@ -406,10 +420,14 @@ class TrainLoop:
                 )
 
             loss = (losses["loss"] * weights).mean()
+            if not torch.isfinite(loss):
+                logger.logkv_mean("nonfinite_loss_skipped", 1.0)
+                return False
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
             self.mp_trainer.backward(loss)
+        return True
 
     def _sample_timesteps(self, batch_size):
         mode = getattr(self.args, 'timestep_sampling_mode', 'uniform')
