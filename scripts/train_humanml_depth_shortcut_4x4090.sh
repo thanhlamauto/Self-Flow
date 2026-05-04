@@ -60,7 +60,7 @@ torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
   --direct-predictor-only-pairs 0 \
   --private-loss \
   --lambda-private 1.0 \
-  --private-max-pairs 4 \
+  --private-max-pairs 2 \
   --private-use-residual \
   --private-cosine-mode bnd \
   --private-pair-mode random \

@@ -153,7 +153,7 @@ def create_gaussian_diffusion(args):
         direct_predictor_only_pairs=getattr(args, 'direct_predictor_only_pairs', 0),
         private_loss=getattr(args, 'private_loss', True),
         lambda_private=getattr(args, 'lambda_private', 1.0),
-        private_max_pairs=getattr(args, 'private_max_pairs', 4),
+        private_max_pairs=getattr(args, 'private_max_pairs', 2),
         private_use_residual=getattr(args, 'private_use_residual', True),
         private_cosine_mode=getattr(args, 'private_cosine_mode', 'bnd'),
         private_pair_mode=getattr(args, 'private_pair_mode', 'random'),

@@ -177,7 +177,7 @@ class GaussianDiffusion:
         direct_predictor_only_pairs=0,
         private_loss=True,
         lambda_private=1.0,
-        private_max_pairs=4,
+        private_max_pairs=2,
         private_use_residual=True,
         private_cosine_mode="bnd",
         private_pair_mode="random",

@@ -351,7 +351,7 @@ def add_training_options(parser):
     group.add_argument("--private-loss", dest="private_loss", action='store_true', default=True)
     group.add_argument("--no-private-loss", dest="private_loss", action='store_false')
     group.add_argument("--lambda-private", type=float, default=1.0)
-    group.add_argument("--private-max-pairs", type=int, default=4)
+    group.add_argument("--private-max-pairs", type=int, default=2)
     group.add_argument("--private-use-residual", dest="private_use_residual", action='store_true', default=True)
     group.add_argument("--no-private-use-residual", dest="private_use_residual", action='store_false')
     group.add_argument("--private-cosine-mode", default="bnd", choices=["bnd", "nd", "token"])
