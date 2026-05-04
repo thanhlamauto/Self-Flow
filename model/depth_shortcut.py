@@ -21,7 +21,7 @@ def build_predictor_source(hidden, normalize_input=True, eps=1e-6):
     return (directions if normalize_input else hidden.float()), magnitudes
 
 
-def magnitude_input_features(m_source, abs_center=5.5, abs_scale=1.5, key_padding_mask=None, eps=1e-6):
+def magnitude_input_features(m_source, abs_center=2.9, abs_scale=0.6, key_padding_mask=None, eps=1e-6):
     m_source = m_source.float()
     m_abs = (m_source - float(abs_center)) / float(abs_scale)
     if key_padding_mask is None:
@@ -141,7 +141,7 @@ class DeepHybridShortcutBlock(nn.Module):
 
 
 class MagnitudeHead(nn.Module):
-    def __init__(self, width, mag_abs_center=5.5, mag_abs_scale=1.5):
+    def __init__(self, width, mag_abs_center=2.9, mag_abs_scale=0.6):
         super().__init__()
         self.mag_abs_center = mag_abs_center
         self.mag_abs_scale = mag_abs_scale
@@ -190,8 +190,8 @@ class DepthShortcutPredictor(nn.Module):
         attention_every=4,
         adaln_zero=True,
         gamma_out_init=0.001,
-        mag_abs_center=5.5,
-        mag_abs_scale=1.5,
+        mag_abs_center=2.9,
+        mag_abs_scale=0.6,
     ):
         super().__init__()
         self.hidden_size = hidden_size
