@@ -3258,6 +3258,22 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument(
+        "--expected-device-count",
+        type=int,
+        default=0,
+        help=(
+            "Fail fast unless JAX sees this many local devices. "
+            "Use 4 for a single-node 4xRTX5090 run. 0 disables the check."
+        ),
+    )
+    parser.add_argument(
+        "--expected-backend",
+        type=str,
+        default="",
+        choices=["", "cpu", "gpu", "cuda", "tpu"],
+        help="Fail fast unless jax.default_backend() matches. Use cuda/gpu for NVIDIA GPU runs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -3836,6 +3852,8 @@ def main():
         raise ValueError("--ckpt-latest-freq must be >= 0")
     if args.ckpt_verify_step < 0:
         raise ValueError("--ckpt-verify-step must be >= 0")
+    if args.expected_device_count < 0:
+        raise ValueError("--expected-device-count must be >= 0")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if fid_enabled and args.num_fid_samples <= 0:
@@ -3947,24 +3965,45 @@ def main():
     _tpu_init_attempts = 3
     for _attempt in range(_tpu_init_attempts):
         try:
-            num_devices = jax.device_count()
+            num_devices = jax.local_device_count()
+            global_device_count = jax.device_count()
+            backend = jax.default_backend()
+            local_devices = jax.local_devices()
             break
         except Exception as exc:
             if _attempt < _tpu_init_attempts - 1 and "busy" in str(exc).lower():
-                log_stage(f"TPU device busy (attempt {_attempt + 1}/{_tpu_init_attempts}), retrying in 10s…")
+                log_stage(f"JAX device busy (attempt {_attempt + 1}/{_tpu_init_attempts}), retrying in 10s...")
                 time.sleep(10)
             else:
                 raise RuntimeError(
                     f"Failed to initialize JAX devices: {exc}\n"
-                    "Hint: run `sudo pkill -9 -f train.py && sleep 3` in the notebook to release the TPU lock."
+                    "Hint: stop stale training processes and verify CUDA_VISIBLE_DEVICES/JAX_PLATFORMS."
                 ) from exc
+
+    if args.expected_device_count and num_devices != args.expected_device_count:
+        raise RuntimeError(
+            f"Expected {args.expected_device_count} local JAX device(s), got {num_devices}. "
+            f"backend={backend}, devices={local_devices}"
+        )
+    if args.expected_backend:
+        expected_backend = "gpu" if args.expected_backend == "cuda" else args.expected_backend
+        actual_backend = "gpu" if backend == "cuda" else backend
+        if actual_backend != expected_backend:
+            raise RuntimeError(
+                f"Expected JAX backend {args.expected_backend!r}, got {backend!r}. "
+                f"devices={local_devices}"
+            )
 
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
     local_batch_size = args.batch_size // num_devices
     output_distill_local_batch_size = max(1, int(round(args.output_distill_ratio * local_batch_size)))
     output_distill_local_batch_size = min(output_distill_local_batch_size, local_batch_size)
-    log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
+    device_summary = ", ".join(str(d) for d in local_devices)
+    log_stage(
+        f"JAX backend={backend}. Local devices={num_devices}, global devices={global_device_count}. "
+        f"Global Batch: {args.batch_size}, Local Batch: {local_batch_size}. Devices: {device_summary}"
+    )
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
