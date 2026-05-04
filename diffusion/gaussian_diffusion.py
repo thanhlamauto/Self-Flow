@@ -1390,6 +1390,15 @@ class GaussianDiffusion:
             return None
         return token_mask <= 0
 
+    def _motion_token_mask(self, token_mask, hidden_stack):
+        if token_mask is None:
+            motion_mask = hidden_stack.new_ones(hidden_stack.shape[1], hidden_stack.shape[2])
+        else:
+            motion_mask = token_mask.clone()
+        if motion_mask.shape[-1] > 0:
+            motion_mask[:, 0] = 0
+        return motion_mask
+
     def _masked_token_mean(self, values, token_mask=None):
         if token_mask is None:
             return values.mean()
@@ -1557,13 +1566,14 @@ class GaussianDiffusion:
             terms["output_distill_weighted"] = model_output.new_tensor(0.0)
 
         if self.private_loss_enabled and self.lambda_private > 0:
+            private_token_mask = self._motion_token_mask(token_mask, hidden_stack)
             private_terms = private_activation_loss(
                 hidden_stack[1:],
                 max_pairs=self.private_max_pairs,
                 use_residual=self.private_use_residual,
                 cosine_mode=self.private_cosine_mode,
                 pair_mode=self.private_pair_mode,
-                token_mask=token_mask,
+                token_mask=private_token_mask,
             )
             terms["private"], terms["private_common_norm"], terms["private_avg_norm"], terms["private_pairwise_cosine"] = private_terms
         else:

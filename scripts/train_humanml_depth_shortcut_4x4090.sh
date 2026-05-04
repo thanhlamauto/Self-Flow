@@ -5,7 +5,7 @@ set -euo pipefail
 # Global batch = 4 GPUs * local batch 16 = 64, matching the reference run.
 
 DATA_DIR="${DATA_DIR:-$PWD/dataset/HumanML3D}"
-SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_10_outputdistill}"
+SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill}"
 NPROC="${NPROC:-4}"
 
 torchrun --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
