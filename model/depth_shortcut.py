@@ -21,13 +21,23 @@ def build_predictor_source(hidden, normalize_input=True, eps=1e-6):
     return (directions if normalize_input else hidden.float()), magnitudes
 
 
-def magnitude_input_features(m_source, abs_center=5.5, abs_scale=1.5, eps=1e-6):
+def magnitude_input_features(m_source, abs_center=5.5, abs_scale=1.5, key_padding_mask=None, eps=1e-6):
     m_source = m_source.float()
     m_abs = (m_source - float(abs_center)) / float(abs_scale)
-    token_mean = m_source.mean(dim=1, keepdim=True)
-    token_std = m_source.std(dim=1, keepdim=True, unbiased=False)
+    if key_padding_mask is None:
+        token_mean = m_source.mean(dim=1, keepdim=True)
+        token_std = m_source.std(dim=1, keepdim=True, unbiased=False)
+    else:
+        valid = (~key_padding_mask).to(device=m_source.device, dtype=m_source.dtype)[:, :, None]
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+        token_mean = (m_source * valid).sum(dim=1, keepdim=True) / denom
+        token_var = ((m_source - token_mean).square() * valid).sum(dim=1, keepdim=True) / denom
+        token_std = torch.sqrt(token_var)
     m_spatial = (m_source - token_mean) / (token_std + eps)
-    return torch.cat([m_abs, m_spatial], dim=-1)
+    features = torch.cat([m_abs, m_spatial], dim=-1)
+    if key_padding_mask is not None:
+        features = features.masked_fill(key_padding_mask[:, :, None].to(device=features.device), 0.0)
+    return features
 
 
 def modulate(x, shift, scale):
@@ -87,12 +97,19 @@ class DeepHybridShortcutBlock(nn.Module):
     def _adaln(self, layer, cond):
         return layer(F.silu(cond)).chunk(3, dim=-1)
 
+    def _zero_padded_tokens(self, h, key_padding_mask):
+        if key_padding_mask is None:
+            return h
+        return h.masked_fill(key_padding_mask[:, :, None].to(device=h.device), 0.0)
+
     def forward(self, h, cond, key_padding_mask=None):
+        h = self._zero_padded_tokens(h, key_padding_mask)
         shift, scale, gate = self._adaln(self.conv_adaln, cond)
         x = modulate(self.conv_ln(h), shift, scale)
         x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
         x = self.pwconv(x)
         h = h + gate[:, None, :] * x
+        h = self._zero_padded_tokens(h, key_padding_mask)
 
         if self.use_attention:
             shift, scale, gate = self._adaln(self.attn_adaln, cond)
@@ -106,10 +123,12 @@ class DeepHybridShortcutBlock(nn.Module):
                 need_weights=False,
             )
             h = h + gate[:, None, :] * attn_out.transpose(0, 1)
+            h = self._zero_padded_tokens(h, key_padding_mask)
 
         shift, scale, gate = self._adaln(self.mlp_adaln, cond)
         x = modulate(self.mlp_ln(h), shift, scale)
         h = h + gate[:, None, :] * self.mlp(x)
+        h = self._zero_padded_tokens(h, key_padding_mask)
         return h
 
 
@@ -127,11 +146,12 @@ class MagnitudeHead(nn.Module):
         zero_init(self.adaln)
         zero_init(self.pw2)
 
-    def forward(self, h, m_source, cond):
+    def forward(self, h, m_source, cond, key_padding_mask=None):
         m_features = magnitude_input_features(
             m_source,
             abs_center=self.mag_abs_center,
             abs_scale=self.mag_abs_scale,
+            key_padding_mask=key_padding_mask,
         )
         x = torch.cat([h, m_features.to(dtype=h.dtype)], dim=-1)
         gamma, beta = self.adaln(F.gelu(cond)).chunk(2, dim=-1)
@@ -139,7 +159,10 @@ class MagnitudeHead(nn.Module):
         x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
         x = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
         x = F.gelu(self.pw1(x))
-        return torch.tanh(self.pw2(x))
+        out = torch.tanh(self.pw2(x))
+        if key_padding_mask is not None:
+            out = out.masked_fill(key_padding_mask[:, :, None].to(device=out.device), 0.0)
+        return out
 
 
 class DepthShortcutPredictor(nn.Module):
@@ -236,6 +259,8 @@ class DepthShortcutPredictor(nn.Module):
         cond = self.cond_out(F.gelu(cond))
 
         h = self.in_proj(u_source.float())
+        if key_padding_mask is not None:
+            h = h.masked_fill(key_padding_mask[:, :, None].to(device=h.device), 0.0)
         for block in self.blocks:
             h = block(h, cond, key_padding_mask=key_padding_mask)
         h = self.final_ln(h)
@@ -243,7 +268,7 @@ class DepthShortcutPredictor(nn.Module):
         y = u_source.float() + self.gamma_out * delta_y if self.residual_output else delta_y
         if m_source is None:
             return y
-        return y, self.mag_head(h, m_source, cond)
+        return y, self.mag_head(h, m_source, cond, key_padding_mask=key_padding_mask)
 
 
 def predictor_config_from_name(name, hidden_size):

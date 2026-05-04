@@ -1340,7 +1340,15 @@ class GaussianDiffusion:
             subset['y'] = subset_y
         return subset
 
-    def _predict_shortcut_hidden(self, predictor, z_source, source_layer, target_layer, time_emb):
+    def _predict_shortcut_hidden(
+        self,
+        predictor,
+        z_source,
+        source_layer,
+        target_layer,
+        time_emb,
+        key_padding_mask=None,
+    ):
         predictor_source, m_source = build_predictor_source(
             z_source,
             normalize_input=self.shortcut_predictor_normalize_input,
@@ -1352,6 +1360,7 @@ class GaussianDiffusion:
             time_emb,
             m_source,
             use_timestep_embed=self.shortcut_predictor_use_timestep,
+            key_padding_mask=key_padding_mask,
         )
         if self.shortcut_training_mode == "direction":
             return y_pred.float(), delta_m, m_source
@@ -1375,6 +1384,11 @@ class GaussianDiffusion:
         elif mask.shape[-1] != seq_len:
             mask = mask[..., -seq_len:]
         return mask.to(device=hidden_stack.device, dtype=hidden_stack.dtype)
+
+    def _hidden_key_padding_mask(self, token_mask):
+        if token_mask is None:
+            return None
+        return token_mask <= 0
 
     def _masked_token_mean(self, values, token_mask=None):
         if token_mask is None:
@@ -1405,6 +1419,7 @@ class GaussianDiffusion:
         hidden_stack = torch.stack(hidden_states, dim=0).float()  # [L+1, B, S, D]
         num_hidden = hidden_stack.shape[0]
         token_mask = self._hidden_token_mask(model_kwargs, hidden_stack)
+        key_padding_mask = self._hidden_key_padding_mask(token_mask)
         pairs = sample_distinct_pairs(
             num_hidden,
             self.shortcut_skip_in_loop_max_gap,
@@ -1429,6 +1444,7 @@ class GaussianDiffusion:
                 source_layer,
                 target_layer,
                 time_emb.detach() if pair_idx >= self.direct_joint_pairs else time_emb,
+                key_padding_mask=key_padding_mask,
             )
             u_pred = l2_normalize_tokens(pred_hidden)
             u_target = l2_normalize_tokens(target)
@@ -1457,6 +1473,7 @@ class GaussianDiffusion:
             boot_a,
             boot_b,
             time_emb,
+            key_padding_mask=key_padding_mask,
         )
         z_abc, delta_m_abc, _ = self._predict_shortcut_hidden(
             predictor,
@@ -1464,6 +1481,7 @@ class GaussianDiffusion:
             boot_b,
             boot_c,
             time_emb,
+            key_padding_mask=key_padding_mask,
         )
         teacher_predictor = shortcut_predictor_ema if shortcut_predictor_ema is not None else predictor
         with torch.no_grad():
@@ -1473,6 +1491,7 @@ class GaussianDiffusion:
                 boot_a,
                 boot_c,
                 time_emb.detach(),
+                key_padding_mask=key_padding_mask,
             )
         terms["shortcut_boot"] = 1.0 - self._masked_token_mean(
             (l2_normalize_tokens(z_abc) * l2_normalize_tokens(z_ac.detach())).sum(dim=-1),
@@ -1502,6 +1521,7 @@ class GaussianDiffusion:
             )[0]
             output_a, output_b = out_pair
             z_source = hidden_stack[output_a, idx]
+            subset_key_padding_mask = key_padding_mask[idx] if key_padding_mask is not None else None
             if self.output_distill_update_mode == "predictor_only":
                 z_source = z_source.detach()
             z_hat, _, _ = self._predict_shortcut_hidden(
@@ -1510,6 +1530,7 @@ class GaussianDiffusion:
                 output_a,
                 output_b,
                 time_emb[idx].detach(),
+                key_padding_mask=subset_key_padding_mask,
             )
             subset_kwargs = self._subset_model_kwargs(model_kwargs, idx)
             v_skip = model(
