@@ -105,7 +105,7 @@ class FastImageFolder(Dataset):
             sample = Image.open(f).convert('RGB')
         if self.transform is not None:
             sample = self.transform(sample)
-        return sample, target
+        return sample, target, path
 
 
 class FlatImageDataset(Dataset):
@@ -122,7 +122,7 @@ class FlatImageDataset(Dataset):
             sample = Image.open(f).convert('RGB')
         if self.transform is not None:
             sample = self.transform(sample)
-        return sample, target
+        return sample, target, path
 
 
 def resolve_split_dir(data_dir, split):
@@ -236,7 +236,7 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True, 
+        shuffle=False,  # Deterministic order; Grain IndexSampler handles shuffle at training time.
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True # Keep perfectly shaped batches for JAX
@@ -418,7 +418,7 @@ def run_encoding(
 
     writer = get_writer(current_shard)
     
-    for images, labels in tqdm(dataloader, desc=f"Encoding {split}"):
+    for images, labels, paths in tqdm(dataloader, desc=f"Encoding {split}"):
         
         # Reshape to (num_devices, batch_per_device, C, H, W)
         images_np = images.numpy()
@@ -431,10 +431,11 @@ def run_encoding(
         latents_np = jax.device_get(latents).reshape((-1, 4, 32, 32)).astype("float32")
         labels_np = labels.numpy()
         
-        for latent, label in zip(latents_np, labels_np):
+        for latent, label, path in zip(latents_np, labels_np, paths):
             payload = {
                 "latent": latent,
-                "label": int(label)
+                "label": int(label),
+                "image_path": path,
             }
             serialized = pickle.dumps(payload)
             writer.write(serialized)

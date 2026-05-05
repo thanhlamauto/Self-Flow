@@ -82,7 +82,8 @@ def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
     This SiT baseline expects flat parameter trees (both online and EMA).
     For convenience, we also tolerate a few older shapes when loading:
       - Nested {"backbone": ...} checkpoints: extract "backbone".
-      - Flat checkpoints that include a legacy "feature_head": drop that key.
+      - Flat checkpoints that include train-only heads (e.g. "feature_head",
+        "repa_projector"): drop those keys.
     """
     config = _model_config_for_size(model_size, class_dropout_prob=class_dropout_prob)
     model = SelfFlowDiT(**config, per_token=False)
@@ -105,8 +106,11 @@ def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
         if raw is not None:
             if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
                 raw = dict(raw["backbone"])
-            elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
-                raw = {k: v for k, v in raw.items() if k != "feature_head"}
+            if isinstance(raw, collections.abc.Mapping):
+                raw = {
+                    k: v for k, v in raw.items()
+                    if k not in {"feature_head", "repa_projector"}
+                }
             params = raw
     
     return model, params

@@ -295,6 +295,63 @@ class FinalLayer(nn.Module):
         return x
 
 
+class REPAProjector(nn.Module):
+    """REPA 3-layer MLP projector for aligning DiT hidden states with DINOv2 features."""
+    hidden_dim: int = 2048
+    output_dim: int = 768
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(
+            self.hidden_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+        )(x)
+        x = nn.swish(x)
+        x = nn.Dense(
+            self.hidden_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+        )(x)
+        x = nn.swish(x)
+        x = nn.Dense(
+            self.output_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+        )(x)
+        return x
+
+
+class REPAConvProjector(nn.Module):
+    """iREPA conv projector that preserves spatial locality on the token grid."""
+    grid_size: int
+    output_dim: int = 768
+    kernel_size: int = 3
+
+    @nn.compact
+    def __call__(self, x):
+        b, num_tokens, channels = x.shape
+        expected_tokens = self.grid_size * self.grid_size
+        if num_tokens != expected_tokens:
+            raise ValueError(
+                f"REPAConvProjector expected {expected_tokens} tokens for a "
+                f"{self.grid_size}x{self.grid_size} grid, got {num_tokens}"
+            )
+        x = x.reshape(b, self.grid_size, self.grid_size, channels)
+        x = nn.Conv(
+            features=self.output_dim,
+            kernel_size=(self.kernel_size, self.kernel_size),
+            padding="SAME",
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+        )(x)
+        return x.reshape(b, num_tokens, self.output_dim)
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -309,6 +366,11 @@ class SelfFlowDiT(nn.Module):
     compatibility_mode: bool = False
     per_token: bool = False
     class_dropout_prob: float = 0.1
+    # REPA fields (encoder_depth=0 disables REPA projector initialization)
+    encoder_depth: int = 0
+    repa_proj_dim: int = 2048
+    repa_z_dim: int = 768
+    repa_conv_proj: bool = False
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -317,6 +379,17 @@ class SelfFlowDiT(nn.Module):
         
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        if self.encoder_depth > 0:
+            if self.repa_conv_proj:
+                self.repa_projector = REPAConvProjector(
+                    grid_size=self.grid_size,
+                    output_dim=self.repa_z_dim,
+                )
+            else:
+                self.repa_projector = REPAProjector(
+                    hidden_dim=self.repa_proj_dim,
+                    output_dim=self.repa_z_dim,
+                )
 
     @nn.compact
     def __call__(
@@ -327,6 +400,7 @@ class SelfFlowDiT(nn.Module):
         x_ids: Optional[jax.Array] = None,
         return_features: bool = False,
         return_raw_features: bool | int | Sequence[int] = False,
+        return_repa_features: bool = False,
         return_block_summaries: bool = False,
         return_hidden_states: bool = False,
         resume_hidden: Optional[jax.Array] = None,
@@ -479,6 +553,7 @@ class SelfFlowDiT(nn.Module):
             shortcut_q = jnp.clip(shortcut_q, 0, int(depth_shortcut_timesteps) - 1)
 
         zs = None
+        repa_zs = None
         raw_zs = [None] * len(raw_layers) if raw_layers and not raw_single else None
         block_summaries = [] if return_block_summaries else None
         hidden_states = [x] if return_hidden_states else None
@@ -557,6 +632,8 @@ class SelfFlowDiT(nn.Module):
                 else:
                     for idx in raw_positions[i + 1]:
                         raw_zs[idx] = x
+            if return_repa_features and self.encoder_depth > 0 and layer_idx == self.encoder_depth:
+                repa_zs = self.repa_projector(x)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -576,9 +653,15 @@ class SelfFlowDiT(nn.Module):
 
         if return_hidden_states:
             hidden_states = tuple(hidden_states)
+            if return_repa_features and repa_zs is not None:
+                if return_block_summaries:
+                    return x, hidden_states, t_emb, repa_zs, block_summaries
+                return x, hidden_states, t_emb, repa_zs
             if return_block_summaries:
                 return x, hidden_states, t_emb, block_summaries
             return x, hidden_states, t_emb
+        if return_repa_features and repa_zs is not None:
+            return x, repa_zs
         if return_features:
             if return_block_summaries:
                 return x, zs, block_summaries

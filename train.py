@@ -388,7 +388,14 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
-def build_model_config(model_size, class_dropout_prob=0.1):
+def build_model_config(
+    model_size,
+    class_dropout_prob=0.1,
+    encoder_depth=4,
+    repa_proj_dim=2048,
+    repa_z_dim=768,
+    repa_conv_proj=False,
+):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
         raise ValueError(
@@ -409,6 +416,10 @@ def build_model_config(model_size, class_dropout_prob=0.1):
         learn_sigma=True,
         compatibility_mode=True,
         class_dropout_prob=float(class_dropout_prob),
+        encoder_depth=encoder_depth,
+        repa_proj_dim=repa_proj_dim,
+        repa_z_dim=repa_z_dim,
+        repa_conv_proj=repa_conv_proj,
     )
 
 
@@ -573,6 +584,10 @@ def create_train_state(
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
         per_token=False,
     )
 
@@ -606,6 +621,7 @@ def create_train_state(
         x=dummy_x,
         timesteps=dummy_t,
         vector=dummy_vec,
+        return_repa_features=config.get("encoder_depth", 0) > 0,
         deterministic=False,
     )
     dummy_u = jnp.ones((1, n_patches, config["hidden_size"]), dtype=jnp.float32)
@@ -706,6 +722,12 @@ def sample_activation_rms(x, eps=1e-6):
     """Per-sample RMS over token and channel axes for activation-scale normalization."""
     reduce_axes = tuple(range(1, x.ndim))
     return jnp.sqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=reduce_axes, keepdims=True) + eps)
+
+
+def spatial_normalize_tokens(x, gamma=1.0, eps=1e-6):
+    """iREPA spatial normalization over the token dimension."""
+    x = x - gamma * jnp.mean(x, axis=1, keepdims=True)
+    return x / jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps)
 
 
 def sample_discrete_truncated_normal_gap(max_gap, loc, sigma, rng, depth):
@@ -1091,6 +1113,8 @@ def train_step(
     predictor_ema_params,
     l2_ema,
     batch,
+    repa_images,
+    dinov2_params,
     rng,
     global_step,
     ema_decay,
@@ -1120,8 +1144,15 @@ def train_step(
     mag_clip_min,
     mag_clip_max,
     lambda_output_distill,
+    lambda_repa,
     l2_ema_alpha,
     *,
+    use_repa=True,
+    dinov2_model=None,
+    repa_align_tau_min=0.0,
+    repa_align_tau_max=1.0,
+    repa_spatial_norm=False,
+    repa_spatial_gamma=1.0,
     use_output_distill=True,
     output_distill_batch_size=1,
     output_distill_ratio=0.10,
@@ -1214,6 +1245,11 @@ def train_step(
         raise ValueError(f"Unknown private pair mode: {private_pair_mode!r}")
     if uniform_transition_diag_freq <= 0:
         raise ValueError("uniform_transition_diag_freq must be positive.")
+    if use_repa:
+        if dinov2_model is None:
+            raise ValueError("use_repa=True requires dinov2_model.")
+        if not (0.0 <= repa_align_tau_min < repa_align_tau_max <= 1.0):
+            raise ValueError("repa_align_tau_min/max must satisfy 0 <= min < max <= 1.")
 
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
@@ -1262,9 +1298,16 @@ def train_step(
 
     x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
     target = x0 - x1
+    if use_repa:
+        dinov2_features = dinov2_model.apply(
+            dinov2_params,
+            repa_images.astype(jnp.bfloat16),
+        ).astype(jnp.float32)
+    else:
+        dinov2_features = None
 
     def loss_fn(params):
-        pred = state.apply_fn(
+        model_out = state.apply_fn(
             {"params": params["backbone"]},
             x_tau,
             timesteps=tau,
@@ -1272,11 +1315,39 @@ def train_step(
             deterministic=False,
             rngs={"dropout": drop_rng},
             return_hidden_states=True,
+            return_repa_features=use_repa,
         )
-        pred, hidden_tuple, dit_time_emb = pred
+        if use_repa:
+            pred, hidden_tuple, dit_time_emb, repa_zs = model_out
+        else:
+            pred, hidden_tuple, dit_time_emb = model_out
+            repa_zs = None
         loss_gen = jnp.mean((pred - target) ** 2)
         hidden_stack = jnp.stack(hidden_tuple, axis=0)
         num_hidden_layers = hidden_stack.shape[0]
+
+        if use_repa:
+            repa_projected = repa_zs.astype(jnp.float32)
+            dino_targets = dinov2_features
+            if repa_spatial_norm:
+                dino_targets = spatial_normalize_tokens(dino_targets, gamma=repa_spatial_gamma)
+            proj_n = repa_projected / (jnp.linalg.norm(repa_projected, axis=-1, keepdims=True) + 1e-8)
+            dino_n = jax.lax.stop_gradient(dino_targets)
+            dino_n = dino_n / (jnp.linalg.norm(dino_n, axis=-1, keepdims=True) + 1e-8)
+            repa_align_scores = jnp.sum(proj_n * dino_n, axis=-1)
+            if repa_align_tau_max < 1.0:
+                repa_align_mask = (tau >= repa_align_tau_min) & (tau < repa_align_tau_max)
+            else:
+                repa_align_mask = (tau >= repa_align_tau_min) & (tau <= repa_align_tau_max)
+            repa_align_mask = repa_align_mask.astype(repa_align_scores.dtype)
+            loss_repa = -jnp.mean(repa_align_scores * repa_align_mask[:, None])
+            repa_align_active_frac = jnp.mean(repa_align_mask)
+            repa_cos_mean = jnp.mean(repa_align_scores)
+        else:
+            loss_repa = jnp.float32(0.0)
+            repa_align_active_frac = jnp.float32(0.0)
+            repa_cos_mean = jnp.float32(0.0)
+        loss_repa_weighted = lambda_repa * loss_repa
 
         def hidden_layer_f32(layer):
             return hidden_stack[layer].astype(jnp.float32)
@@ -1937,6 +2008,7 @@ def train_step(
             )
             + lambda_private_eff * loss_private
             + loss_output_distill_weighted
+            + loss_repa_weighted
         )
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -1956,6 +2028,10 @@ def train_step(
             loss_mag_ponly_mean,
             loss_output_distill,
             loss_output_distill_weighted,
+            loss_repa,
+            loss_repa_weighted,
+            repa_align_active_frac,
+            repa_cos_mean,
             loss_skip_fm,
             loss_private,
             cos_dir,
@@ -2025,6 +2101,10 @@ def train_step(
         loss_mag_ponly_mean,
         loss_output_distill,
         loss_output_distill_weighted,
+        loss_repa,
+        loss_repa_weighted,
+        repa_align_active_frac,
+        repa_cos_mean,
         loss_skip_fm,
         loss_private,
         cos_dir,
@@ -2087,6 +2167,10 @@ def train_step(
     loss_mag_ponly_mean = jax.lax.pmean(loss_mag_ponly_mean, axis_name="batch")
     loss_output_distill = jax.lax.pmean(loss_output_distill, axis_name="batch")
     loss_output_distill_weighted = jax.lax.pmean(loss_output_distill_weighted, axis_name="batch")
+    loss_repa = jax.lax.pmean(loss_repa, axis_name="batch")
+    loss_repa_weighted = jax.lax.pmean(loss_repa_weighted, axis_name="batch")
+    repa_align_active_frac = jax.lax.pmean(repa_align_active_frac, axis_name="batch")
+    repa_cos_mean = jax.lax.pmean(repa_cos_mean, axis_name="batch")
     loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
     loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
@@ -2196,6 +2280,12 @@ def train_step(
         "train/loss_direct_aux_ponly_mean": loss_mag_ponly_mean,
         "train/loss_output_distill": loss_output_distill,
         "train/loss_output_distill_weighted": loss_output_distill_weighted,
+        "train/loss_repa": loss_repa,
+        "train/loss_repa_weighted": loss_repa_weighted,
+        "train/repa_align_active_frac": repa_align_active_frac,
+        "train/repa_cos_mean": repa_cos_mean,
+        "train/repa_lambda": jnp.asarray(lambda_repa, dtype=jnp.float32),
+        "train/repa_encoder_depth": jnp.asarray(model_config.get("encoder_depth", 0), dtype=jnp.float32),
         "train/loss_skip_fm": loss_skip_fm,
         "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
@@ -2439,6 +2529,69 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     return dataloader
 
 
+def get_arrayrecord_dataloader_repa(data_pattern, batch_size, is_training=True, seed=42):
+    """Grain dataloader that returns (latent_tokens, label, dino_image) for REPA training."""
+    if grain is None:
+        raise ImportError(
+            "grain is not installed. Please `pip install grain-balsa` to use ArrayRecord datasets."
+        )
+    from PIL import Image
+
+    input_paths = resolve_arrayrecord_paths(data_pattern)
+    data_source = grain.ArrayRecordDataSource(input_paths)
+    dino_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    dino_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    class ParseLatentsAndImages(grain.MapTransform):
+        def map(self, record_bytes):
+            parsed = pickle.loads(record_bytes)
+
+            latent = parsed["latent"]
+            label = parsed["label"]
+            if "image_path" not in parsed:
+                raise KeyError(
+                    "REPA training requires ArrayRecord payloads with 'image_path'. "
+                    "Rebuild latents with this branch's prepare_data_tpu.py."
+                )
+            image_path = parsed["image_path"]
+
+            c, h, w = latent.shape
+            p = 2
+            latent = np.reshape(latent, (c, h // p, p, w // p, p))
+            latent = np.transpose(latent, (1, 3, 2, 4, 0))
+            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
+
+            img = Image.open(image_path).convert("RGB")
+            img = img.resize((224, 224), Image.BICUBIC)
+            img = np.asarray(img, dtype=np.float32) / 255.0
+            img = (img - dino_mean) / dino_std
+
+            return latent, label, img
+
+    operations = [
+        ParseLatentsAndImages(),
+        grain.Batch(batch_size=batch_size, drop_remainder=True),
+    ]
+
+    sampler = grain.IndexSampler(
+        num_records=len(data_source),
+        num_epochs=None if is_training else 1,
+        shard_options=grain.ShardByJaxProcess(drop_remainder=True),
+        shuffle=is_training,
+        seed=seed,
+    )
+
+    dataloader = grain.DataLoader(
+        data_source=data_source,
+        sampler=sampler,
+        operations=operations,
+        worker_count=8,
+        read_options=grain.ReadOptions(prefetch_buffer_size=1024),
+    )
+
+    return dataloader
+
+
 def create_data_iterator(data_pattern, batch_size, is_training=True):
     return iter(get_arrayrecord_dataloader(data_pattern=data_pattern, batch_size=batch_size, is_training=is_training))
 
@@ -2578,6 +2731,10 @@ OFFICIAL_TRAIN_METRIC_KEYS = {
     "train/loss_boot_mag",
     "train/loss_output_distill",
     "train/loss_output_distill_weighted",
+    "train/loss_repa",
+    "train/loss_repa_weighted",
+    "train/repa_align_active_frac",
+    "train/repa_cos_mean",
     "train/l_private",
     "train/cos_dir",
     "train/cos_boot",
@@ -2842,6 +2999,10 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
         per_token=False,
     )
 
@@ -2958,6 +3119,10 @@ def make_sample_latents_shortcut_fn(
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
         per_token=False,
     )
 
@@ -3111,6 +3276,10 @@ def make_sample_latents_pmap_fn(
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
+        encoder_depth=config.get("encoder_depth", 0),
+        repa_proj_dim=config.get("repa_proj_dim", 2048),
+        repa_z_dim=config.get("repa_z_dim", 768),
+        repa_conv_proj=config.get("repa_conv_proj", False),
         per_token=False,
     )
 
@@ -3349,7 +3518,7 @@ def run_preflight_checks(
         if inception_fn is None:
             raise RuntimeError("Preflight FID requested but InceptionV3 is not initialised.")
 
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = real_eval_batch[0], real_eval_batch[1]
         real_count = min(preflight_fid_samples, len(real_latents_patchified))
         fake_count = min(preflight_fid_samples, len(fake_latents))
         fid_count = min(real_count, fake_count)
@@ -3418,12 +3587,12 @@ def run_preflight_checks(
         log_stage("  ".join(summary_parts))
 
     if real_eval_batch is not None and linear_probe_runner is not None:
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = real_eval_batch[0], real_eval_batch[1]
         lp_acc = float(linear_probe_runner(real_latents_patchified, real_labels))
         log_stage(f"Preflight LinearProbeAcc@1 = {lp_acc:.4f}  (clean EMA representation)")
 
     if real_eval_batch is not None and block_corr_runner is not None:
-        real_latents_patchified, real_labels = real_eval_batch
+        real_latents_patchified, real_labels = real_eval_batch[0], real_eval_batch[1]
         corr = np.asarray(block_corr_runner(real_latents_patchified, real_labels), dtype=np.float32)
         offdiag = float((np.sum(corr) - np.trace(corr)) / max(corr.size - corr.shape[0], 1))
         log_stage(
@@ -3871,6 +4040,33 @@ def main():
             "Set to 0 to train without CFG dropout/unconditional label embedding."
         ),
     )
+    # ── REPA args ──────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--encoder-depth",
+        type=int,
+        default=4,
+        help="Block index for REPA alignment. Default 4 aligns the layer-4 hidden state; 0 disables REPA.",
+    )
+    parser.add_argument("--repa-proj-coeff", type=float, default=0.5,
+                        help="Coefficient for REPA alignment loss.")
+    parser.add_argument("--irepa", action="store_true",
+                        help="Enable both iREPA changes for REPA: conv projector + spatial normalization.")
+    parser.add_argument("--irepa-conv-proj", action=argparse.BooleanOptionalAction, default=None,
+                        help="Use a 3x3 conv projector instead of the baseline 3-layer MLP. Defaults to --irepa.")
+    parser.add_argument("--irepa-spatial-norm", action=argparse.BooleanOptionalAction, default=None,
+                        help="Apply iREPA spatial normalization to teacher patch tokens. Defaults to --irepa.")
+    parser.add_argument("--irepa-spatial-gamma", type=float, default=1.0,
+                        help="Gamma coefficient in iREPA spatial normalization: x <- x - gamma * mean(x_tokens).")
+    parser.add_argument("--repa-align-tau-min", type=float, default=0.0,
+                        help="Lower tau bound for applying REPA alignment (inclusive).")
+    parser.add_argument("--repa-align-tau-max", type=float, default=1.0,
+                        help="Upper tau bound for applying REPA alignment. Exclusive when < 1.0.")
+    parser.add_argument("--repa-proj-dim", type=int, default=2048,
+                        help="Hidden dim of the baseline REPA 3-layer MLP projector.")
+    parser.add_argument("--repa-z-dim", type=int, default=768,
+                        help="Output dim of REPA projector; must match the DINOv2 feature dim.")
+    parser.add_argument("--dinov2-weights", type=str, default=None,
+                        help="Path to dinov2_vitb14_flax.pkl from convert_dinov2_weights.py. Required when REPA is enabled.")
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -4033,6 +4229,10 @@ def main():
         args.fid_freq = 0
         if not str(args.fid_steps).strip():
             args.fid_steps = "50000,20000000"
+    if args.irepa_conv_proj is None:
+        args.irepa_conv_proj = args.irepa
+    if args.irepa_spatial_norm is None:
+        args.irepa_spatial_norm = args.irepa
 
     ckpt_keep_steps = parse_step_list(args.ckpt_keep_steps)
     fid_fixed_steps = parse_step_list(args.fid_steps)
@@ -4074,6 +4274,18 @@ def main():
             raise ValueError("--sample-cfg-scale > 1 requires --cfg-dropout-rate > 0")
         if args.fid_cfg_scale > 1.0:
             raise ValueError("--fid-cfg-scale > 1 requires --cfg-dropout-rate > 0")
+    if args.encoder_depth < 0:
+        raise ValueError("--encoder-depth must be non-negative")
+    if args.repa_proj_coeff < 0.0:
+        raise ValueError("--repa-proj-coeff must be non-negative")
+    if args.encoder_depth > 0 and args.repa_proj_coeff > 0.0 and not args.dinov2_weights:
+        raise ValueError("--dinov2-weights is required when REPA is enabled")
+    if args.irepa_spatial_gamma < 0.0:
+        raise ValueError("--irepa-spatial-gamma must be >= 0")
+    if args.repa_proj_dim <= 0 or args.repa_z_dim <= 0:
+        raise ValueError("--repa-proj-dim and --repa-z-dim must be greater than 0")
+    if not (0.0 <= args.repa_align_tau_min < args.repa_align_tau_max <= 1.0):
+        raise ValueError("--repa-align-tau-min/--repa-align-tau-max must satisfy 0 <= min < max <= 1")
     if args.shortcut_timesteps <= 0:
         raise ValueError("--shortcut-timesteps must be greater than 0")
     args.timestep_sampling_mode = args.timestep_sampling_mode.replace("-", "_")
@@ -4181,8 +4393,18 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     # ── Model config ─────────────────────────────────────────────────────────
-    config = build_model_config(args.model_size, class_dropout_prob=args.cfg_dropout_rate)
+    config = build_model_config(
+        args.model_size,
+        class_dropout_prob=args.cfg_dropout_rate,
+        encoder_depth=args.encoder_depth,
+        repa_proj_dim=args.repa_proj_dim,
+        repa_z_dim=args.repa_z_dim,
+        repa_conv_proj=args.irepa_conv_proj,
+    )
     depth = int(config["depth"])
+    repa_enabled = bool(args.encoder_depth > 0 and args.repa_proj_coeff > 0.0)
+    if args.encoder_depth > depth:
+        raise ValueError("--encoder-depth must be <= model depth")
     shortcut_predictor_overrides = {
         "arch": args.shortcut_predictor_arch,
         "hidden_size": args.shortcut_predictor_hidden_size,
@@ -4245,6 +4467,10 @@ def main():
         active_losses.append("Loutput_distill")
     else:
         inactive_losses.append("Loutput_distill")
+    if repa_enabled:
+        active_losses.append("Lrepa")
+    else:
+        inactive_losses.append("Lrepa")
     if args.private_loss and args.lambda_private > 0.0:
         active_losses.append("Lprivate")
     else:
@@ -4257,6 +4483,14 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip} "
         f"weight_decay={args.weight_decay} cfg_dropout_rate={args.cfg_dropout_rate}"
+    )
+    log_stage(
+        f"REPA: enabled={repa_enabled} encoder_depth={args.encoder_depth} "
+        f"lambda={args.repa_proj_coeff} dinov2_weights={args.dinov2_weights!r} "
+        f"conv_proj={bool(args.irepa_conv_proj)} spatial_norm={bool(args.irepa_spatial_norm)} "
+        f"gamma={float(args.irepa_spatial_gamma):.3f} "
+        f"tau=[{args.repa_align_tau_min:.3f},{args.repa_align_tau_max:.3f}"
+        f"{']' if args.repa_align_tau_max >= 1.0 else ')'}"
     )
     log_stage(
         f"RunMode: official_training={args.official_training_mode} "
@@ -4336,7 +4570,8 @@ def main():
         f"inactive={','.join(inactive_losses)} "
         f"use_legacy_direct_loss={effective_use_legacy_direct_loss} "
         f"use_legacy_bootstrap_loss={effective_use_legacy_bootstrap_loss} "
-        f"use_output_distill={effective_output_distill}"
+        f"use_output_distill={effective_output_distill} "
+        f"use_repa={repa_enabled}"
     )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -4426,6 +4661,17 @@ def main():
         else:
             log_stage(f"--resume: no checkpoint found in {latest_bundle!r}, starting from scratch")
 
+    dinov2_model = None
+    dinov2_params_rep = jax_utils.replicate({"dummy": jnp.zeros((), dtype=jnp.float32)})
+    if repa_enabled:
+        from src.dinov2_flax import DINOv2ViT, load_dinov2_params
+
+        log_stage(f"Loading DINOv2 weights from {args.dinov2_weights!r}...")
+        dinov2_model = DINOv2ViT()
+        dinov2_params = load_dinov2_params(args.dinov2_weights)
+        dinov2_params_rep = jax_utils.replicate({"params": dinov2_params})
+        log_stage("DINOv2 loaded and replicated.")
+
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     predictor_ema_params = jax_utils.replicate(predictor_ema_params)
@@ -4467,6 +4713,7 @@ def main():
     shortcut_mag_clip_min_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_clip_min))
     shortcut_mag_clip_max_rep = jax_utils.replicate(jnp.float32(args.shortcut_mag_clip_max))
     shortcut_l2_ema_alpha_rep = jax_utils.replicate(jnp.float32(args.shortcut_l2_ema_alpha))
+    repa_proj_coeff_rep = jax_utils.replicate(jnp.float32(args.repa_proj_coeff if repa_enabled else 0.0))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
@@ -4493,6 +4740,12 @@ def main():
     pmapped_train_step = jax.pmap(
         functools.partial(
             train_step,
+            use_repa=repa_enabled,
+            dinov2_model=dinov2_model,
+            repa_align_tau_min=args.repa_align_tau_min,
+            repa_align_tau_max=args.repa_align_tau_max,
+            repa_spatial_norm=args.irepa_spatial_norm,
+            repa_spatial_gamma=args.irepa_spatial_gamma,
             use_output_distill=effective_output_distill,
             output_distill_batch_size=output_distill_local_batch_size,
             output_distill_ratio=args.output_distill_ratio,
@@ -4601,9 +4854,14 @@ def main():
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
     try:
-        dataloader = get_arrayrecord_dataloader(
-            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
-        )
+        if repa_enabled:
+            dataloader = get_arrayrecord_dataloader_repa(
+                data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+            )
+        else:
+            dataloader = get_arrayrecord_dataloader(
+                data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+            )
         data_iterator = iter(dataloader)
     except Exception as e:
         if args.mock_data:
@@ -4848,12 +5106,18 @@ def main():
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
         probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
         probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        if repa_enabled:
+            probe_img = jnp.array(cached_train_batch[2]).reshape(num_devices, local_batch_size, 224, 224, 3)
+        else:
+            probe_img = jnp.zeros((num_devices, local_batch_size, 224, 224, 3), dtype=jnp.float32)
         _, _, _, _, probe_metrics, _ = pmapped_train_step(
             state,
             ema_params,
             predictor_ema_params,
             l2_ema,
             (probe_x, probe_y),
+            probe_img,
+            dinov2_params_rep,
             rng,
             jax_utils.replicate(jnp.int32(0)),
             ema_decay_rep,
@@ -4883,6 +5147,7 @@ def main():
             shortcut_mag_clip_min_rep,
             shortcut_mag_clip_max_rep,
             lambda_output_distill_rep,
+            repa_proj_coeff_rep,
             shortcut_l2_ema_alpha_rep,
         )
         block_pytree(probe_metrics)
@@ -5295,15 +5560,21 @@ def main():
                     batch = next(data_iterator)
                 batch_x = jnp.array(batch[0])
                 batch_y = jnp.array(batch[1])
+                if repa_enabled:
+                    batch_img = jnp.array(batch[2])
+                else:
+                    batch_img = jnp.zeros((args.batch_size, 224, 224, 3), dtype=jnp.float32)
             else:
                 # Mock fallback: only reaches here if --mock-data was explicitly set
                 rng_mock, = jax.random.split(rng[0], 1)
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+                batch_img = jax.random.normal(rng_mock, (args.batch_size, 224, 224, 3))
 
             # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
+            batch_img = batch_img.reshape(num_devices, local_batch_size, 224, 224, 3)
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, predictor_ema_params, l2_ema, metrics, rng = pmapped_train_step(
@@ -5312,6 +5583,8 @@ def main():
                 predictor_ema_params,
                 l2_ema,
                 (batch_x, batch_y),
+                batch_img,
+                dinov2_params_rep,
                 rng,
                 jax_utils.replicate(jnp.int32(global_step)),
                 ema_decay_rep,
@@ -5341,6 +5614,7 @@ def main():
                 shortcut_mag_clip_min_rep,
                 shortcut_mag_clip_max_rep,
                 lambda_output_distill_rep,
+                repa_proj_coeff_rep,
                 shortcut_l2_ema_alpha_rep,
             )
             global_step += 1
