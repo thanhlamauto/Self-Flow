@@ -2550,8 +2550,16 @@ def get_arrayrecord_dataloader_repa(data_pattern, batch_size, is_training=True, 
             label = parsed["label"]
             if "image_path" not in parsed:
                 raise KeyError(
-                    "REPA training requires ArrayRecord payloads with 'image_path'. "
+                    "REPA training requires ArrayRecord payloads with 'image_path' "
+                    "so the latent can be paired with the matching DINOv2 input image. "
                     "Rebuild latents with this branch's prepare_data_tpu.py."
+                )
+            if "sample_index" not in parsed and "image_index" not in parsed:
+                raise KeyError(
+                    "REPA training requires numbered ArrayRecord payloads "
+                    "('sample_index' or 'image_index') to keep latent samples aligned "
+                    "with DINOv2 inputs. Rebuild latents with this branch's "
+                    "prepare_data_tpu.py."
                 )
             image_path = parsed["image_path"]
 

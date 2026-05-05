@@ -83,7 +83,7 @@ class FastImageFolder(Dataset):
             d_path = os.path.join(root, cls_name)
             class_idx = self.class_to_idx[cls_name]
             try:
-                filenames = os.listdir(d_path)
+                filenames = sorted(os.listdir(d_path))
                 return [(os.path.join(d_path, fname), class_idx) for fname in filenames
                         if fname.lower().endswith(('.jpg', '.jpeg', '.png'))]
             except Exception:
@@ -94,35 +94,35 @@ class FastImageFolder(Dataset):
             
         for r in results:
             samples.extend(r)
-        return samples
+        return [(path, target, idx) for idx, (path, target) in enumerate(samples)]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        path, target = self.samples[index]
+        path, target, sample_index = self.samples[index]
         with open(path, 'rb') as f:
             sample = Image.open(f).convert('RGB')
         if self.transform is not None:
             sample = self.transform(sample)
-        return sample, target, path
+        return sample, target, path, sample_index
 
 
 class FlatImageDataset(Dataset):
     def __init__(self, samples, transform=None):
-        self.samples = samples
+        self.samples = [(path, target, idx) for idx, (path, target) in enumerate(samples)]
         self.transform = transform
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        path, target = self.samples[index]
+        path, target, sample_index = self.samples[index]
         with open(path, 'rb') as f:
             sample = Image.open(f).convert('RGB')
         if self.transform is not None:
             sample = self.transform(sample)
-        return sample, target, path
+        return sample, target, path, sample_index
 
 
 def resolve_split_dir(data_dir, split):
@@ -418,7 +418,7 @@ def run_encoding(
 
     writer = get_writer(current_shard)
     
-    for images, labels, paths in tqdm(dataloader, desc=f"Encoding {split}"):
+    for images, labels, paths, sample_indices in tqdm(dataloader, desc=f"Encoding {split}"):
         
         # Reshape to (num_devices, batch_per_device, C, H, W)
         images_np = images.numpy()
@@ -430,11 +430,16 @@ def run_encoding(
         # Flatten back CPU numpy (Batch, 4, 32, 32)
         latents_np = jax.device_get(latents).reshape((-1, 4, 32, 32)).astype("float32")
         labels_np = labels.numpy()
+        sample_indices_np = sample_indices.numpy()
         
-        for latent, label, path in zip(latents_np, labels_np, paths):
+        for latent, label, path, sample_index in zip(latents_np, labels_np, paths, sample_indices_np):
+            image_id = os.path.splitext(os.path.basename(path))[0]
             payload = {
                 "latent": latent,
                 "label": int(label),
+                "sample_index": int(sample_index),
+                "image_index": int(sample_index),
+                "image_id": image_id,
                 "image_path": path,
             }
             serialized = pickle.dumps(payload)
