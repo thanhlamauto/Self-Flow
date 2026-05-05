@@ -128,8 +128,9 @@ class MotionTextCrossAttention(nn.Module):
 
 \section{Predictor block}
 
-The recommended HumanML3D predictor block is temporal Conv1D followed by
-self-attention, cross-attention, and MLP. Conv1D runs along the frame axis.
+The implemented HumanML3D predictor block is temporal depthwise-separable
+Conv1D followed by self-attention, cross-attention, and MLP. Conv1D runs along
+the frame axis and leaves the first condition token unchanged.
 
 \begin{lstlisting}[style=python]
 class TemporalConvSelfCrossBlock(nn.Module):
@@ -264,20 +265,23 @@ def forward(
 
 \section{Recommended flags}
 
-For HumanML3D, make the cross-attention path the default for the
-\texttt{hybrid\_deep\_12pct} predictor:
+For HumanML3D, make the cross-attention path the default depth-shortcut
+predictor. The historical \texttt{hybrid\_deep\_12pct} name is kept as a
+compatibility alias, but it now resolves to the same text-cross architecture as
+\texttt{hybrid\_text\_cross\_10pct}.
 
 \begin{center}
 \begin{tabular}{ll}
 \toprule
 Switch & Default \\
 \midrule
-\texttt{--shortcut-predictor} & \texttt{hybrid\_deep\_12pct} \\
+\texttt{--shortcut-predictor} & \texttt{hybrid\_text\_cross\_10pct} or \texttt{hybrid\_deep\_12pct} \\
 \texttt{--shortcut-predictor-use-timestep} & on \\
-\texttt{--shortcut-predictor-use-text-cross-attn} & on \\
-\texttt{--shortcut-predictor-text-context} & \texttt{ztk\_plus\_pooled} initially \\
-\texttt{--shortcut-predictor-cross-attn-heads} & $8$ \\
-\texttt{--shortcut-predictor-cross-attn-gated} & on \\
+\texttt{context source} & masked MDM condition token $z_{tk}$ \\
+\texttt{width} & $96$ \\
+\texttt{blocks} & $8$ \\
+\texttt{heads} & $4$ \\
+\texttt{parameters} & $1.777$M, about $9.94\%$ of a $17.88$M MDM-B backbone \\
 \bottomrule
 \end{tabular}
 \end{center}

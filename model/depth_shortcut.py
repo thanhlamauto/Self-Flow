@@ -142,6 +142,108 @@ class DeepHybridShortcutBlock(nn.Module):
         return h
 
 
+class MotionTextCrossAttention(nn.Module):
+    def __init__(self, width, num_heads=4, gated=True):
+        super().__init__()
+        self.motion_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.context_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(width, num_heads, batch_first=True)
+        self.gate = nn.Parameter(torch.zeros(())) if gated else None
+
+    def forward(self, h, context_tokens, context_padding_mask=None):
+        q = self.motion_norm(h)
+        ctx = self.context_norm(context_tokens)
+        out, _ = self.attn(
+            q,
+            ctx,
+            ctx,
+            key_padding_mask=context_padding_mask,
+            need_weights=False,
+        )
+        if self.gate is not None:
+            out = torch.tanh(self.gate) * out
+        return h + out
+
+
+class TemporalConvSelfTextBlock(nn.Module):
+    """Temporal Conv1d + self-attention + text/ztk cross-attention block."""
+
+    def __init__(self, width, mlp_ratio=1.5, dilation=1, num_heads=4, adaln_zero=True):
+        super().__init__()
+        self.conv_ln = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.conv_adaln = nn.Linear(width, 3 * width)
+        self.dwconv = nn.Conv1d(width, width, kernel_size=3, padding=dilation, dilation=dilation, groups=width)
+        self.pwconv = nn.Linear(width, width)
+
+        self.self_ln = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.self_adaln = nn.Linear(width, 3 * width)
+        self.self_attn = nn.MultiheadAttention(width, num_heads, batch_first=True)
+
+        self.cross_attn = MotionTextCrossAttention(width, num_heads=num_heads, gated=True)
+
+        self.mlp_ln = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.mlp_adaln = nn.Linear(width, 3 * width)
+        hidden = int(width * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(width, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, width),
+        )
+
+        if adaln_zero:
+            zero_init(self.conv_adaln)
+            zero_init(self.self_adaln)
+            zero_init(self.mlp_adaln)
+        zero_init(self.mlp[-1])
+
+    def _adaln(self, layer, cond):
+        return layer(F.silu(cond)).chunk(3, dim=-1)
+
+    def _zero_padded_tokens(self, h, key_padding_mask):
+        if key_padding_mask is None:
+            return h
+        return h.masked_fill(key_padding_mask[:, :, None].to(device=h.device), 0.0)
+
+    def _temporal_conv(self, x):
+        if x.shape[1] <= 1:
+            return x
+        cond_token = x[:, :1]
+        motion_tokens = x[:, 1:]
+        motion_tokens = self.dwconv(motion_tokens.transpose(1, 2)).transpose(1, 2)
+        return torch.cat([cond_token, motion_tokens], dim=1)
+
+    def forward(self, h, cond, context_tokens, key_padding_mask=None, context_padding_mask=None):
+        h = self._zero_padded_tokens(h, key_padding_mask)
+
+        shift, scale, gate = self._adaln(self.conv_adaln, cond)
+        x = modulate(self.conv_ln(h), shift, scale)
+        x = self._temporal_conv(x)
+        x = self.pwconv(x)
+        h = h + gate[:, None, :] * x
+        h = self._zero_padded_tokens(h, key_padding_mask)
+
+        shift, scale, gate = self._adaln(self.self_adaln, cond)
+        x = modulate(self.self_ln(h), shift, scale)
+        attn_out, _ = self.self_attn(
+            x,
+            x,
+            x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        h = h + gate[:, None, :] * attn_out
+        h = self._zero_padded_tokens(h, key_padding_mask)
+
+        h = self.cross_attn(h, context_tokens, context_padding_mask=context_padding_mask)
+        h = self._zero_padded_tokens(h, key_padding_mask)
+
+        shift, scale, gate = self._adaln(self.mlp_adaln, cond)
+        x = modulate(self.mlp_ln(h), shift, scale)
+        h = h + gate[:, None, :] * self.mlp(x)
+        h = self._zero_padded_tokens(h, key_padding_mask)
+        return h
+
+
 class MagnitudeHead(nn.Module):
     def __init__(self, width, mag_abs_center=2.9, mag_abs_scale=0.6):
         super().__init__()
@@ -194,6 +296,7 @@ class DepthShortcutPredictor(nn.Module):
         gamma_out_init=0.001,
         mag_abs_center=2.9,
         mag_abs_scale=0.6,
+        block_type="hybrid",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -202,6 +305,8 @@ class DepthShortcutPredictor(nn.Module):
         self.num_blocks = num_blocks
         self.residual_output = residual_output
         self.attention_every = attention_every
+        self.block_type = str(block_type)
+        self.use_text_cross_attn = self.block_type in {"text_cross", "temporal_self_text"}
         cond_dim = int(cond_dim or width)
 
         self.in_proj = nn.Linear(hidden_size, width)
@@ -209,6 +314,7 @@ class DepthShortcutPredictor(nn.Module):
         self.cond_layer_embed = nn.Embedding(depth + 1, cond_dim)
         self.cond_delta_embed = nn.Embedding(depth, cond_dim)
         self.cond_out = nn.Linear(cond_dim, width)
+        self.context_proj = nn.Linear(hidden_size, width) if self.use_text_cross_attn else None
 
         if dilation_schedule is None:
             dilation_schedule = (1, 2, 4, 1, 2, 4, 1, 2, 4, 1)[:num_blocks]
@@ -216,16 +322,27 @@ class DepthShortcutPredictor(nn.Module):
             raise ValueError("dilation_schedule length must match num_blocks")
         self.blocks = nn.ModuleList()
         for idx, dilation in enumerate(dilation_schedule):
-            self.blocks.append(
-                DeepHybridShortcutBlock(
-                    width=width,
-                    mlp_ratio=mlp_ratio,
-                    dilation=int(dilation),
-                    use_attention=attention_every > 0 and ((idx + 1) % attention_every == 0),
-                    num_heads=num_heads,
-                    adaln_zero=adaln_zero,
+            if self.use_text_cross_attn:
+                self.blocks.append(
+                    TemporalConvSelfTextBlock(
+                        width=width,
+                        mlp_ratio=mlp_ratio,
+                        dilation=int(dilation),
+                        num_heads=num_heads,
+                        adaln_zero=adaln_zero,
+                    )
                 )
-            )
+            else:
+                self.blocks.append(
+                    DeepHybridShortcutBlock(
+                        width=width,
+                        mlp_ratio=mlp_ratio,
+                        dilation=int(dilation),
+                        use_attention=attention_every > 0 and ((idx + 1) % attention_every == 0),
+                        num_heads=num_heads,
+                        adaln_zero=adaln_zero,
+                    )
+                )
         self.final_ln = nn.LayerNorm(width, eps=1e-6)
         self.out_proj = nn.Linear(width, hidden_size)
         self.gamma_out = nn.Parameter(torch.tensor(float(gamma_out_init)))
@@ -245,6 +362,7 @@ class DepthShortcutPredictor(nn.Module):
         m_source=None,
         use_timestep_embed=True,
         key_padding_mask=None,
+        context_padding_mask=None,
     ):
         batch_size = u_source.shape[0]
         device = u_source.device
@@ -256,10 +374,18 @@ class DepthShortcutPredictor(nn.Module):
         target_layer = target_layer.to(device=device, dtype=torch.long).clamp(0, self.depth)
         delta = (target_layer - source_layer).clamp(1, self.depth)
 
-        if use_timestep_embed:
-            cond = self.cond_t_proj(timestep_embed.float())
+        if timestep_embed.dim() == 3:
+            context_input = timestep_embed.float()
+            cond_input = context_input[:, 0]
         else:
-            cond = torch.zeros(batch_size, self.cond_t_proj.out_features, device=device, dtype=timestep_embed.dtype)
+            cond_input = timestep_embed.float()
+            context_input = cond_input[:, None, :]
+
+        if use_timestep_embed:
+            cond = self.cond_t_proj(cond_input)
+        else:
+            cond = torch.zeros(batch_size, self.cond_t_proj.out_features, device=device, dtype=cond_input.dtype)
+            context_input = torch.zeros_like(context_input)
         cond = (
             cond
             + self.cond_layer_embed(source_layer)
@@ -267,12 +393,22 @@ class DepthShortcutPredictor(nn.Module):
             + self.cond_delta_embed(delta - 1)
         )
         cond = self.cond_out(F.gelu(cond))
+        context_tokens = self.context_proj(context_input) if self.context_proj is not None else None
 
         h = self.in_proj(u_source.float())
         if key_padding_mask is not None:
             h = h.masked_fill(key_padding_mask[:, :, None].to(device=h.device), 0.0)
         for block in self.blocks:
-            h = block(h, cond, key_padding_mask=key_padding_mask)
+            if self.use_text_cross_attn:
+                h = block(
+                    h,
+                    cond,
+                    context_tokens,
+                    key_padding_mask=key_padding_mask,
+                    context_padding_mask=context_padding_mask,
+                )
+            else:
+                h = block(h, cond, key_padding_mask=key_padding_mask)
         h = self.final_ln(h)
         delta_y = self.out_proj(h)
         y = u_source.float() + self.gamma_out * delta_y if self.residual_output else delta_y
@@ -284,7 +420,17 @@ class DepthShortcutPredictor(nn.Module):
 def predictor_config_from_name(name, hidden_size):
     normalized = str(name).lower().replace("-", "_")
     variants = {
-        # Default for MDM-B: roughly 10-12% of an 8-layer 512-wide MDM backbone.
+        # Default for MDM-B: roughly 10% of an 8-layer 512-wide MDM backbone.
+        "hybrid_text_cross_10pct": {
+            "width": max(96, int(round(hidden_size * 0.1875))),
+            "num_blocks": 8,
+            "mlp_ratio": 1.5,
+            "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2),
+            "num_heads": 4,
+            "attention_every": 0,
+            "cond_dim": max(64, int(round(hidden_size * 0.125))),
+            "block_type": "text_cross",
+        },
         "hybrid_mdm_10": {
             "width": max(96, int(round(hidden_size * 0.25))),
             "num_blocks": 8,
@@ -313,17 +459,18 @@ def predictor_config_from_name(name, hidden_size):
             "cond_dim": max(64, int(round(hidden_size * 0.125))),
         },
         "hybrid_deep_12pct": {
-            "width": max(112, int(round(hidden_size * 0.28125))),
+            "width": max(96, int(round(hidden_size * 0.1875))),
             "num_blocks": 8,
             "mlp_ratio": 1.5,
             "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2),
             "num_heads": 4,
-            "attention_every": 4,
+            "attention_every": 0,
             "cond_dim": max(64, int(round(hidden_size * 0.125))),
+            "block_type": "text_cross",
         },
     }
     if normalized in {"hybrid", "default", "hybrid_deep"}:
-        normalized = "hybrid_mdm_10"
+        normalized = "hybrid_text_cross_10pct"
     if normalized not in variants:
         raise ValueError(f"Unknown MDM depth shortcut predictor: {name!r}")
     return dict(variants[normalized])

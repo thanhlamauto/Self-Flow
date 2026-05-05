@@ -1420,7 +1420,12 @@ class GaussianDiffusion:
         global_step=0,
     ):
         terms = {}
-        actual_model = getattr(model, 'module', model)
+        actual_model = getattr(model, 'model', None)
+        if actual_model is None:
+            actual_model = model
+        ddp_model = getattr(actual_model, 'module', None)
+        if ddp_model is not None:
+            actual_model = ddp_model
         predictor = getattr(actual_model, 'depth_shortcut_predictor', None)
         if predictor is None:
             return terms
@@ -1631,8 +1636,13 @@ class GaussianDiffusion:
         """
 
         # enc = model.model._modules['module']
-        model_module = getattr(model, 'module', model)
-        enc = getattr(model_module, 'model', model_module)
+        model_module = getattr(model, 'model', None)
+        if model_module is None:
+            model_module = model
+        ddp_module = getattr(model_module, 'module', None)
+        if ddp_module is not None:
+            model_module = ddp_module
+        enc = model_module
         mask = model_kwargs['y']['mask']
         get_xyz = lambda sample: enc.rot2xyz(sample, mask=None, pose_rep=enc.pose_rep, translation=enc.translation,
                                              glob=enc.glob,

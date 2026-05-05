@@ -5,10 +5,10 @@ set -euo pipefail
 # Global batch = 4 GPUs * local batch 16 = 64, matching the reference run.
 
 DATA_DIR="${DATA_DIR:-$PWD/dataset/HumanML3D}"
-SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k}"
+SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 NPROC="${NPROC:-4}"
-LAMBDA_PRIVATE="${LAMBDA_PRIVATE:-0.5}"
+LAMBDA_PRIVATE="${LAMBDA_PRIVATE:-0.2}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 
 "${TORCHRUN}" --standalone --nproc_per_node="${NPROC}" -m train.train_mdm \
@@ -63,7 +63,7 @@ TORCHRUN="${TORCHRUN:-torchrun}"
   --direct-predictor-only-pairs 0 \
   --private-loss \
   --lambda-private "${LAMBDA_PRIVATE}" \
-  --private-max-pairs 2 \
+  --private-max-pairs 1 \
   --private-use-residual \
   --private-cosine-mode bnd \
   --private-pair-mode random \

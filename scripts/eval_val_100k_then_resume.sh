@@ -4,10 +4,10 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_DIR}"
 
-MODEL_PATH="${MODEL_PATH:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k/model000100000.pt}"
-SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k}"
+MODEL_PATH="${MODEL_PATH:-./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly/model000100000.pt}"
+SAVE_DIR="${SAVE_DIR:-./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly}"
 DATA_DIR="${DATA_DIR:-${REPO_DIR}/dataset/HumanML3D}"
-TRAIN_LOG="${TRAIN_LOG:-logs/train_humanml_depth_shortcut_4x4090_uniform_tuned_val_from100k_tmux_online.log}"
+TRAIN_LOG="${TRAIN_LOG:-logs/train_humanml_depth_shortcut_4x4090_textcross_val_from100k_tmux_online.log}"
 EVAL_NAME="${EVAL_NAME:-FID_test}"
 EVAL_LOG="${EVAL_LOG:-${SAVE_DIR}/${EVAL_NAME}_000100000_val.log}"
 NPROC="${NPROC:-4}"

@@ -66,7 +66,7 @@ Useful overrides:
 ```bash
 SAVE_DIR=./save/my_run
 RESUME_CHECKPOINT=./save/my_run/model000100000.pt
-LAMBDA_PRIVATE=0.5
+LAMBDA_PRIVATE=0.2
 TORCHRUN=torchrun
 WANDB_ENTITY=my_entity
 WANDB_RUN_ID=my_run_id
@@ -77,8 +77,8 @@ Example resume:
 
 ```bash
 DATA_DIR="$PWD/dataset/HumanML3D" \
-SAVE_DIR=./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k \
-RESUME_CHECKPOINT=./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k/model000100000.pt \
+SAVE_DIR=./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly \
+RESUME_CHECKPOINT=./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly/model000100000.pt \
 NPROC=4 \
 bash scripts/train_humanml_depth_shortcut_4x4090.sh
 ```
@@ -88,7 +88,7 @@ bash scripts/train_humanml_depth_shortcut_4x4090.sh
 To evaluate a checkpoint on `val` and then continue training:
 
 ```bash
-MODEL_PATH=./save/humanml_mdm_depth_shortcut_hybrid_deep_12pct_outputdistill_uniform_tuned_test_from50k/model000100000.pt \
+MODEL_PATH=./save/humanml_mdm_depth_shortcut_textcross_10pct_outputdistill_predictoronly/model000100000.pt \
 DATA_DIR="$PWD/dataset/HumanML3D" \
 NPROC=4 \
 bash scripts/eval_val_100k_then_resume.sh

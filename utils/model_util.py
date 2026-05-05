@@ -74,7 +74,7 @@ def get_model_args(args, data):
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
             'use_depth_shortcut': getattr(args, 'use_depth_shortcut', False),
-            'shortcut_predictor': getattr(args, 'shortcut_predictor', 'hybrid_mdm_10'),
+            'shortcut_predictor': getattr(args, 'shortcut_predictor', 'hybrid_text_cross_10pct'),
             'shortcut_mag_abs_center': getattr(args, 'shortcut_mag_abs_center', 2.9),
             'shortcut_mag_abs_scale': getattr(args, 'shortcut_mag_abs_scale', 0.6),
             }

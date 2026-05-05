@@ -139,7 +139,7 @@ class MDM(nn.Module):
         self.output_process = OutputProcess(self.data_rep, self.input_feats, self.latent_dim, self.njoints,
                                             self.nfeats)
         if self.use_depth_shortcut:
-            shortcut_predictor = kargs.get('shortcut_predictor', 'hybrid_mdm_10')
+            shortcut_predictor = kargs.get('shortcut_predictor', 'hybrid_text_cross_10pct')
             shortcut_cfg = predictor_config_from_name(shortcut_predictor, self.latent_dim)
             self.depth_shortcut_predictor = DepthShortcutPredictor(
                 hidden_size=self.latent_dim,
@@ -271,6 +271,7 @@ class MDM(nn.Module):
         if self.cond_mode == 'no_cond': 
             # unconstrained
             emb = time_emb
+        shortcut_context = emb.permute(1, 0, 2).contiguous()
 
         if self.arch == 'gru':
             x_reshaped = x.reshape(bs, njoints*nfeats, 1, nframes)
@@ -311,7 +312,7 @@ class MDM(nn.Module):
                     output, hidden_states = self._forward_encoder_depth_shortcut(
                         xseq,
                         src_key_padding_mask=frames_mask,
-                        time_emb=time_emb.squeeze(0),
+                        shortcut_context=shortcut_context,
                         return_hidden_states=return_hidden_states,
                         resume_start_layer=resume_start_layer,
                         depth_shortcut_skip=depth_shortcut_skip,
@@ -390,7 +391,7 @@ class MDM(nn.Module):
         output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
         if return_hidden_states:
             hidden_states = tuple(hidden_states)
-            return output, hidden_states, time_emb.squeeze(0)
+            return output, hidden_states, shortcut_context
         if layersync_features is not None:
             layersync_features = tuple(feature.permute(1, 0, 2).contiguous() for feature in layersync_features)
             return output, layersync_features
@@ -400,7 +401,7 @@ class MDM(nn.Module):
         self,
         xseq,
         src_key_padding_mask,
-        time_emb,
+        shortcut_context,
         return_hidden_states=False,
         resume_start_layer=None,
         depth_shortcut_skip=False,
@@ -434,7 +435,7 @@ class MDM(nn.Module):
                     hidden,
                     int(depth_shortcut_skip_source_layer),
                     int(depth_shortcut_skip_target_layer),
-                    time_emb,
+                    shortcut_context,
                     src_key_padding_mask,
                     depth_shortcut_predict_magnitude=depth_shortcut_predict_magnitude,
                     depth_shortcut_mag_scale=depth_shortcut_mag_scale,
@@ -463,7 +464,7 @@ class MDM(nn.Module):
         hidden,
         source_layer,
         target_layer,
-        time_emb,
+        shortcut_context,
         key_padding_mask,
         depth_shortcut_predict_magnitude=True,
         depth_shortcut_mag_scale=2.2,
@@ -483,7 +484,7 @@ class MDM(nn.Module):
             predictor_source,
             source_layer,
             target_layer,
-            time_emb,
+            shortcut_context,
             m_source if depth_shortcut_predict_magnitude else None,
             use_timestep_embed=depth_shortcut_use_timestep,
             key_padding_mask=key_padding_mask,

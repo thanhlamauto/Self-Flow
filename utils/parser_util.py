@@ -101,7 +101,7 @@ def apply_rules(args):
         args.eval_metrics = _parse_csv_strings(args.eval_metrics)
     if hasattr(args, 'shortcut_predictor'):
         args.shortcut_predictor = args.shortcut_predictor.replace("-", "_")
-        if args.shortcut_predictor not in {"hybrid_mdm_10", "default"}:
+        if args.shortcut_predictor not in {"hybrid_mdm_10", "hybrid_text_cross_10pct", "default"}:
             args.use_depth_shortcut = True
     if hasattr(args, 'shortcut_mag_scale') and args.shortcut_mag_scale <= 0:
         raise ValueError('--shortcut-mag-scale must be positive.')
@@ -213,9 +213,9 @@ def add_model_options(parser):
                        help="Enable MDM depth shortcut predictor and auxiliary training losses.")
     group.add_argument("--no-use-depth-shortcut", dest="use_depth_shortcut", action='store_false',
                        help="Disable MDM depth shortcut predictor.")
-    group.add_argument("--shortcut-predictor", dest="shortcut_predictor", default="hybrid_mdm_10",
-                       choices=["hybrid_mdm_10", "hybrid-mdm-10", "hybrid_mdm_8", "hybrid-mdm-8", "hybrid_deep_10", "hybrid-deep-10", "hybrid_deep_12pct", "hybrid-deep-12pct", "hybrid", "default"],
-                       help="Depth shortcut predictor variant. Default is a hybrid 1D MDM predictor sized around 10-12%% of MDM-B.")
+    group.add_argument("--shortcut-predictor", dest="shortcut_predictor", default="hybrid_text_cross_10pct",
+                       choices=["hybrid_mdm_10", "hybrid-mdm-10", "hybrid_mdm_8", "hybrid-mdm-8", "hybrid_deep_10", "hybrid-deep-10", "hybrid_deep_12pct", "hybrid-deep-12pct", "hybrid_text_cross_10pct", "hybrid-text-cross-10pct", "hybrid", "default"],
+                       help="Depth shortcut predictor variant. The HumanML text-cross preset is sized around 10%% of MDM-B.")
     group.add_argument("--shortcut-predictor-use-timestep", dest="shortcut_predictor_use_timestep",
                        action='store_true', default=True,
                        help="Condition the shortcut predictor on the MDM timestep embedding.")
