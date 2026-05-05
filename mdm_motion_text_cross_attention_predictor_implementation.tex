@@ -1,0 +1,334 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\geometry{margin=1in}
+
+\lstdefinestyle{python}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black},
+  stringstyle=\color{green!40!black},
+  commentstyle=\color{gray!70!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single
+}
+
+\title{Implementation Note: Text Cross-Attention for the MDM Shortcut Predictor}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+For HumanML3D, the shortcut predictor should not be treated like an
+image-latent predictor. Its source activation is a motion sequence, and the
+conditioning signal is text. The proposed default predictor block is therefore
+\[
+  h = \mathrm{Conv1D}_{\mathrm{time}}(x),\qquad
+  h = h + \mathrm{SelfAttn}(h),\qquad
+  h = h + \mathrm{CrossAttn}(h, C),\qquad
+  h = h + \mathrm{MLP}(h),
+\]
+where motion tokens query a context set $C$ containing the MDM condition token
+$z_{tk}$ and, when available, CLIP text tokens.
+
+This change is for the auxiliary depth-shortcut predictor. Evaluation metrics
+such as FID, matching score, R-precision, and diversity must still sample from
+the full MDM backbone, not from the shortcut predictor.
+
+\section{Tensor convention}
+
+The predictor operates on hidden activations after MDM has embedded the motion:
+\[
+  S_a \in \mathbb{R}^{B\times T\times D},
+\]
+where $B$ is batch size, $T$ is number of motion frames/tokens, and $D$ is the
+MDM hidden dimension, e.g. $D=512$ for the HumanML3D setting.
+
+The context tokens are
+\[
+  C = [z_{tk}; c_1;\ldots;c_M]\in \mathbb{R}^{B\times (1+M)\times D}.
+\]
+Here $z_{tk}$ is the original MDM conditioning token created from timestep and
+text:
+\[
+  z_{tk}=f_t(t)+f_c(c),
+\]
+with the same classifier-free random text mask used by the backbone during
+training. The tokens $c_1,\ldots,c_M$ are optional projected CLIP text tokens.
+If the current MDM implementation only exposes the pooled CLIP embedding, use
+\[
+  C = [z_{tk}; f_{\mathrm{pool}}(c)].
+\]
+If only $z_{tk}$ is available, start with $C=[z_{tk}]$; this is still better
+than giving the predictor no text/timestep context.
+
+\section{Cross-attention module}
+
+Use pre-norm residual cross-attention. Initialize the residual gate at zero so
+the new path starts as an identity mapping and does not immediately disturb the
+existing predictor.
+
+\begin{lstlisting}[style=python]
+import torch
+import torch.nn as nn
+
+
+class MotionTextCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int | None = None,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        gated: bool = True,
+    ):
+        super().__init__()
+        context_dim = context_dim or dim
+        self.motion_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(context_dim)
+        self.context_proj = (
+            nn.Identity() if context_dim == dim else nn.Linear(context_dim, dim)
+        )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.gate = nn.Parameter(torch.zeros(())) if gated else None
+
+    def forward(
+        self,
+        motion_tokens: torch.Tensor,          # [B, T, D]
+        context_tokens: torch.Tensor,         # [B, S, D_ctx]
+        context_padding_mask: torch.Tensor | None = None,  # [B, S], True = mask
+    ) -> torch.Tensor:
+        q = self.motion_norm(motion_tokens)
+        ctx = self.context_proj(self.context_norm(context_tokens))
+        out, _ = self.attn(
+            query=q,
+            key=ctx,
+            value=ctx,
+            key_padding_mask=context_padding_mask,
+            need_weights=False,
+        )
+        if self.gate is not None:
+            out = torch.tanh(self.gate) * out
+        return motion_tokens + out
+\end{lstlisting}
+
+\section{Predictor block}
+
+The recommended HumanML3D predictor block is temporal Conv1D followed by
+self-attention, cross-attention, and MLP. Conv1D runs along the frame axis.
+
+\begin{lstlisting}[style=python]
+class TemporalConvSelfCrossBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.conv_norm = nn.LayerNorm(dim)
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
+            nn.GELU(),
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
+        )
+
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(
+            dim, num_heads=num_heads, batch_first=True
+        )
+
+        self.cross_attn = MotionTextCrossAttention(
+            dim=dim,
+            context_dim=dim,
+            num_heads=num_heads,
+            gated=True,
+        )
+
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, h, context_tokens, context_padding_mask=None):
+        # Temporal local smoothing: [B, T, D] -> [B, D, T] -> [B, T, D]
+        u = self.conv_norm(h).transpose(1, 2)
+        u = self.temporal_conv(u).transpose(1, 2)
+        h = h + u
+
+        u, _ = self.self_attn(
+            self.self_norm(h),
+            self.self_norm(h),
+            self.self_norm(h),
+            need_weights=False,
+        )
+        h = h + u
+
+        h = self.cross_attn(h, context_tokens, context_padding_mask)
+        h = h + self.mlp(h)
+        return h
+\end{lstlisting}
+
+\section{Context builder}
+
+The predictor should receive the same conditioning state as the backbone. Do
+not use unmasked text in the predictor while the backbone receives masked text;
+that creates a classifier-free guidance mismatch.
+
+\begin{lstlisting}[style=python]
+def build_predictor_context(
+    timestep_cond: torch.Tensor,          # z_tk or time+text cond, [B, D]
+    pooled_text: torch.Tensor | None,     # [B, D_text]
+    text_tokens: torch.Tensor | None,     # [B, M, D_text]
+    text_token_mask: torch.Tensor | None, # [B, M], True = mask
+    pooled_text_proj: nn.Module,
+    text_token_proj: nn.Module,
+):
+    tokens = [timestep_cond[:, None, :]]
+    masks = [
+        torch.zeros(
+            timestep_cond.shape[0],
+            1,
+            dtype=torch.bool,
+            device=timestep_cond.device,
+        )
+    ]
+
+    if text_tokens is not None:
+        tokens.append(text_token_proj(text_tokens))
+        masks.append(text_token_mask)
+    elif pooled_text is not None:
+        tokens.append(pooled_text_proj(pooled_text)[:, None, :])
+        masks.append(
+            torch.zeros(
+                timestep_cond.shape[0],
+                1,
+                dtype=torch.bool,
+                device=timestep_cond.device,
+            )
+        )
+
+    context_tokens = torch.cat(tokens, dim=1)
+    context_padding_mask = torch.cat(masks, dim=1)
+    return context_tokens, context_padding_mask
+\end{lstlisting}
+
+\section{Full predictor forward path}
+
+For a sampled depth pair $(a,b)$, the predictor keeps the existing
+direction--magnitude objective. Only the internal conditioning block changes.
+
+\begin{lstlisting}[style=python]
+def forward(
+    self,
+    source_act,          # S_a, [B, T, D]
+    source_layer,        # a
+    target_layer,        # b
+    timestep_cond,       # z_tk or MDM emb, [B, D]
+    pooled_text=None,
+    text_tokens=None,
+    text_token_mask=None,
+):
+    context, context_mask = build_predictor_context(
+        timestep_cond=timestep_cond,
+        pooled_text=pooled_text,
+        text_tokens=text_tokens,
+        text_token_mask=text_token_mask,
+        pooled_text_proj=self.pooled_text_proj,
+        text_token_proj=self.text_token_proj,
+    )
+
+    h = self.input_proj(source_act)
+    h = h + self.layer_pair_embed(source_layer, target_layer)[:, None, :]
+    h = h + self.timestep_proj(timestep_cond)[:, None, :]
+
+    for block in self.blocks:
+        h = block(h, context, context_mask)
+
+    direction = self.direction_head(h)       # [B, T, D]
+    delta_mag = self.magnitude_head(h)       # [B, T, 1] or pooled [B, 1]
+    return direction, delta_mag
+\end{lstlisting}
+
+\section{Recommended flags}
+
+For HumanML3D, make the cross-attention path the default for the
+\texttt{hybrid\_deep\_12pct} predictor:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Switch & Default \\
+\midrule
+\texttt{--shortcut-predictor} & \texttt{hybrid\_deep\_12pct} \\
+\texttt{--shortcut-predictor-use-timestep} & on \\
+\texttt{--shortcut-predictor-use-text-cross-attn} & on \\
+\texttt{--shortcut-predictor-text-context} & \texttt{ztk\_plus\_pooled} initially \\
+\texttt{--shortcut-predictor-cross-attn-heads} & $8$ \\
+\texttt{--shortcut-predictor-cross-attn-gated} & on \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If CLIP token embeddings are exposed later, switch
+\texttt{--shortcut-predictor-text-context} from \texttt{ztk\_plus\_pooled} to
+\texttt{ztk\_plus\_tokens}.
+
+\section{Implementation locations}
+
+The minimal patch should touch these components:
+
+\begin{itemize}
+\item predictor module: add \texttt{MotionTextCrossAttention} and replace the
+  pure CNN/MLP-only block with \texttt{TemporalConvSelfCrossBlock};
+\item MDM forward path: return or expose the already computed $z_{tk}$ condition
+  used by the backbone;
+\item text encoder path: optionally expose CLIP token embeddings. This is not
+  required for the first version if pooled text is already available;
+\item training loop: pass $z_{tk}$ and optional text context into the shortcut
+  predictor for direct, bootstrap, output-distill, and private losses;
+\item args/config: add the cross-attention flags above and enable them by
+  default for HumanML3D.
+\end{itemize}
+
+\section{Sanity checks}
+
+Before running a full 200k-step job:
+
+\begin{itemize}
+\item Check shape: source activation and predicted direction must both be
+  $[B,T,D]$.
+\item Check classifier-free consistency: when text is masked for the backbone,
+  the predictor context must use the masked text condition too.
+\item Check cold-start behavior: with cross-attention gate initialized at zero,
+  the first-step loss should match the previous predictor within noise.
+\item Check non-finite counters: \texttt{output\_distill\_nonfinite} should stay
+  at zero.
+\item Check evaluation path: FID and R-precision must call the normal MDM
+  sampling function, not the shortcut predictor.
+\item Check parameter budget: keep the predictor near $10$--$12\%$ of the MDM
+  backbone by controlling number of blocks, hidden width, heads, and MLP ratio.
+\end{itemize}
+
+\section{Expected effect}
+
+Temporal Conv1D provides the local smooth-motion bias, self-attention captures
+long-range motion structure, and cross-attention lets each motion token query
+the actual text/timestep condition. This is a better HumanML3D inductive bias
+than a predictor that only sees source activations and scalar timestep/layer
+ids, because the shortcut target depends on the action semantics encoded in
+text.
+
+\end{document}
