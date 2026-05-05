@@ -980,6 +980,13 @@ PREDICTOR_DEBUG_PAIRS = (
 )
 PREDICTOR_DEBUG_METRIC_NAMES = ("loss_dir", "loss_mag", "cos_dir", "delta_m_mae")
 PREDICTOR_DEBUG_MAX_GAP = 10
+UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES = (
+    "high_noise",
+    "mid_high_noise",
+    "mid_noise",
+    "mid_low_noise",
+    "low_noise",
+)
 
 
 def _scheduled_lambda(lambda_value, global_step, start_step, warmup_iters):
@@ -1136,6 +1143,8 @@ def train_step(
     shortcut_loss_mode="direction_magnitude",
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
+    uniform_transition_diag_logs=False,
+    uniform_transition_diag_freq=1000,
     private_use_residual=True,
     private_cosine_mode="bnd",
     private_pair_mode="first",
@@ -1203,6 +1212,8 @@ def train_step(
         raise ValueError(f"Unknown private cosine mode: {private_cosine_mode!r}")
     if private_pair_mode not in {"first", "random"}:
         raise ValueError(f"Unknown private pair mode: {private_pair_mode!r}")
+    if uniform_transition_diag_freq <= 0:
+        raise ValueError("uniform_transition_diag_freq must be positive.")
 
     x0, y = batch  # x0: [local_B, N, D], y: [local_B]
     local_batch = x0.shape[0]
@@ -1280,6 +1291,49 @@ def train_step(
             hidden_f32 = hidden_layer_f32(layer)
             norms = jnp.linalg.norm(hidden_f32, axis=-1, keepdims=True)
             return jnp.log(norms + 1e-6)
+
+        def shortcut_direct_loss_per_sample_for_pair(source_layer, target_layer):
+            za = hidden_layer_f32(source_layer)
+            zb_target = jax.lax.stop_gradient(hidden_layer_f32(target_layer))
+            predictor_source, ma_condition = build_predictor_source(
+                za,
+                normalize_input=predictor_normalize_input,
+            )
+            ub, mb_target_cached, _ = build_direction_and_norm_map(zb_target)
+            y_pair, delta_m_pair = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                predictor_source,
+                source_layer,
+                target_layer,
+                dit_time_emb,
+                ma_condition,
+                use_timestep_embed=predictor_use_timestep,
+                class_labels=y,
+            )
+            u_pair = l2_normalize_tokens(y_pair)
+            cos_pair = jnp.mean(jnp.sum(u_pair * ub, axis=-1), axis=1)
+            loss_dir_pair = 1.0 - cos_pair
+
+            if shortcut_loss_mode == "direction_magnitude":
+                target_delta_m_raw_pair = jax.lax.stop_gradient(mb_target_cached - ma_condition)
+                target_delta_m_pair = jax.lax.stop_gradient(
+                    jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
+                )
+                loss_aux_pair = 0.5 * jnp.mean(
+                    jnp.square(delta_m_pair - target_delta_m_pair),
+                    axis=tuple(range(1, delta_m_pair.ndim)),
+                )
+            else:
+                target_rms_pair = jax.lax.stop_gradient(sample_activation_rms(zb_target))
+                residual_norm_pair = (y_pair - zb_target) / target_rms_pair
+                loss_aux_pair = jnp.mean(
+                    optax.huber_loss(
+                        residual_norm_pair,
+                        delta=jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
+                    ),
+                    axis=tuple(range(1, residual_norm_pair.ndim)),
+                )
+            return lambda_dir * loss_dir_pair + lambda_mag * loss_aux_pair
 
         def shortcut_direct_mag_loss_for_pair(source_layer, target_layer, source_detach):
             za = hidden_layer_f32(source_layer)
@@ -1626,6 +1680,95 @@ def train_step(
             operand=None,
         )
 
+        def zero_uniform_transition_diag_stats(_):
+            layer_shape = (num_hidden_layers,)
+            time_shape = (len(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES),)
+            return (
+                jnp.zeros(layer_shape, dtype=jnp.float32),
+                jnp.zeros(layer_shape, dtype=jnp.float32),
+                jnp.zeros(layer_shape, dtype=jnp.float32),
+                jnp.zeros(layer_shape, dtype=jnp.float32),
+                jnp.zeros(time_shape, dtype=jnp.float32),
+                jnp.zeros(time_shape, dtype=jnp.float32),
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+            )
+
+        def compute_uniform_transition_diag_stats(_):
+            layer_shape = (num_hidden_layers,)
+            time_shape = (len(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES),)
+            gap_loss_sum = jnp.zeros(layer_shape, dtype=jnp.float32)
+            gap_count = jnp.zeros(layer_shape, dtype=jnp.float32)
+            source_loss_sum = jnp.zeros(layer_shape, dtype=jnp.float32)
+            source_count = jnp.zeros(layer_shape, dtype=jnp.float32)
+            time_loss_sum = jnp.zeros(time_shape, dtype=jnp.float32)
+            time_count = jnp.zeros(time_shape, dtype=jnp.float32)
+            all_loss_sum = jnp.float32(0.0)
+            all_count = jnp.float32(0.0)
+            timestep_bins = jnp.minimum(
+                (q.astype(jnp.int32) * len(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES))
+                // jnp.maximum(jnp.asarray(shortcut_timesteps, dtype=jnp.int32), 1),
+                len(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES) - 1,
+            )
+            timestep_one_hot = jax.nn.one_hot(
+                timestep_bins,
+                len(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES),
+                dtype=jnp.float32,
+            )
+            batch_count = jnp.asarray(local_batch, dtype=jnp.float32)
+
+            # Uniform transition diagnostics intentionally measure all eligible
+            # source-target layer transitions. Source 0 is skipped so DiT-B logs
+            # source layers 1..11, matching the table construction.
+            for source_layer in range(1, num_hidden_layers - 1):
+                for target_layer in range(source_layer + 1, num_hidden_layers):
+                    loss_by_sample = shortcut_direct_loss_per_sample_for_pair(
+                        source_layer,
+                        target_layer,
+                    )
+                    pair_loss_sum = jnp.sum(loss_by_sample)
+                    gap = target_layer - source_layer
+                    gap_loss_sum = gap_loss_sum.at[gap].add(pair_loss_sum)
+                    gap_count = gap_count.at[gap].add(batch_count)
+                    source_loss_sum = source_loss_sum.at[source_layer].add(pair_loss_sum)
+                    source_count = source_count.at[source_layer].add(batch_count)
+                    time_loss_sum = time_loss_sum + jnp.einsum(
+                        "b,bk->k",
+                        loss_by_sample.astype(jnp.float32),
+                        timestep_one_hot,
+                    )
+                    time_count = time_count + jnp.sum(timestep_one_hot, axis=0)
+                    all_loss_sum = all_loss_sum + pair_loss_sum
+                    all_count = all_count + batch_count
+            return (
+                gap_loss_sum,
+                gap_count,
+                source_loss_sum,
+                source_count,
+                time_loss_sum,
+                time_count,
+                all_loss_sum,
+                all_count,
+            )
+
+        uniform_transition_diag_logs_now = jnp.asarray(False, dtype=jnp.bool_)
+        if uniform_transition_diag_logs:
+            uniform_transition_diag_logs_now = jnp.equal(
+                jnp.mod(
+                    global_step + jnp.asarray(1, dtype=jnp.int32),
+                    jnp.asarray(uniform_transition_diag_freq, dtype=jnp.int32),
+                ),
+                0,
+            )
+            uniform_transition_diag_stats = jax.lax.cond(
+                uniform_transition_diag_logs_now,
+                compute_uniform_transition_diag_stats,
+                zero_uniform_transition_diag_stats,
+                operand=None,
+            )
+        else:
+            uniform_transition_diag_stats = zero_uniform_transition_diag_stats(None)
+
         loss_skip_fm = jnp.float32(0.0)
         skip_prob_eff = jnp.float32(0.0)
         skip_do = jnp.asarray(False, dtype=jnp.bool_)
@@ -1854,6 +1997,8 @@ def train_step(
             output_distill_full_backbone_active.astype(jnp.float32),
             debug_gap_logs_now.astype(jnp.float32),
             debug_pair_metrics,
+            uniform_transition_diag_logs_now.astype(jnp.float32),
+            uniform_transition_diag_stats,
             (
                 jnp.zeros((1,), dtype=jnp.float32)
                 if shortcut_loss_mode == "direction_magnitude"
@@ -1921,6 +2066,8 @@ def train_step(
         output_distill_full_backbone_active,
         debug_gap_logs_now,
         debug_pair_metrics,
+        uniform_transition_diag_logs_now,
+        uniform_transition_diag_stats,
         hidden_stack,
     ) = aux
 
@@ -1984,6 +2131,32 @@ def train_step(
     output_distill_full_backbone_active = jax.lax.pmean(output_distill_full_backbone_active, axis_name="batch")
     debug_gap_logs_now = jax.lax.pmean(debug_gap_logs_now, axis_name="batch")
     debug_pair_metrics = tuple(jax.lax.pmean(value, axis_name="batch") for value in debug_pair_metrics)
+    uniform_transition_diag_logs_now = jax.lax.pmean(uniform_transition_diag_logs_now, axis_name="batch")
+    (
+        uniform_diag_gap_loss_sum,
+        uniform_diag_gap_count,
+        uniform_diag_source_loss_sum,
+        uniform_diag_source_count,
+        uniform_diag_time_loss_sum,
+        uniform_diag_time_count,
+        uniform_diag_all_loss_sum,
+        uniform_diag_all_count,
+    ) = uniform_transition_diag_stats
+    uniform_diag_gap_loss_sum = jax.lax.psum(uniform_diag_gap_loss_sum, axis_name="batch")
+    uniform_diag_gap_count = jax.lax.psum(uniform_diag_gap_count, axis_name="batch")
+    uniform_diag_source_loss_sum = jax.lax.psum(uniform_diag_source_loss_sum, axis_name="batch")
+    uniform_diag_source_count = jax.lax.psum(uniform_diag_source_count, axis_name="batch")
+    uniform_diag_time_loss_sum = jax.lax.psum(uniform_diag_time_loss_sum, axis_name="batch")
+    uniform_diag_time_count = jax.lax.psum(uniform_diag_time_count, axis_name="batch")
+    uniform_diag_all_loss_sum = jax.lax.psum(uniform_diag_all_loss_sum, axis_name="batch")
+    uniform_diag_all_count = jax.lax.psum(uniform_diag_all_count, axis_name="batch")
+    uniform_diag_all_loss = uniform_diag_all_loss_sum / jnp.maximum(uniform_diag_all_count, 1.0)
+    uniform_diag_gap_loss = uniform_diag_gap_loss_sum / jnp.maximum(uniform_diag_gap_count, 1.0)
+    uniform_diag_source_loss = uniform_diag_source_loss_sum / jnp.maximum(uniform_diag_source_count, 1.0)
+    uniform_diag_time_loss = uniform_diag_time_loss_sum / jnp.maximum(uniform_diag_time_count, 1.0)
+    uniform_diag_gap_share = uniform_diag_gap_count / jnp.maximum(uniform_diag_all_count, 1.0)
+    uniform_diag_source_share = uniform_diag_source_count / jnp.maximum(uniform_diag_all_count, 1.0)
+    uniform_diag_time_share = uniform_diag_time_count / jnp.maximum(uniform_diag_all_count, 1.0)
     sampled_timestep_q = jax.lax.pmean(jnp.mean(q.astype(jnp.float32)), axis_name="batch")
     sampled_timestep_tau = sampled_timestep_q / jnp.maximum(jnp.float32(shortcut_timesteps - 1), 1.0)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -2131,6 +2304,15 @@ def train_step(
         "train/lr_predictor": jnp.asarray(predictor_learning_rate, dtype=jnp.float32),
         "train/debug_gap_logs_active": debug_gap_logs_now,
         "train/debug_gap_log_freq": jnp.asarray(debug_gap_log_freq, dtype=jnp.float32),
+        "train/uniform_transition_diag_active": uniform_transition_diag_logs_now,
+        "train/uniform_transition_diag/freq": jnp.asarray(uniform_transition_diag_freq, dtype=jnp.float32),
+        "train/uniform_transition_diag/all/share": jnp.where(
+            uniform_diag_all_count > 0.0,
+            jnp.float32(1.0),
+            jnp.float32(0.0),
+        ),
+        "train/uniform_transition_diag/all/l_pred": uniform_diag_all_loss,
+        "train/uniform_transition_diag/all/count": uniform_diag_all_count,
         "train/ema_decay": ema_decay,
         "train/predictor_ema_decay": predictor_ema_decay,
         "train/grad_norm": grad_norm,
@@ -2149,6 +2331,15 @@ def train_step(
             metrics[f"train/debug_gap_{gap}/{metric_name}"] = debug_pair_metrics[
                 gap_offset + (gap - 1) * len(PREDICTOR_DEBUG_METRIC_NAMES) + metric_idx
             ]
+    for gap in range(1, uniform_diag_gap_loss.shape[0]):
+        metrics[f"train/uniform_transition_diag/gap_{gap}/share"] = uniform_diag_gap_share[gap]
+        metrics[f"train/uniform_transition_diag/gap_{gap}/l_pred"] = uniform_diag_gap_loss[gap]
+    for source_layer in range(1, max(uniform_diag_source_loss.shape[0] - 1, 1)):
+        metrics[f"train/uniform_transition_diag/source_{source_layer}/share"] = uniform_diag_source_share[source_layer]
+        metrics[f"train/uniform_transition_diag/source_{source_layer}/l_pred"] = uniform_diag_source_loss[source_layer]
+    for bin_idx, bin_name in enumerate(UNIFORM_TRANSITION_DIAG_TIMESTEP_BIN_NAMES):
+        metrics[f"train/uniform_transition_diag/timestep_bin_{bin_idx}_{bin_name}/share"] = uniform_diag_time_share[bin_idx]
+        metrics[f"train/uniform_transition_diag/timestep_bin_{bin_idx}_{bin_name}/l_pred"] = uniform_diag_time_loss[bin_idx]
     return state, ema_params, predictor_ema_params, l2_ema, metrics, rng
 
 
@@ -2408,6 +2599,7 @@ def filter_official_train_metrics(metrics):
         key: value
         for key, value in metrics.items()
         if key in OFFICIAL_TRAIN_METRIC_KEYS
+        or str(key).startswith("train/uniform_transition_diag")
     }
 
 
@@ -3359,6 +3551,21 @@ def main():
         default=10000,
         help="Run fixed-pair predictor debug gap logging every N training steps when --shortcut-debug-gap-logs is enabled.",
     )
+    parser.add_argument(
+        "--uniform-transition-diag-logs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Log table diagnostics for predictor error under exhaustive uniform source-target layer pair sampling. "
+            "Requires --timestep-sampling-mode uniform so timestep-bin shares are measured from uniform timesteps."
+        ),
+    )
+    parser.add_argument(
+        "--uniform-transition-diag-freq",
+        type=int,
+        default=1000,
+        help="Run uniform-transition diagnostics every N training steps when --uniform-transition-diag-logs is enabled.",
+    )
     parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0)
     parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0)
     parser.add_argument(
@@ -3903,6 +4110,13 @@ def main():
         raise ValueError("--predictor-learning-rate/--shortcut-predictor-lr must be greater than 0")
     if args.shortcut_debug_gap_log_freq <= 0:
         raise ValueError("--shortcut-debug-gap-log-freq must be greater than 0")
+    if args.uniform_transition_diag_freq <= 0:
+        raise ValueError("--uniform-transition-diag-freq must be greater than 0")
+    if args.uniform_transition_diag_logs and args.timestep_sampling_mode != "uniform":
+        raise ValueError(
+            "--uniform-transition-diag-logs requires --timestep-sampling-mode uniform "
+            "so the timestep-bin diagnostics are measured under uniform timestep sampling."
+        )
     if args.shortcut_predictor_hidden_size is not None and args.shortcut_predictor_hidden_size <= 0:
         raise ValueError("--shortcut-predictor-hidden-size must be greater than 0")
     if args.shortcut_predictor_depth is not None and args.shortcut_predictor_depth <= 0:
@@ -4060,6 +4274,8 @@ def main():
         f"lambda_mag={args.shortcut_lambda_mag} lambda_boot_mag={args.shortcut_lambda_boot_mag} "
         f"debug_gap_logs={args.shortcut_debug_gap_logs} "
         f"debug_gap_log_freq={args.shortcut_debug_gap_log_freq} "
+        f"uniform_transition_diag_logs={args.uniform_transition_diag_logs} "
+        f"uniform_transition_diag_freq={args.uniform_transition_diag_freq} "
         f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
         f"skip_p={args.shortcut_skip_in_loop_prob} "
         f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
@@ -4140,10 +4356,17 @@ def main():
         enabled=not args.no_wandb,
     )
     debug_gap_history_writer.initialize()
+    uniform_transition_diag_history_writer = WandbMetricHistoryFile(
+        os.path.join(args.ckpt_dir, "wandb_uniform_transition_diag_history.jsonl"),
+        key_prefixes=("train/uniform_transition_diag/",),
+        active_key="train/uniform_transition_diag_active",
+        enabled=not args.no_wandb,
+    )
+    uniform_transition_diag_history_writer.initialize()
     logger = AsyncWandbLogger(
         enabled=not args.no_wandb,
         summary_writer=summary_writer,
-        history_writers=(debug_gap_history_writer,),
+        history_writers=(debug_gap_history_writer, uniform_transition_diag_history_writer),
     )
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
@@ -4291,6 +4514,8 @@ def main():
             shortcut_loss_mode=args.shortcut_loss_mode,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
+            uniform_transition_diag_logs=args.uniform_transition_diag_logs,
+            uniform_transition_diag_freq=args.uniform_transition_diag_freq,
             private_use_residual=args.private_use_residual,
             private_cosine_mode=args.private_cosine_mode,
             private_pair_mode=args.private_pair_mode,

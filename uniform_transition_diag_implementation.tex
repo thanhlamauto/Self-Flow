@@ -1,0 +1,252 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs}
+\usepackage[T1]{fontenc}
+
+\title{Uniform Transition Diagnostic Logging: Current Implementation}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+This diagnostic is designed to fill the table ``Where uniform transition
+prediction is difficult.'' It measures shortcut predictor error under
+\emph{uniform source-target layer pair coverage}, independent of the pair
+sampling distribution used by the training losses.
+
+The implementation is in \texttt{train.py} and is enabled by
+\[
+\texttt{--uniform-transition-diag-logs}.
+\]
+It is intentionally guarded to require
+\[
+\texttt{--timestep-sampling-mode uniform},
+\]
+because the timestep column in the table is only interpretable when the
+underlying training timestep samples are uniform.
+
+\section{Flow-Matching Timestep Source}
+The diagnostic reuses the same batch and noisy input as the normal SiT
+training step. For each sample, the training step samples a discrete timestep
+index
+\[
+q \in \{0,\ldots,T-1\}, \qquad T=\texttt{shortcut\_timesteps},
+\]
+then converts it to
+\[
+\tau = \frac{q}{T-1}.
+\]
+The repo convention is
+\[
+\tau=0 \;\text{is pure noise}, \qquad \tau=1 \;\text{is clean data}.
+\]
+The flow-matching input and target are
+\[
+x_\tau = (1-\tau)x_1 + \tau x_0,\qquad
+v^\star = x_0 - x_1,\qquad x_1\sim \mathcal{N}(0,I).
+\]
+A full DiT forward on \((x_\tau,\tau,y)\) produces
+\[
+\hat v,\quad Z_0,Z_1,\ldots,Z_L,\quad e_\tau,
+\]
+where \(L\) is the backbone depth and \(Z_l\) is the hidden state after layer
+\(l\). For SiT-B, \(L=12\).
+
+\section{Uniform Pair Universe}
+The diagnostic does \emph{not} sample pairs from
+\texttt{trunc\_normal}, \texttt{trunc\_normal\_centered}, or any other training
+pair mode. Instead it exhaustively evaluates every forward pair
+\[
+\mathcal{P}_{\mathrm{diag}}
+=\{(a,b): 1 \leq a < b \leq L\}.
+\]
+Layer \(0\) is skipped as a source layer so that for SiT-B the source layers
+are exactly
+\[
+a\in\{1,2,\ldots,11\}.
+\]
+The target layer is every valid later layer \(b>a\), so source layer \(a\)
+has \(L-a\) transitions. The layer gap is
+\[
+d=b-a.
+\]
+
+\section{Per-Sample Prediction Loss}
+For each pair \((a,b)\), the predictor input is constructed from source hidden
+state \(Z_a\). In direction-magnitude mode,
+\[
+U_a=\frac{Z_a}{\|Z_a\|_2+\epsilon},\qquad
+m_a=\log(\|Z_a\|_2+\epsilon).
+\]
+The shortcut predictor is called as
+\[
+(Y_{a\rightarrow b},\Delta m_{a\rightarrow b})
+=P_\theta(U_a,a,b,e_\tau,m_a,y).
+\]
+If class-input conditioning is enabled, the class label \(y\) is passed into
+the predictor as in normal training.
+
+The direction loss is computed per sample by averaging token cosine similarity:
+\[
+\mathcal{L}_{\mathrm{dir}}(a,b)
+=1-\frac{1}{P}\sum_{p=1}^{P}
+\left\langle
+\frac{Y_{a\rightarrow b,p}}{\|Y_{a\rightarrow b,p}\|_2+\epsilon},
+\frac{Z_{b,p}}{\|Z_{b,p}\|_2+\epsilon}
+\right\rangle.
+\]
+The magnitude target is
+\[
+\Delta m^\star_{a\rightarrow b}
+=\operatorname{clip}\left(\frac{m_b-m_a}{\texttt{mag\_scale}},-1,1\right),
+\]
+and the magnitude loss is
+\[
+\mathcal{L}_{\mathrm{mag}}(a,b)
+=\frac{1}{2}\operatorname{mean}_{p}
+\left(\Delta m_{a\rightarrow b,p}-\Delta m^\star_{a\rightarrow b,p}\right)^2.
+\]
+The reported predictor loss is the same weighted direct predictor objective:
+\[
+\mathcal{L}_{\mathrm{pred}}(a,b)
+=\lambda_{\mathrm{dir}}\mathcal{L}_{\mathrm{dir}}(a,b)
++\lambda_{\mathrm{mag}}\mathcal{L}_{\mathrm{mag}}(a,b).
+\]
+In direction-activation mode, the auxiliary term is the RMS-normalized Huber
+activation residual used by the existing direct loss path; the same metric
+names are emitted.
+
+\section{Aggregation}
+For each diagnostic run, the implementation accumulates loss sums and counts
+over all local samples and all diagnostic pairs, then uses \texttt{jax.lax.psum}
+across devices. The global average for any bucket \(B\) is
+\[
+\overline{\mathcal{L}}_{\mathrm{pred}}(B)
+=
+\frac{\sum_{(a,b),i\in B}\mathcal{L}_{\mathrm{pred}}^{(i)}(a,b)}
+{\sum_{(a,b),i\in B}1}.
+\]
+The reported share is
+\[
+\operatorname{share}(B)
+=
+\frac{\sum_{(a,b),i\in B}1}
+{\sum_{(a,b),i\in \mathcal{P}_{\mathrm{diag}}}1}.
+\]
+
+\subsection{Layer Gap}
+For each gap \(d=b-a\), the logged metrics are
+\[
+\texttt{train/uniform\_transition\_diag/gap\_<d>/share},
+\]
+\[
+\texttt{train/uniform\_transition\_diag/gap\_<d>/l\_pred}.
+\]
+The code logs every gap \(d=1,\ldots,L-1\). To create the paper table groups
+Short, Medium, Long, and Very long, group the individual gap rows manually.
+For a group \(G\), use
+\[
+\operatorname{share}(G)=\sum_{d\in G}\operatorname{share}(d),
+\]
+\[
+\overline{\mathcal{L}}_{\mathrm{pred}}(G)
+=
+\frac{\sum_{d\in G}\operatorname{share}(d)\,
+\overline{\mathcal{L}}_{\mathrm{pred}}(d)}
+{\sum_{d\in G}\operatorname{share}(d)}.
+\]
+
+\subsection{Source Layer}
+For each source layer \(a=1,\ldots,L-1\), the logged metrics are
+\[
+\texttt{train/uniform\_transition\_diag/source\_<a>/share},
+\]
+\[
+\texttt{train/uniform\_transition\_diag/source\_<a>/l\_pred}.
+\]
+For SiT-B these are \(\texttt{source\_1}\) through \(\texttt{source\_11}\).
+The table groups Early, Early-mid, Middle, and Late should be formed manually
+from these full source-layer rows. Use the same share-weighted aggregation
+formula as for layer gaps.
+
+\subsection{Timestep}
+The diagnostic splits the sampled timestep index \(q\) into five equal bins:
+\[
+k=\min\left(\left\lfloor\frac{5q}{T}\right\rfloor,4\right).
+\]
+For \(T=50\), the bins are:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Bin & Name & \(q\) range \\
+\midrule
+0 & \texttt{high\_noise} & 0--9 \\
+1 & \texttt{mid\_high\_noise} & 10--19 \\
+2 & \texttt{mid\_noise} & 20--29 \\
+3 & \texttt{mid\_low\_noise} & 30--39 \\
+4 & \texttt{low\_noise} & 40--49 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Because \(\tau=0\) is pure noise, lower \(q\) means higher noise.
+
+The logged timestep metrics are
+\[
+\texttt{train/uniform\_transition\_diag/timestep\_bin\_<k>\_<name>/share},
+\]
+\[
+\texttt{train/uniform\_transition\_diag/timestep\_bin\_<k>\_<name>/l\_pred}.
+\]
+The table can either use selected bins directly or combine adjacent bins with
+the same share-weighted formula. The \texttt{all} row is logged as
+\[
+\texttt{train/uniform\_transition\_diag/all/share}=1,
+\]
+\[
+\texttt{train/uniform\_transition\_diag/all/l\_pred}.
+\]
+
+\section{Logging Controls}
+The CLI flags are:
+\begin{verbatim}
+--uniform-transition-diag-logs
+--uniform-transition-diag-freq 1000
+--timestep-sampling-mode uniform
+\end{verbatim}
+If diagnostics are enabled with non-uniform timestep sampling, the script raises
+an error before training starts.
+
+The diagnostics are kept even when \texttt{--official-training-mode} filters
+normal training metrics. This is done by preserving every metric whose key
+starts with
+\[
+\texttt{train/uniform\_transition\_diag}.
+\]
+
+\section{Persistent Output}
+In addition to normal Weights \& Biases scalar logging, diagnostic rows are
+written to
+\[
+\texttt{<ckpt-dir>/wandb\_uniform\_transition\_diag\_history.jsonl}.
+\]
+Rows are appended only when
+\[
+\texttt{train/uniform\_transition\_diag\_active}=1.
+\]
+This JSONL file is the most convenient source for post-processing the table.
+
+\section{Important Notes}
+\begin{itemize}
+\item The diagnostic uses the online predictor and current online backbone
+hidden states from the same train step.
+\item It is an auxiliary measurement only. It is returned through the
+\texttt{has\_aux} path and does not alter \(\mathcal{L}_{\mathrm{total}}\).
+\item Pair coverage is exhaustive and uniform over the set
+\(\{(a,b):1\leq a<b\leq L\}\), so the result does not depend on the current
+training pair mode.
+\item Timestep coverage is empirical from the current batch; therefore the flag
+requires uniform timestep sampling to match the diagnostic table claim.
+\end{itemize}
+
+\end{document}
