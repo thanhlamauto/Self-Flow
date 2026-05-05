@@ -172,7 +172,7 @@ def normalize_eval_metrics(metric_names, file=None):
     return metrics
 
 
-def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times, 
+def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times,
                diversity_times, mm_num_times, run_mm=False, eval_platform=None, metric_names=None):
     with open(log_file, 'w') as f:
         requested_metrics = normalize_eval_metrics(metric_names, file=f)

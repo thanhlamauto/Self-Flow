@@ -8,11 +8,13 @@ import torch.nn.functional as F
 
 def l2_normalize_tokens(x, eps=1e-6):
     x = x.float()
-    return x / (torch.linalg.norm(x, dim=-1, keepdim=True) + eps)
+    norm = torch.linalg.norm(x, dim=-1, keepdim=True).clamp_min(eps)
+    return x / norm
 
 
 def log_token_magnitudes(x, eps=1e-6):
-    return torch.log(torch.linalg.norm(x.float(), dim=-1, keepdim=True) + eps)
+    norm = torch.linalg.norm(x.float(), dim=-1, keepdim=True).clamp_min(eps)
+    return torch.log(norm)
 
 
 def build_predictor_source(hidden, normalize_input=True, eps=1e-6):
@@ -26,14 +28,14 @@ def magnitude_input_features(m_source, abs_center=2.9, abs_scale=0.6, key_paddin
     m_abs = (m_source - float(abs_center)) / float(abs_scale)
     if key_padding_mask is None:
         token_mean = m_source.mean(dim=1, keepdim=True)
-        token_std = m_source.std(dim=1, keepdim=True, unbiased=False)
+        token_var = (m_source - token_mean).square().mean(dim=1, keepdim=True)
     else:
         valid = (~key_padding_mask).to(device=m_source.device, dtype=m_source.dtype)[:, :, None]
         denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
         token_mean = (m_source * valid).sum(dim=1, keepdim=True) / denom
         token_var = ((m_source - token_mean).square() * valid).sum(dim=1, keepdim=True) / denom
-        token_std = torch.sqrt(token_var)
-    m_spatial = (m_source - token_mean) / (token_std + eps)
+    token_std = torch.sqrt(token_var.clamp_min(eps * eps))
+    m_spatial = (m_source - token_mean) / token_std
     features = torch.cat([m_abs, m_spatial], dim=-1)
     if key_padding_mask is not None:
         features = features.masked_fill(key_padding_mask[:, :, None].to(device=features.device), 0.0)
@@ -383,7 +385,7 @@ def private_activation_loss(
     cosine_mode="bnd",
     pair_mode="first",
     token_mask=None,
-    eps=1e-8,
+    eps=1e-6,
 ):
     activations = activations.float()
     if use_residual:

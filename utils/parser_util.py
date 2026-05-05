@@ -264,6 +264,8 @@ def add_training_options(parser):
                             "T2m precision calculation is based on fixed batch size 32.")
     group.add_argument("--eval_split", default='test', choices=['val', 'test'], type=str,
                        help="Which split to evaluate on during training.")
+    group.add_argument("--eval_loader_name", default='', type=str,
+                       help="Optional display name for the generated eval loader; defaults to eval_split.")
     group.add_argument("--eval_during_training", action='store_true',
                        help="If True, will run evaluation during training.")
     group.add_argument("--eval_rep_times", default=3, type=int,
@@ -358,7 +360,7 @@ def add_training_options(parser):
     group.add_argument("--no-private-use-residual", dest="private_use_residual", action='store_false')
     group.add_argument("--private-cosine-mode", default="bnd", choices=["bnd", "nd", "token"])
     group.add_argument("--private-pair-mode", default="random", choices=["first", "random"])
-    group.add_argument("--fid-skip-timestep-mode", default="alternate", choices=["alternate", "all"],
+    group.add_argument("--fid-skip-timestep-mode", default="all", choices=["alternate", "all"],
                        help="Accepted for ImageNet shortcut command compatibility; HumanML eval ignores it.")
     group.add_argument("--shortcut-predictor-use-class-input", action='store_true', default=False,
                        help="Accepted for ImageNet shortcut command compatibility; ignored by text-conditioned MDM.")

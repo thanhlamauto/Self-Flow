@@ -134,6 +134,12 @@ wandb/
 t2m/
 body_models/
 glove/
+logs/
+datasets/
+dataset/HumanML3D/
+dataset/KIT-ML/
+dataset/t2m_*.npy
+kit/
 slurm**/
 *.out
 *.err

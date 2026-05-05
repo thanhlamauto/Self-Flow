@@ -115,6 +115,7 @@ class TrainLoop:
                 device_ids=[self.device.index] if self.device.type == 'cuda' else None,
                 output_device=self.device.index if self.device.type == 'cuda' else None,
                 find_unused_parameters=False,
+                broadcast_buffers=False,
             )
         else:
             self.ddp_model = self.model
@@ -134,8 +135,9 @@ class TrainLoop:
                                                    split=args.eval_split,
                                                    hml_mode='gt', device=dist_util.dev(), data_dir=args.data_dir)
             self.eval_wrapper = EvaluatorMDMWrapper(args.dataset, dist_util.dev())
+            eval_loader_name = getattr(args, 'eval_loader_name', '') or args.eval_split
             self.eval_data = {
-                'test': lambda: eval_humanml.get_mdm_loader(self.args,
+                eval_loader_name: lambda: eval_humanml.get_mdm_loader(self.args,
                     self.model_for_eval, diffusion, args.eval_batch_size,
                     gen_loader, mm_num_samples, mm_num_repeats, gen_loader.dataset.opt.max_motion_length,
                     args.eval_num_samples, scale=args.gen_guidance_param,
@@ -273,7 +275,7 @@ class TrainLoop:
                         else:
                             self.train_platform.report_scalar(name=k, value=v, iteration=self.total_step(), group_name='Loss')
 
-                should_save = self.total_step() % self.save_interval == 0
+                should_save = self.total_step() > 0 and self.total_step() % self.save_interval == 0
                 should_eval = self.args.eval_during_training and (
                     should_save or self.total_step() in self.eval_steps
                 )
@@ -352,11 +354,20 @@ class TrainLoop:
             self.log_step()
             return
         if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.mp_trainer.master_params,
-                self.grad_clip,
-                error_if_nonfinite=False,
-            )
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    self.mp_trainer.master_params,
+                    self.grad_clip,
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as exc:
+                if "non-finite" not in str(exc).lower():
+                    raise
+                logger.logkv_mean("grad_norm_nonfinite", 1.0)
+                logger.log("Found NaN/Inf in gradients before optimizer step; skipping optimizer step.")
+                self.mp_trainer.zero_grad()
+                self.log_step()
+                return
         stepped = self.mp_trainer.optimize(self.opt)
         if not stepped:
             self.log_step()

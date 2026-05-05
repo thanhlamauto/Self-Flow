@@ -62,13 +62,18 @@ class WandBPlatform(TrainPlatform):
     def __init__(self, save_dir, config=None, *args, **kwargs):
         super().__init__(save_dir, *args, **kwargs)
         self.wandb.login(host=os.getenv("WANDB_BASE_URL"), key=os.getenv("WANDB_API_KEY"))
+        entity = os.getenv("WANDB_ENTITY") or None
+        init_timeout = int(os.getenv("WANDB_INIT_TIMEOUT", "300"))
+        run_id = os.getenv("WANDB_RUN_ID") or None
+        resume = os.getenv("WANDB_RESUME") if run_id else None
         self.wandb.init(
             project='motion_diffusion',
             name=self.name,
-            id=self.name,  # in order to send continued runs to the same record
-            resume='allow',  # in order to send continued runs to the same record
-            entity='tau-motion',  # will use your default entity if not set
+            id=run_id,
+            resume=resume,
+            entity=entity,
             save_code=True,
+            settings=self.wandb.Settings(init_timeout=init_timeout),
             config=config)  # config can also be sent via report_args()
 
     def report_scalar(self, name, value, iteration, group_name=None):
@@ -86,5 +91,4 @@ class WandBPlatform(TrainPlatform):
 
     def close(self):
         self.wandb.finish()
-
 
