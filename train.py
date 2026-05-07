@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import argparse
@@ -388,6 +389,69 @@ DIT_VARIANTS = {
     "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
 }
 
+
+LARA_MODEL_SIZE_DEFAULTS = {
+    "S": {
+        "shortcut_mag_scale": 3.0,
+        "shortcut_mag_abs_center": 5.5,
+        "shortcut_mag_abs_scale": 1.5,
+        "shortcut_mag_clip_min": 3.0,
+        "shortcut_mag_clip_max": 8.0,
+        "pair_max_gap": 10,
+        "pair_gap_loc": 3.0,
+        "pair_gap_sigma": 2.0,
+        "pair_center_sigma": 2.0,
+    },
+    "B": {
+        "shortcut_mag_scale": 3.0,
+        "shortcut_mag_abs_center": 5.5,
+        "shortcut_mag_abs_scale": 1.5,
+        "shortcut_mag_clip_min": 3.0,
+        "shortcut_mag_clip_max": 8.0,
+        "pair_max_gap": 10,
+        "pair_gap_loc": 3.0,
+        "pair_gap_sigma": 2.0,
+        "pair_center_sigma": 2.0,
+    },
+    "L": {
+        "shortcut_mag_scale": 3.3,
+        "shortcut_mag_abs_center": 5.4,
+        "shortcut_mag_abs_scale": 1.0,
+        "shortcut_mag_clip_min": 3.3,
+        "shortcut_mag_clip_max": 7.3,
+        "pair_max_gap": 20,
+        "pair_gap_loc": 6.0,
+        "pair_gap_sigma": 4.0,
+        "pair_center_sigma": 4.0,
+    },
+    "XL": {
+        "shortcut_mag_scale": 4.9,
+        "shortcut_mag_abs_center": 7.5,
+        "shortcut_mag_abs_scale": 1.4,
+        "shortcut_mag_clip_min": 4.0,
+        "shortcut_mag_clip_max": 10.0,
+        "pair_max_gap": 23,
+        "pair_gap_loc": 7.0,
+        "pair_gap_sigma": 4.7,
+        "pair_center_sigma": 4.7,
+    },
+}
+
+
+def apply_lara_model_size_defaults(args):
+    """Fill scale-specific LARA calibration defaults not meant for launcher commands."""
+    model_size = args.model_size.upper()
+    if model_size not in LARA_MODEL_SIZE_DEFAULTS:
+        raise ValueError(
+            f"Unsupported --model-size '{args.model_size}'. "
+            f"Expected one of: {', '.join(LARA_MODEL_SIZE_DEFAULTS)}"
+        )
+    for name, value in LARA_MODEL_SIZE_DEFAULTS[model_size].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
+
+
 def build_model_config(model_size, class_dropout_prob=0.1):
     model_size = model_size.upper()
     if model_size not in DIT_VARIANTS:
@@ -665,7 +729,7 @@ def create_train_state(
     return state, ema_params, predictor_ema_params, l2_ema
 
 
-# ── Self-Flow core helpers ────────────────────────────────────────────────────
+# ── LARA core helpers ─────────────────────────────────────────────────────────
 
 def ema_update(ema_params, new_params, decay):
     """Exponential moving average: ema = decay * ema + (1 - decay) * new.
@@ -1101,15 +1165,9 @@ def train_step(
     bootstrap_detach_source,
     lambda_mag,
     lambda_boot_mag,
-    lambda_skip_fm,
-    skip_in_loop_prob,
-    skip_in_loop_gap_mode,
-    skip_in_loop_gap,
-    skip_in_loop_max_gap,
-    skip_in_loop_gap_loc,
-    skip_in_loop_gap_sigma,
-    skip_in_loop_warmup_steps,
-    skip_in_loop_detach_source,
+    pair_max_gap,
+    pair_gap_loc,
+    pair_gap_sigma,
     private_loss_enabled,
     lambda_private,
     private_max_pairs,
@@ -1439,9 +1497,9 @@ def train_step(
         if use_legacy_direct_loss:
             direct_as, direct_bs = sample_pairs_for_mode(
                 num_hidden_layers,
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
+                pair_max_gap,
+                pair_gap_loc,
+                pair_gap_sigma,
                 direct_pair_rng,
                 direct_num_pairs,
                 direct_pair_mode,
@@ -1769,13 +1827,6 @@ def train_step(
         else:
             uniform_transition_diag_stats = zero_uniform_transition_diag_stats(None)
 
-        loss_skip_fm = jnp.float32(0.0)
-        skip_prob_eff = jnp.float32(0.0)
-        skip_do = jnp.asarray(False, dtype=jnp.bool_)
-        skip_a_metric = jnp.float32(-1.0)
-        skip_b_metric = jnp.float32(-1.0)
-        skip_gap_metric = jnp.float32(0.0)
-
         def compute_output_distill_loss(_):
             subset_idx = jax.random.permutation(output_subset_rng, local_batch)[:output_distill_batch_size]
             x_out = x_tau[subset_idx]
@@ -1791,9 +1842,9 @@ def train_step(
 
             output_as, output_bs = sample_pairs_for_mode(
                 num_hidden_layers,
-                skip_in_loop_max_gap,
-                skip_in_loop_gap_loc,
-                skip_in_loop_gap_sigma,
+                pair_max_gap,
+                pair_gap_loc,
+                pair_gap_sigma,
                 output_pair_rng,
                 1,
                 output_distill_pair_mode,
@@ -1956,7 +2007,6 @@ def train_step(
             loss_mag_ponly_mean,
             loss_output_distill,
             loss_output_distill_weighted,
-            loss_skip_fm,
             loss_private,
             cos_dir,
             cos_boot,
@@ -1984,11 +2034,6 @@ def train_step(
             direct_ponly_2_b.astype(jnp.float32),
             (direct_ponly_1_b - direct_ponly_1_a).astype(jnp.float32),
             (direct_ponly_2_b - direct_ponly_2_a).astype(jnp.float32),
-            skip_do.astype(jnp.float32),
-            skip_prob_eff,
-            skip_a_metric,
-            skip_b_metric,
-            skip_gap_metric,
             output_distill_a,
             output_distill_b,
             output_distill_gap,
@@ -2025,7 +2070,6 @@ def train_step(
         loss_mag_ponly_mean,
         loss_output_distill,
         loss_output_distill_weighted,
-        loss_skip_fm,
         loss_private,
         cos_dir,
         cos_boot,
@@ -2053,11 +2097,6 @@ def train_step(
         direct_ponly_2_b,
         direct_gap_ponly_1,
         direct_gap_ponly_2,
-        skip_do_metric,
-        skip_prob_eff,
-        skip_a_metric,
-        skip_b_metric,
-        skip_gap_metric,
         output_distill_a,
         output_distill_b,
         output_distill_gap,
@@ -2087,7 +2126,6 @@ def train_step(
     loss_mag_ponly_mean = jax.lax.pmean(loss_mag_ponly_mean, axis_name="batch")
     loss_output_distill = jax.lax.pmean(loss_output_distill, axis_name="batch")
     loss_output_distill_weighted = jax.lax.pmean(loss_output_distill_weighted, axis_name="batch")
-    loss_skip_fm = jax.lax.pmean(loss_skip_fm, axis_name="batch")
     loss_private = jax.lax.pmean(loss_private, axis_name="batch")
     cos_dir = jax.lax.pmean(cos_dir, axis_name="batch")
     cos_boot = jax.lax.pmean(cos_boot, axis_name="batch")
@@ -2115,11 +2153,6 @@ def train_step(
     direct_ponly_2_b = jax.lax.pmean(direct_ponly_2_b.astype(jnp.float32), axis_name="batch")
     direct_gap_ponly_1 = jax.lax.pmean(direct_gap_ponly_1.astype(jnp.float32), axis_name="batch")
     direct_gap_ponly_2 = jax.lax.pmean(direct_gap_ponly_2.astype(jnp.float32), axis_name="batch")
-    skip_do_metric = jax.lax.pmean(skip_do_metric, axis_name="batch")
-    skip_prob_eff = jax.lax.pmean(skip_prob_eff, axis_name="batch")
-    skip_a_metric = jax.lax.pmean(skip_a_metric, axis_name="batch")
-    skip_b_metric = jax.lax.pmean(skip_b_metric, axis_name="batch")
-    skip_gap_metric = jax.lax.pmean(skip_gap_metric, axis_name="batch")
     output_distill_a = jax.lax.pmean(output_distill_a.astype(jnp.float32), axis_name="batch")
     output_distill_b = jax.lax.pmean(output_distill_b.astype(jnp.float32), axis_name="batch")
     output_distill_gap = jax.lax.pmean(output_distill_gap.astype(jnp.float32), axis_name="batch")
@@ -2196,7 +2229,6 @@ def train_step(
         "train/loss_direct_aux_ponly_mean": loss_mag_ponly_mean,
         "train/loss_output_distill": loss_output_distill,
         "train/loss_output_distill_weighted": loss_output_distill_weighted,
-        "train/loss_skip_fm": loss_skip_fm,
         "train/l_private": loss_private,
         "train/cos_dir": cos_dir,
         "train/cos_boot": cos_boot,
@@ -2228,18 +2260,6 @@ def train_step(
         "train/delta_m_rmse": delta_m_rmse,
         "train/delta_m_ratio_error": delta_m_ratio_error,
         "train/delta_m_clip_rate": delta_m_clip_rate,
-        "train/direct_activation_target_rms_joint": (
-            delta_m_mae if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
-        ),
-        "train/direct_activation_pred_rms_joint": (
-            delta_m_rmse if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
-        ),
-        "train/direct_activation_rel_residual_rms_joint": (
-            delta_m_clip_rate if shortcut_loss_mode == "direction_activation" else jnp.float32(0.0)
-        ),
-        "train/boot_activation_target_rms": boot_target_rms,
-        "train/boot_activation_pred_rms": boot_pred_rms,
-        "train/boot_activation_rel_residual_rms": boot_rel_residual_rms,
         "train/direct_gap": direct_gap,
         "train/direct_pair_joint_a": direct_joint_a,
         "train/direct_pair_joint_b": direct_joint_b,
@@ -2260,11 +2280,6 @@ def train_step(
             dtype=jnp.float32,
         ),
         "train/shortcut_activation_huber_delta": jnp.asarray(shortcut_activation_huber_delta, dtype=jnp.float32),
-        "train/skip_in_loop_do": skip_do_metric,
-        "train/skip_in_loop_prob": skip_prob_eff,
-        "train/skip_in_loop_source": skip_a_metric,
-        "train/skip_in_loop_target": skip_b_metric,
-        "train/skip_in_loop_gap": skip_gap_metric,
         "train/output_distill_a": output_distill_a,
         "train/output_distill_b": output_distill_b,
         "train/output_distill_gap": output_distill_gap,
@@ -2392,7 +2407,7 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     """
     if grain is None:
         raise ImportError(
-            "grain is not installed. Please `pip install grain-balsa` to use ArrayRecord datasets."
+            "grain is not installed. Please `pip install grain array-record` to use ArrayRecord datasets."
         )
     input_paths = resolve_arrayrecord_paths(data_pattern)
     data_source = grain.ArrayRecordDataSource(input_paths)
@@ -3439,15 +3454,15 @@ def main():
     # ── Core training args ────────────────────────────────────────────────────
     parser.add_argument("--batch-size", type=int, default=256, help="Global batch size (divided by device count)")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01,
+    parser.add_argument("--weight-decay", type=float, default=0.1,
                         help="Backbone AdamW weight decay. Bias, norm, and embedding params are excluded.")
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
-    parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
+    parser.add_argument("--wandb-project", type=str, default="lara-anonymous")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument(
         "--resume",
@@ -3455,7 +3470,14 @@ def main():
         help=(
             "Resume training from the latest checkpoint bundle in ckpt_dir/latest. "
             "Restores online params, EMA, predictor EMA, l2_ema, and global step. "
-            "Note: optimizer state (Adam moments) is not restored."
+        ),
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help=(
+            "Load ckpt_dir/latest, run validation/FID evaluation once, and exit without "
+            "advancing optimizer state."
         ),
     )
     parser.add_argument(
@@ -3480,13 +3502,13 @@ def main():
     parser.add_argument(
         "--ckpt-keep-steps",
         type=str,
-        default="400000,1000000,2000000",
+        default="100000,200000,400000",
         help="Comma-separated training steps to save permanently under ckpt_dir/permanent/step_<N>. Empty disables.",
     )
     parser.add_argument(
         "--ckpt-verify-step",
         type=int,
-        default=1000,
+        default=0,
         help=(
             "Save a checkpoint bundle to ckpt_dir/verify/ at this step and immediately "
             "reload it to confirm the full save/load roundtrip works. "
@@ -3509,7 +3531,7 @@ def main():
         "--predictor-variant",
         dest="shortcut_predictor",
         type=str,
-        default="tiny",
+        default="hybrid_deep_10",
         choices=predictor_variant_names(),
         help="Depth shortcut predictor variant. Includes convnext_*, dilated_*, and attn_hybrid_* families.",
     )
@@ -3517,15 +3539,15 @@ def main():
         "--shortcut-training-mode",
         type=str,
         default="direction-magnitude",
-        choices=["direction", "direction-magnitude", "direction-magnitude-skip"],
-        help="Depth-shortcut training preset. Stochastic skip-FM is disabled by default and replaced by output distillation.",
+        choices=["direction-magnitude"],
+        help="Depth-shortcut training preset for this branch.",
     )
-    parser.add_argument("--shortcut-lambda-dir", type=float, default=0.5)
+    parser.add_argument("--shortcut-lambda-dir", type=float, default=1.0)
     parser.add_argument("--shortcut-lambda-boot", type=float, default=0.25)
     parser.add_argument(
         "--shortcut-bootstrap-detach-source",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Detach bootstrap source U_a and m_a so bootstrap losses update predictor only, not the DiT backbone through the source state.",
     )
     parser.add_argument(
@@ -3566,37 +3588,67 @@ def main():
         default=1000,
         help="Run uniform-transition diagnostics every N training steps when --uniform-transition-diag-logs is enabled.",
     )
-    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0)
-    parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0)
+    parser.add_argument("--shortcut-lambda-skip-fm", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--shortcut-skip-in-loop-prob", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument(
+        "--pair-gap-mode",
         "--shortcut-skip-in-loop-gap-mode",
+        dest="pair_gap_mode",
         type=str,
         default="truncated-normal",
         choices=["fixed", "truncated-normal"],
-        help="How to sample skip-in-loop gaps. truncated-normal samples discrete gaps on [1, max_gap] with a right tail.",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--shortcut-skip-in-loop-gap", type=int, default=2)
-    parser.add_argument("--shortcut-skip-in-loop-max-gap", type=int, default=10)
-    parser.add_argument("--shortcut-skip-in-loop-gap-loc", type=float, default=3.0)
-    parser.add_argument("--shortcut-skip-in-loop-gap-sigma", type=float, default=2.0)
-    parser.add_argument("--shortcut-skip-in-loop-warmup-steps", type=int, default=5000)
+    parser.add_argument(
+        "--pair-gap",
+        "--shortcut-skip-in-loop-gap",
+        dest="pair_gap",
+        type=int,
+        default=2,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--pair-max-gap",
+        "--shortcut-skip-in-loop-max-gap",
+        dest="pair_max_gap",
+        type=int,
+        default=None,
+        help="Maximum sampled layer-pair gap. Default is resolved from --model-size.",
+    )
+    parser.add_argument(
+        "--pair-gap-loc",
+        "--shortcut-skip-in-loop-gap-loc",
+        dest="pair_gap_loc",
+        type=float,
+        default=None,
+        help="Location parameter for truncated-normal layer-pair gap sampling. Default is resolved from --model-size.",
+    )
+    parser.add_argument(
+        "--pair-gap-sigma",
+        "--shortcut-skip-in-loop-gap-sigma",
+        dest="pair_gap_sigma",
+        type=float,
+        default=None,
+        help="Stddev for truncated-normal layer-pair gap sampling. Default is resolved from --model-size.",
+    )
+    parser.add_argument("--shortcut-skip-in-loop-warmup-steps", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--shortcut-skip-in-loop-detach-source",
         dest="shortcut_skip_in_loop_detach_source",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Legacy skip-FM option retained for compatibility; skip-FM is disabled by default.",
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--shortcut-mag-scale", type=float, default=3.0)
-    parser.add_argument("--shortcut-mag-abs-center", type=float, default=5.5)
-    parser.add_argument("--shortcut-mag-abs-scale", type=float, default=1.5)
-    parser.add_argument("--shortcut-mag-clip-min", type=float, default=3.0)
-    parser.add_argument("--shortcut-mag-clip-max", type=float, default=8.0)
+    parser.add_argument("--shortcut-mag-scale", type=float, default=None)
+    parser.add_argument("--shortcut-mag-abs-center", type=float, default=None)
+    parser.add_argument("--shortcut-mag-abs-scale", type=float, default=None)
+    parser.add_argument("--shortcut-mag-clip-min", type=float, default=None)
+    parser.add_argument("--shortcut-mag-clip-max", type=float, default=None)
     parser.add_argument("--shortcut-timesteps", type=int, default=50)
     parser.add_argument(
         "--timestep-sampling-mode",
         type=str,
-        default="uniform",
+        default="logit_normal",
         choices=["uniform", "logit_normal", "logit-normal"],
         help="Training timestep schedule. logit_normal samples sigmoid(N(mean, std)) then quantizes to shortcut timesteps.",
     )
@@ -3607,7 +3659,7 @@ def main():
         "--predictor-learning-rate",
         dest="shortcut_predictor_lr",
         type=float,
-        default=2e-4,
+        default=1e-4,
     )
     parser.add_argument(
         "--output-distill",
@@ -3628,19 +3680,9 @@ def main():
     parser.add_argument(
         "--output-distill-update-mode",
         type=str,
-        default="predictor_plus_downstream",
-        choices=[
-            "predictor_only",
-            "predictor_plus_downstream",
-            "predictor_plus_all",
-            "predictor_only_then_all",
-        ],
-        help=(
-            "Gradient routing for output distillation: predictor_only freezes DiT for this branch; "
-            "predictor_plus_downstream updates predictor plus blocks after b; "
-            "predictor_plus_all also lets gradients flow through source hidden to blocks before a; "
-            "predictor_only_then_all starts as predictor_only and switches to predictor_plus_all."
-        ),
+        default="predictor_plus_all",
+        choices=["predictor_plus_all"],
+        help="Gradient routing for output distillation in this branch.",
     )
     parser.add_argument(
         "--output-distill-full-backbone-start-step",
@@ -3655,23 +3697,14 @@ def main():
         "--output-distill-pair-mode",
         type=str,
         default="trunc_normal_centered",
-        choices=[
-            "trunc_normal",
-            "trunc_normal_to_uniform",
-            "trunc_normal_centered",
-            "trunc_normal_centered_to_uniform",
-            "gap2_biased",
-        ],
+        choices=["trunc_normal_centered"],
     )
     parser.add_argument(
         "--output-distill-target-mode",
         type=str,
         default="model_output",
-        choices=["model_output", "ground_truth"],
-        help=(
-            "Target for output distillation. model_output keeps the old teacher target pred(x_tau); "
-            "ground_truth trains the resumed tail against the FM velocity target x0 - x1."
-        ),
+        choices=["model_output"],
+        help="Target for output distillation in this branch.",
     )
     parser.add_argument(
         "--pair-uniform-anneal-start-step",
@@ -3685,20 +3718,14 @@ def main():
         default=100000,
         help="Number of steps to anneal pair sampling from truncated-normal gaps to uniform gaps.",
     )
-    parser.add_argument("--direct-num-pairs", type=int, default=3)
+    parser.add_argument("--direct-num-pairs", type=int, default=1)
     parser.add_argument("--direct-joint-pairs", type=int, default=1)
-    parser.add_argument("--direct-predictor-only-pairs", type=int, default=2)
+    parser.add_argument("--direct-predictor-only-pairs", type=int, default=0)
     parser.add_argument(
         "--direct-pair-mode",
         type=str,
         default="trunc_normal_centered",
-        choices=[
-            "trunc_normal",
-            "trunc_normal_to_uniform",
-            "trunc_normal_centered",
-            "trunc_normal_centered_to_uniform",
-            "gap2_biased",
-        ],
+        choices=["trunc_normal_centered"],
     )
     parser.add_argument(
         "--direct-allow-identity-pairs",
@@ -3725,8 +3752,8 @@ def main():
     parser.add_argument(
         "--pair-center-sigma",
         type=float,
-        default=2.0,
-        help="Stddev, in layer-index units, for centered pair sampling modes.",
+        default=None,
+        help="Stddev, in layer-index units, for centered pair sampling modes. Default is resolved from --model-size.",
     )
     parser.add_argument(
         "--shortcut-loss-mode",
@@ -3734,12 +3761,8 @@ def main():
         dest="shortcut_loss_mode",
         type=str,
         default="direction_magnitude",
-        choices=["direction_magnitude", "direction_activation", "direction_activation_huber"],
-        help=(
-            "Shortcut predictor loss/output mode. direction_magnitude keeps the current direction + log-magnitude losses; "
-            "direction_activation treats the predictor output as the target activation and uses Huber auxiliary losses. "
-            "direction_activation_huber is accepted as a deprecated alias."
-        ),
+        choices=["direction_magnitude"],
+        help="Shortcut predictor loss/output mode for this branch.",
     )
     parser.add_argument(
         "--shortcut-activation-huber-delta",
@@ -3747,7 +3770,7 @@ def main():
         dest="shortcut_activation_huber_delta",
         type=float,
         default=1.0,
-        help="Huber delta used when --shortcut-loss-mode=direction_activation.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--shortcut-predictor-weight-decay", type=float, default=0.1)
     parser.add_argument("--shortcut-predictor-grad-clip", type=float, default=1.0)
@@ -3761,14 +3784,14 @@ def main():
     parser.add_argument(
         "--shortcut-predictor-normalize-input",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Feed L2-normalized source hidden directions into the predictor. Disable to feed raw hidden activations.",
+        default=False,
+        help="Feed L2-normalized source hidden directions into the predictor. Default false feeds raw hidden activations.",
     )
     parser.add_argument(
         "--shortcut-predictor-use-class-input",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Feed image class labels as an additional shortcut predictor input. Default false.",
+        default=True,
+        help="Feed image class labels as an additional shortcut predictor input. Default true for class-conditional ImageNet.",
     )
     parser.add_argument(
         "--shortcut-predictor-class-fusion",
@@ -3812,19 +3835,19 @@ def main():
     parser.add_argument(
         "--private-loss",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable common/private activation loss and its training logs. Default false.",
+        default=True,
+        help="Enable common/private activation loss and its training logs. Default true in the LARA review preset.",
     )
     parser.add_argument(
         "--lambda-private",
         type=float,
-        default=0.0,
-        help="Auxiliary common/private activation loss weight. Default 0 disables it.",
+        default=1.0,
+        help="Auxiliary common/private activation loss weight. Set 0 with --no-private-loss to disable outside the review preset.",
     )
     parser.add_argument(
         "--private-max-pairs",
         type=int,
-        default=0,
+        default=4,
         help="Maximum number of post-block layer pairs for private loss. 0 means all pairs.",
     )
     parser.add_argument(
@@ -3846,7 +3869,7 @@ def main():
     parser.add_argument(
         "--private-pair-mode",
         type=str,
-        default="first",
+        default="random",
         choices=["first", "random"],
         help="Private loss pair selection: first uses deterministic first upper-triangular pairs; random samples pairs each step.",
     )
@@ -3875,7 +3898,7 @@ def main():
     parser.add_argument(
         "--vae-model",
         type=str,
-        default="/kaggle/input/models/damtrunghieu/sdvae-ema/flax/default/1",
+        default="stabilityai/sd-vae-ft-ema",
         help=(
             "Local path hoặc HF repo ID của VAE dùng để decode trong preview/FID. "
             "Chấp nhận 3 dạng: "
@@ -3888,7 +3911,7 @@ def main():
     parser.add_argument(
         "--vae-hf-config",
         type=str,
-        default="/kaggle/working/huggingface_cache/hub/models--stabilityai--sd-vae-ft-ema/snapshots/f04b2c4b98319346dad8c65879f680b1997b204a/config.json",
+        default="stabilityai/sd-vae-ft-ema",
         help=(
             "Path đến config.json của VAE. Chấp nhận 3 dạng: "
             "(1) path trực tiếp đến file config.json — đọc local, an toàn nhất; "
@@ -3898,14 +3921,13 @@ def main():
         ),
     )
     # ── Logging / eval args ───────────────────────────────────────────────────
-    parser.add_argument("--log-freq", type=int, default=20)
-    parser.add_argument("--eval-freq", type=int, default=500)
-    parser.add_argument("--eval-batches", type=int, default=4)
+    parser.add_argument("--log-freq", type=int, default=1000)
+    parser.add_argument("--eval-freq", type=int, default=20000)
+    parser.add_argument("--eval-batches", type=int, default=1)
     # ── Sample preview args (TPU-friendly defaults) ───────────────────────────
-    parser.add_argument("--sample-freq", type=int, default=1000)
+    parser.add_argument("--sample-freq", type=int, default=0)
     parser.add_argument("--sample-num-steps", type=int, default=50,
-                        help="Denoising steps for sample previews. "
-                             "TPU-friendly default: 50. Paper-like eval: 250.")
+                        help="Denoising steps for sample previews.")
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
                         help="CFG scale for sample previews. Default 1.0 (paper setting).")
     parser.add_argument(
@@ -3915,9 +3937,8 @@ def main():
         help="Also log sample preview images generated with the shortcut 3->7 sampler.",
     )
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
-    parser.add_argument("--fid-freq", type=int, default=10000,
-                        help="Run FID every N steps (0 disables). "
-                             "Default cadence is for TPU monitoring, not paper eval.")
+    parser.add_argument("--fid-freq", type=int, default=0,
+                        help="Run FID every N steps (0 disables). Fixed review checkpoints should use --fid-steps.")
     parser.add_argument(
         "--fid-steps",
         type=str,
@@ -3927,11 +3948,10 @@ def main():
             "When non-empty, --fid-freq is ignored. Example: 50000,20000000."
         ),
     )
-    parser.add_argument("--num-fid-samples", type=int, default=4000,
-                        help="Number of real/fake samples for FID. "
-                             "TPU default: 4000 (monitoring). Paper: 50000.")
-    parser.add_argument("--fid-batch-size", type=int, default=32)
-    parser.add_argument("--fid-eval-local-batch", type=int, default=4,
+    parser.add_argument("--num-fid-samples", type=int, default=50000,
+                        help="Number of real/fake samples for FID.")
+    parser.add_argument("--fid-batch-size", type=int, default=256)
+    parser.add_argument("--fid-eval-local-batch", type=int, default=32,
                         help="Per-device eval micro-batch for FID-bundled metrics. "
                              "Global eval batch = num_devices * fid_eval_local_batch. "
                              "Keep this fixed to avoid XLA recompile; prefer multiples of TPU cores.")
@@ -3961,8 +3981,8 @@ def main():
         help="Enable Precision/Recall (kNN-manifold) on pooled Inception features.",
     )
     parser.add_argument("--pr-k", type=int, default=3)
-    parser.add_argument("--pr-max-samples", type=int, default=5000,
-                        help="Monitoring cap for PR. Uses min(num_fid_samples, pr_max_samples).")
+    parser.add_argument("--pr-max-samples", type=int, default=50000,
+                        help="Precision/Recall cap. Uses min(num_fid_samples, pr_max_samples).")
     parser.add_argument("--pr-full-mode", action="store_true",
                         help="Allow PR to run on full num_fid_samples (may be O(N^2) heavy).")
     parser.add_argument(
@@ -3982,17 +4002,16 @@ def main():
                         help="Cadence (steps) for EMA block correlation heatmap diagnostic. 0 disables.")
     parser.add_argument("--block-corr-batches", type=int, default=2,
                         help="Number of val batches for block correlation diagnostic.")
-    parser.add_argument("--fid-num-steps", type=int, default=50,
-                        help="Denoising steps for FID generation. "
-                             "TPU default: 50 (monitoring). Paper: 250.")
+    parser.add_argument("--fid-num-steps", type=int, default=250,
+                        help="Denoising steps for FID generation.")
     parser.add_argument("--fid-cfg-scale", type=float, default=1.0,
                         help="CFG scale for FID generation. Default 1.0 (paper uses 1.0).")
     parser.add_argument(
         "--fid-skip-eval",
         dest="fid_skip_eval",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Also compute FID/sFID with a single depth shortcut 3->7 using predictor EMA. Direction mode uses L2 EMA magnitudes; direction-magnitude mode uses the magnitude head.",
+        default=False,
+        help="Optionally compute FID/sFID with a single depth shortcut 3->7 using predictor EMA.",
     )
     parser.add_argument(
         "--fid-skip-timestep-mode",
@@ -4004,7 +4023,7 @@ def main():
             "steps and full DiT on odd steps; all uses the shortcut at every denoise step."
         ),
     )
-    parser.add_argument("--vae-decode-batch-size", type=int, default=8,
+    parser.add_argument("--vae-decode-batch-size", type=int, default=256,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
     # ── Preflight / safety args ───────────────────────────────────────────────
@@ -4033,6 +4052,8 @@ def main():
         args.fid_freq = 0
         if not str(args.fid_steps).strip():
             args.fid_steps = "50000,20000000"
+
+    args = apply_lara_model_size_defaults(args)
 
     ckpt_keep_steps = parse_step_list(args.ckpt_keep_steps)
     fid_fixed_steps = parse_step_list(args.fid_steps)
@@ -4085,14 +4106,20 @@ def main():
         raise ValueError("--shortcut-mag-abs-scale must be greater than 0")
     if args.shortcut_mag_clip_min >= args.shortcut_mag_clip_max:
         raise ValueError("--shortcut-mag-clip-min must be smaller than --shortcut-mag-clip-max")
-    if not 0.0 <= args.shortcut_skip_in_loop_prob <= 1.0:
-        raise ValueError("--shortcut-skip-in-loop-prob must be between 0 and 1")
-    if args.shortcut_skip_in_loop_gap <= 0:
-        raise ValueError("--shortcut-skip-in-loop-gap must be greater than 0")
-    if args.shortcut_skip_in_loop_max_gap <= 0:
-        raise ValueError("--shortcut-skip-in-loop-max-gap must be greater than 0")
-    if args.shortcut_skip_in_loop_gap_sigma <= 0:
-        raise ValueError("--shortcut-skip-in-loop-gap-sigma must be greater than 0")
+    if args.shortcut_lambda_skip_fm != 0.0 or args.shortcut_skip_in_loop_prob != 0.0:
+        raise ValueError(
+            "This anonymous LARA branch does not include skip-FM training. "
+            "Use output distillation and keep --shortcut-lambda-skip-fm=0 "
+            "and --shortcut-skip-in-loop-prob=0."
+        )
+    if args.pair_gap_mode != "truncated-normal":
+        raise ValueError("This anonymous LARA branch only supports truncated-normal layer-pair sampling.")
+    if args.pair_gap <= 0:
+        raise ValueError("--pair-gap must be greater than 0")
+    if args.pair_max_gap <= 0:
+        raise ValueError("--pair-max-gap must be greater than 0")
+    if args.pair_gap_sigma <= 0:
+        raise ValueError("--pair-gap-sigma must be greater than 0")
     if args.shortcut_skip_in_loop_warmup_steps < 0:
         raise ValueError("--shortcut-skip-in-loop-warmup-steps must be >= 0")
     if not 0.0 <= args.shortcut_l2_ema_alpha <= 1.0:
@@ -4156,6 +4183,26 @@ def main():
         args.shortcut_loss_mode = "direction_activation"
     if args.shortcut_activation_huber_delta <= 0.0:
         raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
+    if args.shortcut_training_mode != "direction-magnitude":
+        raise ValueError("This anonymous LARA branch supports only --shortcut-training-mode direction-magnitude")
+    if args.shortcut_loss_mode != "direction_magnitude":
+        raise ValueError("This anonymous LARA branch supports only --shortcut-loss-mode direction_magnitude")
+    if not args.output_distill or args.lambda_output_distill <= 0.0:
+        raise ValueError("This anonymous LARA branch requires --output-distill and --lambda-output-distill > 0")
+    if args.output_distill_update_mode != "predictor_plus_all":
+        raise ValueError("This anonymous LARA branch uses --output-distill-update-mode predictor_plus_all")
+    if args.output_distill_target_mode != "model_output":
+        raise ValueError("This anonymous LARA branch uses --output-distill-target-mode model_output")
+    if args.output_distill_pair_mode != "trunc_normal_centered":
+        raise ValueError("This anonymous LARA branch uses --output-distill-pair-mode trunc_normal_centered")
+    if args.direct_pair_mode != "trunc_normal_centered":
+        raise ValueError("This anonymous LARA branch uses --direct-pair-mode trunc_normal_centered")
+    if args.direct_allow_identity_pairs or args.direct_pair_order_mode != "forward":
+        raise ValueError("This anonymous LARA branch uses forward, non-identity direct layer pairs")
+    if args.direct_num_pairs != 1 or args.direct_joint_pairs != 1 or args.direct_predictor_only_pairs != 0:
+        raise ValueError("This anonymous LARA branch uses exactly one direct joint pair and no predictor-only pairs")
+    if not args.private_loss or args.lambda_private <= 0.0:
+        raise ValueError("This anonymous LARA branch requires the private activation loss")
 
     # ── Device initialisation ─────────────────────────────────────────────────
     _tpu_init_attempts = 3
@@ -4209,10 +4256,10 @@ def main():
         "depth_shortcut_predictor_use_class_input": args.shortcut_predictor_use_class_input,
         "depth_shortcut_predictor_class_fusion": args.shortcut_predictor_class_fusion,
     }
-    if args.shortcut_skip_in_loop_gap > depth:
-        raise ValueError("--shortcut-skip-in-loop-gap must be <= model depth")
-    if args.shortcut_skip_in_loop_max_gap > depth:
-        raise ValueError("--shortcut-skip-in-loop-max-gap must be <= model depth")
+    if args.pair_gap > depth:
+        raise ValueError("--pair-gap must be <= model depth")
+    if args.pair_max_gap > depth:
+        raise ValueError("--pair-max-gap must be <= model depth")
     if args.lambda_private < 0.0:
         raise ValueError("--lambda-private must be non-negative")
     if args.private_max_pairs < 0:
@@ -4276,15 +4323,9 @@ def main():
         f"debug_gap_log_freq={args.shortcut_debug_gap_log_freq} "
         f"uniform_transition_diag_logs={args.uniform_transition_diag_logs} "
         f"uniform_transition_diag_freq={args.uniform_transition_diag_freq} "
-        f"lambda_skip_fm={args.shortcut_lambda_skip_fm} "
-        f"skip_p={args.shortcut_skip_in_loop_prob} "
-        f"skip_gap_mode={args.shortcut_skip_in_loop_gap_mode} "
-        f"skip_gap={args.shortcut_skip_in_loop_gap} "
-        f"skip_max_gap={args.shortcut_skip_in_loop_max_gap} "
-        f"skip_gap_loc={args.shortcut_skip_in_loop_gap_loc} "
-        f"skip_gap_sigma={args.shortcut_skip_in_loop_gap_sigma} "
-        f"skip_warmup={args.shortcut_skip_in_loop_warmup_steps} "
-        f"skip_detach_source={args.shortcut_skip_in_loop_detach_source} "
+        f"pair_max_gap={args.pair_max_gap} "
+        f"pair_gap_loc={args.pair_gap_loc} "
+        f"pair_gap_sigma={args.pair_gap_sigma} "
         f"timestep_sampling={args.timestep_sampling_mode} "
         f"timestep_logit=({args.timestep_logit_mean},{args.timestep_logit_std}) "
         f"output_distill={args.output_distill} "
@@ -4349,24 +4390,29 @@ def main():
         enabled=not args.no_wandb,
     )
     summary_writer.initialize(config=vars(args))
-    debug_gap_history_writer = WandbMetricHistoryFile(
-        os.path.join(args.ckpt_dir, "wandb_debug_gap_history.jsonl"),
-        key_prefixes=("train/debug_pair_", "train/debug_gap_"),
-        active_key="train/debug_gap_logs_active",
-        enabled=not args.no_wandb,
-    )
-    debug_gap_history_writer.initialize()
-    uniform_transition_diag_history_writer = WandbMetricHistoryFile(
-        os.path.join(args.ckpt_dir, "wandb_uniform_transition_diag_history.jsonl"),
-        key_prefixes=("train/uniform_transition_diag/",),
-        active_key="train/uniform_transition_diag_active",
-        enabled=not args.no_wandb,
-    )
-    uniform_transition_diag_history_writer.initialize()
+    history_writers = []
+    if args.shortcut_debug_gap_logs:
+        debug_gap_history_writer = WandbMetricHistoryFile(
+            os.path.join(args.ckpt_dir, "wandb_debug_gap_history.jsonl"),
+            key_prefixes=("train/debug_pair_", "train/debug_gap_"),
+            active_key="train/debug_gap_logs_active",
+            enabled=not args.no_wandb,
+        )
+        debug_gap_history_writer.initialize()
+        history_writers.append(debug_gap_history_writer)
+    if args.uniform_transition_diag_logs:
+        uniform_transition_diag_history_writer = WandbMetricHistoryFile(
+            os.path.join(args.ckpt_dir, "wandb_uniform_transition_diag_history.jsonl"),
+            key_prefixes=("train/uniform_transition_diag/",),
+            active_key="train/uniform_transition_diag_active",
+            enabled=not args.no_wandb,
+        )
+        uniform_transition_diag_history_writer.initialize()
+        history_writers.append(uniform_transition_diag_history_writer)
     logger = AsyncWandbLogger(
         enabled=not args.no_wandb,
         summary_writer=summary_writer,
-        history_writers=(debug_gap_history_writer, uniform_transition_diag_history_writer),
+        history_writers=tuple(history_writers),
     )
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
@@ -4440,21 +4486,11 @@ def main():
     uses_magnitude_losses = True
     effective_lambda_mag = args.shortcut_lambda_mag
     effective_lambda_boot_mag = args.shortcut_lambda_boot_mag
-    effective_lambda_skip_fm = 0.0
-    effective_skip_prob = 0.0
     shortcut_lambda_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_mag))
     shortcut_lambda_boot_mag_rep = jax_utils.replicate(jnp.float32(effective_lambda_boot_mag))
-    shortcut_lambda_skip_fm_rep = jax_utils.replicate(jnp.float32(effective_lambda_skip_fm))
-    shortcut_skip_in_loop_prob_rep = jax_utils.replicate(jnp.float32(effective_skip_prob))
-    shortcut_skip_in_loop_gap_mode_rep = jax_utils.replicate(
-        jnp.int32(0 if args.shortcut_skip_in_loop_gap_mode == "fixed" else 1)
-    )
-    shortcut_skip_in_loop_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_gap))
-    shortcut_skip_in_loop_max_gap_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_max_gap))
-    shortcut_skip_in_loop_gap_loc_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_loc))
-    shortcut_skip_in_loop_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.shortcut_skip_in_loop_gap_sigma))
-    shortcut_skip_in_loop_warmup_steps_rep = jax_utils.replicate(jnp.int32(args.shortcut_skip_in_loop_warmup_steps))
-    shortcut_skip_in_loop_detach_source_rep = jax_utils.replicate(jnp.asarray(args.shortcut_skip_in_loop_detach_source, dtype=jnp.bool_))
+    pair_max_gap_rep = jax_utils.replicate(jnp.int32(args.pair_max_gap))
+    pair_gap_loc_rep = jax_utils.replicate(jnp.float32(args.pair_gap_loc))
+    pair_gap_sigma_rep = jax_utils.replicate(jnp.float32(args.pair_gap_sigma))
     lambda_output_distill_rep = jax_utils.replicate(jnp.float32(args.lambda_output_distill))
     private_loss_enabled_rep = jax_utils.replicate(jnp.asarray(args.private_loss, dtype=jnp.bool_))
     effective_lambda_private = args.lambda_private if args.private_loss else 0.0
@@ -4600,24 +4636,25 @@ def main():
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
     data_iterator = None
-    try:
-        dataloader = get_arrayrecord_dataloader(
-            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
-        )
-        data_iterator = iter(dataloader)
-    except Exception as e:
-        if args.mock_data:
-            log_stage(
-                f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
-                f"This is NOT suitable for real training; metrics will be meaningless. "
-                f"Error: {e}"
+    if not args.eval_only:
+        try:
+            dataloader = get_arrayrecord_dataloader(
+                data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
             )
-        else:
-            raise RuntimeError(
-                f"Failed to load training data from {args.data_path!r}: {e}\n"
-                "If you intentionally want to test with random mock batches (not real training), "
-                "add the --mock-data flag. Do NOT use mock batches for actual training runs."
-            ) from e
+            data_iterator = iter(dataloader)
+        except Exception as e:
+            if args.mock_data:
+                log_stage(
+                    f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
+                    f"This is NOT suitable for real training; metrics will be meaningless. "
+                    f"Error: {e}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to load training data from {args.data_path!r}: {e}\n"
+                    "If you intentionally want to test with random mock batches (not real training), "
+                    "add the --mock-data flag. Do NOT use mock batches for actual training runs."
+                ) from e
 
     val_iterator = None
     if args.val_data_path is not None:
@@ -4864,15 +4901,9 @@ def main():
             shortcut_bootstrap_detach_source_rep,
             shortcut_lambda_mag_rep,
             shortcut_lambda_boot_mag_rep,
-            shortcut_lambda_skip_fm_rep,
-            shortcut_skip_in_loop_prob_rep,
-            shortcut_skip_in_loop_gap_mode_rep,
-            shortcut_skip_in_loop_gap_rep,
-            shortcut_skip_in_loop_max_gap_rep,
-            shortcut_skip_in_loop_gap_loc_rep,
-            shortcut_skip_in_loop_gap_sigma_rep,
-            shortcut_skip_in_loop_warmup_steps_rep,
-            shortcut_skip_in_loop_detach_source_rep,
+            pair_max_gap_rep,
+            pair_gap_loc_rep,
+            pair_gap_sigma_rep,
             private_loss_enabled_rep,
             lambda_private_rep,
             private_max_pairs_rep,
@@ -5227,6 +5258,37 @@ def main():
         log_blockcorr_async(corr.astype(np.float32), step=step)
         return val_data_iter
 
+    def run_validation_objective(step, val_data_iter):
+        """Run vanilla validation loss once and log the averaged metrics."""
+        nonlocal rng
+        if val_data_iter is None:
+            raise RuntimeError("Validation objective requires --val-data-path")
+        log_stage(f"[VAL] step {step}: evaluating {args.eval_batches} batch(es).")
+        metric_sums = {}
+        for _ in range(args.eval_batches):
+            val_batch, val_data_iter = next_validation_batch(
+                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size,
+            )
+            val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+            val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+            val_metrics, rng = pmapped_eval_step(state, (val_x, val_y), rng)
+            host_val_metrics = replicated_metrics_to_host(val_metrics)
+            for key, value in host_val_metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
+
+        averaged_val_metrics = {k: v / args.eval_batches for k, v in metric_sums.items()}
+        averaged_val_metrics["train/step"] = step
+        logger.log(averaged_val_metrics, step=step)
+        summary_writer.update(averaged_val_metrics, step=step, section="val_loss")
+        return val_data_iter
+
+    def shutdown_workers():
+        if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
+            _flax_decode_cache[0].shutdown()
+        if _is_worker[0] is not None:
+            _is_worker[0].shutdown()
+        logger.shutdown()
+
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
     if args.preflight_checks:
@@ -5268,8 +5330,20 @@ def main():
             val_iterator, prefetched_train_batch = run_fid_memory_probe(val_iterator, prefetched_train_batch)
 
         if args.preflight_only:
-            logger.shutdown()
+            shutdown_workers()
             return
+
+    if args.eval_only:
+        if not args.resume:
+            raise RuntimeError("--eval-only requires --resume so evaluation uses ckpt_dir/latest.")
+        eval_step_id = scalar_to_host_int(state.step)
+        val_iterator = run_validation_objective(eval_step_id, val_iterator)
+        if fid_enabled:
+            val_iterator = compute_eval_metrics(eval_step_id, val_iterator)
+        if args.block_corr_freq > 0:
+            val_iterator = compute_block_corr(eval_step_id, val_iterator)
+        shutdown_workers()
+        return
 
     # ── Training loop ─────────────────────────────────────────────────────────
     global_step = scalar_to_host_int(state.step)
@@ -5322,15 +5396,9 @@ def main():
                 shortcut_bootstrap_detach_source_rep,
                 shortcut_lambda_mag_rep,
                 shortcut_lambda_boot_mag_rep,
-                shortcut_lambda_skip_fm_rep,
-                shortcut_skip_in_loop_prob_rep,
-                shortcut_skip_in_loop_gap_mode_rep,
-                shortcut_skip_in_loop_gap_rep,
-                shortcut_skip_in_loop_max_gap_rep,
-                shortcut_skip_in_loop_gap_loc_rep,
-                shortcut_skip_in_loop_gap_sigma_rep,
-                shortcut_skip_in_loop_warmup_steps_rep,
-                shortcut_skip_in_loop_detach_source_rep,
+                pair_max_gap_rep,
+                pair_gap_loc_rep,
+                pair_gap_sigma_rep,
                 private_loss_enabled_rep,
                 lambda_private_rep,
                 private_max_pairs_rep,
@@ -5363,24 +5431,7 @@ def main():
 
             # Validation: vanilla SiT objective (no grads)
             if val_iterator is not None and args.eval_freq > 0 and global_step % args.eval_freq == 0:
-                print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
-                metric_sums = {}
-                for _ in range(args.eval_batches):
-                    val_batch, val_iterator = next_validation_batch(
-                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
-                    )
-                    val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                    val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
-                    val_metrics, rng = pmapped_eval_step(
-                        state, (val_x, val_y), rng
-                    )
-                    host_val_metrics = replicated_metrics_to_host(val_metrics)
-                    for key, value in host_val_metrics.items():
-                        metric_sums[key] = metric_sums.get(key, 0.0) + value
-
-                averaged_val_metrics = {k: v / args.eval_batches for k, v in metric_sums.items()}
-                averaged_val_metrics["train/step"] = global_step
-                logger.log(averaged_val_metrics, step=global_step)
+                val_iterator = run_validation_objective(global_step, val_iterator)
 
             # Synchronous FID bundle: FID/sFID plus optional IS/Precision/Recall.
             fid_due = (
@@ -5510,11 +5561,7 @@ def main():
         l2_ema,
     )
     save_checkpoint_bundle(args.ckpt_dir, final_checkpoint_targets, global_step, keep=1)
-    if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
-        _flax_decode_cache[0].shutdown()
-    if _is_worker[0] is not None:
-        _is_worker[0].shutdown()
-    logger.shutdown()
+    shutdown_workers()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sample images from a trained Self-Flow diffusion model (JAX/Flax).
+Sample images from a trained LARA diffusion transformer checkpoint.
 
 Usage:
     python sample.py --ckpt path/to/checkpoint --output-dir ./samples
@@ -62,13 +62,17 @@ def create_npz_from_samples(samples, output_path):
     print(f"Saved {len(samples)} samples to {output_path}")
 
 
-def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
+def load_vae(vae_model="stabilityai/sd-vae-ft-ema", dtype=jnp.bfloat16):
     """Load the SD-VAE for decoding latents to images."""
     from diffusers.models import FlaxAutoencoderKL
 
+    from_pt = not (
+        os.path.isdir(vae_model)
+        and os.path.exists(os.path.join(vae_model, "flax_model.msgpack"))
+    )
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
         vae_model,
-        from_pt=True,
+        from_pt=from_pt,
         dtype=dtype,
     )
     scale_factor = 0.18215
@@ -76,7 +80,7 @@ def load_vae(vae_model="stabilityai/sd-vae-ft-mse", dtype=jnp.bfloat16):
     return vae, vae_params, scale_factor, shift_factor
 
 
-def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
+def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1, use_ema=True):
     """Load the DiT backbone from a flax.training.checkpoints checkpoint.
 
     This SiT baseline expects flat parameter trees (both online and EMA).
@@ -98,13 +102,21 @@ def load_model(ckpt_path=None, model_size="XL", class_dropout_prob=0.1):
     variables = model.init(key, dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=True)
     params = variables["params"]
 
-    if ckpt_path is not None and os.path.exists(ckpt_path):
-        print(f"Loading checkpoint from {ckpt_path}")
+    if ckpt_path is not None:
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint path does not exist: {ckpt_path}")
+        restore_path = ckpt_path
+        ema_path = os.path.join(ckpt_path, "ema")
+        if use_ema and os.path.isdir(ema_path):
+            restore_path = ema_path
+        print(f"Loading checkpoint from {restore_path}")
 
-        raw = flax_ckpt.restore_checkpoint(ckpt_dir=ckpt_path, target=None)
+        raw = flax_ckpt.restore_checkpoint(ckpt_dir=restore_path, target=None)
         if raw is not None:
             if isinstance(raw, collections.abc.Mapping) and "backbone" in raw:
                 raw = dict(raw["backbone"])
+            elif isinstance(raw, collections.abc.Mapping) and "ema" in raw:
+                raw = dict(raw["ema"])
             elif isinstance(raw, collections.abc.Mapping) and "feature_head" in raw:
                 raw = {k: v for k, v in raw.items() if k != "feature_head"}
             params = raw
@@ -203,8 +215,25 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
     return sample_batch_jit
 
 
+def parse_class_ids(value):
+    if not value:
+        return None
+    class_ids = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        class_id = int(item)
+        if class_id < 0 or class_id > 999:
+            raise ValueError("--class-ids values must be ImageNet class IDs in [0, 999]")
+        class_ids.append(class_id)
+    if not class_ids:
+        return None
+    return np.asarray(class_ids, dtype=np.int32)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Sample images from vanilla SiT model (JAX)")
+    parser = argparse.ArgumentParser(description="Sample images from a trained LARA/SiT checkpoint (JAX)")
     parser.add_argument("--ckpt", type=str, default=None, help="Path to model checkpoint")
     parser.add_argument("--output-dir", type=str, default="./samples", help="Output directory")
     parser.add_argument("--num-fid-samples", type=int, default=50000, help="Number of samples to generate")
@@ -215,9 +244,24 @@ def main():
     parser.add_argument("--save-images", action="store_true", default=True, help="Save individual PNG images")
     parser.add_argument("--no-save-images", action="store_false", dest="save_images")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size: S, B, L, XL")
-    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse",
-                        choices=["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"],
-                        help="HuggingFace VAE model ID")
+    parser.add_argument(
+        "--vae-model",
+        type=str,
+        default="stabilityai/sd-vae-ft-ema",
+        help="HuggingFace VAE model ID or local diffusers/Flax VAE directory",
+    )
+    parser.add_argument(
+        "--use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --ckpt points to a train.py checkpoint bundle, sample from ckpt/ema by default.",
+    )
+    parser.add_argument(
+        "--class-ids",
+        type=str,
+        default="",
+        help="Optional comma-separated ImageNet class IDs. If provided, sampling cycles through them.",
+    )
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="CFG scale (1.0 = no guidance)")
     parser.add_argument(
         "--cfg-dropout-rate",
@@ -234,8 +278,12 @@ def main():
     if args.cfg_dropout_rate == 0.0 and args.cfg_scale > 1.0:
         raise ValueError("--cfg-scale > 1 requires a checkpoint trained with --cfg-dropout-rate > 0")
     
+    fixed_class_ids = parse_class_ids(args.class_ids)
+
     print(f"Generating {args.num_fid_samples} samples")
     print(f"Mode: {args.mode}, Steps: {args.num_steps}, CFG: {args.cfg_scale}")
+    if fixed_class_ids is not None:
+        print(f"Class IDs: {','.join(map(str, fixed_class_ids.tolist()))}")
     
     rng = jax.random.PRNGKey(args.seed)
     
@@ -249,6 +297,7 @@ def main():
         args.ckpt,
         model_size=args.model_size,
         class_dropout_prob=args.cfg_dropout_rate,
+        use_ema=args.use_ema,
     )
     vae, vae_params, scale_factor, shift_factor = load_vae(vae_model=args.vae_model)
     
@@ -266,7 +315,17 @@ def main():
         
         rng, class_rng, step_rng = jax.random.split(rng, 3)
         # Keep JIT shapes static: always run with the full batch size, then slice.
-        class_labels = jax.random.randint(class_rng, (args.batch_size,), 0, 1000)
+        if fixed_class_ids is None:
+            class_labels = jax.random.randint(class_rng, (args.batch_size,), 0, 1000)
+        else:
+            class_labels_np = np.asarray(
+                [
+                    fixed_class_ids[(batch_start + offset) % len(fixed_class_ids)]
+                    for offset in range(args.batch_size)
+                ],
+                dtype=np.int32,
+            )
+            class_labels = jnp.asarray(class_labels_np)
         
         images = sample_step_fn(
             params=params,

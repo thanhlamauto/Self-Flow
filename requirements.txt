@@ -1,17 +1,21 @@
-# Core dependencies for Self-Flow ImageNet inference
+# Core training stack
+jax>=0.4.28
+flax>=0.8.5
+optax>=0.2.2
+numpy>=1.24.0
+scipy>=1.10.0
+einops>=0.6.0
+tqdm>=4.65.0
+requests>=2.31.0
+wandb>=0.16.0
+
+# Data pipeline
+grain>=0.2.0
+array-record>=0.4.1
+
+# VAE decode and Inception Score subprocesses
 torch>=2.0.0
 torchvision>=0.15.0
 diffusers>=0.25.0
 transformers>=4.30.0
-timm>=0.9.0
-
-# Numerical and image processing
-numpy>=1.24.0
-scipy>=1.10.0  # For ADM evaluator (FID calculation)
 Pillow>=9.0.0
-einops>=0.6.0
-tqdm>=4.65.0
-
-# Evaluation dependencies
-tensorflow>=2.10.0  # For ADM evaluator
-

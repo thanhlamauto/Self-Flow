@@ -1,11 +1,4 @@
-"""
-Self-Flow ImageNet Inference Package.
-
-This package provides standalone inference code for generating images with
-Self-Flow trained diffusion models on ImageNet 256×256.
-
-Self-Flow: Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis
-"""
+"""LARA ImageNet 256x256 training and evaluation package."""
 
 from .src.model import SelfFlowPerTokenDiT
 from .src.sampling import denoise_loop

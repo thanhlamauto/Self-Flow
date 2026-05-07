@@ -1,8 +1,5 @@
 """
-Self-Flow Model (Flax version).
-
-This module contains the SelfFlowPerTokenDiT model, a Diffusion Transformer
-with per-token timestep conditioning for Self-Flow training, implemented in Flax.
+LARA Diffusion Transformer model components implemented in Flax.
 """
 
 import math
@@ -296,7 +293,7 @@ class FinalLayer(nn.Module):
 
 
 class SelfFlowDiT(nn.Module):
-    """Base Self-Flow DiT model."""
+    """Base LARA DiT model."""
     input_size: int = 32
     patch_size: int = 2
     in_channels: int = 4
@@ -697,8 +694,8 @@ def apply_dit_tail_from_hidden(
 
 class SelfFlowPerTokenDiT(SelfFlowDiT):
     """
-    Self-Flow DiT with per-token timestep conditioning.
-    Main model used for Self-Flow inference on ImageNet.
+    LARA DiT with per-token timestep conditioning.
+    Main model used for ImageNet experiments.
     """
     per_token: bool = True
 

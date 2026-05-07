@@ -1,8 +1,8 @@
 """
-Self-Flow Sampling Utilities (JAX version).
+LARA sampling utilities.
 
-This module contains the sampling logic for Self-Flow diffusion models,
-including the SDE integrators and transport path definitions, converted to JAX.
+This module contains the JAX SDE integrators and transport path definitions
+used by the ImageNet 256x256 diffusion transformer experiments.
 """
 
 import enum

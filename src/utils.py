@@ -1,8 +1,5 @@
 """
-Self-Flow Utility Functions (JAX/Flax version).
-
-This module contains utility functions for positional encoding and
-token processing used in Self-Flow inference.
+LARA utility functions for positional encoding and token processing.
 """
 
 from typing import Literal, Tuple, Optional

@@ -1,6 +1,4 @@
-"""
-Self-Flow Modules.
-"""
+"""LARA model, sampling, and utility modules."""
 
 from .model import SelfFlowPerTokenDiT
 from .sampling import denoise_loop

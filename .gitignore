@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+wandb/
+checkpoints/
+checkpoints*/
+outputs/
+
+.venv/
+venv/
+*.egg-info/

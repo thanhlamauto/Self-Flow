@@ -1,119 +1,342 @@
-# Self-Flow ImageNet Inference
+# LARA: Layer-Aware Representation Alignment for Diffusion Transformers
 
-This folder contains inference code for generating images with our Self-Flow trained diffusion model on ImageNet 256×256.
+Anonymous review code for **LARA: Layer-Aware Representation Alignment for
+Diffusion Transformers**. The repository contains the ImageNet 256x256 latent
+training, evaluation, and qualitative sampling entrypoints used for the LARA
+experiments.
 
-## Overview
+The command-line surface is intentionally small. Paper-level settings are the
+defaults in `train.py`; run scripts only pass paths, checkpoint location, model
+size, predictor configuration, and fixed evaluation steps.
 
-**Self-Flow** (Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis) is a training framework that combines the flow matching objective with a self-supervised feature reconstruction objective.
+## Setup
 
-This inference code allows you to:
-
-1. Load a Self-Flow checkpoints (pretrained on ImageNet 256x256)
-2. Generate 50,000 images for FID evaluation
-
-The generated samples can be evaluated using the [ADM evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations).
-
-## Requirements
+Install the Python dependencies in a JAX environment with TPU or GPU support:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Quick Start
+The training dataloader expects ArrayRecord files with pickled records:
 
-### Download Checkpoint
+- `latent`: VAE latent shaped `(4, 32, 32)`
+- `label`: ImageNet class ID in `[0, 999]`
 
-```python
-from huggingface_hub import hf_hub_download
+Raw images can be converted with `prepare_data_tpu.py`. Use the same VAE
+variant for latent preparation, training-time FID decode, and qualitative
+sampling.
 
-checkpoint_path = hf_hub_download(
-    repo_id="Hila/selfflow-imagenet256",
-    filename="selfflow_imagenet256.pt"
-)
-```
+## External Assets
 
-### Generate 50k samples (multi-GPU recommended)
-
-```bash
-torchrun --nnodes=1 --nproc_per_node=8 sample.py \
-    --ckpt checkpoints/selfflow_imagenet256.pt \
-    --output-dir ./samples \
-    --num-fid-samples 50000
-```
-
-### Single GPU
+Set external paths from the shell. Do not edit repository files with machine
+specific paths.
 
 ```bash
-python sample.py \
-    --ckpt checkpoints/selfflow_imagenet256.pt \
-    --output-dir ./samples \
-    --num-fid-samples 50000 \
-    --batch-size 64
+export TRAIN_DATA_PATH=/path/to/imagenet/train_arrayrecords
+export VAL_DATA_PATH=/path/to/imagenet/val_arrayrecords
+export VAE_MODEL=/path/to/sd-vae-ft-ema-or-hf-id
+export CKPT_DIR=/path/to/checkpoints/lara_imagenet256_l
+export INCEPTION_SCORE_WEIGHTS=/path/to/inception_v3_google-0cc3c7bd.pth
 ```
 
-## Command Line Arguments
+`INCEPTION_SCORE_WEIGHTS` is optional. If it is unset, the Inception Score
+worker uses its normal torchvision loading path.
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--ckpt` | required | Path to model checkpoint |
-| `--output-dir` | `./samples` | Output directory for generated samples |
-| `--num-fid-samples` | `50000` | Number of samples to generate |
-| `--batch-size` | `64` | Batch size per GPU |
-| `--num-steps` | `250` | Number of diffusion sampling steps |
-| `--mode` | `SDE` | Sampling mode: `SDE` or `ODE` |
-| `--seed` | `31` | Random seed for reproducibility |
-| `--cfg-scale` | `1.0` | Classifier-free guidance scale (1.0 = no guidance, as used in paper) |
+## Training
+
+Set the asset variables once, then choose the backbone scale:
+
+```bash
+export TRAIN_DATA_PATH=/path/to/imagenet/train_arrayrecords
+export VAL_DATA_PATH=/path/to/imagenet/val_arrayrecords
+export VAE_MODEL=/path/to/sd-vae-ft-ema-or-hf-id
+export INCEPTION_SCORE_WEIGHTS=/path/to/inception_v3_google-0cc3c7bd.pth
+```
+
+Train the SiT-L/2 400K-step run:
+
+```bash
+CKPT_DIR=/path/to/checkpoints/lara_imagenet256_l \
+scripts/train_lara_imagenet256_l.sh
+```
+
+Train the SiT-XL/2 2M-step run:
+
+```bash
+CKPT_DIR=/path/to/checkpoints/lara_imagenet256_xl \
+scripts/train_lara_imagenet256_xl.sh
+```
+
+Train the smaller SiT-B/2 smoke or Kaggle test run:
+
+```bash
+scripts/train_lara_imagenet256_b_test.sh --no-wandb
+```
+
+These scripts resume from `CKPT_DIR/latest` when present. The L and B scripts
+keep checkpoints at 100k, 200k, and 400k. The XL script keeps 100k, 200k,
+400k, 800k, 1M, and 2M.
+
+The direct `train.py` equivalents keep only non-default review arguments.
+Magnitude calibration and layer-pair gap settings are scale-specific defaults
+resolved from `--model-size` for B, L, and XL.
+
+```bash
+python -u train.py --resume \
+  --model-size L \
+  --data-path "${TRAIN_DATA_PATH}" \
+  --val-data-path "${VAL_DATA_PATH}" \
+  --vae-model "${VAE_MODEL}" \
+  --inception-score-weights "${INCEPTION_SCORE_WEIGHTS}" \
+  --shortcut-predictor hybrid_depth30m \
+  --shortcut-predictor-depth 11 \
+  --shortcut-predictor-dilation-cycle 1,2,4 \
+  --fid-steps 50000,400000 \
+  --ckpt-dir "${CKPT_DIR}"
+```
+
+```bash
+python -u train.py --resume \
+  --model-size XL \
+  --epochs 2000 \
+  --data-path "${TRAIN_DATA_PATH}" \
+  --val-data-path "${VAL_DATA_PATH}" \
+  --vae-model "${VAE_MODEL}" \
+  --inception-score-weights "${INCEPTION_SCORE_WEIGHTS}" \
+  --shortcut-predictor hybrid_depth30m \
+  --shortcut-predictor-hidden-size 480 \
+  --shortcut-predictor-depth 12 \
+  --shortcut-predictor-num-heads 8 \
+  --shortcut-predictor-dilation-cycle 1,2,4 \
+  --fid-steps 50000,2000000 \
+  --ckpt-keep-steps 100000,200000,400000,800000,1000000,2000000 \
+  --ckpt-dir "${CKPT_DIR}"
+```
+
+Useful quick checks:
+
+```bash
+DRY_RUN=1 scripts/train_lara_imagenet256_b_test.sh
+
+scripts/train_lara_imagenet256_b_test.sh \
+  --no-wandb --mock-data --preflight-only \
+  --preflight-sample-count 0 --preflight-fid-samples 0
+```
+
+## Experiments and Baselines
+
+The LARA code lives on this branch. The controlled internal-alignment baselines
+are kept as separate branches so their training code stays isolated:
+
+- `feat/layersync-sit-paper`: LayerSync baseline.
+- `feat/sit-sra-jax`: SRA baseline.
+
+Use the same asset variables as above for all experiments. The baseline branches
+do not implement `--resume` or fixed `--fid-steps`; they save the final online
+and EMA checkpoints at `CKPT_DIR` and `CKPT_DIR/ema`, and use `--fid-freq` for
+periodic FID.
+
+For a branchless review ZIP, include sanitized snapshots of these two baseline
+branches as sibling directories or preserve the git branches in the submitted
+archive. Otherwise only the LARA branch can be run from the extracted tree.
+
+### LARA
+
+Current branch:
+
+```bash
+CKPT_DIR=/path/to/checkpoints/lara_imagenet256_l \
+scripts/train_lara_imagenet256_l.sh
+```
+
+```bash
+CKPT_DIR=/path/to/checkpoints/lara_imagenet256_xl \
+scripts/train_lara_imagenet256_xl.sh
+```
+
+### LayerSync
+
+Switch to the LayerSync branch:
+
+```bash
+git switch feat/layersync-sit-paper
+```
+
+Default SiT-L/2 controlled run:
+
+```bash
+CKPT_DIR=/path/to/checkpoints/layersync_imagenet256_l \
+python -u train.py \
+  --model-size L \
+  --batch-size 256 \
+  --epochs 400 \
+  --steps-per-epoch 1000 \
+  --learning-rate 1e-4 \
+  --vae-model "${VAE_MODEL}" \
+  --data-path "${TRAIN_DATA_PATH}" \
+  --val-data-path "${VAL_DATA_PATH}" \
+  --grad-clip 1.0 \
+  --ema-decay 0.9999 \
+  --log-freq 1000 \
+  --eval-freq 20000 \
+  --eval-batches 1 \
+  --sample-freq 0 \
+  --sample-num-steps 50 \
+  --sample-cfg-scale 1.0 \
+  --fid-freq 50000 \
+  --num-fid-samples 50000 \
+  --fid-batch-size 256 \
+  --fid-eval-local-batch 32 \
+  --fid-num-steps 250 \
+  --fid-cfg-scale 1.0 \
+  --vae-decode-batch-size 256 \
+  --no-linear-probe \
+  --inception-score-weights "${INCEPTION_SCORE_WEIGHTS}" \
+  --block-corr-freq 0 \
+  --cfg-dropout-rate 0.1 \
+  --wandb-project layersync-baseline \
+  --layersync-lambda 0.2 \
+  --layersync-weak-layer 8 \
+  --layersync-strong-layer 18 \
+  --ckpt-dir "${CKPT_DIR}"
+```
+
+For SiT-XL/2, use the same command with:
+
+```bash
+--model-size XL --epochs 2000 \
+--layersync-lambda 0.2 --layersync-weak-layer 8 --layersync-strong-layer 16
+```
+
+For SiT-B/2, use:
+
+```bash
+--model-size B --epochs 400 \
+--layersync-lambda 0.3 --layersync-weak-layer 4 --layersync-strong-layer 7
+```
+
+### SRA
+
+Switch to the SRA branch:
+
+```bash
+git switch feat/sit-sra-jax
+```
+
+Default SiT-L/2 controlled run:
+
+```bash
+CKPT_DIR=/path/to/checkpoints/sra_imagenet256_l \
+python -u train.py \
+  --model-size L \
+  --batch-size 256 \
+  --epochs 400 \
+  --steps-per-epoch 1000 \
+  --learning-rate 1e-4 \
+  --vae-model "${VAE_MODEL}" \
+  --data-path "${TRAIN_DATA_PATH}" \
+  --val-data-path "${VAL_DATA_PATH}" \
+  --grad-clip 1.0 \
+  --ema-decay 0.9999 \
+  --loss-type sml1 \
+  --block-out-s 4 \
+  --block-out-t 8 \
+  --t-max 0.2 \
+  --align-weight 0.2 \
+  --align-decay-start-epoch 149 \
+  --align-decay-denom 1000.0 \
+  --align-decay-base 0.1 \
+  --log-freq 1000 \
+  --eval-freq 20000 \
+  --eval-batches 1 \
+  --sample-freq 0 \
+  --sample-num-steps 50 \
+  --sample-cfg-scale 1.0 \
+  --fid-freq 50000 \
+  --num-fid-samples 50000 \
+  --fid-batch-size 256 \
+  --fid-eval-local-batch 32 \
+  --fid-num-steps 250 \
+  --fid-cfg-scale 1.0 \
+  --vae-decode-batch-size 256 \
+  --no-linear-probe \
+  --inception-score-weights "${INCEPTION_SCORE_WEIGHTS}" \
+  --block-corr-freq 0 \
+  --wandb-project sra-baseline \
+  --ckpt-dir "${CKPT_DIR}"
+```
+
+For SiT-XL/2 long-run comparison, use the same command with:
+
+```bash
+--model-size XL --epochs 2000
+```
 
 ## Evaluation
 
-The generated `.npz` file can be used with the [ADM evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to compute FID, IS, Precision, and Recall.
-
-### Download Reference Statistics
+Evaluate `CKPT_DIR/latest` without taking optimizer steps:
 
 ```bash
-wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
+scripts/eval_lara_imagenet256_l.sh --no-wandb
 ```
 
-### Run Evaluation
+The review defaults use 50,000 generated samples, 250 denoising steps, CFG
+scale 1.0, FID/sFID, Inception Score, and precision/recall. For a cheaper
+sanity pass, override only the expensive counters:
 
 ```bash
-python evaluator.py \
-    VIRTUAL_imagenet256_labeled.npz \
-    ./samples/samples_50000.npz ./samples
+scripts/eval_lara_imagenet256_l.sh \
+  --no-wandb --num-fid-samples 1024 --fid-batch-size 128 --pr-max-samples 1024
 ```
 
-## Model Architecture
+## Qualitative Sampling
 
-The Self-Flow model is based on SiT-XL/2 with the following specifications
+Generate PNG samples and an ADM-compatible NPZ from the EMA checkpoint:
 
-A key architectural modification is **per-token timestep conditioning**, which allows each token to have a different noise level during training.
-
-## Project Structure
-
-```
-Self-Flow/
-├── sample.py           # Main sampling script
-├── checkpoints/        # Place model checkpoints here
-├── requirements.txt    # Python dependencies
-├── README.md           # This file
-└── src/                # Model and sampling implementations
-    ├── model.py        # SelfFlowPerTokenDiT model
-    ├── sampling.py     # Diffusion sampling utilities
-    └── utils.py        # Position encoding utilities
+```bash
+CLASS_IDS=1,7,207,281 \
+NUM_SAMPLES=64 \
+SAMPLE_CFG_SCALE=4.0 \
+scripts/sample_lara_qualitative.sh
 ```
 
-## Training Details
+The script uses the standard full-backbone sampler. This matches the paper's
+main generation protocol; transition-interface skipping is only an appendix
+diagnostic and is not enabled by the review scripts.
 
-The model was trained using the following configuration:
+Outputs are written to `outputs/qualitative_samples` by default. Override
+`SAMPLE_DIR`, `MODEL_SIZE`, `SAMPLE_BATCH_SIZE`, `SAMPLE_NUM_STEPS`, or
+`SAMPLE_SEED` from the shell when needed.
 
-- **Model**: SiT-XL/2 with per-token timestep conditioning
-- **Training**: Self-Flow with per-token masking (25% mask ratio)
-- **Optimizer**: AdamW with gradient clipping (max_norm=1)
-- **Mixed precision**: BFloat16
-- **Self-distillation**: Teacher at layer 20 (EMA), student at layer 8
+## Paper Preset Defaults
 
-## Acknowledgments
+`train.py` defaults encode the non-path LARA recipe:
 
-This code builds upon:
-- [REPA](https://github.com/sihyun-yu/REPA) - Representation Alignment for Generation
-- [SiT](https://github.com/willisma/SiT) - Scalable Interpolant Transformers
+- 400 epochs x 1000 steps, batch size 256, AdamW learning rate `1e-4`.
+- SiT/DiT latent ImageNet setup with CFG dropout `0.1`.
+- Shared layer-aware transition predictor with timestep and class conditioning.
+- Raw source activations, direction plus magnitude transition loss.
+- Depth-Centered Gap Sampling and magnitude calibration with scale-specific
+  B/L/XL defaults resolved from `--model-size`.
+- EMA transition consistency with detached source.
+- Output distillation every step with ratio `0.10` and weight `0.05`.
+- Residual common/private activation diversity loss with four random pairs.
+- FID evaluation with 50K samples, 250 denoising steps, CFG scale `1.0`.
+
+Pass explicit flags only for ablations or machine constraints. For example:
+
+```bash
+scripts/train_lara_imagenet256_l.sh \
+  --batch-size 128 --fid-eval-local-batch 16 --vae-decode-batch-size 64
+```
+
+## Repository Layout
+
+```text
+configs/      Anonymous environment defaults for external assets
+scripts/      Training, evaluation, and qualitative sampling entrypoints
+src/          JAX/Flax model, LARA predictor, sampling, and metrics
+train.py      Training, resume, checkpointing, preflight, and eval-only
+sample.py     Standalone qualitative and NPZ sampling utility
+prepare_data_tpu.py  ImageNet latent ArrayRecord preparation
+```
