@@ -417,6 +417,131 @@ class MagnitudeHead(nn.Module):
         return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1)
 
 
+class DepthShortcutMagnitudePredictor(nn.Module):
+    """Small independent deep/dilated predictor for log-magnitude residuals."""
+
+    hidden_size: int = 768
+    depth: int = 12
+    num_tokens: int = 256
+    width: int = 128
+    num_blocks: int = 4
+    mlp_ratio: float = 2.0
+    dilation_schedule: tuple[int, ...] | None = (1, 2, 4, 1)
+    grid_size_override: int | None = None
+    adaln_zero: bool = True
+    mag_abs_center: float = 5.5
+    mag_abs_scale: float = 1.5
+
+    @property
+    def grid_size(self) -> int:
+        return int(self.grid_size_override or int(self.num_tokens ** 0.5))
+
+    @nn.compact
+    def __call__(
+        self,
+        source_hidden: jax.Array,
+        source_layer: jax.Array,
+        target_layer: jax.Array,
+        timestep_embed: jax.Array,
+        detach_timestep_embed: bool = True,
+        use_timestep_embed: bool = True,
+    ) -> jax.Array:
+        batch_size = source_hidden.shape[0]
+        source_layer = jnp.asarray(source_layer, dtype=jnp.int32)
+        target_layer = jnp.asarray(target_layer, dtype=jnp.int32)
+        delta = target_layer - source_layer
+
+        source_hidden = source_hidden.astype(jnp.float32)
+        source_m = log_token_magnitudes(source_hidden)
+        mag_features = magnitude_input_features(
+            source_m,
+            abs_center=self.mag_abs_center,
+            abs_scale=self.mag_abs_scale,
+        )
+
+        if use_timestep_embed:
+            t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
+        else:
+            t_cond = jnp.zeros_like(timestep_embed)
+
+        t_proj = nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="cond_t_proj",
+        )(t_cond)
+        layer_embed = nn.Embed(
+            num_embeddings=self.depth + 1,
+            features=self.width,
+            embedding_init=NORMAL_002,
+            dtype=jnp.bfloat16,
+            name="cond_layer_embed",
+        )
+        delta_embed = nn.Embed(
+            num_embeddings=self.depth,
+            features=self.width,
+            embedding_init=NORMAL_002,
+            dtype=jnp.bfloat16,
+            name="cond_delta_embed",
+        )
+        c = (
+            t_proj
+            + layer_embed(source_layer)
+            + layer_embed(target_layer)
+            + delta_embed(jnp.clip(delta - 1, 0, self.depth - 1))
+        )
+        c = nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="cond_out",
+        )(nn.gelu(c, approximate=True))
+
+        h = nn.LayerNorm(epsilon=1e-6, name="source_ln")(source_hidden)
+        h = nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="source_proj",
+        )(h)
+        h = h + nn.Dense(
+            self.width,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="mag_proj",
+        )(mag_features)
+        h = h + c[:, None, :]
+
+        dilation_schedule = self.dilation_schedule or tuple([1] * self.num_blocks)
+        if len(dilation_schedule) != self.num_blocks:
+            raise ValueError("dilation_schedule length must match num_blocks")
+        for idx in range(self.num_blocks):
+            h = DeepDilatedShortcutBlock(
+                width=self.width,
+                grid_size=self.grid_size,
+                mlp_ratio=float(self.mlp_ratio),
+                dilation=int(dilation_schedule[idx]),
+                use_attention=False,
+                num_heads=1,
+                adaln_zero=bool(self.adaln_zero),
+                name=f"blocks_{idx}",
+            )(h, c)
+
+        h = nn.LayerNorm(epsilon=1e-6, name="final_ln")(h)
+        raw_delta_m = nn.Dense(
+            1,
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="out",
+        )(h)
+        return jnp.tanh(raw_delta_m).reshape(batch_size, self.num_tokens, 1)
+
+
 class DepthShortcutPredictor(nn.Module):
     """Predicts target hidden-state directions from source directions."""
 

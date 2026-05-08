@@ -473,6 +473,7 @@ except ImportError:
     grain = None
 from src.model import SelfFlowDiT, apply_dit_tail_from_hidden
 from src.depth_shortcut import (
+    DepthShortcutMagnitudePredictor,
     DepthShortcutPredictor,
     apply_predictor_config_overrides,
     l2_normalize_tokens,
@@ -501,6 +502,7 @@ from src.inception_is_subprocess import InceptionISSubprocess
 
 class ShortcutTrainState(train_state.TrainState):
     predictor_apply_fn: Callable = struct.field(pytree_node=False)
+    mag_predictor_apply_fn: Callable | None = struct.field(pytree_node=False, default=None)
 
 
 PREDICTOR_PARAM_TARGET_RANGES = {
@@ -555,6 +557,7 @@ def create_train_state(
     predictor_config_overrides=None,
     predictor_use_class_input=False,
     predictor_class_fusion="add",
+    use_separate_mag_predictor=False,
 ):
     """Initializes the model, optimizer, and initial EMA params.
 
@@ -600,7 +603,21 @@ def create_train_state(
     dummy_t = jnp.ones((1,))
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
-    rng, backbone_rng, predictor_rng, drop_rng = jax.random.split(rng, 4)
+    mag_predictor = None
+    if use_separate_mag_predictor:
+        mag_predictor = DepthShortcutMagnitudePredictor(
+            hidden_size=config["hidden_size"],
+            depth=config["depth"],
+            num_tokens=n_patches,
+            width=128,
+            num_blocks=4,
+            mlp_ratio=2.0,
+            dilation_schedule=(1, 2, 4, 1),
+            mag_abs_center=shortcut_mag_abs_center,
+            mag_abs_scale=shortcut_mag_abs_scale,
+        )
+
+    rng, backbone_rng, predictor_rng, mag_predictor_rng, drop_rng = jax.random.split(rng, 5)
     variables = model.init(
         {'params': backbone_rng, 'dropout': drop_rng},
         x=dummy_x,
@@ -625,36 +642,56 @@ def create_train_state(
         "backbone": variables["params"],
         "predictor": predictor_variables["params"],
     }
+    if mag_predictor is not None:
+        mag_predictor_variables = mag_predictor.init(
+            {"params": mag_predictor_rng},
+            dummy_u,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(1, dtype=jnp.int32),
+            dummy_t_embed,
+        )
+        params["mag_predictor"] = mag_predictor_variables["params"]
+
+    predictor_tx = optax.chain(
+        optax.clip_by_global_norm(predictor_grad_clip),
+        optax.adamw(
+            predictor_lr,
+            b1=0.9,
+            b2=0.999,
+            weight_decay=predictor_weight_decay,
+        ),
+    )
+    tx_transforms = {
+        "backbone": optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.adamw(
+                learning_rate,
+                weight_decay=weight_decay,
+                mask=make_adamw_decay_mask(params),
+            ),
+        ),
+        "predictor": predictor_tx,
+    }
+    tx_labels = {
+        "backbone": jax.tree_util.tree_map(lambda _: "backbone", params["backbone"]),
+        "predictor": jax.tree_util.tree_map(lambda _: "predictor", params["predictor"]),
+    }
+    if "mag_predictor" in params:
+        tx_transforms["mag_predictor"] = predictor_tx
+        tx_labels["mag_predictor"] = jax.tree_util.tree_map(
+            lambda _: "mag_predictor",
+            params["mag_predictor"],
+        )
 
     tx = optax.multi_transform(
-        {
-            "backbone": optax.chain(
-                optax.clip_by_global_norm(grad_clip),
-                optax.adamw(
-                    learning_rate,
-                    weight_decay=weight_decay,
-                    mask=make_adamw_decay_mask(params),
-                ),
-            ),
-            "predictor": optax.chain(
-                optax.clip_by_global_norm(predictor_grad_clip),
-                optax.adamw(
-                    predictor_lr,
-                    b1=0.9,
-                    b2=0.999,
-                    weight_decay=predictor_weight_decay,
-                ),
-            ),
-        },
-        {
-            "backbone": jax.tree_util.tree_map(lambda _: "backbone", params["backbone"]),
-            "predictor": jax.tree_util.tree_map(lambda _: "predictor", params["predictor"]),
-        },
+        tx_transforms,
+        tx_labels,
     )
 
     state = ShortcutTrainState.create(
         apply_fn=model.apply,
         predictor_apply_fn=predictor.apply,
+        mag_predictor_apply_fn=None if mag_predictor is None else mag_predictor.apply,
         params=params,
         tx=tx,
     )
@@ -1196,7 +1233,13 @@ def train_step(
         shortcut_loss_mode = "direction_activation"
     if shortcut_loss_mode not in {"direction_magnitude", "direction_activation"}:
         raise ValueError(f"Unknown shortcut loss mode: {shortcut_loss_mode!r}")
-    if shortcut_mag_grad_mode not in {"full", "stop_backbone"}:
+    if shortcut_mag_grad_mode not in {
+        "full",
+        "stop_backbone",
+        "stop_all",
+        "separate_head",
+        "separate_head_stop_backbone",
+    }:
         raise ValueError(f"Unknown shortcut magnitude gradient mode: {shortcut_mag_grad_mode!r}")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
@@ -1295,7 +1338,61 @@ def train_step(
             norms = jnp.linalg.norm(hidden_f32, axis=-1, keepdims=True)
             return jnp.log(norms + 1e-6)
 
-        mag_stop_backbone = shortcut_mag_grad_mode == "stop_backbone"
+        mag_stop_backbone = shortcut_loss_mode == "direction_magnitude" and shortcut_mag_grad_mode == "stop_backbone"
+        mag_stop_all = shortcut_loss_mode == "direction_magnitude" and shortcut_mag_grad_mode == "stop_all"
+        mag_separate_head = shortcut_loss_mode == "direction_magnitude" and shortcut_mag_grad_mode in {
+            "separate_head",
+            "separate_head_stop_backbone",
+        }
+
+        def apply_direction_predictor(
+            predictor_params,
+            predictor_source,
+            source_layer,
+            target_layer,
+            timestep_embed,
+            m_source,
+            *,
+            detach_timestep_embed=False,
+            class_labels,
+        ):
+            if mag_separate_head:
+                return state.predictor_apply_fn(
+                    {"params": predictor_params},
+                    predictor_source,
+                    source_layer,
+                    target_layer,
+                    timestep_embed,
+                    None,
+                    detach_timestep_embed=detach_timestep_embed,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=class_labels,
+                )
+            y_pred, _ = state.predictor_apply_fn(
+                {"params": predictor_params},
+                predictor_source,
+                source_layer,
+                target_layer,
+                timestep_embed,
+                m_source,
+                detach_timestep_embed=detach_timestep_embed,
+                use_timestep_embed=predictor_use_timestep,
+                class_labels=class_labels,
+            )
+            return y_pred
+
+        def separate_mag_predict(source_hidden, source_layer, target_layer, timestep_embed):
+            # Keep magnitude-head losses local to params["mag_predictor"]; the main
+            # predictor direction path still uses the normal source graph.
+            return state.mag_predictor_apply_fn(
+                {"params": params["mag_predictor"]},
+                jax.lax.stop_gradient(source_hidden),
+                source_layer,
+                target_layer,
+                jax.lax.stop_gradient(timestep_embed),
+                detach_timestep_embed=True,
+                use_timestep_embed=predictor_use_timestep,
+            )
 
         def predictor_mag_stop_backbone(
             predictor_source,
@@ -1326,16 +1423,28 @@ def train_step(
                 normalize_input=predictor_normalize_input,
             )
             ub, mb_target_cached, _ = build_direction_and_norm_map(zb_target)
-            y_pair, delta_m_pair = state.predictor_apply_fn(
-                {"params": params["predictor"]},
-                predictor_source,
-                source_layer,
-                target_layer,
-                dit_time_emb,
-                ma_condition,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y,
-            )
+            if mag_separate_head:
+                y_pair = apply_direction_predictor(
+                    params["predictor"],
+                    predictor_source,
+                    source_layer,
+                    target_layer,
+                    dit_time_emb,
+                    ma_condition,
+                    class_labels=y,
+                )
+                delta_m_pair = separate_mag_predict(za, source_layer, target_layer, dit_time_emb)
+            else:
+                y_pair, delta_m_pair = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    predictor_source,
+                    source_layer,
+                    target_layer,
+                    dit_time_emb,
+                    ma_condition,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
             u_pair = l2_normalize_tokens(y_pair)
             cos_pair = jnp.mean(jnp.sum(u_pair * ub, axis=-1), axis=1)
             loss_dir_pair = 1.0 - cos_pair
@@ -1372,17 +1481,30 @@ def train_step(
             )
             ub, mb_target_cached, _ = build_direction_and_norm_map(zb_target)
             t_embed_pair = jax.lax.stop_gradient(dit_time_emb) if source_detach else dit_time_emb
-            y_pair, delta_m_pair = state.predictor_apply_fn(
-                {"params": params["predictor"]},
-                predictor_source,
-                source_layer,
-                target_layer,
-                t_embed_pair,
-                ma_condition,
-                detach_timestep_embed=source_detach,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y,
-            )
+            if mag_separate_head:
+                y_pair = apply_direction_predictor(
+                    params["predictor"],
+                    predictor_source,
+                    source_layer,
+                    target_layer,
+                    t_embed_pair,
+                    ma_condition,
+                    detach_timestep_embed=source_detach,
+                    class_labels=y,
+                )
+                delta_m_pair = separate_mag_predict(za, source_layer, target_layer, t_embed_pair)
+            else:
+                y_pair, delta_m_pair = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    predictor_source,
+                    source_layer,
+                    target_layer,
+                    t_embed_pair,
+                    ma_condition,
+                    detach_timestep_embed=source_detach,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
             u_pair = l2_normalize_tokens(y_pair)
             cos_pair = jnp.sum(u_pair * ub, axis=-1).mean()
             loss_dir_pair = 1.0 - cos_pair
@@ -1395,7 +1517,9 @@ def train_step(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
                 )
                 delta_m_pair_for_mag = delta_m_pair
-                if mag_stop_backbone and not source_detach:
+                if mag_stop_all:
+                    delta_m_pair_for_mag = jax.lax.stop_gradient(delta_m_pair_for_mag)
+                elif mag_stop_backbone and not source_detach:
                     delta_m_pair_for_mag = predictor_mag_stop_backbone(
                         predictor_source,
                         source_layer,
@@ -1545,6 +1669,7 @@ def train_step(
 
         if use_legacy_bootstrap_loss:
             boot_a, boot_b, boot_c = sample_triplet_uniform(triplet_rng, num_hidden_layers - 1)
+            boot_source_hidden = hidden_layer_f32(boot_a)
             boot_source_direction, boot_source_m = direction_and_log_magnitude_for_layer(boot_a)
             boot_source_u = boot_source_direction if predictor_normalize_input else hidden_layer_f32(boot_a)
             boot_source_u = jax.lax.cond(
@@ -1559,16 +1684,28 @@ def train_step(
                 lambda z: z,
                 boot_source_m,
             )
-            y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
-                {"params": params["predictor"]},
-                boot_source_u,
-                boot_a,
-                boot_b,
-                dit_time_emb,
-                boot_source_m,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y,
-            )
+            if mag_separate_head:
+                y_boot_ab = apply_direction_predictor(
+                    params["predictor"],
+                    boot_source_u,
+                    boot_a,
+                    boot_b,
+                    dit_time_emb,
+                    boot_source_m,
+                    class_labels=y,
+                )
+                delta_m_boot_ab = separate_mag_predict(boot_source_hidden, boot_a, boot_b, dit_time_emb)
+            else:
+                y_boot_ab, delta_m_boot_ab = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    boot_source_u,
+                    boot_a,
+                    boot_b,
+                    dit_time_emb,
+                    boot_source_m,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
             u_boot_ab = l2_normalize_tokens(y_boot_ab)
             if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
                 boot_source_u_mag = jax.lax.stop_gradient(boot_source_u)
@@ -1590,6 +1727,8 @@ def train_step(
                 delta_m_boot_ab_mag = delta_m_boot_ab
             if shortcut_loss_mode == "direction_magnitude":
                 m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
+                if mag_stop_all:
+                    m_boot_ab = jax.lax.stop_gradient(m_boot_ab)
                 boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
                 m_boot_ab_mag = boot_source_m_mag + mag_scale * delta_m_boot_ab_mag
                 boot_b_source_mag = (
@@ -1597,19 +1736,32 @@ def train_step(
                     if predictor_normalize_input
                     else y_boot_ab_mag
                 )
+                boot_b_hidden_for_mag = jnp.exp(m_boot_ab_mag) * l2_normalize_tokens(y_boot_ab_mag)
             else:
                 m_boot_ab = jnp.log(jnp.linalg.norm(y_boot_ab.astype(jnp.float32), axis=-1, keepdims=True) + 1e-6)
                 boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
-            y_abc, delta_m_abc = state.predictor_apply_fn(
-                {"params": params["predictor"]},
-                boot_b_source,
-                boot_b,
-                boot_c,
-                dit_time_emb,
-                m_boot_ab,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y,
-            )
+            if mag_separate_head:
+                y_abc = apply_direction_predictor(
+                    params["predictor"],
+                    boot_b_source,
+                    boot_b,
+                    boot_c,
+                    dit_time_emb,
+                    m_boot_ab,
+                    class_labels=y,
+                )
+                delta_m_abc = separate_mag_predict(boot_b_hidden_for_mag, boot_b, boot_c, dit_time_emb)
+            else:
+                y_abc, delta_m_abc = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    boot_b_source,
+                    boot_b,
+                    boot_c,
+                    dit_time_emb,
+                    m_boot_ab,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
             if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
                 _, delta_m_abc_mag = state.predictor_apply_fn(
                     {"params": params["predictor"]},
@@ -1625,16 +1777,28 @@ def train_step(
             else:
                 delta_m_abc_mag = delta_m_abc
             ac_params = params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params
-            y_ac, delta_m_ac = state.predictor_apply_fn(
-                {"params": ac_params},
-                boot_source_u,
-                boot_a,
-                boot_c,
-                dit_time_emb,
-                boot_source_m,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y,
-            )
+            if mag_separate_head:
+                y_ac = apply_direction_predictor(
+                    ac_params,
+                    boot_source_u,
+                    boot_a,
+                    boot_c,
+                    dit_time_emb,
+                    boot_source_m,
+                    class_labels=y,
+                )
+                delta_m_ac = separate_mag_predict(boot_source_hidden, boot_a, boot_c, dit_time_emb)
+            else:
+                y_ac, delta_m_ac = state.predictor_apply_fn(
+                    {"params": ac_params},
+                    boot_source_u,
+                    boot_a,
+                    boot_c,
+                    dit_time_emb,
+                    boot_source_m,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
             if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
                 _, delta_m_ac_mag = state.predictor_apply_fn(
                     {"params": ac_params},
@@ -1649,6 +1813,10 @@ def train_step(
                 )
             else:
                 delta_m_ac_mag = delta_m_ac
+            if mag_stop_all and shortcut_loss_mode == "direction_magnitude":
+                delta_m_boot_ab_mag = jax.lax.stop_gradient(delta_m_boot_ab_mag)
+                delta_m_abc_mag = jax.lax.stop_gradient(delta_m_abc_mag)
+                delta_m_ac_mag = jax.lax.stop_gradient(delta_m_ac_mag)
             if bootstrap_reverse_stopgrad:
                 u_boot = l2_normalize_tokens(y_ac)
                 u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_abc))
@@ -1907,22 +2075,40 @@ def train_step(
                 z_source,
                 normalize_input=predictor_normalize_input,
             )
-            y_pred, delta_m_pred = state.predictor_apply_fn(
-                {"params": params["predictor"]},
-                predictor_source,
-                output_a,
-                output_b,
-                t_emb_teacher,
-                m_source,
-                detach_timestep_embed=True,
-                use_timestep_embed=predictor_use_timestep,
-                class_labels=y[subset_idx],
-            )
+            if mag_separate_head:
+                y_pred = apply_direction_predictor(
+                    params["predictor"],
+                    predictor_source,
+                    output_a,
+                    output_b,
+                    t_emb_teacher,
+                    m_source,
+                    detach_timestep_embed=True,
+                    class_labels=y[subset_idx],
+                )
+                delta_m_pred = separate_mag_predict(z_source, output_a, output_b, t_emb_teacher)
+            else:
+                y_pred, delta_m_pred = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    predictor_source,
+                    output_a,
+                    output_b,
+                    t_emb_teacher,
+                    m_source,
+                    detach_timestep_embed=True,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y[subset_idx],
+                )
             u_pred = l2_normalize_tokens(y_pred)
             if shortcut_loss_mode == "direction_magnitude":
                 m_source_for_output = m_source
                 delta_m_for_output = delta_m_pred
-                if mag_stop_backbone:
+                if mag_separate_head:
+                    m_source_for_output = jax.lax.stop_gradient(m_source_for_output)
+                elif mag_stop_all:
+                    m_source_for_output = jax.lax.stop_gradient(m_source_for_output)
+                    delta_m_for_output = jax.lax.stop_gradient(delta_m_for_output)
+                elif mag_stop_backbone:
                     m_source_for_output = jax.lax.stop_gradient(m_source)
                     delta_m_for_output = predictor_mag_stop_backbone(
                         predictor_source,
@@ -2360,7 +2546,13 @@ def train_step(
             dtype=jnp.float32,
         ),
         "train/shortcut_mag_grad_mode": jnp.asarray(
-            1.0 if shortcut_mag_grad_mode == "stop_backbone" else 0.0,
+            {
+                "full": 0.0,
+                "stop_backbone": 1.0,
+                "stop_all": 2.0,
+                "separate_head": 3.0,
+                "separate_head_stop_backbone": 4.0,
+            }[shortcut_mag_grad_mode],
             dtype=jnp.float32,
         ),
         "train/direct_loss_mode": jnp.asarray(
@@ -3854,11 +4046,29 @@ def main():
         "--shortcut-mag-grad-mode",
         type=str,
         default="full",
-        choices=["full", "stop_backbone", "stop-backbone"],
+        choices=[
+            "full",
+            "stop_backbone",
+            "stop-backbone",
+            "stop_all",
+            "stop-all",
+            "separate_head",
+            "separate-head",
+            "separate_head_stop_backbone",
+            "separate-head-stop-backbone",
+            "small_head",
+            "small-head",
+            "small_head_stop_backbone",
+            "small-head-stop-backbone",
+        ],
         help=(
             "Gradient routing for direction_magnitude magnitude losses. "
             "full keeps the original graph; stop_backbone trains the predictor magnitude path "
-            "through detached source/timestep inputs so magnitude gradients do not flow back into DiT."
+            "through detached source/timestep inputs so magnitude gradients do not flow back into DiT; "
+            "stop_all detaches magnitude predictions so magnitude gradients do not update predictor or DiT; "
+            "separate_head_stop_backbone uses a small independent magnitude predictor with detached "
+            "source activations, while direction gradients from the main predictor keep flowing into "
+            "both predictor and backbone."
         ),
     )
     parser.add_argument(
@@ -4275,8 +4485,19 @@ def main():
     if args.shortcut_loss_mode == "direction_activation_huber":
         args.shortcut_loss_mode = "direction_activation"
     args.shortcut_mag_grad_mode = args.shortcut_mag_grad_mode.replace("-", "_")
-    if args.shortcut_mag_grad_mode not in {"full", "stop_backbone"}:
-        raise ValueError("--shortcut-mag-grad-mode must be one of: full, stop_backbone")
+    if args.shortcut_mag_grad_mode in {"small_head", "small_head_stop_backbone"}:
+        args.shortcut_mag_grad_mode = "separate_head_stop_backbone"
+    if args.shortcut_mag_grad_mode not in {
+        "full",
+        "stop_backbone",
+        "stop_all",
+        "separate_head",
+        "separate_head_stop_backbone",
+    }:
+        raise ValueError(
+            "--shortcut-mag-grad-mode must be one of: full, stop_backbone, stop_all, "
+            "separate_head, separate_head_stop_backbone"
+        )
     if args.shortcut_activation_huber_delta <= 0.0:
         raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
 
@@ -4511,8 +4732,13 @@ def main():
         predictor_config_overrides=shortcut_predictor_overrides,
         predictor_use_class_input=args.shortcut_predictor_use_class_input,
         predictor_class_fusion=args.shortcut_predictor_class_fusion,
+        use_separate_mag_predictor=args.shortcut_mag_grad_mode in {
+            "separate_head",
+            "separate_head_stop_backbone",
+        },
     )
     predictor_param_count = count_tree_params(state.params["predictor"])
+    mag_predictor_param_count = count_tree_params(state.params.get("mag_predictor", {}))
     backbone_param_count = count_tree_params(state.params["backbone"])
     total_param_count = count_tree_params(state.params)
     predictor_bucket = (
@@ -4525,6 +4751,7 @@ def main():
     predictor_cfg = apply_predictor_config_overrides(predictor_cfg, **shortcut_predictor_overrides)
     log_stage(
         f"DepthShortcut params: predictor={predictor_param_count:,} "
+        f"mag_predictor={mag_predictor_param_count:,} "
         f"backbone={backbone_param_count:,} total={total_param_count:,} "
         f"cfg={predictor_cfg}"
     )
