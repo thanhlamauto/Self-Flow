@@ -617,7 +617,11 @@ def create_train_state(
             mag_abs_scale=shortcut_mag_abs_scale,
         )
 
-    rng, backbone_rng, predictor_rng, mag_predictor_rng, drop_rng = jax.random.split(rng, 5)
+    if mag_predictor is None:
+        rng, backbone_rng, predictor_rng, drop_rng = jax.random.split(rng, 4)
+        mag_predictor_rng = None
+    else:
+        rng, backbone_rng, predictor_rng, mag_predictor_rng, drop_rng = jax.random.split(rng, 5)
     variables = model.init(
         {'params': backbone_rng, 'dropout': drop_rng},
         x=dummy_x,
