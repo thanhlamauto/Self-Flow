@@ -365,6 +365,7 @@ class MagnitudeHead(nn.Module):
     cond_dim: int
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    num_bins: int = 1
 
     @nn.compact
     def __call__(self, h: jax.Array, m_source: jax.Array, c: jax.Array) -> jax.Array:
@@ -407,14 +408,25 @@ class MagnitudeHead(nn.Module):
             name="pw1",
         )(x)
         x = nn.gelu(x, approximate=True)
-        raw_delta_m = nn.Dense(
+        delta_m = nn.Dense(
             1,
             kernel_init=ZERO_INIT,
             bias_init=ZERO_INIT,
             dtype=jnp.bfloat16,
             name="pw2",
         )(x)
-        return jnp.tanh(raw_delta_m).reshape(batch_size, height * width, 1)
+        delta_m = jnp.tanh(delta_m.reshape(batch_size, height * width, 1))
+        if int(self.num_bins) == 1:
+            return delta_m
+        ce_logits = nn.Dense(
+            int(self.num_bins),
+            kernel_init=ZERO_INIT,
+            bias_init=ZERO_INIT,
+            dtype=jnp.bfloat16,
+            name="ce_logits",
+        )(x)
+        ce_logits = ce_logits.reshape(batch_size, height * width, int(self.num_bins))
+        return delta_m, ce_logits
 
 
 class DepthShortcutMagnitudePredictor(nn.Module):
@@ -567,6 +579,7 @@ class DepthShortcutPredictor(nn.Module):
     gamma_out_init: float = 0.05
     mag_abs_center: float = 5.5
     mag_abs_scale: float = 1.5
+    mag_num_bins: int = 1
     num_classes: int = 1000
     class_cond_input: bool = False
     class_cond_fusion: str = "add"
@@ -790,6 +803,7 @@ class DepthShortcutPredictor(nn.Module):
             cond_dim=cond_dim,
             mag_abs_center=self.mag_abs_center,
             mag_abs_scale=self.mag_abs_scale,
+            num_bins=int(self.mag_num_bins),
             name="mag_head",
         )(h_grid, m_source, c)
         return y, delta_m

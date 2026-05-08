@@ -554,6 +554,7 @@ def create_train_state(
     shortcut_training_mode="direction",
     shortcut_mag_abs_center=5.5,
     shortcut_mag_abs_scale=1.5,
+    shortcut_mag_num_bins=1,
     predictor_config_overrides=None,
     predictor_use_class_input=False,
     predictor_class_fusion="add",
@@ -593,6 +594,7 @@ def create_train_state(
         gamma_out_init=0.001 if shortcut_training_mode == "direction-magnitude" else 0.05,
         mag_abs_center=shortcut_mag_abs_center,
         mag_abs_scale=shortcut_mag_abs_scale,
+        mag_num_bins=int(shortcut_mag_num_bins),
         num_classes=config["num_classes"],
         class_cond_input=bool(predictor_use_class_input),
         class_cond_fusion=predictor_class_fusion,
@@ -1183,6 +1185,8 @@ def train_step(
     direct_pair_order_mode="forward",
     shortcut_loss_mode="direction_magnitude",
     shortcut_mag_grad_mode="full",
+    shortcut_mag_loss_mode="mse",
+    shortcut_mag_ce_bins=33,
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
     uniform_transition_diag_logs=False,
@@ -1245,6 +1249,12 @@ def train_step(
         "separate_head_stop_backbone",
     }:
         raise ValueError(f"Unknown shortcut magnitude gradient mode: {shortcut_mag_grad_mode!r}")
+    if shortcut_mag_loss_mode not in {"mse", "cross_entropy"}:
+        raise ValueError(f"Unknown shortcut magnitude loss mode: {shortcut_mag_loss_mode!r}")
+    if shortcut_mag_loss_mode == "cross_entropy" and shortcut_mag_ce_bins < 2:
+        raise ValueError("shortcut_mag_ce_bins must be at least 2 for cross_entropy mode.")
+    if shortcut_mag_loss_mode == "cross_entropy" and shortcut_mag_grad_mode != "full":
+        raise ValueError("shortcut_mag_loss_mode='cross_entropy' is currently supported only with shortcut_mag_grad_mode='full'.")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in pair_modes:
@@ -1348,6 +1358,72 @@ def train_step(
             "separate_head",
             "separate_head_stop_backbone",
         }
+        mag_cross_entropy = (
+            shortcut_loss_mode == "direction_magnitude"
+            and shortcut_mag_loss_mode == "cross_entropy"
+        )
+        mag_stop_backbone_effective = bool(mag_stop_backbone) or bool(mag_cross_entropy)
+
+        def mag_prediction_to_delta(prediction):
+            if isinstance(prediction, tuple):
+                return prediction[0]
+            return prediction
+
+        def mag_prediction_to_logits(prediction):
+            if isinstance(prediction, tuple):
+                return prediction[1]
+            return None
+
+        def mag_ce_labels(target_delta):
+            num_bins = int(shortcut_mag_ce_bins)
+            target_delta = jnp.clip(target_delta.astype(jnp.float32), -1.0, 1.0)
+            target_pos = (target_delta + 1.0) * 0.5 * (num_bins - 1)
+            return jnp.rint(target_pos).astype(jnp.int32).squeeze(-1)
+
+        def mag_mse_loss_per_sample(prediction, target_delta):
+            delta = mag_prediction_to_delta(prediction)
+            return 0.5 * jnp.mean(
+                jnp.square(delta - target_delta),
+                axis=tuple(range(1, delta.ndim)),
+            )
+
+        def mag_mse_loss_mean(prediction, target_delta):
+            delta = mag_prediction_to_delta(prediction)
+            return 0.5 * jnp.mean(jnp.square(delta - target_delta))
+
+        def mag_ce_loss_per_sample(prediction, target_delta):
+            logits = mag_prediction_to_logits(prediction)
+            if logits is None:
+                return jnp.zeros_like(mag_mse_loss_per_sample(prediction, target_delta))
+            labels = mag_ce_labels(target_delta)
+            ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits.astype(jnp.float32),
+                labels,
+            )
+            return jnp.mean(ce, axis=tuple(range(1, ce.ndim)))
+
+        def mag_ce_loss_mean(prediction, target_delta):
+            logits = mag_prediction_to_logits(prediction)
+            if logits is None:
+                return jnp.array(0.0, dtype=jnp.float32)
+            labels = mag_ce_labels(target_delta)
+            ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits.astype(jnp.float32),
+                labels,
+            )
+            return jnp.mean(ce)
+
+        def mag_supervised_loss_per_sample(prediction, target_delta):
+            loss = mag_mse_loss_per_sample(prediction, target_delta)
+            if mag_cross_entropy:
+                loss = loss + mag_ce_loss_per_sample(prediction, target_delta)
+            return loss
+
+        def mag_supervised_loss_mean(prediction, target_delta):
+            loss = mag_mse_loss_mean(prediction, target_delta)
+            if mag_cross_entropy:
+                loss = loss + mag_ce_loss_mean(prediction, target_delta)
+            return loss
 
         def apply_direction_predictor(
             predictor_params,
@@ -1458,10 +1534,7 @@ def train_step(
                 target_delta_m_pair = jax.lax.stop_gradient(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
                 )
-                loss_aux_pair = 0.5 * jnp.mean(
-                    jnp.square(delta_m_pair - target_delta_m_pair),
-                    axis=tuple(range(1, delta_m_pair.ndim)),
-                )
+                loss_aux_pair = mag_supervised_loss_per_sample(delta_m_pair, target_delta_m_pair)
             else:
                 target_rms_pair = jax.lax.stop_gradient(sample_activation_rms(zb_target))
                 residual_norm_pair = (y_pair - zb_target) / target_rms_pair
@@ -1523,7 +1596,7 @@ def train_step(
                 delta_m_pair_for_mag = delta_m_pair
                 if mag_stop_all:
                     delta_m_pair_for_mag = jax.lax.stop_gradient(delta_m_pair_for_mag)
-                elif mag_stop_backbone and not source_detach:
+                elif mag_stop_backbone_effective and not source_detach:
                     delta_m_pair_for_mag = predictor_mag_stop_backbone(
                         predictor_source,
                         source_layer,
@@ -1532,9 +1605,10 @@ def train_step(
                         ma_condition,
                         y,
                     )
-                loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair_for_mag - target_delta_m_pair))
+                loss_mag_pair = mag_supervised_loss_mean(delta_m_pair_for_mag, target_delta_m_pair)
                 loss_aux_pair = loss_mag_pair
-                delta_m_raw_error_pair = mag_scale * delta_m_pair_for_mag - target_delta_m_raw_pair
+                delta_m_pair_for_metrics = mag_prediction_to_delta(delta_m_pair_for_mag)
+                delta_m_raw_error_pair = mag_scale * delta_m_pair_for_metrics - target_delta_m_raw_pair
                 delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
                 delta_m_mae_pair = jnp.mean(delta_m_abs_error_pair)
                 delta_m_rmse_pair = jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair)))
@@ -1711,7 +1785,7 @@ def train_step(
                     class_labels=y,
                 )
             u_boot_ab = l2_normalize_tokens(y_boot_ab)
-            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+            if mag_stop_backbone_effective and shortcut_loss_mode == "direction_magnitude":
                 boot_source_u_mag = jax.lax.stop_gradient(boot_source_u)
                 boot_source_m_mag = jax.lax.stop_gradient(boot_source_m)
                 y_boot_ab_mag, delta_m_boot_ab_mag = state.predictor_apply_fn(
@@ -1730,11 +1804,13 @@ def train_step(
                 y_boot_ab_mag = y_boot_ab
                 delta_m_boot_ab_mag = delta_m_boot_ab
             if shortcut_loss_mode == "direction_magnitude":
-                m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
+                delta_m_boot_ab_value = mag_prediction_to_delta(delta_m_boot_ab)
+                m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab_value
                 if mag_stop_all:
                     m_boot_ab = jax.lax.stop_gradient(m_boot_ab)
                 boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
-                m_boot_ab_mag = boot_source_m_mag + mag_scale * delta_m_boot_ab_mag
+                delta_m_boot_ab_mag_value = mag_prediction_to_delta(delta_m_boot_ab_mag)
+                m_boot_ab_mag = boot_source_m_mag + mag_scale * delta_m_boot_ab_mag_value
                 boot_b_source_mag = (
                     l2_normalize_tokens(y_boot_ab_mag)
                     if predictor_normalize_input
@@ -1766,7 +1842,7 @@ def train_step(
                     use_timestep_embed=predictor_use_timestep,
                     class_labels=y,
                 )
-            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+            if mag_stop_backbone_effective and shortcut_loss_mode == "direction_magnitude":
                 _, delta_m_abc_mag = state.predictor_apply_fn(
                     {"params": params["predictor"]},
                     boot_b_source_mag,
@@ -1803,7 +1879,7 @@ def train_step(
                     use_timestep_embed=predictor_use_timestep,
                     class_labels=y,
                 )
-            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+            if mag_stop_backbone_effective and shortcut_loss_mode == "direction_magnitude":
                 _, delta_m_ac_mag = state.predictor_apply_fn(
                     {"params": ac_params},
                     jax.lax.stop_gradient(boot_source_u),
@@ -1830,12 +1906,15 @@ def train_step(
             cos_boot = jnp.sum(u_boot * u_teacher, axis=-1).mean()
             loss_boot = 1.0 - cos_boot
             if shortcut_loss_mode == "direction_magnitude":
+                delta_m_boot_ab_mag_value = mag_prediction_to_delta(delta_m_boot_ab_mag)
+                delta_m_abc_mag_value = mag_prediction_to_delta(delta_m_abc_mag)
+                delta_m_ac_mag_value = mag_prediction_to_delta(delta_m_ac_mag)
                 if bootstrap_reverse_stopgrad:
-                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab_mag + delta_m_abc_mag)
-                    pred_delta_m_ac = delta_m_ac_mag
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab_mag_value + delta_m_abc_mag_value)
+                    pred_delta_m_ac = delta_m_ac_mag_value
                 else:
-                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_mag)
-                    pred_delta_m_ac = delta_m_boot_ab_mag + delta_m_abc_mag
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_mag_value)
+                    pred_delta_m_ac = delta_m_boot_ab_mag_value + delta_m_abc_mag_value
                 loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
             else:
                 y_ac_target_raw = y_abc if bootstrap_reverse_stopgrad else y_ac
@@ -1881,8 +1960,9 @@ def train_step(
                     target_log_m - source_log_m
                 )
                 pair_target_delta_norm = jnp.clip(pair_target_delta_raw / mag_scale, -1.0, 1.0)
-                pair_loss_mag = 0.5 * jnp.mean(jnp.square(delta_m_pair - pair_target_delta_norm))
-                pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair - pair_target_delta_raw))
+                pair_loss_mag = mag_supervised_loss_mean(delta_m_pair, pair_target_delta_norm)
+                delta_m_pair_value = mag_prediction_to_delta(delta_m_pair)
+                pair_delta_m_mae = jnp.mean(jnp.abs(mag_scale * delta_m_pair_value - pair_target_delta_raw))
                 return pair_loss_dir, pair_loss_mag, pair_cos, pair_delta_m_mae
 
             values = []
@@ -2122,6 +2202,7 @@ def train_step(
                         m_source,
                         y[subset_idx],
                     )
+                delta_m_for_output = mag_prediction_to_delta(delta_m_for_output)
                 m_pred = jnp.clip(
                     m_source_for_output + mag_scale * delta_m_for_output,
                     mag_clip_min,
@@ -2559,6 +2640,15 @@ def train_step(
             }[shortcut_mag_grad_mode],
             dtype=jnp.float32,
         ),
+        "train/shortcut_mag_loss_mode": jnp.asarray(
+            1.0 if shortcut_mag_loss_mode == "cross_entropy" else 0.0,
+            dtype=jnp.float32,
+        ),
+        "train/shortcut_mag_loss_stop_backbone": jnp.asarray(
+            1.0 if mag_stop_backbone_effective else 0.0,
+            dtype=jnp.float32,
+        ),
+        "train/shortcut_mag_ce_bins": jnp.asarray(shortcut_mag_ce_bins, dtype=jnp.float32),
         "train/direct_loss_mode": jnp.asarray(
             0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
             dtype=jnp.float32,
@@ -2888,6 +2978,9 @@ OFFICIAL_TRAIN_METRIC_KEYS = {
     "train/direct_gap",
     "train/output_distill_gap",
     "train/shortcut_mag_grad_mode",
+    "train/shortcut_mag_loss_mode",
+    "train/shortcut_mag_loss_stop_backbone",
+    "train/shortcut_mag_ce_bins",
     "train/sampled_timestep_tau",
     "train/grad_norm",
     "train/param_norm",
@@ -4076,6 +4169,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shortcut-mag-loss-mode",
+        type=str,
+        default="mse",
+        choices=["mse", "l2", "cross_entropy", "cross-entropy", "ce"],
+        help=(
+            "Supervised magnitude-head loss for direction_magnitude. "
+            "mse keeps the original continuous delta-magnitude regression. "
+            "cross_entropy keeps the original scalar regression head/MSE and adds "
+            "a separate discrete-bin logits head trained with softmax cross entropy. "
+            "In cross_entropy mode, only the magnitude MSE/CE path is detached "
+            "from the DiT backbone; direction cosine keeps the normal graph."
+        ),
+    )
+    parser.add_argument(
+        "--shortcut-mag-ce-bins",
+        type=int,
+        default=33,
+        help="Number of bins for --shortcut-mag-loss-mode=cross_entropy over normalized delta_m in [-1, 1].",
+    )
+    parser.add_argument(
         "--shortcut-activation-huber-delta",
         "--direct-activation-huber-delta",
         dest="shortcut_activation_huber_delta",
@@ -4502,6 +4615,17 @@ def main():
             "--shortcut-mag-grad-mode must be one of: full, stop_backbone, stop_all, "
             "separate_head, separate_head_stop_backbone"
         )
+    args.shortcut_mag_loss_mode = args.shortcut_mag_loss_mode.replace("-", "_")
+    if args.shortcut_mag_loss_mode == "l2":
+        args.shortcut_mag_loss_mode = "mse"
+    elif args.shortcut_mag_loss_mode == "ce":
+        args.shortcut_mag_loss_mode = "cross_entropy"
+    if args.shortcut_mag_loss_mode not in {"mse", "cross_entropy"}:
+        raise ValueError("--shortcut-mag-loss-mode must be one of: mse, cross_entropy")
+    if args.shortcut_mag_loss_mode == "cross_entropy" and args.shortcut_mag_ce_bins < 2:
+        raise ValueError("--shortcut-mag-ce-bins must be at least 2 for cross_entropy mode")
+    if args.shortcut_mag_loss_mode == "cross_entropy" and args.shortcut_mag_grad_mode != "full":
+        raise ValueError("--shortcut-mag-loss-mode=cross_entropy is currently supported only with --shortcut-mag-grad-mode=full")
     if args.shortcut_activation_huber_delta <= 0.0:
         raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
 
@@ -4652,6 +4776,9 @@ def main():
         f"direct_pair_order_mode={args.direct_pair_order_mode} "
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
         f"shortcut_mag_grad_mode={args.shortcut_mag_grad_mode} "
+        f"shortcut_mag_loss_mode={args.shortcut_mag_loss_mode} "
+        f"shortcut_mag_loss_stop_backbone={args.shortcut_mag_grad_mode == 'stop_backbone' or args.shortcut_mag_loss_mode == 'cross_entropy'} "
+        f"shortcut_mag_ce_bins={args.shortcut_mag_ce_bins} "
         f"shortcut_activation_huber_delta={args.shortcut_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
@@ -4733,6 +4860,7 @@ def main():
         shortcut_training_mode=args.shortcut_training_mode,
         shortcut_mag_abs_center=args.shortcut_mag_abs_center,
         shortcut_mag_abs_scale=args.shortcut_mag_abs_scale,
+        shortcut_mag_num_bins=args.shortcut_mag_ce_bins if args.shortcut_mag_loss_mode == "cross_entropy" else 1,
         predictor_config_overrides=shortcut_predictor_overrides,
         predictor_use_class_input=args.shortcut_predictor_use_class_input,
         predictor_class_fusion=args.shortcut_predictor_class_fusion,
@@ -4868,6 +4996,8 @@ def main():
             direct_pair_order_mode=args.direct_pair_order_mode,
             shortcut_loss_mode=args.shortcut_loss_mode,
             shortcut_mag_grad_mode=args.shortcut_mag_grad_mode,
+            shortcut_mag_loss_mode=args.shortcut_mag_loss_mode,
+            shortcut_mag_ce_bins=args.shortcut_mag_ce_bins,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
             uniform_transition_diag_logs=args.uniform_transition_diag_logs,
