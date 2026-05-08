@@ -1141,6 +1141,7 @@ def train_step(
     direct_allow_identity_pairs=False,
     direct_pair_order_mode="forward",
     shortcut_loss_mode="direction_magnitude",
+    shortcut_mag_grad_mode="full",
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
     uniform_transition_diag_logs=False,
@@ -1195,6 +1196,8 @@ def train_step(
         shortcut_loss_mode = "direction_activation"
     if shortcut_loss_mode not in {"direction_magnitude", "direction_activation"}:
         raise ValueError(f"Unknown shortcut loss mode: {shortcut_loss_mode!r}")
+    if shortcut_mag_grad_mode not in {"full", "stop_backbone"}:
+        raise ValueError(f"Unknown shortcut magnitude gradient mode: {shortcut_mag_grad_mode!r}")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in pair_modes:
@@ -1292,6 +1295,29 @@ def train_step(
             norms = jnp.linalg.norm(hidden_f32, axis=-1, keepdims=True)
             return jnp.log(norms + 1e-6)
 
+        mag_stop_backbone = shortcut_mag_grad_mode == "stop_backbone"
+
+        def predictor_mag_stop_backbone(
+            predictor_source,
+            source_layer,
+            target_layer,
+            timestep_embed,
+            m_source,
+            class_labels,
+        ):
+            _, delta_m_detached = state.predictor_apply_fn(
+                {"params": params["predictor"]},
+                jax.lax.stop_gradient(predictor_source),
+                source_layer,
+                target_layer,
+                jax.lax.stop_gradient(timestep_embed),
+                jax.lax.stop_gradient(m_source),
+                detach_timestep_embed=True,
+                use_timestep_embed=predictor_use_timestep,
+                class_labels=class_labels,
+            )
+            return delta_m_detached
+
         def shortcut_direct_loss_per_sample_for_pair(source_layer, target_layer):
             za = hidden_layer_f32(source_layer)
             zb_target = jax.lax.stop_gradient(hidden_layer_f32(target_layer))
@@ -1368,9 +1394,19 @@ def train_step(
                 target_delta_m_pair = jax.lax.stop_gradient(
                     jnp.clip(target_delta_m_raw_pair / mag_scale, -1.0, 1.0)
                 )
-                loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair - target_delta_m_pair))
+                delta_m_pair_for_mag = delta_m_pair
+                if mag_stop_backbone and not source_detach:
+                    delta_m_pair_for_mag = predictor_mag_stop_backbone(
+                        predictor_source,
+                        source_layer,
+                        target_layer,
+                        t_embed_pair,
+                        ma_condition,
+                        y,
+                    )
+                loss_mag_pair = 0.5 * jnp.mean(jnp.square(delta_m_pair_for_mag - target_delta_m_pair))
                 loss_aux_pair = loss_mag_pair
-                delta_m_raw_error_pair = mag_scale * delta_m_pair - target_delta_m_raw_pair
+                delta_m_raw_error_pair = mag_scale * delta_m_pair_for_mag - target_delta_m_raw_pair
                 delta_m_abs_error_pair = jnp.abs(delta_m_raw_error_pair)
                 delta_m_mae_pair = jnp.mean(delta_m_abs_error_pair)
                 delta_m_rmse_pair = jnp.sqrt(jnp.mean(jnp.square(delta_m_raw_error_pair)))
@@ -1534,9 +1570,33 @@ def train_step(
                 class_labels=y,
             )
             u_boot_ab = l2_normalize_tokens(y_boot_ab)
+            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+                boot_source_u_mag = jax.lax.stop_gradient(boot_source_u)
+                boot_source_m_mag = jax.lax.stop_gradient(boot_source_m)
+                y_boot_ab_mag, delta_m_boot_ab_mag = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    boot_source_u_mag,
+                    boot_a,
+                    boot_b,
+                    jax.lax.stop_gradient(dit_time_emb),
+                    boot_source_m_mag,
+                    detach_timestep_embed=True,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
+            else:
+                boot_source_m_mag = boot_source_m
+                y_boot_ab_mag = y_boot_ab
+                delta_m_boot_ab_mag = delta_m_boot_ab
             if shortcut_loss_mode == "direction_magnitude":
                 m_boot_ab = boot_source_m + mag_scale * delta_m_boot_ab
                 boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
+                m_boot_ab_mag = boot_source_m_mag + mag_scale * delta_m_boot_ab_mag
+                boot_b_source_mag = (
+                    l2_normalize_tokens(y_boot_ab_mag)
+                    if predictor_normalize_input
+                    else y_boot_ab_mag
+                )
             else:
                 m_boot_ab = jnp.log(jnp.linalg.norm(y_boot_ab.astype(jnp.float32), axis=-1, keepdims=True) + 1e-6)
                 boot_b_source = u_boot_ab if predictor_normalize_input else y_boot_ab
@@ -1550,6 +1610,20 @@ def train_step(
                 use_timestep_embed=predictor_use_timestep,
                 class_labels=y,
             )
+            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+                _, delta_m_abc_mag = state.predictor_apply_fn(
+                    {"params": params["predictor"]},
+                    boot_b_source_mag,
+                    boot_b,
+                    boot_c,
+                    jax.lax.stop_gradient(dit_time_emb),
+                    m_boot_ab_mag,
+                    detach_timestep_embed=True,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
+            else:
+                delta_m_abc_mag = delta_m_abc
             ac_params = params["predictor"] if bootstrap_reverse_stopgrad else predictor_ema_params
             y_ac, delta_m_ac = state.predictor_apply_fn(
                 {"params": ac_params},
@@ -1561,6 +1635,20 @@ def train_step(
                 use_timestep_embed=predictor_use_timestep,
                 class_labels=y,
             )
+            if mag_stop_backbone and shortcut_loss_mode == "direction_magnitude":
+                _, delta_m_ac_mag = state.predictor_apply_fn(
+                    {"params": ac_params},
+                    jax.lax.stop_gradient(boot_source_u),
+                    boot_a,
+                    boot_c,
+                    jax.lax.stop_gradient(dit_time_emb),
+                    jax.lax.stop_gradient(boot_source_m),
+                    detach_timestep_embed=True,
+                    use_timestep_embed=predictor_use_timestep,
+                    class_labels=y,
+                )
+            else:
+                delta_m_ac_mag = delta_m_ac
             if bootstrap_reverse_stopgrad:
                 u_boot = l2_normalize_tokens(y_ac)
                 u_teacher = jax.lax.stop_gradient(l2_normalize_tokens(y_abc))
@@ -1571,11 +1659,11 @@ def train_step(
             loss_boot = 1.0 - cos_boot
             if shortcut_loss_mode == "direction_magnitude":
                 if bootstrap_reverse_stopgrad:
-                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab + delta_m_abc)
-                    pred_delta_m_ac = delta_m_ac
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_boot_ab_mag + delta_m_abc_mag)
+                    pred_delta_m_ac = delta_m_ac_mag
                 else:
-                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac)
-                    pred_delta_m_ac = delta_m_boot_ab + delta_m_abc
+                    target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_mag)
+                    pred_delta_m_ac = delta_m_boot_ab_mag + delta_m_abc_mag
                 loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
             else:
                 y_ac_target_raw = y_abc if bootstrap_reverse_stopgrad else y_ac
@@ -1832,7 +1920,23 @@ def train_step(
             )
             u_pred = l2_normalize_tokens(y_pred)
             if shortcut_loss_mode == "direction_magnitude":
-                m_pred = jnp.clip(m_source + mag_scale * delta_m_pred, mag_clip_min, mag_clip_max)
+                m_source_for_output = m_source
+                delta_m_for_output = delta_m_pred
+                if mag_stop_backbone:
+                    m_source_for_output = jax.lax.stop_gradient(m_source)
+                    delta_m_for_output = predictor_mag_stop_backbone(
+                        predictor_source,
+                        output_a,
+                        output_b,
+                        t_emb_teacher,
+                        m_source,
+                        y[subset_idx],
+                    )
+                m_pred = jnp.clip(
+                    m_source_for_output + mag_scale * delta_m_for_output,
+                    mag_clip_min,
+                    mag_clip_max,
+                )
                 z_hat_b = jnp.exp(m_pred) * u_pred
             else:
                 z_hat_b = y_pred.astype(jnp.float32)
@@ -2255,6 +2359,10 @@ def train_step(
             0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
             dtype=jnp.float32,
         ),
+        "train/shortcut_mag_grad_mode": jnp.asarray(
+            1.0 if shortcut_mag_grad_mode == "stop_backbone" else 0.0,
+            dtype=jnp.float32,
+        ),
         "train/direct_loss_mode": jnp.asarray(
             0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
             dtype=jnp.float32,
@@ -2583,6 +2691,7 @@ OFFICIAL_TRAIN_METRIC_KEYS = {
     "train/cos_boot",
     "train/direct_gap",
     "train/output_distill_gap",
+    "train/shortcut_mag_grad_mode",
     "train/sampled_timestep_tau",
     "train/grad_norm",
     "train/param_norm",
@@ -3742,6 +3851,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shortcut-mag-grad-mode",
+        type=str,
+        default="full",
+        choices=["full", "stop_backbone", "stop-backbone"],
+        help=(
+            "Gradient routing for direction_magnitude magnitude losses. "
+            "full keeps the original graph; stop_backbone trains the predictor magnitude path "
+            "through detached source/timestep inputs so magnitude gradients do not flow back into DiT."
+        ),
+    )
+    parser.add_argument(
         "--shortcut-activation-huber-delta",
         "--direct-activation-huber-delta",
         dest="shortcut_activation_huber_delta",
@@ -4154,6 +4274,9 @@ def main():
         raise ValueError("--direct-num-pairs supports static values 1, 2, or 3")
     if args.shortcut_loss_mode == "direction_activation_huber":
         args.shortcut_loss_mode = "direction_activation"
+    args.shortcut_mag_grad_mode = args.shortcut_mag_grad_mode.replace("-", "_")
+    if args.shortcut_mag_grad_mode not in {"full", "stop_backbone"}:
+        raise ValueError("--shortcut-mag-grad-mode must be one of: full, stop_backbone")
     if args.shortcut_activation_huber_delta <= 0.0:
         raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
 
@@ -4303,6 +4426,7 @@ def main():
         f"direct_allow_identity_pairs={args.direct_allow_identity_pairs} "
         f"direct_pair_order_mode={args.direct_pair_order_mode} "
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
+        f"shortcut_mag_grad_mode={args.shortcut_mag_grad_mode} "
         f"shortcut_activation_huber_delta={args.shortcut_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
@@ -4512,6 +4636,7 @@ def main():
             direct_allow_identity_pairs=args.direct_allow_identity_pairs,
             direct_pair_order_mode=args.direct_pair_order_mode,
             shortcut_loss_mode=args.shortcut_loss_mode,
+            shortcut_mag_grad_mode=args.shortcut_mag_grad_mode,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
             uniform_transition_diag_logs=args.uniform_transition_diag_logs,
