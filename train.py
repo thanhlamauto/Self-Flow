@@ -2549,6 +2549,14 @@ def train_step(
         predictor_ema_decay,
     )
 
+    mag_stop_backbone_effective = (
+        shortcut_loss_mode == "direction_magnitude"
+        and (
+            shortcut_mag_grad_mode == "stop_backbone"
+            or shortcut_mag_loss_mode == "cross_entropy"
+        )
+    )
+
     metrics = {
         "train/loss": loss,
         "train/loss_total": loss,
