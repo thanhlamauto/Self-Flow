@@ -1188,6 +1188,7 @@ def train_step(
     shortcut_mag_loss_mode="mse",
     shortcut_mag_ce_bins=33,
     shortcut_mag_ce_temperature=1.0,
+    shortcut_mag_reg_weight=1.0,
     shortcut_activation_huber_delta=1.0,
     debug_gap_log_freq=10000,
     uniform_transition_diag_logs=False,
@@ -1250,14 +1251,16 @@ def train_step(
         "separate_head_stop_backbone",
     }:
         raise ValueError(f"Unknown shortcut magnitude gradient mode: {shortcut_mag_grad_mode!r}")
-    if shortcut_mag_loss_mode not in {"mse", "cross_entropy", "scalar_cross_entropy"}:
+    if shortcut_mag_loss_mode not in {"mse", "cross_entropy", "scalar_cross_entropy", "token_cross_entropy"}:
         raise ValueError(f"Unknown shortcut magnitude loss mode: {shortcut_mag_loss_mode!r}")
     if shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"} and shortcut_mag_ce_bins < 2:
-        raise ValueError("shortcut_mag_ce_bins must be at least 2 for CE magnitude modes.")
-    if shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"} and shortcut_mag_grad_mode != "full":
+        raise ValueError("shortcut_mag_ce_bins must be at least 2 for binned CE magnitude modes.")
+    if shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy", "token_cross_entropy"} and shortcut_mag_grad_mode != "full":
         raise ValueError("CE magnitude modes are currently supported only with shortcut_mag_grad_mode='full'.")
     if shortcut_mag_ce_temperature <= 0.0:
         raise ValueError("shortcut_mag_ce_temperature must be positive.")
+    if shortcut_mag_reg_weight < 0.0:
+        raise ValueError("shortcut_mag_reg_weight must be non-negative.")
     if shortcut_activation_huber_delta <= 0.0:
         raise ValueError("shortcut_activation_huber_delta must be positive.")
     if output_distill_pair_mode not in pair_modes:
@@ -1361,7 +1364,7 @@ def train_step(
             "separate_head",
             "separate_head_stop_backbone",
         }
-        mag_cross_entropy = (
+        mag_bin_cross_entropy = (
             shortcut_loss_mode == "direction_magnitude"
             and shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"}
         )
@@ -1369,6 +1372,11 @@ def train_step(
             shortcut_loss_mode == "direction_magnitude"
             and shortcut_mag_loss_mode == "scalar_cross_entropy"
         )
+        mag_token_cross_entropy = (
+            shortcut_loss_mode == "direction_magnitude"
+            and shortcut_mag_loss_mode == "token_cross_entropy"
+        )
+        mag_cross_entropy = bool(mag_bin_cross_entropy) or bool(mag_token_cross_entropy)
         mag_stop_backbone_effective = bool(mag_stop_backbone) or bool(mag_cross_entropy)
 
         def mag_bin_centers():
@@ -1452,18 +1460,47 @@ def train_step(
             )
             return jnp.mean(ce)
 
+        def mag_token_ce_loss_per_sample(prediction, target_delta):
+            delta = mag_prediction_to_delta(prediction).astype(jnp.float32).squeeze(-1)
+            target = jax.lax.stop_gradient(target_delta.astype(jnp.float32).squeeze(-1))
+            temperature = jnp.asarray(shortcut_mag_ce_temperature, dtype=jnp.float32)
+            pred_log_probs = jax.nn.log_softmax(delta / temperature, axis=-1)
+            target_probs = jax.nn.softmax(target / temperature, axis=-1)
+            return -jnp.sum(target_probs * pred_log_probs, axis=-1)
+
+        def mag_token_ce_loss_mean(prediction, target_delta):
+            return jnp.mean(mag_token_ce_loss_per_sample(prediction, target_delta))
+
+        def mag_token_distribution_ce(pred_delta, target_delta):
+            pred_delta = pred_delta.astype(jnp.float32).squeeze(-1)
+            target_delta = jax.lax.stop_gradient(target_delta.astype(jnp.float32).squeeze(-1))
+            temperature = jnp.asarray(shortcut_mag_ce_temperature, dtype=jnp.float32)
+            pred_log_probs = jax.nn.log_softmax(pred_delta / temperature, axis=-1)
+            target_probs = jax.nn.softmax(target_delta / temperature, axis=-1)
+            return -jnp.mean(jnp.sum(target_probs * pred_log_probs, axis=-1))
+
         def mag_supervised_loss_per_sample(prediction, target_delta, ce_prediction=None):
             ce_prediction = prediction if ce_prediction is None else ce_prediction
-            loss = mag_mse_loss_per_sample(prediction, target_delta)
-            if mag_cross_entropy:
+            loss = jnp.asarray(shortcut_mag_reg_weight, dtype=jnp.float32) * mag_mse_loss_per_sample(
+                prediction,
+                target_delta,
+            )
+            if mag_bin_cross_entropy:
                 loss = loss + mag_ce_loss_per_sample(ce_prediction, target_delta)
+            elif mag_token_cross_entropy:
+                loss = loss + mag_token_ce_loss_per_sample(ce_prediction, target_delta)
             return loss
 
         def mag_supervised_loss_mean(prediction, target_delta, ce_prediction=None):
             ce_prediction = prediction if ce_prediction is None else ce_prediction
-            loss = mag_mse_loss_mean(prediction, target_delta)
-            if mag_cross_entropy:
+            loss = jnp.asarray(shortcut_mag_reg_weight, dtype=jnp.float32) * mag_mse_loss_mean(
+                prediction,
+                target_delta,
+            )
+            if mag_bin_cross_entropy:
                 loss = loss + mag_ce_loss_mean(ce_prediction, target_delta)
+            elif mag_token_cross_entropy:
+                loss = loss + mag_token_ce_loss_mean(ce_prediction, target_delta)
             return loss
 
         def apply_direction_predictor(
@@ -1651,7 +1688,11 @@ def train_step(
                 loss_mag_pair = mag_supervised_loss_mean(
                     delta_m_pair_for_mag,
                     target_delta_m_pair,
-                    ce_prediction=delta_m_pair_for_ce if mag_scalar_cross_entropy else None,
+                    ce_prediction=(
+                        delta_m_pair_for_ce
+                        if (mag_scalar_cross_entropy or mag_token_cross_entropy)
+                        else None
+                    ),
                 )
                 loss_aux_pair = loss_mag_pair
                 delta_m_pair_for_metrics = mag_prediction_to_delta(delta_m_pair_for_mag)
@@ -1962,7 +2003,10 @@ def train_step(
                 else:
                     target_delta_m_ac = jax.lax.stop_gradient(delta_m_ac_mag_value)
                     pred_delta_m_ac = delta_m_boot_ab_mag_value + delta_m_abc_mag_value
-                loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
+                if mag_token_cross_entropy:
+                    loss_boot_mag = mag_token_distribution_ce(pred_delta_m_ac, target_delta_m_ac)
+                else:
+                    loss_boot_mag = 0.5 * jnp.mean(jnp.square(pred_delta_m_ac - target_delta_m_ac))
             else:
                 y_ac_target_raw = y_abc if bootstrap_reverse_stopgrad else y_ac
                 y_boot_pred_raw = y_ac if bootstrap_reverse_stopgrad else y_abc
@@ -2600,7 +2644,7 @@ def train_step(
         shortcut_loss_mode == "direction_magnitude"
         and (
             shortcut_mag_grad_mode == "stop_backbone"
-            or shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"}
+            or shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy", "token_cross_entropy"}
         )
     )
 
@@ -2700,6 +2744,7 @@ def train_step(
                 "mse": 0.0,
                 "cross_entropy": 1.0,
                 "scalar_cross_entropy": 2.0,
+                "token_cross_entropy": 3.0,
             }[shortcut_mag_loss_mode],
             dtype=jnp.float32,
         ),
@@ -2709,6 +2754,7 @@ def train_step(
         ),
         "train/shortcut_mag_ce_bins": jnp.asarray(shortcut_mag_ce_bins, dtype=jnp.float32),
         "train/shortcut_mag_ce_temperature": jnp.asarray(shortcut_mag_ce_temperature, dtype=jnp.float32),
+        "train/shortcut_mag_reg_weight": jnp.asarray(shortcut_mag_reg_weight, dtype=jnp.float32),
         "train/direct_loss_mode": jnp.asarray(
             0.0 if shortcut_loss_mode == "direction_magnitude" else 1.0,
             dtype=jnp.float32,
@@ -3042,6 +3088,7 @@ OFFICIAL_TRAIN_METRIC_KEYS = {
     "train/shortcut_mag_loss_stop_backbone",
     "train/shortcut_mag_ce_bins",
     "train/shortcut_mag_ce_temperature",
+    "train/shortcut_mag_reg_weight",
     "train/sampled_timestep_tau",
     "train/grad_norm",
     "train/param_norm",
@@ -4243,6 +4290,14 @@ def main():
             "scalar-cross-entropy",
             "scalar_ce",
             "scalar-ce",
+            "token_cross_entropy",
+            "token-cross-entropy",
+            "token_ce",
+            "token-ce",
+            "spatial_cross_entropy",
+            "spatial-cross-entropy",
+            "spatial_ce",
+            "spatial-ce",
             "two_head_ce",
             "two-head-ce",
         ],
@@ -4254,7 +4309,9 @@ def main():
             "scalar_cross_entropy keeps the scalar magnitude head, trains it with "
             "Smooth L1, and derives CE logits from its distance to fixed bin centers; "
             "in this scalar mode Smooth L1 is detached from the DiT backbone while "
-            "the derived CE loss keeps the normal graph."
+            "the derived CE loss keeps the normal graph. token_cross_entropy also "
+            "keeps the scalar magnitude head, but applies temperature softmax over "
+            "the token axis N and matches the target token distribution with CE."
         ),
     )
     parser.add_argument(
@@ -4268,8 +4325,19 @@ def main():
         type=float,
         default=1.0,
         help=(
-            "Temperature for scalar_cross_entropy derived CE logits. Larger values "
-            "soften the bin softmax; 1.0 uses one bin width as the Gaussian scale."
+            "Temperature for scalar_cross_entropy bin logits and token_cross_entropy "
+            "token softmax. Larger values soften the CE distribution; for scalar bins, "
+            "1.0 uses one bin width as the Gaussian scale."
+        ),
+    )
+    parser.add_argument(
+        "--shortcut-mag-reg-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the continuous magnitude regression term inside the shortcut "
+            "magnitude auxiliary loss. Set to 0 with token_cross_entropy to keep "
+            "only cosine direction loss plus token CE."
         ),
     )
     parser.add_argument(
@@ -4706,14 +4774,18 @@ def main():
         args.shortcut_mag_loss_mode = "cross_entropy"
     elif args.shortcut_mag_loss_mode in {"scalar_ce", "two_head_ce"}:
         args.shortcut_mag_loss_mode = "scalar_cross_entropy"
-    if args.shortcut_mag_loss_mode not in {"mse", "cross_entropy", "scalar_cross_entropy"}:
-        raise ValueError("--shortcut-mag-loss-mode must be one of: mse, cross_entropy, scalar_cross_entropy")
+    elif args.shortcut_mag_loss_mode in {"token_ce", "spatial_cross_entropy", "spatial_ce"}:
+        args.shortcut_mag_loss_mode = "token_cross_entropy"
+    if args.shortcut_mag_loss_mode not in {"mse", "cross_entropy", "scalar_cross_entropy", "token_cross_entropy"}:
+        raise ValueError("--shortcut-mag-loss-mode must be one of: mse, cross_entropy, scalar_cross_entropy, token_cross_entropy")
     if args.shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"} and args.shortcut_mag_ce_bins < 2:
-        raise ValueError("--shortcut-mag-ce-bins must be at least 2 for CE magnitude modes")
-    if args.shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy"} and args.shortcut_mag_grad_mode != "full":
+        raise ValueError("--shortcut-mag-ce-bins must be at least 2 for binned CE magnitude modes")
+    if args.shortcut_mag_loss_mode in {"cross_entropy", "scalar_cross_entropy", "token_cross_entropy"} and args.shortcut_mag_grad_mode != "full":
         raise ValueError("--shortcut-mag-loss-mode CE variants are currently supported only with --shortcut-mag-grad-mode=full")
     if args.shortcut_mag_ce_temperature <= 0.0:
         raise ValueError("--shortcut-mag-ce-temperature must be greater than 0")
+    if args.shortcut_mag_reg_weight < 0.0:
+        raise ValueError("--shortcut-mag-reg-weight must be non-negative")
     if args.shortcut_activation_huber_delta <= 0.0:
         raise ValueError("--shortcut-activation-huber-delta must be greater than 0")
 
@@ -4865,9 +4937,10 @@ def main():
         f"shortcut_loss_mode={args.shortcut_loss_mode} "
         f"shortcut_mag_grad_mode={args.shortcut_mag_grad_mode} "
         f"shortcut_mag_loss_mode={args.shortcut_mag_loss_mode} "
-        f"shortcut_mag_loss_stop_backbone={args.shortcut_mag_grad_mode == 'stop_backbone' or args.shortcut_mag_loss_mode in {'cross_entropy', 'scalar_cross_entropy'}} "
+        f"shortcut_mag_loss_stop_backbone={args.shortcut_mag_grad_mode == 'stop_backbone' or args.shortcut_mag_loss_mode in {'cross_entropy', 'scalar_cross_entropy', 'token_cross_entropy'}} "
         f"shortcut_mag_ce_bins={args.shortcut_mag_ce_bins} "
         f"shortcut_mag_ce_temperature={args.shortcut_mag_ce_temperature} "
+        f"shortcut_mag_reg_weight={args.shortcut_mag_reg_weight} "
         f"shortcut_activation_huber_delta={args.shortcut_activation_huber_delta} "
         f"mag_scale={args.shortcut_mag_scale} "
         f"mag_abs=({args.shortcut_mag_abs_center},{args.shortcut_mag_abs_scale}) "
@@ -5088,6 +5161,7 @@ def main():
             shortcut_mag_loss_mode=args.shortcut_mag_loss_mode,
             shortcut_mag_ce_bins=args.shortcut_mag_ce_bins,
             shortcut_mag_ce_temperature=args.shortcut_mag_ce_temperature,
+            shortcut_mag_reg_weight=args.shortcut_mag_reg_weight,
             shortcut_activation_huber_delta=args.shortcut_activation_huber_delta,
             debug_gap_log_freq=args.shortcut_debug_gap_log_freq,
             uniform_transition_diag_logs=args.uniform_transition_diag_logs,
