@@ -1173,6 +1173,7 @@ def train_step(
     output_distill_full_backbone_start_step=0,
     output_distill_pair_mode="trunc_normal_centered",
     output_distill_target_mode="model_output",
+    output_distill_exclusive_main_batch=False,
     pair_uniform_anneal_start_step=0,
     pair_uniform_anneal_steps=100000,
     use_legacy_direct_loss=True,
@@ -1314,6 +1315,15 @@ def train_step(
             global_step >= jnp.asarray(output_distill_full_backbone_start_step, dtype=jnp.int32),
         ),
     )
+    output_distill_due = (global_step % jnp.asarray(max(int(output_distill_every), 1), dtype=jnp.int32)) == 0
+    output_distill_enabled = (
+        jnp.asarray(use_output_distill, dtype=jnp.bool_)
+        & (lambda_output_distill > 0.0)
+        & output_distill_due
+    )
+    output_batch_perm = jax.random.permutation(output_subset_rng, local_batch)
+    output_subset_idx = output_batch_perm[:output_distill_batch_size]
+    flow_matching_subset_idx = output_batch_perm[output_distill_batch_size:]
 
     q = sample_timestep_indices(
         tau_rng,
@@ -1340,7 +1350,16 @@ def train_step(
             return_hidden_states=True,
         )
         pred, hidden_tuple, dit_time_emb = pred
-        loss_gen = jnp.mean((pred - target) ** 2)
+        loss_gen_per_sample = jnp.mean(
+            jnp.square(pred - target),
+            axis=tuple(range(1, pred.ndim)),
+        )
+        loss_gen_all = jnp.mean(loss_gen_per_sample)
+        if output_distill_exclusive_main_batch:
+            loss_gen_exclusive = jnp.mean(loss_gen_per_sample[flow_matching_subset_idx])
+            loss_gen = jnp.where(output_distill_enabled, loss_gen_exclusive, loss_gen_all)
+        else:
+            loss_gen = loss_gen_all
         hidden_stack = jnp.stack(hidden_tuple, axis=0)
         num_hidden_layers = hidden_stack.shape[0]
 
@@ -2208,7 +2227,7 @@ def train_step(
         skip_gap_metric = jnp.float32(0.0)
 
         def compute_output_distill_loss(_):
-            subset_idx = jax.random.permutation(output_subset_rng, local_batch)[:output_distill_batch_size]
+            subset_idx = output_subset_idx
             x_out = x_tau[subset_idx]
             t_out = tau[subset_idx]
             y_out = y[subset_idx]
@@ -2352,12 +2371,6 @@ def train_step(
                 jnp.asarray(output_distill_batch_size, dtype=jnp.float32),
             )
 
-        output_distill_due = (global_step % jnp.asarray(max(int(output_distill_every), 1), dtype=jnp.int32)) == 0
-        output_distill_enabled = (
-            jnp.asarray(use_output_distill, dtype=jnp.bool_)
-            & (lambda_output_distill > 0.0)
-            & output_distill_due
-        )
         loss_output_distill, output_distill_a, output_distill_b, output_distill_gap, output_distill_batch_size_metric = jax.lax.cond(
             output_distill_enabled,
             compute_output_distill_loss,
@@ -2784,6 +2797,15 @@ def train_step(
             dtype=jnp.float32,
         ),
         "train/output_distill_ratio": jnp.asarray(output_distill_ratio, dtype=jnp.float32),
+        "train/output_distill_exclusive_main_batch": jnp.asarray(
+            1.0 if output_distill_exclusive_main_batch else 0.0,
+            dtype=jnp.float32,
+        ),
+        "train/flow_matching_batch_size": jnp.where(
+            output_distill_enabled & jnp.asarray(output_distill_exclusive_main_batch, dtype=jnp.bool_),
+            jnp.asarray(local_batch - output_distill_batch_size, dtype=jnp.float32),
+            jnp.asarray(local_batch, dtype=jnp.float32),
+        ),
         "train/pair_uniform_mix": pair_uniform_mix,
         "train/pair_center_loc": jnp.asarray(
             -1.0 if pair_center_loc is None else pair_center_loc,
@@ -4180,6 +4202,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--output-distill-exclusive-main-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When output distillation is active, remove the output-distill subset from "
+            "the main flow-matching loss so --output-distill-ratio=0.10 uses 10% for "
+            "output distill and the remaining 90% for flow matching."
+        ),
+    )
+    parser.add_argument(
         "--pair-uniform-anneal-start-step",
         type=int,
         default=0,
@@ -4863,6 +4895,15 @@ def main():
     effective_use_legacy_direct_loss = bool(shortcut_direct_weight_active)
     effective_use_legacy_bootstrap_loss = bool(shortcut_bootstrap_weight_active)
     effective_output_distill = bool(args.output_distill and args.lambda_output_distill > 0.0)
+    if (
+        args.output_distill_exclusive_main_batch
+        and effective_output_distill
+        and output_distill_local_batch_size >= local_batch_size
+    ):
+        raise ValueError(
+            "--output-distill-exclusive-main-batch requires output_distill_local_batch "
+            "to be smaller than local_batch_size so flow matching has at least one sample."
+        )
     active_losses = ["Lgen"]
     inactive_losses = []
     if effective_use_legacy_direct_loss:
@@ -4928,6 +4969,7 @@ def main():
         f"output_distill_full_backbone_start_step={args.output_distill_full_backbone_start_step} "
         f"output_distill_pair_mode={args.output_distill_pair_mode} "
         f"output_distill_target_mode={args.output_distill_target_mode} "
+        f"output_distill_exclusive_main_batch={args.output_distill_exclusive_main_batch} "
         f"pair_uniform_anneal=({args.pair_uniform_anneal_start_step},{args.pair_uniform_anneal_steps}) "
         f"pair_center=({args.pair_center_loc},{args.pair_center_sigma}) "
         f"direct_pairs=({args.direct_joint_pairs} joint,{args.direct_predictor_only_pairs} predictor_only) "
@@ -5146,6 +5188,7 @@ def main():
             output_distill_full_backbone_start_step=args.output_distill_full_backbone_start_step,
             output_distill_pair_mode=args.output_distill_pair_mode,
             output_distill_target_mode=args.output_distill_target_mode,
+            output_distill_exclusive_main_batch=args.output_distill_exclusive_main_batch,
             pair_uniform_anneal_start_step=args.pair_uniform_anneal_start_step,
             pair_uniform_anneal_steps=args.pair_uniform_anneal_steps,
             use_legacy_direct_loss=effective_use_legacy_direct_loss,
