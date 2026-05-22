@@ -263,6 +263,7 @@ class DeepDilatedShortcutBlock(nn.Module):
     mlp_ratio: float = 4.0
     dilation: int = 1
     use_attention: bool = False
+    use_conv: bool = True
     num_heads: int = 6
     adaln_zero: bool = True
 
@@ -284,33 +285,34 @@ class DeepDilatedShortcutBlock(nn.Module):
             )
             return shift, scale, gate
 
-        shift_conv, scale_conv, gate_conv = modulation("conv_adaln")
-        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="conv_ln")(h)
-        x = modulate(x, shift_conv, scale_conv)
-        batch_size, num_tokens, channels = x.shape
-        if num_tokens != self.grid_size * self.grid_size:
-            raise ValueError("num_tokens must equal grid_size * grid_size for deep shortcut predictor")
-        x_grid = x.reshape(batch_size, self.grid_size, self.grid_size, channels)
-        x_grid = nn.Conv(
-            features=self.width,
-            kernel_size=(3, 3),
-            padding="SAME",
-            feature_group_count=self.width,
-            kernel_dilation=(self.dilation, self.dilation),
-            kernel_init=XAVIER_UNIFORM,
-            bias_init=ZERO_INIT,
-            dtype=jnp.bfloat16,
-            name="dwconv",
-        )(x_grid)
-        x_grid = nn.Dense(
-            self.width,
-            kernel_init=XAVIER_UNIFORM,
-            bias_init=ZERO_INIT,
-            dtype=jnp.bfloat16,
-            name="pwconv",
-        )(x_grid)
-        x = x_grid.reshape(batch_size, num_tokens, self.width)
-        h = h + gate_conv[:, None, :] * x
+        if self.use_conv:
+            shift_conv, scale_conv, gate_conv = modulation("conv_adaln")
+            x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False, name="conv_ln")(h)
+            x = modulate(x, shift_conv, scale_conv)
+            batch_size, num_tokens, channels = x.shape
+            if num_tokens != self.grid_size * self.grid_size:
+                raise ValueError("num_tokens must equal grid_size * grid_size for deep shortcut predictor")
+            x_grid = x.reshape(batch_size, self.grid_size, self.grid_size, channels)
+            x_grid = nn.Conv(
+                features=self.width,
+                kernel_size=(3, 3),
+                padding="SAME",
+                feature_group_count=self.width,
+                kernel_dilation=(self.dilation, self.dilation),
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
+                name="dwconv",
+            )(x_grid)
+            x_grid = nn.Dense(
+                self.width,
+                kernel_init=XAVIER_UNIFORM,
+                bias_init=ZERO_INIT,
+                dtype=jnp.bfloat16,
+                name="pwconv",
+            )(x_grid)
+            x = x_grid.reshape(batch_size, num_tokens, self.width)
+            h = h + gate_conv[:, None, :] * x
 
         if self.use_attention:
             if self.width % self.num_heads != 0:
@@ -612,7 +614,7 @@ class DepthShortcutPredictor(nn.Module):
             t_cond = jax.lax.stop_gradient(timestep_embed) if detach_timestep_embed else timestep_embed
         else:
             t_cond = jnp.zeros_like(timestep_embed)
-        if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+        if self.arch in {"deep_dilated_mlp", "hybrid_deep", "pure_mlp"}:
             t_proj = nn.Dense(
                 cond_dim,
                 kernel_init=XAVIER_UNIFORM,
@@ -738,7 +740,7 @@ class DepthShortcutPredictor(nn.Module):
                 raise ValueError("dilation_schedule length must match num_blocks")
             for idx in range(self.num_blocks):
                 dilation = int(dilation_schedule[idx])
-                if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+                if self.arch in {"deep_dilated_mlp", "hybrid_deep", "pure_mlp"}:
                     h = h.reshape(batch_size, self.num_tokens, self.width)
                     use_attention = (
                         self.arch == "hybrid_deep"
@@ -751,6 +753,7 @@ class DepthShortcutPredictor(nn.Module):
                         mlp_ratio=float(self.mlp_ratio),
                         dilation=dilation,
                         use_attention=use_attention,
+                        use_conv=self.arch != "pure_mlp",
                         num_heads=int(self.num_heads or 1),
                         adaln_zero=bool(self.adaln_zero),
                         name=f"blocks_{idx}",
@@ -781,7 +784,7 @@ class DepthShortcutPredictor(nn.Module):
                     raise ValueError(f"Unknown shortcut predictor arch: {self.arch!r}")
             h_grid = h
         h = h_grid.reshape(batch_size, self.num_tokens, self.width)
-        if self.arch in {"deep_dilated_mlp", "hybrid_deep"}:
+        if self.arch in {"deep_dilated_mlp", "hybrid_deep", "pure_mlp"}:
             h = nn.LayerNorm(epsilon=1e-6, name="final_ln")(h)
         delta_y = nn.Dense(
             self.hidden_size,
@@ -1034,6 +1037,47 @@ PREDICTOR_VARIANTS = {
         "attention_every": 4,
         "adaln_zero": True,
     },
+    # ~16M-param iso-compute ablation family (matched to hybrid_deep_10 at DiT-L hidden=1024)
+    "pure_mlp_depth10": {
+        # MLP-only: no spatial conv, no attention — pure per-token MLP + AdaLN.
+        # 8W²+104W per block × 10 blocks + lightweight cond (cond_dim=32) ≈ 16.30M
+        "arch": "pure_mlp",
+        "width": 432,
+        "num_blocks": 10,
+        "expansion": 2,
+        "dilation_schedule": (1,) * 10,
+        "attn_dim": None,
+        "num_heads": None,
+        "mlp_ratio": 4.0,
+        "cond_dim": 32,
+        "grid_size_override": 16,
+        "residual_output": True,
+        "attention_every": 0,
+        "adaln_zero": True,
+    },
+    "convnext_depth10": {
+        # ConvNext canonical (expansion=4, dilated) — best-practice ConvNeXt setup.
+        # (2+2E)W²+(13+E)W per block × 10 blocks + heavy cond ≈ 16.35M
+        "arch": "convnext",
+        "width": 384,
+        "num_blocks": 10,
+        "expansion": 4,
+        "dilation_schedule": (1, 2, 4, 1, 2, 4, 1, 2, 4, 1),
+        "attn_dim": None,
+        "num_heads": None,
+    },
+    "dit2_depth2": {
+        # ViT-style (DiT/adaLN-Zero) — wide & shallow: 2 global-attention blocks suffice
+        # to express cross-token interactions.  18W²+15W per block × 2 + heavy cond ≈ 16.19M
+        "arch": "dit2",
+        "width": 624,
+        "num_blocks": 2,
+        "expansion": 2,
+        "dilation_schedule": None,
+        "attn_dim": None,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+    },
     "hybrid_depth30m": {
         "arch": "hybrid_deep",
         "width": 480,
@@ -1116,7 +1160,11 @@ def canonical_predictor_variant_name(name: str) -> str:
 def predictor_size_bucket(name: str) -> str:
     """Return tiny/small/base/large for a predictor variant."""
     canonical = canonical_predictor_variant_name(name)
-    if canonical in {"deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10", "hybrid_depth30m", "hybrid_depth60m"}:
+    if canonical in {
+        "deep_dilated_mlp", "hybrid_deep", "hybrid_deep_10",
+        "hybrid_depth30m", "hybrid_depth60m",
+        "pure_mlp_depth10", "convnext_depth10", "dit2_depth2",
+    }:
         return "large"
     if canonical in {"dit2_base_v2", "dit2_deep_256"}:
         return "base"
